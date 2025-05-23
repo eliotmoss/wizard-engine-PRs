@@ -1,0 +1,56 @@
+// Persistent WASM region definition
+class X86_64PWRegion {
+	new(numBlocks: u64);
+	private def init() {
+		var hdr = getHeader();
+		hdr.numBlocks = numBlocks;
+		hdr.numBytes = size;
+		// ...
+	}
+	def getHeader() -> Ref<PWRegionHeader>;
+	def getBlockSize() -> u64;
+	def defaultMetadataDescs() -> Range<byte>;
+	def lineMarks() -> Range<byte>;
+	def resetAllLineMarks();
+	def lineMarkOfOffset(lineMarks: Range<byte>, offset: u64) -> Ref<LineMark>;
+	// ....
+
+}
+
+layout PWRegionHeader {
+	+0	blockTable:	u64;	// offset in the region of the block table
+	+8	sentinels:	u64;	// offset of the sentinels (whatever type are!)
+	+16	numBlocks:	u64;
+	+24	numBytes:	u64;
+	+32	numDescs:	u64;
+	+40	metaData:	u64;	// offset of the metadata area
+	+48	metaDataDescs:	u64;	// offset of the metadata descriptors
+	=56;				// size of header
+}
+
+def PWMemBlockSize: u64 = 4096u64;
+
+class X86_64PWMemRegion extends X86_64PWRegion {
+	def var mapping: Mapping;
+	new(numBlocks: u64) super(numBlocks) {
+		var size = numBlocks * PWMemBlockSize;
+		var prot = Mmap.PROT_READ | Mmap.PROT_WRITE;
+		var mapping = Mmap.reserve(size, prot);
+		if (mapping == null) {
+			// failure
+		}
+		init();
+	}
+	def getHeader() -> Ref<PWRegionHeader> {
+		return Ref<PWRegionHeader>.of(mapping.range(0, PWReagionHeader.SIZE));
+	}
+	def getBlockSize() -> u64 { return PWMEMBlockSize; }
+}
+
+class X86_64PWNVRegion extends X86_64PWRegion {
+	// ...
+	new (path: string, numBlocks: u64) super(numBlocks) {
+		// ...
+		init();
+	}
+}
