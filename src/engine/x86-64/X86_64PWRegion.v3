@@ -1,4 +1,23 @@
 // Persistent WASM region definition
+class RangeOfLayout<T> {
+	def var rng: Range<byte>;
+	def var x: T;
+	new(rng, x);
+	def getRefTo(index: u32) -> T {
+		match(x) {
+			y: Ref<LineMark> => {
+				return Ref<LineMark>.at(rng, index * LineMark.SIZE);
+			}
+			y: Ref<MetadataDesc> => {
+				return Ref<MetadataDesc>.at(rng, index * MetadataDesc.SIZE);
+			}
+			_ => ;
+		}
+	}
+}
+
+
+
 class X86_64PWRegion {
 	new(numBlocks: u64);
 	private def init() {
@@ -9,10 +28,17 @@ class X86_64PWRegion {
 	}
 	def getHeader() -> Ref<PWRegionHeader>;
 	def getBlockSize() -> u64;
-	def defaultMetadataDescs() -> Range<byte>;
-	def lineMarks() -> Range<byte>;
+	def defaultMetadataDescs() -> RangeOfLayout;
+	def lineMarks() -> RangeOfLayout<Ref<LineMark>> {
+		var rng = ...;  // need actual offset of linemarks!
+		var r: Ref<LineMark>;
+		return RangeOfLayout.new(rng, r);
+	}
 	def resetAllLineMarks();
-	def lineMarkOfOffset(lineMarks: Range<byte>, offset: u64) -> Ref<LineMark>;
+	def lineMarkOfOffset(lineMarks: RangeOfLayout<Ref<LineMark>>, offset: u64) -> Ref<LineMark> {
+		var r: Ref<LineMark>;
+		return lineMarks.getRefTo(offset, r);
+	}
 	// ....
 
 }
