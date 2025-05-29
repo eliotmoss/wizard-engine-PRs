@@ -1,47 +1,91 @@
-// Persistent WASM region definition
-class RangeOfLayout<T> {
-	def var rng: Range<byte>;
-	def var x: T;
-	new(rng, x);
-	def getRefTo(index: u32) -> T {
-		match(x) {
-			y: Ref<LineMark> => {
-				return Ref<LineMark>.at(rng, index * LineMark.SIZE);
-			}
-			y: Ref<MetadataDesc> => {
-				return Ref<MetadataDesc>.at(rng, index * MetadataDesc.SIZE);
-			}
-			_ => ;
-		}
+// Really want to write something like this, Virgil does not support it:
+//
+// class LayoutRange<Ref<L>> {
+//	def var rng: Range<byte>;
+//	new(rng);
+//	def [index: u64] => Ref<L>.at(rng[index * L.size ..+ L.size]);
+// }
+
+// Layout ranges may go into a Virgil library once tested and refined
+
+// The concept is essentially an array/range of a layout, i.e., multiple
+// copies of the same layout up against each other.  The "at" function does
+// the actual indexing and constructs a Ref, so this class does little actual
+// work (but see the companion component, LayoutRanges).
+
+class LayoutRange<T> {
+	def var rng: Range<byte>;  // the underlying range of bytes
+	def at: (Range<byte>, u64) -> T;  // a function to index that range and return a Ref
+	def [index: u64] => at(rng, index);  // indexing that supports [i] notation
+	new(rng, at) { }
+}
+
+// This component provides several functions that can be used to index a
+// LayoutRange with different semantics for the index passed in.
+
+component LayoutRanges {
+
+	// atIndex interprets the index as indicating which element of the
+	// range is desired.  Thus, an index of 2 indicates the third element
+	// of the range.  atIndex requires the size in order to calculate the
+	// byte offset.
+	def atIndex<T>(rng: Range<byte>, index: u64, size: int, at: Range<byte> -> T) -> T {
+		return at(rng[index * size ..+ size]);
+	}
+
+	// atByte interprets the index as indicating the starting byte.  Thus, an index
+	// of 2 indicates to start at the third *byte* on the range.  It uses the size
+	// only to determine the size of the subrange passed to "at".
+	def atByte<T>(rng: Range<byte>, pos: u64, size: int, at: Range<byte> -> T) -> T {
+		return at(rng[pos ..+ size]);
+	}
+
+	// forOffset takes an offset (into some other range of bytes) and
+	// converts that into a suitable index in this LayoutRange based on
+	// their being one layout per some number of bytes in the other range.
+	// Here an offset of 2 means to convert from that offset in the
+	// original range.  To perform the computation, forOffset requires a
+	// "divisor" (the number of bytes in the other range per layout in
+	// this range) and the size of each layout in this range.
+	def forOffset<T>(rng: Range<byte>, offset: u64, divisor: u64, size: int,
+			at: Range<byte> -> T) -> T {
+		return at(rng[(offset / divisor) * size ..+ size]);
+	}
+
+	// Creates a LayoutRange that uses the atIndex accessor
+	// Example: LayoutRanges.byIndex(rng, L.size, Ref<L>.at)
+	def byIndex<T>(rng: Range<byte>, size: int, atFunc: (Range<byte>, u64) -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.atIndex(rng, _, size, atFunc));
+	}
+
+	// Creates a LayoutRange that uses the atByte accessor
+	// Example: LayoutRanges.byByte(rng, L.size, Ref<L>.at)
+	def byByte<T>(rng: Range<byte>, size: int, atFunc: (Range<byte>, u64) -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.atByte(rng, _, size, atFunc));
+	}
+
+	// Creates a LayoutRange that uses the forOffset accessor
+	// Example: LayoutRanges.byOffset(rng, otherUnit, L.size, Ref<L>.at)
+	def byOffset<T>(rng: Range<byte>, divisor: u64, size: int, atFunc: (Range<byte>, u64) -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.forOffset(rng, _, divisor, size, atFunc));
 	}
 }
 
-
-
-class X86_64PWRegion {
-	new(numBlocks: u64);
-	private def init() {
-		var hdr = getHeader();
-		hdr.numBlocks = numBlocks;
-		hdr.numBytes = size;
-		// ...
-	}
-	def getHeader() -> Ref<PWRegionHeader>;
-	def getBlockSize() -> u64;
-	def defaultMetadataDescs() -> RangeOfLayout;
-	def lineMarks() -> RangeOfLayout<Ref<LineMark>> {
-		var rng = ...;  // need actual offset of linemarks!
-		var r: Ref<LineMark>;
-		return RangeOfLayout.new(rng, r);
-	}
-	def resetAllLineMarks();
-	def lineMarkOfOffset(lineMarks: RangeOfLayout<Ref<LineMark>>, offset: u64) -> Ref<LineMark> {
-		var r: Ref<LineMark>;
-		return lineMarks.getRefTo(offset, r);
-	}
-	// ....
-
+/*
+def lineMarkAtIndex(lineMarksByIndex: LayoutRange<Ref<LineMark>>, index: u64) -> Ref<LineMark> {
+	return lineMarksByIndex[index];
+//	return Ref<LineMark>.at(lineMarks.rng[index * LineMark.size ..+ LineMark.size])
+//	return LayoutRanges.atIndex  (lineMarks.rng, index,                 LineMark.size, Ref<LineMark>.at);
+//	return LayoutRanges.atByte   (lineMarks.rng, index * LineMark.size, LineMark.size, Ref<LineMark>.at);
+//	return LayoutRanges.forOffset(lineMarks.rng, index, LineMarkUnit,   LineMark.size, Ref<LineMark>.at);
 }
+
+// don't really need two functions :-)
+def lineMarksAtOffset(lineMarksByByte: LayoutRange<Ref<LineMark>>, offset: u64) -> Ref<LineMark> {
+	// lineMarksByByte uses the atByte
+	return lineMarksByByte[offset];
+}
+*/
 
 layout PWRegionHeader {
 	+0	blockTable:	u64;	// offset in the region of the block table
@@ -52,6 +96,78 @@ layout PWRegionHeader {
 	+40	metaData:	u64;	// offset of the metadata area
 	+48	metaDataDescs:	u64;	// offset of the metadata descriptors
 	=56;				// size of header
+}
+
+layout MetadataDesc {
+	+0	kind:		u32;  // unique code, identifying the kind of metadata
+	+4	fixedBytes:	u32;  // single-copy data at beginning of metadata block
+	+8	unitSize:	u32;  // number of bytes of data space per metadata item
+	+12	bytesPerUnit:	u32;  // size of each metadata item, in bytes
+	+16	offset:		u64;  // offset in region of the actual metadata
+	=24;
+}
+
+class X86_64PWRegion {
+	new(numBlocks: u64) { }
+	def var rng: Range<byte>;  // the actual bytes of the region
+	def var descs: LayoutRange<Ref<MetadataDesc>>;
+	private def init() {
+		var hdr = getHeader();
+		hdr.numBlocks = numBlocks;
+		hdr.numBytes = size;
+		// ...
+		descs = metadataDescs();
+	}
+	def getHeader() -> Ref<PWRegionHeader>;
+	def getBlockSize() -> u64;
+	def defaultMetadataDescs() -> LayoutRange<Ref<MetadataDesc>>;
+	def metadataDescs() -> LayoutRange<Ref<MetadataDesc>> {
+		var hdr = getHeader();
+		var metaDescOffset = hdr.metaDataDescs;
+		var numDescs = hdr.numDescs;
+		var descs = rng[metaDescOffset ..+ numDescs * MetadataDesc.size];
+		var at = LayoutRange.atIndex(_, _, MetadataDesc.size, Ref<MetadataDec.size>.at);
+		return LayoutRange<Ref<MetadataDesc>>.new(descs, at);
+	}
+	// ...
+}
+
+// kind is notional for now - need a convention and place where they are all declared
+
+def ImmixLineMarkMetaKind = 0x0000_0001_0000_0000u64;
+def immixLineMarkResetValue = 0u8;
+
+layout LineMark {
+	+0	mark:		u8;	// line mark info
+	=1;
+}
+
+class ImmixPWRegion extends X86_64PWRegion {
+	private def init() {
+		X86_64PWRegion.init(this);
+		lineMarks = getLineMarks();
+	}
+	// Line mark definitions
+	def ImmixLineSize = 256;  // sample - needs to be done using the metadata descriptior
+	def var lineMarks: LayoutRange<Ref<LineMark>>;
+	def var numLineMarks: u64;
+	private def getLineMarks() -> LayoutRange<Ref<LineMark>> {
+		for (i < hdr.numDescs) {
+			var r = descs[i];
+			if (r.kind == ImmixLineMarkMetaKind) {
+				var spaceSize = numBlocks * getBlockSize();
+				numLineMarks = spaceSize / ImmixLineSize;
+				var lmrng = this.rng[r.offset ..+ numLineMarks * LineMark.size];
+				return LayoutRanges.byOffset(lmrng, ImmixLineSize, LineMark.size, Ref<LineMark>.at);
+			}
+		}
+		return null;
+	}
+	def resetAllLineMarks() {
+		for (i < numLineMarks) {
+			lineMarks[i].mark = ImmixLineMarkResetValue;
+		}
+	}
 }
 
 def PWMemBlockSize: u64 = 4096u64;
