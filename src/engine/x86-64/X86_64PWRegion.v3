@@ -381,7 +381,7 @@ class X86_64PWMemRegion extends X86_64PWRegion {
 
 class X86_64PWNVRegion extends X86_64PWRegion {
 	// ...
-	new (path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDatDesc>>) super(numBlocks, metaDataDescs) {
+	new (path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>) super(numBlocks, metaDataDescs) {
 		// ...
 		init();
 	}

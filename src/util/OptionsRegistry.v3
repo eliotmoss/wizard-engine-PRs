@@ -4,7 +4,8 @@
 // Centralizes management of help for options and sections for various utilities,
 // which is used to print out help for all command-line options.
 component OptionsRegistry {
-	def ALL = BasicOptions.new(null);
+	def ALL = BasicOptions.new();
+//	def ALL = BasicOptions.new(null);
 	var groups: List<(OptionGroup, TraceBuilder -> void)>;
 	var funcs: List<(string, ErrorGen) -> bool>;
 
@@ -31,7 +32,8 @@ component OptionsRegistry {
 		}
 	}
 	def parse(arg: string, err: ErrorGen) -> bool {
-		if (ALL.parseOption(arg)) return true;
+		if (ALL.setOption(ALL.parseOption(arg))) return true;
+//		if (ALL.parseOption(arg)) return true;
 		for (l = funcs; l != null; l = l.tail) {
 			if (l.head(arg, err)) return true;
 		}
