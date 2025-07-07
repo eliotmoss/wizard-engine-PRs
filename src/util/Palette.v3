@@ -66,5 +66,5 @@ component Palettes {
 	];
 
 	def get() => if(on, defaultOn, defaultOff);
-	def reset(on: bool) => void(this.on = on);
+	def reset(on: bool) { return void(this.on = on); }
 }

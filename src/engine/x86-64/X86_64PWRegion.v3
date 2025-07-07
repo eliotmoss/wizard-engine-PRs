@@ -16,8 +16,9 @@
 class LayoutRange<T> {
 	def var rng: Range<byte>;  // the underlying range of bytes
 	def at: (Range<byte>, u64) -> T;  // a function to index that range and return a Ref
+	def offset: u64 -> u64;  // a function to go from index to offset
 	def [index: u64] => at(rng, index);  // indexing that supports [i] notation
-	new(rng, at) { }
+	new(rng, at, offset) { }
 }
 
 // This component provides several functions that can be used to index a
@@ -30,7 +31,7 @@ component LayoutRanges {
 	// of the range.  atIndex requires the size in order to calculate the
 	// byte offset.
 	def atIndex<T>(rng: Range<byte>, index: u64, size: int, at: Range<byte> -> T) -> T {
-		return at(rng[index * size ..+ size]);
+		return at(rng[index * u64.!(size) ..+ size]);
 	}
 
 	// atByte interprets the index as indicating the starting byte.  Thus, an index
@@ -49,41 +50,56 @@ component LayoutRanges {
 	// this range) and the size of each layout in this range.
 	def forOffset<T>(rng: Range<byte>, offset: u64, divisor: u64, size: int,
 			at: Range<byte> -> T) -> T {
-		return at(rng[(offset / divisor) * size ..+ size]);
+		return at(rng[(offset / divisor) * u64.!(size) ..+ size]);
+	}
+
+	private def offset(base: u64, size: int, index: u64) -> u64 {
+		return base + index * u64.!(size);
+	}
+	// Creates a LayoutRange that uses the atIndex accessor and gives offset as within the original range
+	// Example: LayoutRanges.subrangeByIndex(rng, start, L.size, count, Ref<L>.at)
+	def subrangeByIndex<T>(rng: Range<byte>, base: u64, size: int, count: u64, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		var sub = rng[base ..+ count * u64.!(size)];
+		return LayoutRange<T>.new(sub, LayoutRanges.atIndex(_, _, size, atFunc), offset(base, size, _));
 	}
 
 	// Creates a LayoutRange that uses the atIndex accessor
 	// Example: LayoutRanges.byIndex(rng, L.size, Ref<L>.at)
-	def byIndex<T>(rng: Range<byte>, size: int, atFunc: (Range<byte>, u64) -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.atIndex(rng, _, size, atFunc));
+	def byIndex<T>(rng: Range<byte>, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.atIndex(_, _, size, atFunc), u64.*(u64.!(size),_));
 	}
 
 	// Creates a LayoutRange that uses the atByte accessor
 	// Example: LayoutRanges.byByte(rng, L.size, Ref<L>.at)
-	def byByte<T>(rng: Range<byte>, size: int, atFunc: (Range<byte>, u64) -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.atByte(rng, _, size, atFunc));
+	def byByte<T>(rng: Range<byte>, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.atByte(_, _, size, atFunc), u64.*(u64.!(size),_));
 	}
 
 	// Creates a LayoutRange that uses the forOffset accessor
 	// Example: LayoutRanges.byOffset(rng, otherUnit, L.size, Ref<L>.at)
-	def byOffset<T>(rng: Range<byte>, divisor: u64, size: int, atFunc: (Range<byte>, u64) -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.forOffset(rng, _, divisor, size, atFunc));
+	def byOffset<T>(rng: Range<byte>, divisor: u64, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.forOffset(_, _, divisor, size, atFunc), u64.*(u64.!(size),_));
 	}
 }
 
+// Don't see any advantage of Pointer based solution right now ...
 /*
-def lineMarkAtIndex(lineMarksByIndex: LayoutRange<Ref<LineMark>>, index: u64) -> Ref<LineMark> {
-	return lineMarksByIndex[index];
-//	return Ref<LineMark>.at(lineMarks.rng[index * LineMark.size ..+ LineMark.size])
-//	return LayoutRanges.atIndex  (lineMarks.rng, index,                 LineMark.size, Ref<LineMark>.at);
-//	return LayoutRanges.atByte   (lineMarks.rng, index * LineMark.size, LineMark.size, Ref<LineMark>.at);
-//	return LayoutRanges.forOffset(lineMarks.rng, index, LineMarkUnit,   LineMark.size, Ref<LineMark>.at);
-}
+class LayoutPtr<T> {
+	def atFunc: Range<byte> -> T;  // a function to go from bytes to T (Ref<L> for some L)
+	def size: int;  // field (like this), or argument to each call?
+	def atByte(pos: u64) -> T {
+		// TODO: insure pos < limit
+		return atFunc(CiRuntime.forgeRange<byte>(p + pos, size));
+	}
+	def at() -> T { return atByte(0); }
+	def atIndex(index: u64) -> T { return atByte(index * size); }
 
-// don't really need two functions :-)
-def lineMarksAtOffset(lineMarksByByte: LayoutRange<Ref<LineMark>>, offset: u64) -> Ref<LineMark> {
-	// lineMarksByByte uses the atByte
-	return lineMarksByByte[offset];
+	def var p: Pointer;
+	def var limit: long;
+	new(rng: Range<byte>, atFunc, size) {
+		p = Pointer.atElement(rng, 0);
+		limit = rng.size - size;
+	}
 }
 */
 
@@ -98,44 +114,201 @@ layout PWRegionHeader {
 	=56;				// size of header
 }
 
-layout MetadataDesc {
-	+0	kind:		u32;  // unique code, identifying the kind of metadata
-	+4	fixedBytes:	u32;  // single-copy data at beginning of metadata block
-	+8	unitSize:	u32;  // number of bytes of data space per metadata item
-	+12	bytesPerUnit:	u32;  // size of each metadata item, in bytes
-	+16	offset:		u64;  // offset in region of the actual metadata
-	=24;
+layout MetaDataDesc {
+	+0	kind:		u64;  // unique code, identifying the kind of metadata
+	+8	fixedBytes:	u32;  // single-copy data at beginning of metadata block
+	+12	unitSize:	u32;  // number of bytes of data space per metadata item
+	+16	bytesPerUnit:	u32;  // size of each metadata item, in bytes
+				      // gap
+	+24	offset:		u64;  // offset in region of the actual metadata
+	=32;
+}
+
+layout BlockEntry {
+	+0	listNum:	i16;  // which list is this entry part of
+	+2	used:		bool; // is this block in use?
+				      // gap
+	+8	prev:		u64;  // prev entry in memory;
+	+16	next:		u64;  // next entry in memory order
+	+24	listPrev:	u64;  // prev entry on same list
+	+32	listNext:	u64;  // next entry on same list
+	=40;			      // size of block entry
+}
+
+enum ListKind(code: i16) {
+	METADATA(-1),
+	NONE(-2),
+	USED(-3),
+	SMALL_FREE(0),
+	LARGE_FREE(1)
+}
+
+component BlockLists {
+	def MAX_LISTS = 8;	// maximum number of lists == number of list sentinels
+				// METADATA, etc., do not have sentinels and not part of this count
 }
 
 class X86_64PWRegion {
-	new(numBlocks: u64) { }
+	def var mapping: Mapping;
 	def var rng: Range<byte>;  // the actual bytes of the region
-	def var descs: LayoutRange<Ref<MetadataDesc>>;
+	def numBlocks: u64;
+	def metaDataDescs: Range<Ref<MetaDataDesc>>;
+	def var descs: LayoutRange<Ref<MetaDataDesc>>;
+	new(numBlocks, metaDataDescs) { }
+	private def sanitizeOffset(offset: u64) {
+		if (PWRegions.sanitize) {
+			var addr: long = Pointer.atElement(rng, 0) - Pointer.NULL;
+			if (offset < rng.length) {
+				Trace.OUT.put3("offset %d is good for region at 0x%x of length %d", offset, addr, rng.length).ln();
+			} else {
+				Trace.OUT.put3("offset %d is bad for region at 0x%x of length %d", offset, addr, rng.length).ln();
+			}
+		}
+	}
+	private def sanitizeAddress(addr: Pointer) {
+		if (PWRegions.sanitize) {
+			var delta: long = addr - Pointer.atElement(rng, 0);
+			var addrAsLong: long = addr - Pointer.NULL;
+			if (delta < 0 || delta >= rng.length) {
+				Trace.OUT.put3("address 0x%x is bad for region at 0x%x of length %d", addr, addrAsLong, rng.length).ln();
+			} else {
+				Trace.OUT.put3("address 0x%x is good for region at 0x%x of length %d", addr, addrAsLong, rng.length).ln();
+			}
+		}
+	}
 	private def init() {
+		var size = numBlocks * PWRegions.blockSize;
 		var hdr = getHeader();
+		sanitizeAddress(Pointer.atRef(hdr));
 		hdr.numBlocks = numBlocks;
 		hdr.numBytes = size;
-		// ...
-		descs = metadataDescs();
+		var currentRegionEnd = size;
+
+		// set up list sentinels just after the header
+		hdr.sentinels = u64.!(PWRegionHeader.size);
+		var sentinels = LayoutRanges.subrangeByIndex<Ref<BlockEntry>>(
+					rng, hdr.sentinels, BlockEntry.size, u64.!(BlockLists.MAX_LISTS), Ref<BlockEntry>.of);
+		sanitizeOffset(hdr.sentinels);
+		sanitizeOffset(hdr.sentinels + u64.!(sentinels.rng.length));
+		for (i < BlockLists.MAX_LISTS) {
+			var entry = sentinels[u64.!(i)];
+			entry.listNum = 0;
+			entry.used = false;
+			entry.prev = 0;
+			entry.next = 0;
+			entry.listPrev = 0;
+			entry.listNext = 0;
+		}
+
+		// take space for block table
+		var blockTableSize = (numBlocks + 1) * u64.!(BlockEntry.size);
+		currentRegionEnd -= blockTableSize;
+		hdr.blockTable = currentRegionEnd;
+		sanitizeOffset(currentRegionEnd);
+		var blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
+					rng[hdr.blockTable ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
+
+		// clear block table entries (filled in better later)
+		for (i < numBlocks + 1) {
+			var entry = blockLayouts[i];
+			entry.listNum = 0;
+			entry.used = false;
+			entry.prev = 0;
+			entry.next = 0;
+			entry.listPrev = 0;
+			entry.listNext = 0;
+		}
+
+		// take space for metadata descriptors
+		var metaDataDescsSize = metaDataDescs.length * MetaDataDesc.size;
+		currentRegionEnd -= u64.!(metaDataDescsSize);
+		sanitizeOffset(currentRegionEnd);
+		hdr.metaDataDescs = currentRegionEnd;
+		hdr.numDescs = u64.!(metaDataDescs.length);
+		var metaDataLayouts = LayoutRanges.byIndex<Ref<MetaDataDesc>>(
+					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
+
+		// fill metadata descriptors and allocate metadata space
+		for (i < metaDataDescs.length) {
+			var desc = metaDataDescs[i];
+			var metaDataSize = u64.!(desc.fixedBytes);
+			var numUnits = (size + desc.unitSize - 1) / desc.unitSize;
+			metaDataSize += numUnits * desc.bytesPerUnit;
+			currentRegionEnd -= metaDataSize;
+			sanitizeOffset(currentRegionEnd);
+			var newDesc = metaDataLayouts[u64.!(i)];
+			newDesc.kind = desc.kind;
+			newDesc.fixedBytes = desc.fixedBytes;
+			newDesc.unitSize = desc.unitSize;
+			newDesc.bytesPerUnit = desc.bytesPerUnit;
+			newDesc.offset = currentRegionEnd;
+		}
+
+		var metaDataBytes = u64.!(rng.length) - currentRegionEnd;
+		var metaDataBlocks = (metaDataBytes + (PWRegions.blockSize - 1)) / PWRegions.blockSize;
+		var userDataBlocks = numBlocks - (metaDataBlocks + 1);
+		
+
+		// set up block lists
+		var first = blockLayouts[0];
+		sanitizeAddress(Pointer.atRef(first));
+		first.listNum = ListKind.METADATA.code;
+		first.used = true;
+		sanitizeOffset(blockLayouts.offset(1));
+		first.next = blockLayouts.offset(1);
+
+		var second = blockLayouts[1];
+		sanitizeAddress(Pointer.atRef(second));
+		second.listNum = ListKind.LARGE_FREE.code;
+		second.next = blockLayouts.offset(userDataBlocks + 1);
+		second.prev = blockLayouts.offset(0);
+		second.listPrev = sentinels.offset(u64.!(ListKind.LARGE_FREE.code));  // TODO
+		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
+		sanitizeOffset(blockLayouts.offset(0));
+		sanitizeOffset(sentinels.offset(u64.!(ListKind.LARGE_FREE.code)));
+
+		var largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
+		sanitizeAddress(Pointer.atRef(largeSentinel));
+		largeSentinel.listNext = blockLayouts.offset(1);
+		sanitizeOffset(blockLayouts.offset(1));
+
+		var meta = blockLayouts[userDataBlocks + 1];
+		sanitizeAddress(Pointer.atRef(meta));
+		meta.listNum = ListKind.METADATA.code;
+		meta.used = true;
+		meta.next = blockLayouts.offset(numBlocks);
+		meta.prev = blockLayouts.offset(1);
+		sanitizeOffset(blockLayouts.offset(numBlocks));
+		sanitizeOffset(blockLayouts.offset(1));
+
+		var last = blockLayouts[numBlocks];
+		sanitizeAddress(Pointer.atRef(last));
+		last.listNum = ListKind.NONE.code;
+		last.used = true;
+		last.prev = blockLayouts.offset(userDataBlocks + 1);
+		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
 	}
-	def getHeader() -> Ref<PWRegionHeader>;
+	def getHeader() -> Ref<PWRegionHeader> {
+		return Ref<PWRegionHeader>.of(mapping.range.range(0, PWRegionHeader.size));
+	}
+	def regionHeaderSize() -> int {
+		return PWRegionHeader.size;  // default implementation
+	}
 	def getBlockSize() -> u64;
-	def defaultMetadataDescs() -> LayoutRange<Ref<MetadataDesc>>;
-	def metadataDescs() -> LayoutRange<Ref<MetadataDesc>> {
+	def defaultMetadataDescs() -> LayoutRange<Ref<MetaDataDesc>>;
+	def metadataDescs() -> LayoutRange<Ref<MetaDataDesc>> {
 		var hdr = getHeader();
-		var metaDescOffset = hdr.metaDataDescs;
-		var numDescs = hdr.numDescs;
-		var descs = rng[metaDescOffset ..+ numDescs * MetadataDesc.size];
-		var at = LayoutRange.atIndex(_, _, MetadataDesc.size, Ref<MetadataDec.size>.at);
-		return LayoutRange<Ref<MetadataDesc>>.new(descs, at);
+		var metaDataDescsSize = hdr.numDescs * u64.!(MetaDataDesc.size);
+		return LayoutRanges.byIndex<Ref<MetaDataDesc>>(
+					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
 	}
 	// ...
 }
 
-// kind is notional for now - need a convention and place where they are all declared
-
-def ImmixLineMarkMetaKind = 0x0000_0001_0000_0000u64;
-def immixLineMarkResetValue = 0u8;
+component PWRegions {
+	def blockSize: u64 = 256u64 * 1024u64;
+	def sanitize = true;
+}
 
 layout LineMark {
 	+0	mark:		u8;	// line mark info
@@ -143,39 +316,59 @@ layout LineMark {
 }
 
 class ImmixPWRegion extends X86_64PWRegion {
+	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>)
+		super(numBlocks, metaDataDescs) { }
 	private def init() {
 		X86_64PWRegion.init(this);
 		lineMarks = getLineMarks();
 	}
 	// Line mark definitions
-	def ImmixLineSize = 256;  // sample - needs to be done using the metadata descriptior
 	def var lineMarks: LayoutRange<Ref<LineMark>>;
 	def var numLineMarks: u64;
 	private def getLineMarks() -> LayoutRange<Ref<LineMark>> {
+		var hdr = getHeader();
 		for (i < hdr.numDescs) {
 			var r = descs[i];
-			if (r.kind == ImmixLineMarkMetaKind) {
+			if (r.kind == ImmixPWRegions.ImmixLineMarkMetaKind) {
 				var spaceSize = numBlocks * getBlockSize();
-				numLineMarks = spaceSize / ImmixLineSize;
-				var lmrng = this.rng[r.offset ..+ numLineMarks * LineMark.size];
-				return LayoutRanges.byOffset(lmrng, ImmixLineSize, LineMark.size, Ref<LineMark>.at);
+				numLineMarks = spaceSize / u64.!(ImmixPWRegions.ImmixLineSize);
+				var lmrng = this.rng[r.offset ..+ numLineMarks * u64.!(LineMark.size)];
+				return LayoutRanges.byOffset(lmrng, u64.!(ImmixPWRegions.ImmixLineSize), LineMark.size, Ref<LineMark>.of);
 			}
 		}
 		return null;
 	}
 	def resetAllLineMarks() {
 		for (i < numLineMarks) {
-			lineMarks[i].mark = ImmixLineMarkResetValue;
+			lineMarks[i].mark = ImmixPWRegions.ImmixLineMarkResetValue;
 		}
 	}
 }
 
-def PWMemBlockSize: u64 = 4096u64;
+component ImmixPWRegions {
+	def ImmixLineMarkMetaKind = 0x0000_0001_0000_0000u64;
+	def ImmixLineMarkResetValue = 0u8;
+	def ImmixLineSize = 256;  // sample - needs to be done using the metadata descriptior
+}
+
+
+component MemRegions {
+	def defaultMetaDataDescs = Array<byte>.new(MetaDataDesc.size * 1);
+	def lineMarkDescRef = Ref<MetaDataDesc>.at(defaultMetaDataDescs, 0);
+	def BlockSize = 512u64 * 1024u64;
+	new() {
+		var r = lineMarkDescRef;
+		r.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		r.fixedBytes = 0;
+		r.unitSize = u32.!(ImmixPWRegions.ImmixLineSize);
+		r.bytesPerUnit = u32.!(LineMark.size);
+		// leave offset unset (i.e., 0)
+	}
+}
 
 class X86_64PWMemRegion extends X86_64PWRegion {
-	def var mapping: Mapping;
-	new(numBlocks: u64) super(numBlocks) {
-		var size = numBlocks * PWMemBlockSize;
+	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>) super(numBlocks, metaDataDescs) {
+		var size = numBlocks * MemRegions.BlockSize;
 		var prot = Mmap.PROT_READ | Mmap.PROT_WRITE;
 		var mapping = Mmap.reserve(size, prot);
 		if (mapping == null) {
@@ -183,15 +376,12 @@ class X86_64PWMemRegion extends X86_64PWRegion {
 		}
 		init();
 	}
-	def getHeader() -> Ref<PWRegionHeader> {
-		return Ref<PWRegionHeader>.of(mapping.range(0, PWReagionHeader.SIZE));
-	}
-	def getBlockSize() -> u64 { return PWMEMBlockSize; }
+	def getBlockSize() -> u64 { return MemRegions.BlockSize; }
 }
 
 class X86_64PWNVRegion extends X86_64PWRegion {
 	// ...
-	new (path: string, numBlocks: u64) super(numBlocks) {
+	new (path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDatDesc>>) super(numBlocks, metaDataDescs) {
 		// ...
 		init();
 	}

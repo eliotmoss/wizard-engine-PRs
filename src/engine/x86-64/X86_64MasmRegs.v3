@@ -52,13 +52,13 @@ component X86_64MasmRegs {
 	def RET_GPRS = [RAX, RDX, RCX, RSI];
 
 	// The set of all registers including the `Reg` instances and their names.
-	def SET = (fun -> RegSet {
+	def SET = (fun() -> RegSet {
 		var set = RegSet.new(all.extract(), names.extract());
 		return set;
 	})();
 
 	// The register configuration maps `Reg` instances to pools.
-	def CONFIG = (fun -> RegConfig {
+	def CONFIG = (fun() -> RegConfig {
 		var config = RegConfig.new(SET);
 		config.vfp = R11;
 		config.scratch = RBP;
@@ -87,7 +87,7 @@ component X86_64MasmRegs {
 	})();
 
 	// Build both the SPC and INT execution environments together.
-	private def t = (fun -> (SpcExecEnv, IntExecEnv) {
+	private def t = (fun() -> (SpcExecEnv, IntExecEnv) {
 		var xspc = SpcExecEnv.new();
 		var xint = IntExecEnv.new();
 
@@ -150,7 +150,7 @@ component X86_64MasmRegs {
 	def INT_EXEC_ENV = t.1;
 
 	// A register allocator for single-pass compilation contexts.
-	def SPC_ALLOC = (fun -> RegAlloc {
+	def SPC_ALLOC = (fun() -> RegAlloc {
 		var pools = [
 			RegPool32.new([RAX, RBX, RSI, RCX, RDX, R8, R9, R12, R13, R14, R15]),
 			RegPool32.new([XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14])
@@ -159,7 +159,7 @@ component X86_64MasmRegs {
 	})();
 
 	// A register allocator for interpreter contexts.
-	def INT_ALLOC = (fun -> RegAlloc {
+	def INT_ALLOC = (fun() -> RegAlloc {
 		var pools = [
 			RegPool32.new([RCX, RDX, R8, R9]),
 			RegPool32.new([XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14])
