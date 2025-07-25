@@ -135,6 +135,14 @@ layout BlockEntry {
 	=40;			      // size of block entry
 }
 
+layout ChunkHeader {
+	+0	offset:		u64; // offset in chunk for next allocation
+	+8	limit:		u64; // offset just beyond last available byte in chunk
+	+16	chunk_limit:	u64; // offset just beyond end of the chunk
+	+24	linemarks:	u64; // offset to first link mark of the chunk
+	=32;			     // size of chunk header
+}
+
 enum ListKind(code: i16) {
 	METADATA(-1),
 	NONE(-2),
@@ -154,6 +162,13 @@ class X86_64PWRegion {
 	def numBlocks: u64;
 	def metaDataDescs: Range<Ref<MetaDataDesc>>;
 	def var descs: LayoutRange<Ref<MetaDataDesc>>;
+	def var sentinels: LayoutRange<Ref<BlockEntry>>;
+	def var smallSentinel: Ref<BlockEntry>;
+	def var largeSentinel: Ref<BlockEntry>;
+	def blankChunkHeader = Array<byte>.new(ChunkHeader.size);  // so we can return *something* when allocation fails
+	def blankChunkHeaderRef = Ref<ChunkHeader>.of(blankChunkHeader);
+	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
+
 	new(numBlocks, metaDataDescs) { }
 	private def sanitizeOffset(offset: u64) {
 		if (PWRegions.sanitize) {
@@ -186,7 +201,7 @@ class X86_64PWRegion {
 
 		// set up list sentinels just after the header
 		hdr.sentinels = u64.!(PWRegionHeader.size);
-		var sentinels = LayoutRanges.subrangeByIndex<Ref<BlockEntry>>(
+		sentinels = LayoutRanges.subrangeByIndex<Ref<BlockEntry>>(
 					rng, hdr.sentinels, BlockEntry.size, u64.!(BlockLists.MAX_LISTS), Ref<BlockEntry>.of);
 		sanitizeOffset(hdr.sentinels);
 		sanitizeOffset(hdr.sentinels + u64.!(sentinels.rng.length));
@@ -205,7 +220,7 @@ class X86_64PWRegion {
 		currentRegionEnd -= blockTableSize;
 		hdr.blockTable = currentRegionEnd;
 		sanitizeOffset(currentRegionEnd);
-		var blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
+		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
 					rng[hdr.blockTable ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
 
 		// clear block table entries (filled in better later)
@@ -267,7 +282,9 @@ class X86_64PWRegion {
 		sanitizeOffset(blockLayouts.offset(0));
 		sanitizeOffset(sentinels.offset(u64.!(ListKind.LARGE_FREE.code)));
 
-		var largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
+		smallSentinel = sentinels[u64.!(ListKind.SMALL_FREE.code)];
+
+		largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
 		sanitizeAddress(Pointer.atRef(largeSentinel));
 		largeSentinel.listNext = blockLayouts.offset(1);
 		sanitizeOffset(blockLayouts.offset(1));
@@ -301,6 +318,90 @@ class X86_64PWRegion {
 		var metaDataDescsSize = hdr.numDescs * u64.!(MetaDataDesc.size);
 		return LayoutRanges.byIndex<Ref<MetaDataDesc>>(
 					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
+	}
+	def blockIndexOfEntry(entry: Ref<BlockEntry>) -> u64 {
+		var blkTablePtr = Pointer.atElement(rng, 0) + i64.!(getHeader().blockTable);
+		var entryPtr = Pointer.atRef(entry);
+		return u64.!((entryPtr - blkTablePtr) / BlockEntry.size);
+	}
+	def blockOffsetOfIndex(index: u64) -> u64 {
+		return index * getBlockSize();
+	}
+	def createChunk(startEntry: Ref<BlockEntry>, numBlocks: int) -> Ref<ChunkHeader> {
+		var blockOffset = blockOffsetOfIndex(blockIndexOfEntry(startEntry));
+		var chunk = Ref<ChunkHeader>.of(rng[blockOffset ..+ ChunkHeader.size]);
+		chunk.offset = u64.!(ChunkHeader.size);
+		chunk.limit = u64.!(numBlocks) * getBlockSize();
+		// TODO link mark field
+		return chunk;
+	}
+	def allocChunk(numBlocks: int) -> Ref<ChunkHeader> {
+		if (numBlocks == 1) {
+			// Try the small free block list
+			var firstBlock = smallSentinel.listNext;
+			if (firstBlock != 0) {
+				var firstRef = blockEntryAt(firstBlock);
+				removeFromList(firstRef);
+				firstRef.used = true;
+				return createChunk(firstRef, 1);
+			}
+		}
+		var thisBlock = largeSentinel.listNext;
+		while (thisBlock != 0) {
+			var thisRef = blockEntryAt(thisBlock);
+			var thisIndex = blockIndexOfEntry(thisRef);
+			var next = thisRef.next;
+			if (next == 0) return blankChunkHeaderRef;
+			var nextRef = blockEntryAt(next);
+			var nextIndex = blockIndexOfEntry(nextRef);
+			var chunkBlocks = nextIndex - thisIndex;
+			if (numBlocks > chunkBlocks) {
+				thisBlock = next;
+				continue;
+			}
+			if (numBlocks == chunkBlocks) {
+				removeFromList(thisRef);
+				thisRef.used = true;
+				return createChunk(thisRef, numBlocks);
+			}
+			// need to split the block
+			var remIndex = thisIndex + u64.!(numBlocks);
+			var remRef = blockLayouts[remIndex];
+			var remBlocks = nextIndex - remIndex;
+			var remOffset = blockOffsetOfIndex(remIndex);
+			remRef.listNum = if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code);
+			remRef.used = false;
+			remRef.prev = thisBlock;
+			remRef.next = next;
+			remRef.listPrev = thisBlock;
+			remRef.listNext = thisRef.next;
+			thisRef.next = remOffset;
+			thisRef.listNext = remOffset;
+			nextRef.prev = remOffset;
+			var listNextRef = blockEntryAt(thisRef.listNext);
+			listNextRef.listPrev = remOffset;
+			removeFromList(thisRef);
+			return createChunk(thisRef, numBlocks);
+		}
+		return blankChunkHeaderRef;
+	}
+	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
+		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
+	}
+	def removeFromList(blk: Ref<BlockEntry>) {
+		var prev = blk.listPrev;
+		var next = blk.listNext;
+		if (prev != 0) {
+			var prevRef = blockEntryAt(prev);
+			prevRef.listNext = next;
+		}
+		if (next != 0) {
+			var nextRef = blockEntryAt(next);
+			nextRef.listPrev = prev;
+		}
+		blk.listPrev = 0;
+		blk.listNext = 0;
+		blk.listNum = ListKind.NONE.code;
 	}
 	// ...
 }
