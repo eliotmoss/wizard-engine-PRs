@@ -124,6 +124,23 @@ layout MetaDataDesc {
 	=32;
 }
 
+type BlockEntryHandle(addr: Pointer) #unboxed {
+	def getRef() -> Ref<BlockEntry> {
+		return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(addr, BlockEntry.size));
+	}
+
+	// if we use relative addressing (not offsets)
+	def getPrev() -> BlockEntryHandle {
+		var delta = getRef().prev;
+		return BlockEntryHandle(if(delta == 0, Pointer.NULL, addr + i64.view(delta)));
+	}
+}
+type ChunkHeaderHandle(region: X86_64PWRegion, addr: Pointer) { }
+
+def getBlockEntryHandle(r: Ref<BlockEntry>) -> BlockEntryHandle {
+	return BlockEntryHandle(Pointer.atRef(r));
+}
+
 layout BlockEntry {
 	+0	listNum:	i16;  // which list is this entry part of
 	+2	used:		bool; // is this block in use?
@@ -385,6 +402,58 @@ class X86_64PWRegion {
 		}
 		return blankChunkHeaderRef;
 	}
+/*	// Alternative using BlockEntryHandle, etc., and relative offsets
+	def allocChunk(numBlocks: int) -> ChunkHeaderHandle {
+		if (numBlocks == 1) {
+			// Try the small free block list
+			var firstBlock = smallSentinel.listNext;
+			if (firstBlock.addr != Pointer.NULL) {
+				// var firstRef = blockEntryAt(firstBlock);
+				removeFromList(firstBlock);
+				firstBlock.setUsed(true);
+				return createChunk(firstBlock, 1);
+			}
+		}
+
+		var thisBlock = largeSentinel.listNext;
+		while (thisBlock.addr != Pointer.NULL) {
+			var thisIndex = thisBlock.getIndex();
+			var next = thisBlock.getNext();
+			if (next.addr == Pointer.NULL) return blankChunkHeaderHandle;
+			var nextIndex = next.getIndex();
+			var chunkBlocks = nextIndex - thisIndex;
+			if (numBlocks > chunkBlocks) {
+				thisBlock = next;
+				continue;
+			}
+			// ...
+			if (numBlocks == chunkBlocks) {
+				removeFromList(thisRef);
+				thisRef.used = true;
+				return createChunk(thisRef, numBlocks);
+			}
+			// need to split the block
+			var remIndex = thisIndex + u64.!(numBlocks);
+			var remRef = blockLayouts[remIndex];
+			var remBlocks = nextIndex - remIndex;
+			var remOffset = blockOffsetOfIndex(remIndex);
+			remRef.listNum = if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code);
+			remRef.used = false;
+			remRef.prev = thisBlock;
+			remRef.next = next;
+			remRef.listPrev = thisBlock;
+			remRef.listNext = thisRef.next;
+			thisRef.next = remOffset;
+			thisRef.listNext = remOffset;
+			nextRef.prev = remOffset;
+			var listNextRef = blockEntryAt(thisRef.listNext);
+			listNextRef.listPrev = remOffset;
+			removeFromList(thisRef);
+			return createChunk(thisRef, numBlocks);
+		}
+		return blankChunkHeaderRef;
+	}
+*/
 	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
 		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
 	}
