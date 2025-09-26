@@ -104,13 +104,13 @@ class LayoutPtr<T> {
 */
 
 layout PWRegionHeader {
-	+0	blockTable:	u64;	// offset in the region of the block table
+	+0	blockTable:	u64;	// relative offset to the block table
 	+8	sentinels:	u64;	// offset of the sentinels (whatever type are!)
 	+16	numBlocks:	u64;
 	+24	numBytes:	u64;
 	+32	numDescs:	u64;
-	+40	metaData:	u64;	// offset of the metadata area
-	+48	metaDataDescs:	u64;	// offset of the metadata descriptors
+	+40	metaData:	u64;	// relative offset to the metadata area
+	+48	metaDataDescs:	u64;	// relative offset to the metadata descriptors
 	=56;				// size of header
 }
 
@@ -125,21 +125,88 @@ layout MetaDataDesc {
 }
 
 type BlockEntryHandle(addr: Pointer) #unboxed {
+	def isNull() -> bool {
+		return addr == Pointer.NULL;
+	}
+
+	def toHandle(offset: i64) -> BlockEntryHandle {
+		return BlockEntryHandle(Pointer.NULL + offset);
+	} 
+
+	def toOffset(handle: BlockEntryHandle) -> i64 {
+		return this.addr - handle.addr;
+	}
+
 	def getRef() -> Ref<BlockEntry> {
 		return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(addr, BlockEntry.size));
 	}
 
-	// if we use relative addressing (not offsets)
+	def getListNum() -> i16 {
+		return getRef().listNum;
+	}
+
+	def getUsed() -> bool {
+		return getRef().used;
+	}
+
+	// // if we use relative addressing (not offsets)
+	// def getPrev() -> BlockEntryHandle {
+	// 	var delta = getRef().prev;
+	// 	return BlockEntryHandle(if(delta == 0, Pointer.NULL, addr + i64.view(delta)));
+	// }
+
 	def getPrev() -> BlockEntryHandle {
-		var delta = getRef().prev;
-		return BlockEntryHandle(if(delta == 0, Pointer.NULL, addr + i64.view(delta)));
+		return toHandle(i64.view(getRef().prev));
+	}
+
+	def getNext() -> BlockEntryHandle {
+		return toHandle(i64.view(getRef().next));
+	}
+
+	def getListPrev() -> BlockEntryHandle {
+		return toHandle(i64.view(getRef().listPrev));
+	}
+
+	def getListNext() -> BlockEntryHandle {
+		return toHandle(i64.view(getRef().listNext));
+	}
+
+	def setListNum(listNum: i16) {
+		getRef().listNum = listNum;
+	}
+
+	def setUsed(used: bool) {
+		getRef().used = used;
+	}
+
+	def setPrev(prev: BlockEntryHandle) {
+		getRef().prev = u64.view(toOffset(prev));
+	}
+
+	def setNext(next: BlockEntryHandle) {
+		getRef().next = u64.view(toOffset(next));
+	}
+
+	def setListPrev(listPrev: BlockEntryHandle) {
+		getRef().listPrev = u64.view(toOffset(listPrev));
+	}
+
+	def setListNext(listNext: BlockEntryHandle) {
+		getRef().listNext = u64.view(toOffset(listNext));
 	}
 }
-type ChunkHeaderHandle(region: X86_64PWRegion, addr: Pointer) { }
 
 def getBlockEntryHandle(r: Ref<BlockEntry>) -> BlockEntryHandle {
 	return BlockEntryHandle(Pointer.atRef(r));
 }
+
+
+// Unsure if needed or even correct
+type ChunkHeaderHandle(region: X86_64PWRegion, addr: Pointer) {
+	def getRef() -> Ref<ChunkHeader> {
+		return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(addr, ChunkHeader.size));
+	}
+ }
 
 layout BlockEntry {
 	+0	listNum:	i16;  // which list is this entry part of
@@ -180,8 +247,8 @@ class X86_64PWRegion {
 	def metaDataDescs: Range<Ref<MetaDataDesc>>;
 	def var descs: LayoutRange<Ref<MetaDataDesc>>;
 	def var sentinels: LayoutRange<Ref<BlockEntry>>;
-	def var smallSentinel: Ref<BlockEntry>;
-	def var largeSentinel: Ref<BlockEntry>;
+	def var smallSentinel: BlockEntryHandle;
+	def var largeSentinel: BlockEntryHandle;
 	def blankChunkHeader = Array<byte>.new(ChunkHeader.size);  // so we can return *something* when allocation fails
 	def blankChunkHeaderRef = Ref<ChunkHeader>.of(blankChunkHeader);
 	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
@@ -209,6 +276,7 @@ class X86_64PWRegion {
 		}
 	}
 	private def init() {
+		def nullBTE = BlockEntryHandle(Pointer.NULL);
 		var size = numBlocks * PWRegions.blockSize;
 		var hdr = getHeader();
 		sanitizeAddress(Pointer.atRef(hdr));
@@ -223,13 +291,14 @@ class X86_64PWRegion {
 		sanitizeOffset(hdr.sentinels);
 		sanitizeOffset(hdr.sentinels + u64.!(sentinels.rng.length));
 		for (i < BlockLists.MAX_LISTS) {
-			var entry = sentinels[u64.!(i)];
-			entry.listNum = 0;
-			entry.used = false;
-			entry.prev = 0;
-			entry.next = 0;
-			entry.listPrev = 0;
-			entry.listNext = 0;
+			var entryRef = sentinels[u64.!(i)];
+			var entryHandle = getBlockEntryHandle(entryRef);
+			entryHandle.setListNum(0);
+			entryHandle.setUsed(false);
+			entryHandle.setPrev(nullBTE);
+			entryHandle.setNext(nullBTE);
+			entryHandle.setListPrev(nullBTE);
+			entryHandle.setListNext(nullBTE);
 		}
 
 		// take space for block table
@@ -242,13 +311,14 @@ class X86_64PWRegion {
 
 		// clear block table entries (filled in better later)
 		for (i < numBlocks + 1) {
-			var entry = blockLayouts[i];
-			entry.listNum = 0;
-			entry.used = false;
-			entry.prev = 0;
-			entry.next = 0;
-			entry.listPrev = 0;
-			entry.listNext = 0;
+			var entryRef = blockLayouts[i];
+			var entryHandle = getBlockEntryHandle(entryRef);
+			entryHandle.setListNum(0);
+			entryHandle.setUsed(false);
+			entryHandle.setPrev(nullBTE);
+			entryHandle.setNext(nullBTE);
+			entryHandle.setListPrev(nullBTE);
+			entryHandle.setListNext(nullBTE);
 		}
 
 		// take space for metadata descriptors
@@ -282,44 +352,60 @@ class X86_64PWRegion {
 		
 
 		// set up block lists
-		var first = blockLayouts[0];
-		sanitizeAddress(Pointer.atRef(first));
-		first.listNum = ListKind.METADATA.code;
-		first.used = true;
-		sanitizeOffset(blockLayouts.offset(1));
-		first.next = blockLayouts.offset(1);
+		var firstRef = blockLayouts[0];
+		var firstHandle = getBlockEntryHandle(firstRef);
 
-		var second = blockLayouts[1];
-		sanitizeAddress(Pointer.atRef(second));
-		second.listNum = ListKind.LARGE_FREE.code;
-		second.next = blockLayouts.offset(userDataBlocks + 1);
-		second.prev = blockLayouts.offset(0);
-		second.listPrev = sentinels.offset(u64.!(ListKind.LARGE_FREE.code));  // TODO
+		var secondRef = blockLayouts[1];
+		var secondHandle = getBlockEntryHandle(secondRef);
+	
+		var smallSentinelRef = sentinels[u64.!(ListKind.SMALL_FREE.code)];
+		smallSentinel = getBlockEntryHandle(smallSentinelRef);
+
+		var largeSentinelRef = sentinels[u64.!(ListKind.LARGE_FREE.code)];
+		largeSentinel = getBlockEntryHandle(largeSentinelRef);
+
+		var metaRef = blockLayouts[userDataBlocks + 1];
+		var metaHandle = getBlockEntryHandle(metaRef);
+
+		var lastRef = blockLayouts[numBlocks];
+		var lastHandle = getBlockEntryHandle(lastRef);
+
+		sanitizeAddress(firstHandle.addr);
+		firstHandle.setListNum(ListKind.METADATA.code);
+		firstHandle.setUsed(true);
+		firstHandle.setNext(secondHandle);
+		firstHandle.setListPrev(smallSentinel);
+		sanitizeOffset(blockLayouts.offset(1));
+
+		sanitizeAddress(secondHandle.addr);
+		secondHandle.setListNum(ListKind.LARGE_FREE.code);
+		secondHandle.setNext(metaHandle);
+		secondHandle.setPrev(firstHandle);
+		secondHandle.setListPrev(largeSentinel);  // TODO
 		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
 		sanitizeOffset(blockLayouts.offset(0));
 		sanitizeOffset(sentinels.offset(u64.!(ListKind.LARGE_FREE.code)));
 
-		smallSentinel = sentinels[u64.!(ListKind.SMALL_FREE.code)];
+		sanitizeAddress(smallSentinel.addr);
+		smallSentinel.setListNext(firstHandle);
+		sanitizeOffset(blockLayouts.offset(0));
 
-		largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
-		sanitizeAddress(Pointer.atRef(largeSentinel));
-		largeSentinel.listNext = blockLayouts.offset(1);
+		sanitizeAddress(largeSentinel.addr);
+		largeSentinel.setListNext(secondHandle);
 		sanitizeOffset(blockLayouts.offset(1));
-
-		var meta = blockLayouts[userDataBlocks + 1];
-		sanitizeAddress(Pointer.atRef(meta));
-		meta.listNum = ListKind.METADATA.code;
-		meta.used = true;
-		meta.next = blockLayouts.offset(numBlocks);
-		meta.prev = blockLayouts.offset(1);
+		
+		sanitizeAddress(metaHandle.addr);
+		metaHandle.setListNum(ListKind.METADATA.code);
+		metaHandle.setUsed(true);
+		metaHandle.setNext(lastHandle);
+		metaHandle.setPrev(secondHandle);
 		sanitizeOffset(blockLayouts.offset(numBlocks));
 		sanitizeOffset(blockLayouts.offset(1));
-
-		var last = blockLayouts[numBlocks];
-		sanitizeAddress(Pointer.atRef(last));
-		last.listNum = ListKind.NONE.code;
-		last.used = true;
-		last.prev = blockLayouts.offset(userDataBlocks + 1);
+		
+		sanitizeAddress(lastHandle.addr);
+		lastHandle.setListNum(ListKind.NONE.code);
+		lastHandle.setUsed(true);
+		lastHandle.setPrev(metaHandle);
 		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
 	}
 	def getHeader() -> Ref<PWRegionHeader> {
@@ -336,15 +422,15 @@ class X86_64PWRegion {
 		return LayoutRanges.byIndex<Ref<MetaDataDesc>>(
 					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
 	}
-	def blockIndexOfEntry(entry: Ref<BlockEntry>) -> u64 {
+	def blockIndexOfEntry(entry: BlockEntryHandle) -> u64 {
 		var blkTablePtr = Pointer.atElement(rng, 0) + i64.!(getHeader().blockTable);
-		var entryPtr = Pointer.atRef(entry);
+		var entryPtr = entry.addr;
 		return u64.!((entryPtr - blkTablePtr) / BlockEntry.size);
 	}
 	def blockOffsetOfIndex(index: u64) -> u64 {
 		return index * getBlockSize();
 	}
-	def createChunk(startEntry: Ref<BlockEntry>, numBlocks: int) -> Ref<ChunkHeader> {
+	def createChunk(startEntry: BlockEntryHandle, numBlocks: int) -> Ref<ChunkHeader> {
 		var blockOffset = blockOffsetOfIndex(blockIndexOfEntry(startEntry));
 		var chunk = Ref<ChunkHeader>.of(rng[blockOffset ..+ ChunkHeader.size]);
 		chunk.offset = u64.!(ChunkHeader.size);
@@ -355,50 +441,48 @@ class X86_64PWRegion {
 	def allocChunk(numBlocks: int) -> Ref<ChunkHeader> {
 		if (numBlocks == 1) {
 			// Try the small free block list
-			var firstBlock = smallSentinel.listNext;
-			if (firstBlock != 0) {
-				var firstRef = blockEntryAt(firstBlock);
-				removeFromList(firstRef);
-				firstRef.used = true;
-				return createChunk(firstRef, 1);
+			var firstHandle = smallSentinel.getListNext();
+			if (!firstHandle.isNull()) {
+				removeFromList(firstHandle);
+				firstHandle.setUsed(true);
+				return createChunk(firstHandle, 1);
 			}
 		}
-		var thisBlock = largeSentinel.listNext;
-		while (thisBlock != 0) {
-			var thisRef = blockEntryAt(thisBlock);
-			var thisIndex = blockIndexOfEntry(thisRef);
-			var next = thisRef.next;
-			if (next == 0) return blankChunkHeaderRef;
-			var nextRef = blockEntryAt(next);
-			var nextIndex = blockIndexOfEntry(nextRef);
+		var thisHandle = largeSentinel.getListNext();
+		while (!thisHandle.isNull()) {
+			var thisIndex = blockIndexOfEntry(thisHandle);
+			var nextHandle = thisHandle.getNext();
+			if (nextHandle.isNull()) return blankChunkHeaderRef;
+			var nextIndex = blockIndexOfEntry(nextHandle);
 			var chunkBlocks = nextIndex - thisIndex;
 			if (numBlocks > chunkBlocks) {
-				thisBlock = next;
+				thisHandle = thisHandle.getNext();
 				continue;
 			}
 			if (numBlocks == chunkBlocks) {
-				removeFromList(thisRef);
-				thisRef.used = true;
-				return createChunk(thisRef, numBlocks);
+				removeFromList(thisHandle);
+				thisHandle.setUsed(true);
+				return createChunk(thisHandle, numBlocks);
 			}
 			// need to split the block
 			var remIndex = thisIndex + u64.!(numBlocks);
 			var remRef = blockLayouts[remIndex];
+			var remHandle = getBlockEntryHandle(remRef);
 			var remBlocks = nextIndex - remIndex;
-			var remOffset = blockOffsetOfIndex(remIndex);
-			remRef.listNum = if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code);
-			remRef.used = false;
-			remRef.prev = thisBlock;
-			remRef.next = next;
-			remRef.listPrev = thisBlock;
-			remRef.listNext = thisRef.next;
-			thisRef.next = remOffset;
-			thisRef.listNext = remOffset;
-			nextRef.prev = remOffset;
-			var listNextRef = blockEntryAt(thisRef.listNext);
-			listNextRef.listPrev = remOffset;
-			removeFromList(thisRef);
-			return createChunk(thisRef, numBlocks);
+
+			remHandle.setListNum(if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
+			remHandle.setUsed(false);
+			remHandle.setPrev(thisHandle);
+			remHandle.setNext(nextHandle);
+			remHandle.setListPrev(thisHandle);
+			remHandle.setListNext(nextHandle);
+			thisHandle.setNext(remHandle);
+			thisHandle.setListNext(remHandle);
+			nextHandle.setPrev(remHandle);
+			var listNextHandle = thisHandle.getListNext();
+			listNextHandle.setListPrev(remHandle);
+			removeFromList(thisHandle);
+			return createChunk(thisHandle, numBlocks);
 		}
 		return blankChunkHeaderRef;
 	}
@@ -406,15 +490,15 @@ class X86_64PWRegion {
 	def allocChunk(numBlocks: int) -> ChunkHeaderHandle {
 		if (numBlocks == 1) {
 			// Try the small free block list
-			var firstBlock = smallSentinel.listNext;
+			var firstBlock = BlockEntryHandle(Pointer.NULL + long.!(smallSentinel.listNext));
 			if (firstBlock.addr != Pointer.NULL) {
 				// var firstRef = blockEntryAt(firstBlock);
-				removeFromList(firstBlock);
+				removeFromList(firstBlock.getRef());
 				firstBlock.setUsed(true);
-				return createChunk(firstBlock, 1);
+				return createChunk(firstBlock.getRef(), 1);
 			}
 		}
-
+/*
 		var thisBlock = largeSentinel.listNext;
 		while (thisBlock.addr != Pointer.NULL) {
 			var thisIndex = thisBlock.getIndex();
@@ -457,20 +541,19 @@ class X86_64PWRegion {
 	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
 		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
 	}
-	def removeFromList(blk: Ref<BlockEntry>) {
-		var prev = blk.listPrev;
-		var next = blk.listNext;
-		if (prev != 0) {
-			var prevRef = blockEntryAt(prev);
-			prevRef.listNext = next;
+	def removeFromList(blk: BlockEntryHandle) {
+		var prev = blk.getListPrev();
+		var next = blk.getListNext();
+		if (!prev.isNull()) {
+			prev.setListNext(next);
 		}
-		if (next != 0) {
-			var nextRef = blockEntryAt(next);
-			nextRef.listPrev = prev;
+		if (!next.isNull()) {
+			next.setListPrev(prev);
 		}
-		blk.listPrev = 0;
-		blk.listNext = 0;
-		blk.listNum = ListKind.NONE.code;
+		def nullBTE = BlockEntryHandle(Pointer.NULL);
+		blk.setListPrev(nullBTE);
+		blk.setListNext(nullBTE);
+		blk.setListNum(ListKind.NONE.code);
 	}
 	// ...
 }
