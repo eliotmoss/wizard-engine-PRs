@@ -183,6 +183,48 @@ def getBlockEntryHandle(r: Ref<BlockEntry>) -> BlockEntryHandle {
 	return BlockEntryHandle(Pointer.atRef(r));
 }
 
+type ChunkHandle(addr: Pointer) #unboxed {
+    def isNull() -> bool {
+        return addr == Pointer.NULL;
+    }
+
+    def getRef() -> Ref<ChunkHeader> {
+        return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(addr, ChunkHeader.size));
+    }
+
+    def getOffset() -> u64 {
+        return getRef().offset;
+    }
+
+    def setOffset(v: u64) {
+        getRef().offset = v;
+    }
+
+    def getLimit() -> u64 {
+        return getRef().limit;
+    }
+
+    def setLimit(v: u64) {
+        getRef().limit = v;
+    }
+
+    def getChunkLimit() -> u64 {
+        return getRef().chunk_limit;
+    }
+
+    def setChunkLimit(v: u64) {
+        getRef().chunk_limit = v;
+    }
+
+    def getLinemarks() -> u64 {
+        return getRef().linemarks;
+    }
+
+    def setLinemarks(v: u64) {
+        getRef().linemarks = v;
+    }
+}
+
 layout BlockEntry {
 	+0	listNum:	i16;  // which list is this entry part of
 	+2	used:		u1; // is this block in use? // TODO: Use bool after the compiler is fixed
@@ -227,7 +269,7 @@ class PWRegion {
 	def var smallSentinel: BlockEntryHandle;
 	def var largeSentinel: BlockEntryHandle;
 	def blankChunkHeader = Array<byte>.new(ChunkHeader.size);  // so we can return *something* when allocation fails
-	def blankChunkHeaderRef = Ref<ChunkHeader>.of(blankChunkHeader);
+	def blankChunkHandle = ChunkHandle(Pointer.atElement(blankChunkHeader, 0));
 	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
 
 	new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64) {
@@ -437,17 +479,20 @@ class PWRegion {
 		return index * getBlockSize();
 	}
 	
-	def createChunk(startEntry: BlockEntryHandle, numBlocks: int) -> Ref<ChunkHeader> {
+	def createChunk(startEntry: BlockEntryHandle, numBlocks: int) -> ChunkHandle {
 		var blockIndex = blockIndexOfEntry(startEntry);
 		var blockOffset = blockOffsetOfIndex(blockIndex);
-		var chunk = Ref<ChunkHeader>.of(rng[blockOffset ..+ ChunkHeader.size]);
-		chunk.offset = u64.!(ChunkHeader.size);
-		chunk.limit = u64.!(numBlocks) * getBlockSize();
+
+        var ptr = Pointer.atElement(rng, int.!(blockOffset));
+        var chunk = ChunkHandle(ptr);
+
+        chunk.setOffset(u64.!(ChunkHeader.size));
+        chunk.setLimit(u64.!(numBlocks) * getBlockSize());
 		// TODO link mark field
 		return chunk;
 	}
 	
-	def allocChunk(numBlocks: int) -> Ref<ChunkHeader> {
+	def allocChunk(numBlocks: int) -> ChunkHandle {
 		if (numBlocks == 1) {
 			// Try the small free block list
 			var firstHandle = smallSentinel.getListNext();
@@ -461,7 +506,7 @@ class PWRegion {
 		while (!thisHandle.isNull()) {
 			var thisIndex = blockIndexOfEntry(thisHandle);
 			var nextHandle = thisHandle.getNext();
-			if (nextHandle.isNull()) return blankChunkHeaderRef;
+			if (nextHandle.isNull()) return blankChunkHandle;
 			var nextIndex = blockIndexOfEntry(nextHandle);
 			var chunkBlocks = nextIndex - thisIndex;
 			if (numBlocks > chunkBlocks) {
@@ -493,7 +538,7 @@ class PWRegion {
 			removeFromList(thisHandle);
 			return createChunk(thisHandle, numBlocks);
 		}
-		return blankChunkHeaderRef;
+		return blankChunkHandle;
 	}
 	
 	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
