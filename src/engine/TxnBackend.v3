@@ -1,0 +1,175 @@
+// Abstract interface for transaction storage backends
+// Supports multiple implementations: volatile memory (mmap), SSD, PMEM, etc.
+//
+// This abstraction allows PWRegion (block-based memory manager) to work with
+// different storage backends without platform-specific code:
+//
+// 1. MmapVolatileBackend: Anonymous memory (DRAM) using mmap
+// 2. MmapPersistentBackend: PMEM/DAX using mmap with MAP_SYNC
+// 3. DiskBackend: Block device storage (future)
+//
+// The backend is responsible for:
+// - Allocating/deallocating regions
+// - Memory protection (mprotect)
+// - Cache flushing for persistence (CLWB/CLFLUSH)
+// - Memory fencing for ordering (SFENCE)
+
+// A memory region allocated by a backend
+class BackendRegion {
+	def range: Range<byte>;  // The actual bytes of the region
+	def backend: TxnRegionBackend;  // Reference to the backend that created this
+	var mapping: Mapping;  // Keeps the Mapping alive so GC finalizer doesn't unmap prematurely
+	
+	new(range, backend) { }
+	
+	// Flush data to persistent storage (no-op for volatile)
+	def flush(offset: u64, size: u64) {
+		backend.flush(range, offset, size);
+	}
+	
+	// Ensure durability fence (no-op for volatile)
+	def fence() {
+		backend.fence();
+	}
+}
+
+// Backend interface that all storage implementations must provide
+class TxnRegionBackend {
+	// Allocate a region of the given size with specified protection
+	def allocate(size: u64, prot: int) -> BackendRegion;
+	
+	// Deallocate a previously allocated region
+	def deallocate(region: BackendRegion);
+	
+	// Change protection on a region
+	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool;
+	
+	// Flush cache lines to storage (persistence operation)
+	def flush(range: Range<byte>, offset: u64, size: u64);
+	
+	// Memory fence to ensure all flushes complete
+	def fence();
+	
+	// Check if this backend provides persistence
+	def isPersistent() -> bool;
+	
+	// Get the name of this backend (for debugging)
+	def name() -> string;
+}
+
+// Protection flags (mirror Linux mmap flags)
+component BackendProt {
+	def NONE = 0;
+	def READ = 1;
+	def WRITE = 2;
+	def EXEC = 4;
+}
+
+// Platform-independent volatile memory backend using simple Array allocation
+class VolatileBackend extends TxnRegionBackend {
+	
+	def allocate(size: u64, prot: int) -> BackendRegion {
+		// Allocate a byte array for the region
+		var data = Array<byte>.new(int.!(size));
+		var range = data[0 ..+ data.length];
+		return BackendRegion.new(range, this);
+	}
+	
+	def deallocate(region: BackendRegion) {
+		// Array will be garbage collected automatically
+		// No explicit deallocation needed
+	}
+	
+	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
+		// No-op for array-based memory (no memory protection)
+		return true;
+	}
+	
+	def flush(range: Range<byte>, offset: u64, size: u64) {
+		// No-op for volatile memory
+	}
+	
+	def fence() {
+		// No-op for volatile memory
+	}
+	
+	def isPersistent() -> bool {
+		return false;
+	}
+	
+	def name() -> string {
+		return "volatile";
+	}
+}
+
+// Mmap-based memory backend (platform-independent, uses POSIX mmap)
+class MmapBackend extends TxnRegionBackend {
+	def allocate(size: u64, prot: int) -> BackendRegion {
+		var mmapProt = convertProt(prot);
+		var mapping = Mmap.reserve(size, mmapProt);
+		if (mapping == null) return null;
+		var range = CiRuntime.forgeRange<byte>(mapping.range.start, int.!(size));
+		var region = BackendRegion.new(range, this);
+		region.mapping = mapping;  // Keep mapping alive to prevent premature GC/unmapping
+		return region;
+	}
+	
+	def deallocate(region: BackendRegion) {
+		// Explicitly unmap and clear reference
+		if (region.mapping != null) {
+			region.mapping.range.unmap();
+			region.mapping = null;
+		}
+	}
+	
+	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
+		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
+		var mmapProt = convertProt(prot);
+		return Mmap.protect(start, size, mmapProt);
+	}
+	
+	def flush(range: Range<byte>, offset: u64, size: u64) {
+		// No-op for volatile memory
+	}
+	
+	def fence() {
+		// No-op for volatile memory
+	}
+	
+	def isPersistent() -> bool {
+		return false;
+	}
+	
+	def name() -> string {
+		return "mmap";
+	}
+	
+	private def convertProt(prot: int) -> int {
+		var mmapProt = Mmap.PROT_NONE;
+		if ((prot & BackendProt.READ) != 0) mmapProt |= Mmap.PROT_READ;
+		if ((prot & BackendProt.WRITE) != 0) mmapProt |= Mmap.PROT_WRITE;
+		if ((prot & BackendProt.EXEC) != 0) mmapProt |= Mmap.PROT_EXEC;
+		return mmapProt;
+	}
+}
+
+// Global instances of platform-independent backends
+component Backends {
+	private var volatileBackend: VolatileBackend;
+	private var mmapBackend: MmapBackend;
+	
+	def getVolatile() -> TxnRegionBackend {
+		if (volatileBackend == null) {
+			volatileBackend = VolatileBackend.new();
+		}
+		return volatileBackend;
+	}
+	
+	def getMmap() -> TxnRegionBackend {
+		if (mmapBackend == null) {
+			mmapBackend = MmapBackend.new();
+		}
+		return mmapBackend;
+	}
+}
+

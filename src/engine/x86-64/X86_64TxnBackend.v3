@@ -1,0 +1,106 @@
+// x86-64 specific transaction backend implementations
+
+// Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
+class MmapPersistentBackend extends TxnRegionBackend {
+	def path: string;  // Path to PMEM device or DAX file
+	
+	new(path) { }
+	
+	def allocate(size: u64, prot: int) -> BackendRegion {
+		// For now, just use anonymous mmap
+		// TODO: Implement true PMEM mapping when file descriptor can be obtained
+		// This requires the file to already exist with the correct size
+		var mmapProt = convertProt(prot);
+		var mapping = Mmap.reserve(size, mmapProt);
+		if (mapping == null) return null;
+		var range = CiRuntime.forgeRange<byte>(mapping.range.start, int.!(size));
+		var region = BackendRegion.new(range, this);
+		region.mapping = mapping;  // Keep mapping alive to prevent premature GC/unmapping
+		return region;
+	}
+	
+	def deallocate(region: BackendRegion) {
+		// Explicitly unmap and clear reference
+		if (region.mapping != null) {
+			region.mapping.range.unmap();
+			region.mapping = null;
+		}
+	}
+	
+	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
+		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
+		var mmapProt = convertProt(prot);
+		return Mmap.protect(start, size, mmapProt);
+	}
+	
+	def flush(range: Range<byte>, offset: u64, size: u64) {
+		// Flush cache lines to PMEM
+		// CLWB (Cache Line Write Back) is the preferred instruction
+		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
+		var start = Pointer.atElement(range, 0) + i64.view(offset);
+		var end = start + i64.view(size);
+		var cacheLineSize = 64; // x86-64 cache line size
+		
+		// Flush each cache line
+		var addr = start;
+		while (addr < end) {
+			flushCacheLine(addr);
+			addr = addr + cacheLineSize;
+		}
+	}
+	
+	def fence() {
+		// SFENCE ensures all cache line flushes complete before continuing
+		storeFence();
+	}
+	
+	def isPersistent() -> bool {
+		return true;
+	}
+	
+	def name() -> string {
+		return "mmap-pmem";
+	}
+	
+	private def convertProt(prot: int) -> int {
+		var mmapProt = Mmap.PROT_NONE;
+		if ((prot & BackendProt.READ) != 0) mmapProt |= Mmap.PROT_READ;
+		if ((prot & BackendProt.WRITE) != 0) mmapProt |= Mmap.PROT_WRITE;
+		if ((prot & BackendProt.EXEC) != 0) mmapProt |= Mmap.PROT_EXEC;
+		return mmapProt;
+	}
+	
+	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
+	private def flushCacheLine(addr: Pointer) {
+		// TODO: This needs compiler support for inline assembly
+		// Ideally: __builtin_ia32_clwb(addr) or asm volatile("clwb (%0)" :: "r"(addr))
+		// For now, this is a placeholder that would need to be implemented
+		// with proper x86-64 CLWB/CLFLUSHOPT/CLFLUSH instruction
+	}
+	
+	// Platform-specific store fence
+	private def storeFence() {
+		// TODO: This needs compiler support for inline assembly
+		// Ideally: __builtin_ia32_sfence() or asm volatile("sfence")
+		// For now, this is a placeholder
+	}
+}
+
+// Factory for creating backend instances
+component X86_64Backends {
+	// Use platform-independent backends by default
+	def getVolatile() -> TxnRegionBackend {
+		return Backends.getVolatile();
+	}
+	
+	// Get mmap-based backend (delegates to platform-independent version)
+	def getMmap() -> TxnRegionBackend {
+		return Backends.getMmap();
+	}
+	
+	// Get PMEM backend (x86-64 specific with cache flush instructions)
+	def getPersistent(path: string) -> TxnRegionBackend {
+		return MmapPersistentBackend.new(path);
+	}
+}
+
