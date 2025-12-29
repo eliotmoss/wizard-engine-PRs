@@ -540,7 +540,82 @@ class PWRegion {
 		}
 		return blankChunkHandle;
 	}
-	
+
+    def freeChunk(chunk: ChunkHandle) {
+        if (chunk.isNull()) return;
+
+        // Map the chunk address back to the BlockEntry
+        var regionBase = Pointer.atElement(rng, 0);
+        var chunkOffset = chunk.addr - regionBase;
+        var index = u64.!(chunkOffset) / blockSize;
+
+        // Retrieve the handle for the header of this block
+        var entryRef = blockLayouts[index];
+        var entry = getBlockEntryHandle(entryRef);
+
+        // Ensure we aren't freeing an already free block
+        if (!entry.getUsed()) return;
+        
+        entry.setUsed(false);
+
+        // Coalesce Left
+        var prev = entry.getPrev();
+        if (!prev.isNull() && !prev.getUsed()) {
+            removeFromList(prev); // Remove prev from its specific free list temporarily
+
+            var next = entry.getNext();
+            prev.setNext(next);
+            if (!next.isNull()) {
+                next.setPrev(prev);
+            }
+
+            // Update local handle to point to 'prev' so subsequent logic works on the merged head.
+            entry = prev;
+        }
+
+        // Coalesce Right
+        var next = entry.getNext();
+        if (!next.isNull() && !next.getUsed()) {
+            removeFromList(next); // Remove next from its specific free list temporarily
+            
+            var nextNext = next.getNext();
+            entry.setNext(nextNext);
+            if (!nextNext.isNull()) {
+                nextNext.setPrev(entry);
+            }
+        }
+
+        // Calculate new size to determine which list to use
+        // Size = (Index of next block) - (Index of current block)
+        var startIndex = blockIndexOfEntry(entry);
+        var nextNeighbor = entry.getNext();
+        // If there is no next neighbor, the block extends to the end of the region (numBlocks)
+        var endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
+        var newSize = endIndex - startIndex;
+
+        if (newSize == 1) {
+            insertAfter(smallSentinel, entry, ListKind.SMALL_FREE);
+        } else {
+            insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
+        }
+    }
+
+    // Helper to insert an entry into a list immediately after the sentinel (Head insertion)
+    def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
+        entry.setListNum(kind.code);
+        
+        var next = sentinel.getListNext();
+        
+        // Link: sentinel -> entry -> next
+        sentinel.setListNext(entry);
+        entry.setListPrev(sentinel);
+        entry.setListNext(next);
+        
+        if (!next.isNull()) {
+            next.setListPrev(entry);
+        }
+    }
+
 	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
 		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
 	}
