@@ -184,50 +184,50 @@ def getBlockEntryHandle(r: Ref<BlockEntry>) -> BlockEntryHandle {
 }
 
 type ChunkHandle(addr: Pointer) #unboxed {
-    def isNull() -> bool {
-        return addr == Pointer.NULL;
-    }
+	def isNull() -> bool {
+		return addr == Pointer.NULL;
+	}
 
-    def getRef() -> Ref<ChunkHeader> {
-        return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(addr, ChunkHeader.size));
-    }
+	def getRef() -> Ref<ChunkHeader> {
+		return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(addr, ChunkHeader.size));
+	}
 
-    def getOffset() -> u64 {
-        return getRef().offset;
-    }
+	def getOffset() -> u64 {
+		return getRef().offset;
+	}
 
-    def setOffset(v: u64) {
-        getRef().offset = v;
-    }
+	def setOffset(v: u64) {
+		getRef().offset = v;
+	}
 
-    def getLimit() -> u64 {
-        return getRef().limit;
-    }
+	def getLimit() -> u64 {
+		return getRef().limit;
+	}
 
-    def setLimit(v: u64) {
-        getRef().limit = v;
-    }
+	def setLimit(v: u64) {
+		getRef().limit = v;
+	}
 
-    def getChunkLimit() -> u64 {
-        return getRef().chunk_limit;
-    }
+	def getChunkLimit() -> u64 {
+		return getRef().chunk_limit;
+	}
 
-    def setChunkLimit(v: u64) {
-        getRef().chunk_limit = v;
-    }
+	def setChunkLimit(v: u64) {
+		getRef().chunk_limit = v;
+	}
 
-    def getLinemarks() -> u64 {
-        return getRef().linemarks;
-    }
+	def getLinemarks() -> u64 {
+		return getRef().linemarks;
+	}
 
-    def setLinemarks(v: u64) {
-        getRef().linemarks = v;
-    }
+	def setLinemarks(v: u64) {
+		getRef().linemarks = v;
+	}
 }
 
 layout BlockEntry {
 	+0	listNum:	i16;  // which list is this entry part of
-	+2	used:		u1; // is this block in use? // TODO: Use bool after the compiler is fixed
+	+2	used:		u1;   // is this block in use? // TODO: Use bool after the compiler is fixed
 				      // gap
 	+8	prev:		i64;  // prev entry in memory;
 	+16	next:		i64;  // next entry in memory order
@@ -257,6 +257,8 @@ component BlockLists {
 				// METADATA, etc., do not have sentinels and not part of this count
 }
 
+type LogEntry(addr: Pointer) { }
+
 // Generic block-based region manager (platform-independent)
 class PWRegion {
 	def var backendRegion: BackendRegion;
@@ -270,7 +272,10 @@ class PWRegion {
 	def var largeSentinel: BlockEntryHandle;
 	def blankChunkHeader = Array<byte>.new(ChunkHeader.size);  // so we can return *something* when allocation fails
 	def blankChunkHandle = ChunkHandle(Pointer.atElement(blankChunkHeader, 0));
+	def var blockTableHandle: BlockTableHandle;
 	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
+	def var logChunk: ChunkHandle;
+	def var logPointer: LogEntry;
 
 	new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64) {
 		var size = numBlocks * blockSize;
@@ -308,6 +313,22 @@ class PWRegion {
 		}
 	}
 	
+	def offsetInRegion(addr: u64) -> u64 {
+		return addr - u64.view((Pointer.atElement(rng, 0) - Pointer.NULL));
+	}
+
+	def blockOfOffset(offset: u64) -> u64 {
+		return offset / blockSize;
+	}
+
+	def blockIndexOf(bte: BlockEntryHandle) -> u64 {
+		return u64.view((bte.addr - blockTableHandle.addr) / BlockEntry.size);
+	}
+
+	def chunkForBlockEntry(blk: BlockEntryHandle) -> ChunkHandle {
+		return ChunkHandle(Pointer.atElement(rng, 0) + long.view(blockSize * blockIndexOf(blk)));
+	}
+
 	private def init(blockSize: u64) {
 		def nullBTE = BlockEntryHandle(Pointer.NULL);
 		var size = numBlocks * blockSize;
@@ -338,7 +359,7 @@ class PWRegion {
 		currentRegionEnd -= blockTableSize;
 		hdr.blockTable = currentRegionEnd;
 		sanitizeOffset(currentRegionEnd);
-		var blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(currentRegionEnd)), numBlockTableEntries);
+		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(currentRegionEnd)), numBlockTableEntries);
 		
 		// Initialize blockLayouts as a LayoutRange
 		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
@@ -392,6 +413,9 @@ class PWRegion {
 		var secondRef = blockLayouts[1];
 		var secondHandle = getBlockEntryHandle(secondRef);
 	
+		var thirdRef = blockLayouts[2];
+		var thirdHandle = getBlockEntryHandle(thirdRef);
+
 		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
 
 		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
@@ -408,12 +432,19 @@ class PWRegion {
 		firstHandle.setNext(secondHandle);
 		sanitizeOffset(blockLayouts.offset(1));
 
-		sanitizeAddress(secondHandle.addr);
-		secondHandle.setListNum(ListKind.LARGE_FREE.code);
-		secondHandle.setNext(metaHandle);
-		secondHandle.setPrev(firstHandle);
-		secondHandle.setListPrev(largeSentinel);
-		secondHandle.setListNext(metaHandle);
+		sanitizeAddress(secondHandle.addr);  // log block
+		secondHandle.setListNum(ListKind.METADATA.code);
+		secondHandle.setUsed(true);
+		secondHandle.setNext(thirdHandle);
+		sanitizeOffset(blockLayouts.offset(2));
+		logChunk = chunkForBlockEntry(secondHandle);
+
+		sanitizeAddress(thirdHandle.addr);
+		thirdHandle.setListNum(ListKind.LARGE_FREE.code);
+		thirdHandle.setNext(metaHandle);
+		thirdHandle.setPrev(firstHandle);
+		thirdHandle.setListPrev(largeSentinel);
+		thirdHandle.setListNext(metaHandle);
 		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
 		sanitizeOffset(blockLayouts.offset(0));
 		sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
@@ -424,6 +455,7 @@ class PWRegion {
 		sanitizeOffset(blockLayouts.offset(0));
 
 		sanitizeAddress(largeSentinel.addr);
+
 		largeSentinel.setListNext(secondHandle);
 		largeSentinel.setListPrev(metaHandle);
 		sanitizeOffset(blockLayouts.offset(1));
@@ -483,11 +515,11 @@ class PWRegion {
 		var blockIndex = blockIndexOfEntry(startEntry);
 		var blockOffset = blockOffsetOfIndex(blockIndex);
 
-        var ptr = Pointer.atElement(rng, int.!(blockOffset));
-        var chunk = ChunkHandle(ptr);
+	var ptr = Pointer.atElement(rng, int.!(blockOffset));
+	var chunk = ChunkHandle(ptr);
 
-        chunk.setOffset(u64.!(ChunkHeader.size));
-        chunk.setLimit(u64.!(numBlocks) * getBlockSize());
+	chunk.setOffset(u64.!(ChunkHeader.size));
+	chunk.setLimit(u64.!(numBlocks) * getBlockSize());
 		// TODO link mark field
 		return chunk;
 	}
@@ -541,80 +573,75 @@ class PWRegion {
 		return blankChunkHandle;
 	}
 
-    def freeChunk(chunk: ChunkHandle) {
-        if (chunk.isNull()) return;
+	def freeChunk(chunk: ChunkHandle) {
+		if (chunk.isNull()) return;
 
-        // Map the chunk address back to the BlockEntry
-        var regionBase = Pointer.atElement(rng, 0);
-        var chunkOffset = chunk.addr - regionBase;
-        var index = u64.!(chunkOffset) / blockSize;
+		// Map the chunk address back to the BlockEntry
+		var index = blockOfOffset(offsetInRegion(u64.view(chunk.addr - Pointer.NULL)));
 
-        // Retrieve the handle for the header of this block
-        var entryRef = blockLayouts[index];
-        var entry = getBlockEntryHandle(entryRef);
+		// Retrieve the handle for the header of this block
+		var entry = blockTableHandle[long.view(index)];
 
-        // Ensure we aren't freeing an already free block
-        if (!entry.getUsed()) return;
-        
-        entry.setUsed(false);
+		// Ensure we aren't freeing an already free block
+		if (!entry.getUsed()) return;
+	
+		entry.setUsed(false);
 
-        // Coalesce Left
-        var prev = entry.getPrev();
-        if (!prev.isNull() && !prev.getUsed()) {
-            removeFromList(prev); // Remove prev from its specific free list temporarily
+		// Coalesce Left
+		var prev = entry.getPrev();
+		if (!prev.isNull() && !prev.getUsed()) {
+			removeFromList(prev); // Remove prev from its specific free list
+			var next = entry.getNext();
+			prev.setNext(next);
+			if (!next.isNull()) {
+				next.setPrev(prev);
+			}
+			// Update local handle to point to 'prev' so subsequent logic works on the merged head.
+			entry = prev;
+		}
 
-            var next = entry.getNext();
-            prev.setNext(next);
-            if (!next.isNull()) {
-                next.setPrev(prev);
-            }
+		// Coalesce Right
+		var next = entry.getNext();
+		if (!next.isNull() && !next.getUsed()) {
+			removeFromList(next); // Remove next from its specific free list temporarily
+	    
+			var nextNext = next.getNext();
+			entry.setNext(nextNext);
+			if (!nextNext.isNull()) {
+				nextNext.setPrev(entry);
+			}
+		}
 
-            // Update local handle to point to 'prev' so subsequent logic works on the merged head.
-            entry = prev;
-        }
+		// Calculate new size to determine which list to use
+		// Size = (Index of next block) - (Index of current block)
+		var startIndex = blockIndexOfEntry(entry);
+		var nextNeighbor = entry.getNext();
+		// If there is no next neighbor, the block extends to the end of the region (numBlocks)
+		var endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
+		var newSize = endIndex - startIndex;
 
-        // Coalesce Right
-        var next = entry.getNext();
-        if (!next.isNull() && !next.getUsed()) {
-            removeFromList(next); // Remove next from its specific free list temporarily
-            
-            var nextNext = next.getNext();
-            entry.setNext(nextNext);
-            if (!nextNext.isNull()) {
-                nextNext.setPrev(entry);
-            }
-        }
+		if (newSize == 1) {
+			insertAfter(smallSentinel, entry, ListKind.SMALL_FREE);
+		} else {
+			insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
+		}
+	}
 
-        // Calculate new size to determine which list to use
-        // Size = (Index of next block) - (Index of current block)
-        var startIndex = blockIndexOfEntry(entry);
-        var nextNeighbor = entry.getNext();
-        // If there is no next neighbor, the block extends to the end of the region (numBlocks)
-        var endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
-        var newSize = endIndex - startIndex;
-
-        if (newSize == 1) {
-            insertAfter(smallSentinel, entry, ListKind.SMALL_FREE);
-        } else {
-            insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
-        }
-    }
-
-    // Helper to insert an entry into a list immediately after the sentinel (Head insertion)
-    def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
-        entry.setListNum(kind.code);
-        
-        var next = sentinel.getListNext();
-        
-        // Link: sentinel -> entry -> next
-        sentinel.setListNext(entry);
-        entry.setListPrev(sentinel);
-        entry.setListNext(next);
-        
-        if (!next.isNull()) {
-            next.setListPrev(entry);
-        }
-    }
+	// Helper to insert an entry into a list immediately after the sentinel (Head insertion)
+	def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
+		entry.setListNum(kind.code);
+	
+		var next = sentinel.getListNext();
+	
+		// Link: sentinel -> entry -> next
+		sentinel.setListNext(entry);
+		entry.setListPrev(sentinel);
+		entry.setListNext(next);
+	
+		if (!next.isNull()) {
+			next.setListPrev(entry);
+		}
+	}
 
 	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
 		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
@@ -642,6 +669,15 @@ class PWRegion {
 			backendRegion = null;
 		}
 	}
+}
+
+layout LogEntry {
+	+0	kind:		u8;	// what kind of log entry
+	+1	size:		u8;	// number of bytes being changed (1, 2, 4, 8)
+	+8	offset:		u64;	// offset of first changed byte, within the region
+	+16	old_val:	u64;
+	+24	new_val:	u64;
+	=32;
 }
 
 component PWRegions {
