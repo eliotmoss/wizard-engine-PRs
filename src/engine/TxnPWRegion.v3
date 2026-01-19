@@ -816,6 +816,53 @@ layout LogEntry {
 	=32;
 }
 
+// Wrapper class to store the value and its width (size)
+class CachedUpdate {
+        def value: u64;
+        def size: u4; // e.g., 1, 2, 4, or 8 bytes
+
+        new(value, size) { }
+}
+
+class WALCache {
+        private var cache: HashMap<Pointer, CachedUpdate>;
+
+        new() {
+                cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
+        }
+
+        // Buffer a write operation
+        def write(addr: Pointer, value: u64, size: u4) {
+                cache[addr] = CachedUpdate.new(value, size);
+        }
+
+        // Retrieve a cached value if it exists
+        // Returns null if the address is not in the cache
+        def read(addr: Pointer) -> CachedUpdate {
+                if (cache.has(addr)) {
+                        return cache[addr];
+                }
+                return null;
+        }
+
+        // Check if an address is dirty (has cached changes)
+        def isDirty(addr: Pointer) -> bool {
+                return cache.has(addr);
+        }
+
+        // Clear the cache (maybe after a flush?)
+        // Note: The HashMap util doesn't have a clear(), so we just re-initialize
+        def clear() {
+                cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
+        }
+
+        // Hash function: Convert Pointer -> u64 -> i32
+        private def hash(p: Pointer) => i32.view(u64.view(p - Pointer.NULL));
+
+        // Equality function
+        private def equals(a: Pointer, b: Pointer) => a == b;
+}
+
 component PWRegions {
 	def blockSize: u64 = 256u64 * 1024u64;
 	def sanitize = true;
