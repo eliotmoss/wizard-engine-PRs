@@ -824,6 +824,15 @@ class CachedUpdate {
         new(value, size) { }
 }
 
+// A write-behind cache for the Write Ahead Log (WAL).
+// This component buffers writes in DRAM.
+//
+// CONSTRAINT: ALIGNED ACCESS ONLY
+// This implementation uses a HashMap to store updates. It does not support spatial
+// queries or overlapping intervals. Consequently:
+// 1. Reads must match the exact address of previous writes.
+// 2. Mixed-width accesses (e.g., writing 8 bytes at 0x10, then reading 1 byte at 0x11)
+//    will result in a cache miss, returning stale data.
 class WALCache {
         private var cache: HashMap<Pointer, CachedUpdate>;
 
