@@ -515,11 +515,21 @@ class PWRegion {
 		var blockIndex = blockIndexOfEntry(startEntry);
 		var blockOffset = blockOffsetOfIndex(blockIndex);
 
-	var ptr = Pointer.atElement(rng, int.!(blockOffset));
-	var chunk = ChunkHandle(ptr);
+	        var ptr = Pointer.atElement(rng, int.!(blockOffset));
+	        var chunk = ChunkHandle(ptr);
 
-	chunk.setOffset(u64.!(ChunkHeader.size));
-	chunk.setLimit(u64.!(numBlocks) * getBlockSize());
+                // LOG: Chunk Header Initialization
+                // Address: chunk.addr + ChunkHeader.offset (offset 0)
+                // Size: 8 bytes
+                // New Value: ChunkHeader.size
+	        chunk.setOffset(u64.!(ChunkHeader.size));
+
+                // LOG: Chunk Header Limit
+                // Address: chunk.addr + ChunkHeader.limit (offset 8)
+                // Size: 8 bytes
+                // New Value: numBlocks * getBlockSize()
+	        chunk.setLimit(u64.!(numBlocks) * getBlockSize());
+
 		// TODO link mark field
 		return chunk;
 	}
@@ -529,8 +539,16 @@ class PWRegion {
 			// Try the small free block list
 			var firstHandle = smallSentinel.getListNext();
 			if (!firstHandle.isNull()) {
+                                // Note: removeFromList handles its own logging
 				removeFromList(firstHandle);
+
+                                // LOG: BlockEntry Used Flag
+                                // Address: firstHandle.addr + BlockEntry.used (offset 2)
+                                // Size: 1 byte
+                                // New Value: 1 (true)
 				firstHandle.setUsed(true);
+
+                                // Note: createChunk handles logging of header initialization
 				return createChunk(firstHandle, 1);
 			}
 		}
@@ -546,28 +564,69 @@ class PWRegion {
 				continue;
 			}
 			if (numBlocks == chunkBlocks) {
+                                // Note: removeFromList handles its own logging
 				removeFromList(thisHandle);
+
+                                // LOG: BlockEntry Used Flag
+                                // Address: thisHandle.addr + BlockEntry.used (offset 2)
+                                // Size: 1 byte
+                                // New Value: 1 (true)
 				thisHandle.setUsed(true);
+
+                                // Note: createChunk handles logging of header initialization
 				return createChunk(thisHandle, numBlocks);
 			}
-			// need to split the block
+
+                        // --- Splitting Block Logic ---
+
 			var remIndex = thisIndex + u64.!(numBlocks);
 			var remRef = blockLayouts[remIndex];
 			var remHandle = getBlockEntryHandle(remRef);
 			var remBlocks = nextIndex - remIndex;
 
+                        // LOG: Remainder Block Metadata Initialization
+                        // 1. ListNum (Offset 0, 2 bytes): SMALL_FREE or LARGE_FREE
+                        // 2. Used (Offset 2, 1 byte): 0 (false)
+                        // 3. Prev (Offset 8, 8 bytes): remHandle.toOffset(thisHandle)
+                        // 4. Next (Offset 8, 8 bytes): remHandle.toOffset(nextHandle)
+                        // 5. ListPrev (Offset 24, 8 bytes): remHandle.toOffset(thisHandle)
+                        // 6. ListNext (Offset 32, 8 bytes): remHandle.toOffset(nextHandle)
 			remHandle.setListNum(if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
 			remHandle.setUsed(false);
 			remHandle.setPrev(thisHandle);
 			remHandle.setNext(nextHandle);
 			remHandle.setListPrev(thisHandle);
 			remHandle.setListNext(nextHandle);
+
+                        // LOG: Update 'this' block Next pointer
+                        // Address: thisHandle.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: thisHandle.toOffset(remHandle)
 			thisHandle.setNext(remHandle);
+
+                        // LOG: Update 'this' block ListNext pointer
+                        // Address: thisHandle.addr + BlockEntry.listNext (offset 32)
+                        // Size: 8 bytes
+                        // New Value: thisHandle.toOffset(remHandle)
 			thisHandle.setListNext(remHandle);
+
+                        // LOG: Update 'next' block Prev pointer
+                        // Address: nextHandle.addr + BlockEntry.prev (offset 8)
+                        // Size: 8 bytes
+                        // New Value: nextHandle.toOffset(remHandle)
 			nextHandle.setPrev(remHandle);
+
 			var listNextHandle = thisHandle.getListNext();
+                        
+                        // LOG: Update 'listNext' block ListPrev pointer
+                        // Address: listNextHandle.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: listNextHandle.toOffset(remHandle)
 			listNextHandle.setListPrev(remHandle);
+
+                        // Note: removeFromList handles its own logging
 			removeFromList(thisHandle);
+
 			return createChunk(thisHandle, numBlocks);
 		}
 		return blankChunkHandle;
@@ -585,15 +644,31 @@ class PWRegion {
 		// Ensure we aren't freeing an already free block
 		if (!entry.getUsed()) return;
 	
+                // LOG: Mark Block as Unused
+                // Address: entry.addr + BlockEntry.used (offset 2)
+                // Size: 1 bytes
+                // New Value: 0 (false)
 		entry.setUsed(false);
 
 		// Coalesce Left
 		var prev = entry.getPrev();
 		if (!prev.isNull() && !prev.getUsed()) {
+                        // Note: removeFromList handles its own logging
 			removeFromList(prev); // Remove prev from its specific free list
+
 			var next = entry.getNext();
+                        
+                        // LOG: Update Prev's Next pointer (Coalescing)
+                        // Address: prev.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: prev.toOffset(next)
 			prev.setNext(next);
+
 			if (!next.isNull()) {
+                                // LOG: Update Next's Prev pointer (Coalescing)
+                                // Address: next.addr + BlockEntry.prev (offset 8)
+                                // Size: 8 bytes
+                                // New Value: next.toOffset(prev)
 				next.setPrev(prev);
 			}
 			// Update local handle to point to 'prev' so subsequent logic works on the merged head.
@@ -603,23 +678,34 @@ class PWRegion {
 		// Coalesce Right
 		var next = entry.getNext();
 		if (!next.isNull() && !next.getUsed()) {
+                        // Note: removeFromList handles its own logging
 			removeFromList(next); // Remove next from its specific free list temporarily
 	    
 			var nextNext = next.getNext();
+                        
+                        // LOG: Update Entry's Next pointer (Coalescing)
+                        // Address: entry.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: entry.toOffset(nextNext)
 			entry.setNext(nextNext);
+
 			if (!nextNext.isNull()) {
+                                // LOG: Update NextNext's Prev pointer (Coalescing)
+                                // Address: nextNext.addr + BlockEntry.prev (offset 8)
+                                // Size: 8 bytes
+                                // New Value: nextNext.toOffset(entry)
 				nextNext.setPrev(entry);
 			}
 		}
 
 		// Calculate new size to determine which list to use
-		// Size = (Index of next block) - (Index of current block)
 		var startIndex = blockIndexOfEntry(entry);
 		var nextNeighbor = entry.getNext();
 		// If there is no next neighbor, the block extends to the end of the region (numBlocks)
 		var endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
 		var newSize = endIndex - startIndex;
 
+                // Note: insertAfter handles its own logging
 		if (newSize == 1) {
 			insertAfter(smallSentinel, entry, ListKind.SMALL_FREE);
 		} else {
@@ -629,16 +715,39 @@ class PWRegion {
 
 	// Helper to insert an entry into a list immediately after the sentinel (Head insertion)
 	def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
+                // LOG: Set List Kind
+                // Address: entry.addr + BlockEntry.listNum (offset 0)
+                // Size: 2 bytes
+                // New Value: kind.code
 		entry.setListNum(kind.code);
 	
 		var next = sentinel.getListNext();
 	
 		// Link: sentinel -> entry -> next
+
+                // LOG: Link Sentinel to Entry
+                // Address: sentinel.addr + BlockEntry.listNext (offset 32)
+                // Size: 8 bytes
+                // New Value: sentinel.toOffset(entry)
 		sentinel.setListNext(entry);
+                
+                // LOG: Link Entry to Sentinel (Prev)
+                // Address: entry.addr + BlockEntry.listPrev (offset 24)
+                // Size: 8 bytes
+                // New Value: entry.toOffset(sentinel)
 		entry.setListPrev(sentinel);
+        
+                // LOG: Link Entry to Next (Next)
+                // Address: entry.addr + BlockEntry.listNext (offset 32)
+                // Size: 8 bytes
+                // New Value: entry.toOffset(next)
 		entry.setListNext(next);
 	
 		if (!next.isNull()) {
+                        // LOG: Link Next back to Entry (Prev)
+                        // Address: next.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: next.toOffset(entry)
 			next.setListPrev(entry);
 		}
 	}
@@ -650,15 +759,42 @@ class PWRegion {
 	def removeFromList(blk: BlockEntryHandle) {
 		var prev = blk.getListPrev();
 		var next = blk.getListNext();
+
 		if (!prev.isNull()) {
+                        // LOG: Update Prev's ListNext
+                        // Address: prev.addr + BlockEntry.listNext (offset 32)
+                        // Size: 8 bytes
+                        // New Value: prev.toOffset(next)
 			prev.setListNext(next);
 		}
+
 		if (!next.isNull()) {
+                        // LOG: Update Next's ListPrev
+                        // Address: next.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: next.toOffset(prev)
 			next.setListPrev(prev);
 		}
+
 		def nullBTE = BlockEntryHandle(Pointer.NULL);
+
+                
+                // LOG: Clear blk ListPrev
+                // Address: blk.addr + BlockEntry.listPrev (offset 24)
+                // Size: 8 bytes
+                // New Value: null
 		blk.setListPrev(nullBTE);
+
+                // LOG: Clear blk ListNext
+                // Address: blk.addr + BlockEntry.listNext (offset 32)
+                // Size: 8 bytes
+                // New Value: null
 		blk.setListNext(nullBTE);
+
+                // LOG: Clear blk ListNum
+                // Address: blk.addr + BlockEntry.listNum (offset 0)
+                // Size: 2 bytes
+                // New Value: ListKind.NONE (-2)
 		blk.setListNum(ListKind.NONE.code);
 	}
 	
