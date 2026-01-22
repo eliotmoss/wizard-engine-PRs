@@ -1,0 +1,134 @@
+// WALCache Tests
+// Tests the in-memory write-behind cache for the Write Ahead Log
+
+def T = UnitTests.registerT("wal_cache:", _, WALCacheTester.new, _);
+def X = [
+	T("basic_write_read", test_basic_write_read),
+	T("cache_miss", test_cache_miss),
+	T("overwrite_update", test_overwrite_update),
+	T("is_dirty_check", test_is_dirty_check),
+	T("clear_cache", test_clear_cache),
+	T("multiple_entries", test_multiple_entries),
+	T("aligned_access_constraint", test_aligned_access_constraint),
+	()
+];
+
+class WALCacheTester(t: Tester) {
+	// Helper to create valid pointers for testing without a full heap region
+	def dummyData = Array<byte>.new(1024);
+	
+	def getPtr(offset: int) -> Pointer {
+		return Pointer.atElement(dummyData, offset);
+	}
+}
+
+// Test 1: Basic Write and Read flow
+def test_basic_write_read(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var ptr = tc.getPtr(0);
+	var val = 0xDEADBEEFCAFEBABEu64;
+	var size = 8u4;
+
+	// Perform write
+	cache.write(ptr, val, size);
+
+	// Perform read
+	var result = cache.read(ptr);
+
+	// Assertions
+	tc.t.assert_ne(null, result);
+	tc.t.assert_eq(val, result.value);
+	tc.t.assert_eq(size, result.size);
+}
+
+// Test 2: Reading an address that hasn't been written
+def test_cache_miss(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var ptr1 = tc.getPtr(0);
+	var ptr2 = tc.getPtr(8);
+
+	cache.write(ptr1, 100u64, 8u4);
+
+	// ptr2 was never written
+	var result = cache.read(ptr2);
+
+	tc.t.assert_eq(null, result);
+}
+
+// Test 3: Overwriting an existing key updates the value
+def test_overwrite_update(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var ptr = tc.getPtr(16);
+
+	// Initial write
+	cache.write(ptr, 10u64, 4u4);
+	var res1 = cache.read(ptr);
+	tc.t.assert_eq(10u64, res1.value);
+
+	// Update write
+	cache.write(ptr, 99u64, 4u4);
+	var res2 = cache.read(ptr);
+	tc.t.assert_eq(99u64, res2.value);
+}
+
+// Test 4: Verifying the isDirty boolean check
+def test_is_dirty_check(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var ptr = tc.getPtr(32);
+	var cleanPtr = tc.getPtr(40);
+
+	tc.t.assertz(false, cache.isDirty(ptr));
+
+	cache.write(ptr, 1u64, 1u4);
+
+	tc.t.assertz(true, cache.isDirty(ptr));
+	tc.t.assertz(false, cache.isDirty(cleanPtr));
+}
+
+// Test 5: Clearing the cache wipes all data
+def test_clear_cache(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var ptr = tc.getPtr(0);
+
+	cache.write(ptr, 123u64, 8u4);
+	tc.t.assertz(true, cache.isDirty(ptr));
+
+	cache.clear();
+
+	tc.t.assertz(false, cache.isDirty(ptr));
+	tc.t.assert_eq(null, cache.read(ptr));
+}
+
+// Test 6: Handling multiple distinct entries
+def test_multiple_entries(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var p1 = tc.getPtr(0);
+	var p2 = tc.getPtr(8);
+	var p3 = tc.getPtr(16);
+
+	cache.write(p1, 11u64, 8u4);
+	cache.write(p2, 22u64, 8u4);
+	cache.write(p3, 33u64, 8u4);
+
+	tc.t.assert_eq(11u64, cache.read(p1).value);
+	tc.t.assert_eq(22u64, cache.read(p2).value);
+	tc.t.assert_eq(33u64, cache.read(p3).value);
+}
+
+// Test 7: Verify the "Aligned Access Only" Constraint
+// This test ensures that the HashMap behaves as expected: 
+// A write to base address does NOT satisfy a read to base + offset.
+def test_aligned_access_constraint(tc: WALCacheTester) {
+	var cache = WALCache.new();
+	var basePtr = tc.getPtr(100);
+	var offsetPtr = tc.getPtr(101); // 1 byte into the object
+
+	// Write an 8-byte value at base
+	cache.write(basePtr, 0xFFFFFFFFFFFFFFFFu64, 8u4);
+
+	// Try to read at offset (simulating an unaligned access)
+	// Because we use a HashMap of Pointers, this MUST return null.
+	var result = cache.read(offsetPtr);
+
+	tc.t.assert_eq(null, result);
+}
