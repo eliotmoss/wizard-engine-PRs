@@ -276,6 +276,7 @@ class PWRegion {
 	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
 	def var logChunk: ChunkHandle;
 	def var logPointer: LogEntry;
+	def var walCache = WALCache.new();
 
 	new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64) {
 		var size = numBlocks * blockSize;
@@ -511,30 +512,32 @@ class PWRegion {
 		return index * getBlockSize();
 	}
 	
-	def createChunk(startEntry: BlockEntryHandle, numBlocks: int) -> ChunkHandle {
+	def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
 		var blockIndex = blockIndexOfEntry(startEntry);
 		var blockOffset = blockOffsetOfIndex(blockIndex);
 
 	        var ptr = Pointer.atElement(rng, int.!(blockOffset));
 	        var chunk = ChunkHandle(ptr);
 
+		walCache.write(chunk.addr, u64.view(ChunkHeader.size), 8);
                 // LOG: Chunk Header Initialization
                 // Address: chunk.addr + ChunkHeader.offset (offset 0)
                 // Size: 8 bytes
                 // New Value: ChunkHeader.size
 	        chunk.setOffset(u64.!(ChunkHeader.size));
 
+		walCache.write(chunk.addr + 8, numBlocks * getBlockSize(), 8);
                 // LOG: Chunk Header Limit
                 // Address: chunk.addr + ChunkHeader.limit (offset 8)
                 // Size: 8 bytes
                 // New Value: numBlocks * getBlockSize()
-	        chunk.setLimit(u64.!(numBlocks) * getBlockSize());
+	        chunk.setLimit(numBlocks * getBlockSize());
 
 		// TODO link mark field
 		return chunk;
 	}
 	
-	def allocChunk(numBlocks: int) -> ChunkHandle {
+	def allocChunk(numBlocks: u32) -> ChunkHandle {
 		if (numBlocks == 1) {
 			// Try the small free block list
 			var firstHandle = smallSentinel.getListNext();
@@ -757,40 +760,71 @@ class PWRegion {
 	}
 	
 	def removeFromList(blk: BlockEntryHandle) {
-		var prev = blk.getListPrev();
-		var next = blk.getListNext();
-
-		if (!prev.isNull()) {
-                        // LOG: Update Prev's ListNext
-                        // Address: prev.addr + BlockEntry.listNext (offset 32)
-                        // Size: 8 bytes
-                        // New Value: prev.toOffset(next)
-			prev.setListNext(next);
+		var listPrev: BlockEntryHandle;
+		def listPrevUpdate = walCache.read(blk.addr + 24);
+		match (listPrevUpdate) {
+			None => {
+				listPrev = blk.getListPrev();
+			}
+			Some(listPrevOffsetFromBlk, size) => {
+				// Unsure if need to call different .view function on the value based on its size
+				// If size is not needed, might as well just store the value
+				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
+				listPrev = blk.toHandle(i64.view(listPrevOffsetFromBlk));
+			}
 		}
 
-		if (!next.isNull()) {
-                        // LOG: Update Next's ListPrev
-                        // Address: next.addr + BlockEntry.listPrev (offset 24)
+		var listNext: BlockEntryHandle;
+		def listNextUpdate = walCache.read(blk.addr + 32);
+		match (listNextUpdate) {
+			None => {
+				listNext = blk.getListNext();
+			}
+			Some(listNextOffsetFromBlk, size) => {
+				// Unsure if need to call different .view function on the value based on its size
+				// If size is not needed, might as well just store the value
+				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
+				listNext = blk.toHandle(i64.view(listNextOffsetFromBlk));
+			}
+		}
+
+		if (!listPrev.isNull()) {
+			def listNextOffsetFromListPrev = listPrev.toOffset(listNext);
+			walCache.write(listPrev.addr + 32, u64.view(listNextOffsetFromListPrev) , 8);
+                        // LOG: Update listPrev's ListNext
+                        // Address: listPrev.addr + BlockEntry.listNext (offset 32)
                         // Size: 8 bytes
-                        // New Value: next.toOffset(prev)
-			next.setListPrev(prev);
+                        // New Value: listNextOffsetFromListPrev 
+			listPrev.setListNext(listNext);
+		}
+
+		if (!listNext.isNull()) {
+			def listPrevOffsetFromListNext = listNext.toOffset(listPrev);
+			walCache.write(listNext.addr + 24, u64.view(listPrevOffsetFromListNext), 8);
+                        // LOG: Update listNext's ListPrev
+                        // Address: listNext.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: listPrevOffsetFromListNext
+			listNext.setListPrev(listPrev);
 		}
 
 		def nullBTE = BlockEntryHandle(Pointer.NULL);
-
                 
+		walCache.write(blk.addr + 24, 0, 8);
                 // LOG: Clear blk ListPrev
                 // Address: blk.addr + BlockEntry.listPrev (offset 24)
                 // Size: 8 bytes
-                // New Value: null
+                // New Value: null (0)
 		blk.setListPrev(nullBTE);
 
+		walCache.write(blk.addr + 32, 0, 8);
                 // LOG: Clear blk ListNext
                 // Address: blk.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
-                // New Value: null
+                // New Value: null (0)
 		blk.setListNext(nullBTE);
 
+		walCache.write(blk.addr, u64.view(ListKind.NONE.code), 8);
                 // LOG: Clear blk ListNum
                 // Address: blk.addr + BlockEntry.listNum (offset 0)
                 // Size: 2 bytes
@@ -816,12 +850,10 @@ layout LogEntry {
 	=32;
 }
 
-// Wrapper class to store the value and its width (size)
-class CachedUpdate {
-        def value: u64;
-        def size: u4; // e.g., 1, 2, 4, or 8 bytes
-
-        new(value, size) { }
+// Wrapper ADT to store the cached value and its width (size)
+type CachedUpdate #unboxed {
+	case None;
+	case Some(value: u64, size: u4);
 }
 
 // A write-behind cache for the Write Ahead Log (WAL).
@@ -842,7 +874,7 @@ class WALCache {
 
         // Buffer a write operation
         def write(addr: Pointer, value: u64, size: u4) {
-                cache[addr] = CachedUpdate.new(value, size);
+                cache[addr] = CachedUpdate.Some(value, size);
         }
 
         // Retrieve a cached value if it exists
@@ -851,7 +883,7 @@ class WALCache {
                 if (cache.has(addr)) {
                         return cache[addr];
                 }
-                return null;
+                return CachedUpdate.None;
         }
 
         // Check if an address is dirty (has cached changes)
@@ -865,8 +897,8 @@ class WALCache {
                 cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
         }
 
-        // Hash function: Convert Pointer -> u64 -> i32
-        private def hash(p: Pointer) => i32.view(u64.view(p - Pointer.NULL));
+        // Hash function: Convert Pointer -> i32
+        private def hash(p: Pointer) => i32.view(p - Pointer.NULL);
 
         // Equality function
         private def equals(a: Pointer, b: Pointer) => a == b;

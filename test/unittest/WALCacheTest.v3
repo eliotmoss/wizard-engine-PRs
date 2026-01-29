@@ -20,6 +20,14 @@ class WALCacheTester(t: Tester) {
 	def getPtr(offset: int) -> Pointer {
 		return Pointer.atElement(dummyData, offset);
 	}
+
+	// Helper to unpack the ADT and assert the value
+	def assert_value(expected: u64, actual: CachedUpdate) {
+		match (actual) {
+			Some(v, _) => t.assert_eq(expected, v);
+			None => t.fail("Expected CachedUpdate.Some, got None");
+		}
+	}
 }
 
 // Test 1: Basic Write and Read flow
@@ -35,10 +43,16 @@ def test_basic_write_read(tc: WALCacheTester) {
 	// Perform read
 	var result = cache.read(ptr);
 
-	// Assertions
-	tc.t.assert_ne(null, result);
-	tc.t.assert_eq(val, result.value);
-	tc.t.assert_eq(size, result.size);
+	// Assertions using pattern matching
+	match (result) {
+		Some(v, s) => {
+			tc.t.assert_eq(val, v);
+			tc.t.assert_eq(size, s);
+		}
+		None => {
+			tc.t.fail("Expected result to be Some, found None");
+		}
+	}
 }
 
 // Test 2: Reading an address that hasn't been written
@@ -52,7 +66,7 @@ def test_cache_miss(tc: WALCacheTester) {
 	// ptr2 was never written
 	var result = cache.read(ptr2);
 
-	tc.t.assert_eq(null, result);
+	tc.t.assert_eq(CachedUpdate.None, result);
 }
 
 // Test 3: Overwriting an existing key updates the value
@@ -62,13 +76,11 @@ def test_overwrite_update(tc: WALCacheTester) {
 
 	// Initial write
 	cache.write(ptr, 10u64, 4u4);
-	var res1 = cache.read(ptr);
-	tc.t.assert_eq(10u64, res1.value);
+	tc.assert_value(10u64, cache.read(ptr));
 
 	// Update write
 	cache.write(ptr, 99u64, 4u4);
-	var res2 = cache.read(ptr);
-	tc.t.assert_eq(99u64, res2.value);
+	tc.assert_value(99u64, cache.read(ptr));
 }
 
 // Test 4: Verifying the isDirty boolean check
@@ -96,7 +108,7 @@ def test_clear_cache(tc: WALCacheTester) {
 	cache.clear();
 
 	tc.t.assertz(false, cache.isDirty(ptr));
-	tc.t.assert_eq(null, cache.read(ptr));
+	tc.t.assert_eq(CachedUpdate.None, cache.read(ptr));
 }
 
 // Test 6: Handling multiple distinct entries
@@ -110,9 +122,9 @@ def test_multiple_entries(tc: WALCacheTester) {
 	cache.write(p2, 22u64, 8u4);
 	cache.write(p3, 33u64, 8u4);
 
-	tc.t.assert_eq(11u64, cache.read(p1).value);
-	tc.t.assert_eq(22u64, cache.read(p2).value);
-	tc.t.assert_eq(33u64, cache.read(p3).value);
+	tc.assert_value(11u64, cache.read(p1));
+	tc.assert_value(22u64, cache.read(p2));
+	tc.assert_value(33u64, cache.read(p3));
 }
 
 // Test 7: Verify the "Aligned Access Only" Constraint
@@ -127,8 +139,8 @@ def test_aligned_access_constraint(tc: WALCacheTester) {
 	cache.write(basePtr, 0xFFFFFFFFFFFFFFFFu64, 8u4);
 
 	// Try to read at offset (simulating an unaligned access)
-	// Because we use a HashMap of Pointers, this MUST return null.
+	// Because we use a HashMap of Pointers, this MUST return None.
 	var result = cache.read(offsetPtr);
 
-	tc.t.assert_eq(null, result);
+	tc.t.assert_eq(CachedUpdate.None, result);
 }
