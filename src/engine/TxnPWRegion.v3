@@ -718,40 +718,57 @@ class PWRegion {
 
 	// Helper to insert an entry into a list immediately after the sentinel (Head insertion)
 	def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
+		walCache.write(entry.addr, u64.view(kind.code), 2);
                 // LOG: Set List Kind
                 // Address: entry.addr + BlockEntry.listNum (offset 0)
                 // Size: 2 bytes
                 // New Value: kind.code
 		entry.setListNum(kind.code);
 	
-		var next = sentinel.getListNext();
+		var listNext: BlockEntryHandle;
+		def listNextUpdate = walCache.read(sentinel.addr + 32);
+		match (listNextUpdate) {
+			None => {
+				listNext = sentinel.getListNext();
+			}
+			Some(listNextOffsetFromSentinel, size) => {
+				// Unsure if need to call different .view function on the value based on its size
+				// If size is not needed, might as well just store the value
+				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
+				listNext = sentinel.toHandle(i64.view(listNextOffsetFromSentinel));
+			}
+		}
 	
-		// Link: sentinel -> entry -> next
+		// Link: sentinel -> entry -> listNext
 
+		walCache.write(sentinel.addr + 32, u64.view(sentinel.toOffset(entry)), 8);
                 // LOG: Link Sentinel to Entry
                 // Address: sentinel.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
                 // New Value: sentinel.toOffset(entry)
 		sentinel.setListNext(entry);
                 
+		walCache.write(entry.addr + 24, u64.view(entry.toOffset(sentinel)), 8);
                 // LOG: Link Entry to Sentinel (Prev)
                 // Address: entry.addr + BlockEntry.listPrev (offset 24)
                 // Size: 8 bytes
                 // New Value: entry.toOffset(sentinel)
 		entry.setListPrev(sentinel);
         
-                // LOG: Link Entry to Next (Next)
+		walCache.write(entry.addr + 32, u64.view(entry.toOffset(listNext)), 8);
+                // LOG: Link Entry to listNext (Next)
                 // Address: entry.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
-                // New Value: entry.toOffset(next)
-		entry.setListNext(next);
+                // New Value: entry.toOffset(listNext)
+		entry.setListNext(listNext);
 	
-		if (!next.isNull()) {
-                        // LOG: Link Next back to Entry (Prev)
-                        // Address: next.addr + BlockEntry.listPrev (offset 24)
+		if (!listNext.isNull()) {
+			walCache.write(listNext.addr + 24, u64.view(listNext.toOffset(entry)), 8);
+                        // LOG: Link listNext back to Entry (Prev)
+                        // Address: listNext.addr + BlockEntry.listPrev (offset 24)
                         // Size: 8 bytes
-                        // New Value: next.toOffset(entry)
-			next.setListPrev(entry);
+                        // New Value: listNext.toOffset(entry)
+			listNext.setListPrev(entry);
 		}
 	}
 
