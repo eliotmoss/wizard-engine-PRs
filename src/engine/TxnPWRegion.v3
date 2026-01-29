@@ -765,20 +765,7 @@ class PWRegion {
 	}
 	
 	def removeFromList(blk: BlockEntryHandle) {
-		var listPrev: BlockEntryHandle;
-		def listPrevUpdate = walCache.read(blk.addr + 24);
-		match (listPrevUpdate) {
-			None => {
-				listPrev = blk.getListPrev();
-			}
-			Some(listPrevOffsetFromBlk, size) => {
-				// Unsure if need to call different .view function on the value based on its size
-				// If size is not needed, might as well just store the value
-				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
-				listPrev = blk.toHandle(i64.view(listPrevOffsetFromBlk));
-			}
-		}
-
+		var listPrev = walCache.readListPrev(blk);
 		var listNext = walCache.readListNext(blk);
 
 		if (!listPrev.isNull()) {
@@ -889,6 +876,21 @@ class WALCache {
         def clear() {
                 cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
         }
+
+	def readListPrev(entry: BlockEntryHandle) -> BlockEntryHandle {
+		def listPrevUpdate = this.read(entry.addr + 24);
+		match (listPrevUpdate) {
+			None => {
+				return entry.getListPrev();
+			}
+			Some(listPrevOffsetFromBlk, size) => {
+				// Unsure if need to call different .view function on the value based on its size
+				// If size is not needed, might as well just store the value
+				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
+				return entry.toHandle(i64.view(listPrevOffsetFromBlk));
+			}
+		}
+	}
 
 	def readListNext(entry: BlockEntryHandle) ->  BlockEntryHandle {
 		def listNextUpdate = this.read(entry.addr + 32);
