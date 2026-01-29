@@ -512,6 +512,40 @@ class PWRegion {
 		return index * getBlockSize();
 	}
 	
+	// Helper to read listPrev handle specifically from the cache or memory
+	def readListPrev(entry: BlockEntryHandle) -> BlockEntryHandle {
+		def offset = 24;
+		def targetAddr = entry.addr + offset;
+		
+		def cached = walCache.read(targetAddr);
+		
+		match (cached) {
+			Some(val, sz) => {
+				return entry.toHandle(i64.view(val));
+			}
+			None => {
+				return entry.getListPrev();
+			}
+		}
+	}
+
+	// Helper to read listNext handle specifically from the cache or memory
+	def readListNext(entry: BlockEntryHandle) -> BlockEntryHandle {
+		def offset = 32;
+		def targetAddr = entry.addr + offset;
+
+		def cached = walCache.read(targetAddr);
+
+		match (cached) {
+			Some(val, sz) => {
+				return entry.toHandle(i64.view(val));
+			}
+			None => {
+				return entry.getListNext();
+			}
+		}
+	}
+
 	def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
 		var blockIndex = blockIndexOfEntry(startEntry);
 		var blockOffset = blockOffsetOfIndex(blockIndex);
@@ -725,7 +759,7 @@ class PWRegion {
                 // New Value: kind.code
 		entry.setListNum(kind.code);
 	
-		var listNext = walCache.readListNext(sentinel);
+		var listNext = readListNext(sentinel);
 	
 		// Link: sentinel -> entry -> listNext
 
@@ -765,8 +799,8 @@ class PWRegion {
 	}
 	
 	def removeFromList(blk: BlockEntryHandle) {
-		var listPrev = walCache.readListPrev(blk);
-		var listNext = walCache.readListNext(blk);
+		var listPrev = readListPrev(blk);
+		var listNext = readListNext(blk);
 
 		if (!listPrev.isNull()) {
 			def listNextOffsetFromListPrev = listPrev.toOffset(listNext);
@@ -876,36 +910,6 @@ class WALCache {
         def clear() {
                 cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
         }
-
-	def readListPrev(entry: BlockEntryHandle) -> BlockEntryHandle {
-		def listPrevUpdate = this.read(entry.addr + 24);
-		match (listPrevUpdate) {
-			None => {
-				return entry.getListPrev();
-			}
-			Some(listPrevOffsetFromBlk, size) => {
-				// Unsure if need to call different .view function on the value based on its size
-				// If size is not needed, might as well just store the value
-				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
-				return entry.toHandle(i64.view(listPrevOffsetFromBlk));
-			}
-		}
-	}
-
-	def readListNext(entry: BlockEntryHandle) ->  BlockEntryHandle {
-		def listNextUpdate = this.read(entry.addr + 32);
-		match (listNextUpdate) {
-			None => {
-				return entry.getListNext();
-			}
-			Some(listNextOffsetFromSentinel, size) => {
-				// Unsure if need to call different .view function on the value based on its size
-				// If size is not needed, might as well just store the value
-				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
-				return entry.toHandle(i64.view(listNextOffsetFromSentinel));
-			}
-		}
-	}
 
         // Hash function: Convert Pointer -> i32
         private def hash(p: Pointer) => i32.view(p - Pointer.NULL);
