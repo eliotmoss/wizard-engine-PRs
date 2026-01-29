@@ -725,19 +725,7 @@ class PWRegion {
                 // New Value: kind.code
 		entry.setListNum(kind.code);
 	
-		var listNext: BlockEntryHandle;
-		def listNextUpdate = walCache.read(sentinel.addr + 32);
-		match (listNextUpdate) {
-			None => {
-				listNext = sentinel.getListNext();
-			}
-			Some(listNextOffsetFromSentinel, size) => {
-				// Unsure if need to call different .view function on the value based on its size
-				// If size is not needed, might as well just store the value
-				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
-				listNext = sentinel.toHandle(i64.view(listNextOffsetFromSentinel));
-			}
-		}
+		var listNext = walCache.readListNext(sentinel);
 	
 		// Link: sentinel -> entry -> listNext
 
@@ -791,19 +779,7 @@ class PWRegion {
 			}
 		}
 
-		var listNext: BlockEntryHandle;
-		def listNextUpdate = walCache.read(blk.addr + 32);
-		match (listNextUpdate) {
-			None => {
-				listNext = blk.getListNext();
-			}
-			Some(listNextOffsetFromBlk, size) => {
-				// Unsure if need to call different .view function on the value based on its size
-				// If size is not needed, might as well just store the value
-				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
-				listNext = blk.toHandle(i64.view(listNextOffsetFromBlk));
-			}
-		}
+		var listNext = walCache.readListNext(blk);
 
 		if (!listPrev.isNull()) {
 			def listNextOffsetFromListPrev = listPrev.toOffset(listNext);
@@ -913,6 +889,21 @@ class WALCache {
         def clear() {
                 cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
         }
+
+	def readListNext(entry: BlockEntryHandle) ->  BlockEntryHandle {
+		def listNextUpdate = this.read(entry.addr + 32);
+		match (listNextUpdate) {
+			None => {
+				return entry.getListNext();
+			}
+			Some(listNextOffsetFromSentinel, size) => {
+				// Unsure if need to call different .view function on the value based on its size
+				// If size is not needed, might as well just store the value
+				// If size is required, can add a method to the CachedUpdate ADT to unpack value in different ways
+				return entry.toHandle(i64.view(listNextOffsetFromSentinel));
+			}
+		}
+	}
 
         // Hash function: Convert Pointer -> i32
         private def hash(p: Pointer) => i32.view(p - Pointer.NULL);
