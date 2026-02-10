@@ -154,6 +154,31 @@ type BlockEntryHandle(addr: Pointer) #unboxed {
 		return toHandle(getRef().listNext);
 	}
 
+	def getListNumCached(cache: WALCache) -> i16 {
+		return cache.readI16(Pointer.atField(getRef().listNum));
+	}
+
+	def getUsedCached(cache:WALCache) -> bool {
+		def used = cache.readU8(Pointer.atField(getRef().used));
+		return used == 1u1;
+	}
+
+	def getPrevCached(cache: WALCache) -> BlockEntryHandle {
+		return toHandle(cache.readI64(Pointer.atField(getRef().prev)));
+	}
+
+	def getNextCached(cache: WALCache) -> BlockEntryHandle {
+		return toHandle(cache.readI64(Pointer.atField(getRef().next)));
+	}
+
+	def getListPrevCached(cache: WALCache) -> BlockEntryHandle {
+		return toHandle(cache.readI64(Pointer.atField(getRef().listPrev)));
+	}
+
+	def getListNextCached(cache: WALCache) -> BlockEntryHandle {
+		return toHandle(cache.readI64(Pointer.atField(getRef().listNext)));
+	}
+
 	def setListNum(listNum: i16) {
 		getRef().listNum = listNum;
 	}
@@ -177,6 +202,31 @@ type BlockEntryHandle(addr: Pointer) #unboxed {
 	def setListNext(listNext: BlockEntryHandle) {
 		getRef().listNext = toOffset(listNext);
 	}
+
+	def setListNumCached(cache: WALCache, listNum: i16) {
+		cache.writeI16(Pointer.atField(getRef().listNum), listNum);
+	}
+
+	def setUsedCached(cache: WALCache, used: bool) {
+		def value = if(used, 1u1, 0u1);
+		cache.writeU8(Pointer.atField(getRef().used), value);
+	}
+
+	def setPrevCached(cache: WALCache, prev: BlockEntryHandle) {
+		cache.writeI64(Pointer.atField(getRef().prev), toOffset(prev));
+	}
+
+	def setNextCached(cache: WALCache, next: BlockEntryHandle) {
+		cache.writeI64(Pointer.atField(getRef().next), toOffset(next));
+	}
+
+	def setListPrevCached(cache: WALCache, listPrev: BlockEntryHandle) {
+		cache.writeI64(Pointer.atField(getRef().listPrev), toOffset(listPrev));
+	}
+
+	def setListNextCached(cache: WALCache, listNext: BlockEntryHandle) {
+		cache.writeI64(Pointer.atField(getRef().listNext), toOffset(listNext));
+	}
 }
 
 def getBlockEntryHandle(r: Ref<BlockEntry>) -> BlockEntryHandle {
@@ -196,32 +246,40 @@ type ChunkHandle(addr: Pointer) #unboxed {
 		return getRef().offset;
 	}
 
-	def setOffset(v: u64) {
-		getRef().offset = v;
-	}
-
 	def getLimit() -> u64 {
 		return getRef().limit;
-	}
-
-	def setLimit(v: u64) {
-		getRef().limit = v;
 	}
 
 	def getChunkLimit() -> u64 {
 		return getRef().chunk_limit;
 	}
 
-	def setChunkLimit(v: u64) {
-		getRef().chunk_limit = v;
-	}
-
 	def getLinemarks() -> u64 {
 		return getRef().linemarks;
 	}
 
+	def setOffset(v: u64) {
+		getRef().offset = v;
+	}
+
+	def setLimit(v: u64) {
+		getRef().limit = v;
+	}
+
+	def setChunkLimit(v: u64) {
+		getRef().chunk_limit = v;
+	}
+
 	def setLinemarks(v: u64) {
 		getRef().linemarks = v;
+	}
+
+	def setOffsetCached(cache: WALCache, v: u64) {
+		cache.writeU64(Pointer.atField(getRef().offset), v);
+	}
+
+	def setLimitCached(cache: WALCache, v: u64) {
+		cache.writeU64(Pointer.atField(getRef().offset), v);
 	}
 }
 
@@ -511,40 +569,6 @@ class PWRegion {
 	def blockOffsetOfIndex(index: u64) -> u64 {
 		return index * getBlockSize();
 	}
-	
-	// Helper to read listPrev handle specifically from the cache or memory
-	def readListPrev(entry: BlockEntryHandle) -> BlockEntryHandle {
-		def offset = 24;
-		def targetAddr = entry.addr + offset;
-		
-		def cached = walCache.read(targetAddr);
-		
-		match (cached) {
-			Some(val, sz) => {
-				return entry.toHandle(i64.view(val));
-			}
-			None => {
-				return entry.getListPrev();
-			}
-		}
-	}
-
-	// Helper to read listNext handle specifically from the cache or memory
-	def readListNext(entry: BlockEntryHandle) -> BlockEntryHandle {
-		def offset = 32;
-		def targetAddr = entry.addr + offset;
-
-		def cached = walCache.read(targetAddr);
-
-		match (cached) {
-			Some(val, sz) => {
-				return entry.toHandle(i64.view(val));
-			}
-			None => {
-				return entry.getListNext();
-			}
-		}
-	}
 
 	def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
 		var blockIndex = blockIndexOfEntry(startEntry);
@@ -553,19 +577,17 @@ class PWRegion {
 	        var ptr = Pointer.atElement(rng, int.!(blockOffset));
 	        var chunk = ChunkHandle(ptr);
 
-		walCache.write(chunk.addr, u64.view(ChunkHeader.size), 8);
+		chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
                 // LOG: Chunk Header Initialization
                 // Address: chunk.addr + ChunkHeader.offset (offset 0)
                 // Size: 8 bytes
                 // New Value: ChunkHeader.size
-	        chunk.setOffset(u64.!(ChunkHeader.size));
 
-		walCache.write(chunk.addr + 8, numBlocks * getBlockSize(), 8);
+		chunk.setLimitCached(walCache, numBlocks * getBlockSize());
                 // LOG: Chunk Header Limit
                 // Address: chunk.addr + ChunkHeader.limit (offset 8)
                 // Size: 8 bytes
                 // New Value: numBlocks * getBlockSize()
-	        chunk.setLimit(numBlocks * getBlockSize());
 
 		// TODO link mark field
 		return chunk;
@@ -752,45 +774,40 @@ class PWRegion {
 
 	// Helper to insert an entry into a list immediately after the sentinel (Head insertion)
 	def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
-		walCache.write(entry.addr, u64.view(kind.code), 2);
+		entry.setListNumCached(walCache, kind.code);
                 // LOG: Set List Kind
                 // Address: entry.addr + BlockEntry.listNum (offset 0)
                 // Size: 2 bytes
                 // New Value: kind.code
-		entry.setListNum(kind.code);
 	
-		var listNext = readListNext(sentinel);
+		var listNext = sentinel.getListNextCached(walCache);
 	
 		// Link: sentinel -> entry -> listNext
 
-		walCache.write(sentinel.addr + 32, u64.view(sentinel.toOffset(entry)), 8);
+		sentinel.setListNextCached(walCache, entry);
                 // LOG: Link Sentinel to Entry
                 // Address: sentinel.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
                 // New Value: sentinel.toOffset(entry)
-		sentinel.setListNext(entry);
                 
-		walCache.write(entry.addr + 24, u64.view(entry.toOffset(sentinel)), 8);
+		entry.setListPrevCached(walCache, sentinel);
                 // LOG: Link Entry to Sentinel (Prev)
                 // Address: entry.addr + BlockEntry.listPrev (offset 24)
                 // Size: 8 bytes
                 // New Value: entry.toOffset(sentinel)
-		entry.setListPrev(sentinel);
         
-		walCache.write(entry.addr + 32, u64.view(entry.toOffset(listNext)), 8);
+	  	entry.setListNextCached(walCache, listNext);
                 // LOG: Link Entry to listNext (Next)
                 // Address: entry.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
                 // New Value: entry.toOffset(listNext)
-		entry.setListNext(listNext);
 	
 		if (!listNext.isNull()) {
-			walCache.write(listNext.addr + 24, u64.view(listNext.toOffset(entry)), 8);
+			listNext.setListPrevCached(walCache, entry);
                         // LOG: Link listNext back to Entry (Prev)
                         // Address: listNext.addr + BlockEntry.listPrev (offset 24)
                         // Size: 8 bytes
                         // New Value: listNext.toOffset(entry)
-			listNext.setListPrev(entry);
 		}
 	}
 
@@ -799,51 +816,45 @@ class PWRegion {
 	}
 	
 	def removeFromList(blk: BlockEntryHandle) {
-		var listPrev = readListPrev(blk);
-		var listNext = readListNext(blk);
+		var listPrev = blk.getListPrevCached(walCache);
+		var listNext = blk.getListNextCached(walCache);
 
 		if (!listPrev.isNull()) {
-			def listNextOffsetFromListPrev = listPrev.toOffset(listNext);
-			walCache.write(listPrev.addr + 32, u64.view(listNextOffsetFromListPrev) , 8);
+			listPrev.setListNextCached(walCache, listNext);
                         // LOG: Update listPrev's ListNext
                         // Address: listPrev.addr + BlockEntry.listNext (offset 32)
                         // Size: 8 bytes
                         // New Value: listNextOffsetFromListPrev 
-			listPrev.setListNext(listNext);
+			// listPrev.setListNext(listNext);
 		}
 
 		if (!listNext.isNull()) {
-			def listPrevOffsetFromListNext = listNext.toOffset(listPrev);
-			walCache.write(listNext.addr + 24, u64.view(listPrevOffsetFromListNext), 8);
+			listNext.setListPrevCached(walCache, listPrev);
                         // LOG: Update listNext's ListPrev
                         // Address: listNext.addr + BlockEntry.listPrev (offset 24)
                         // Size: 8 bytes
                         // New Value: listPrevOffsetFromListNext
-			listNext.setListPrev(listPrev);
 		}
 
 		def nullBTE = BlockEntryHandle(Pointer.NULL);
                 
-		walCache.write(blk.addr + 24, 0, 8);
+		blk.setListPrevCached(walCache, nullBTE);
                 // LOG: Clear blk ListPrev
                 // Address: blk.addr + BlockEntry.listPrev (offset 24)
                 // Size: 8 bytes
                 // New Value: null (0)
-		blk.setListPrev(nullBTE);
 
-		walCache.write(blk.addr + 32, 0, 8);
+		blk.setListNextCached(walCache, nullBTE);
                 // LOG: Clear blk ListNext
                 // Address: blk.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
                 // New Value: null (0)
-		blk.setListNext(nullBTE);
 
-		walCache.write(blk.addr, u64.view(ListKind.NONE.code), 8);
+		blk.setListNumCached(walCache, ListKind.NONE.code);
                 // LOG: Clear blk ListNum
                 // Address: blk.addr + BlockEntry.listNum (offset 0)
                 // Size: 2 bytes
-                // New Value: ListKind.NONE (-2)
-		blk.setListNum(ListKind.NONE.code);
+                // New Value: ListKind.NONE.code (-2)
 	}
 	
 	// Deallocate this region
@@ -865,10 +876,7 @@ layout LogEntry {
 }
 
 // Wrapper ADT to store the cached value and its width (size)
-type CachedUpdate #unboxed {
-	case None;
-	case Some(value: u64, size: u4);
-}
+type CachedUpdate(value: u64, size: u4) #unboxed { }
 
 // A write-behind cache for the Write Ahead Log (WAL).
 // This component buffers writes in DRAM.
@@ -883,21 +891,7 @@ class WALCache {
         private var cache: HashMap<Pointer, CachedUpdate>;
 
         new() {
-                cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
-        }
-
-        // Buffer a write operation
-        def write(addr: Pointer, value: u64, size: u4) {
-                cache[addr] = CachedUpdate.Some(value, size);
-        }
-
-        // Retrieve a cached value if it exists
-        // Returns null if the address is not in the cache
-        def read(addr: Pointer) -> CachedUpdate {
-                if (cache.has(addr)) {
-                        return cache[addr];
-                }
-                return CachedUpdate.None;
+                cache = HashMap<Pointer, CachedUpdate>.new(hash, Pointer.==);
         }
 
         // Check if an address is dirty (has cached changes)
@@ -905,17 +899,74 @@ class WALCache {
                 return cache.has(addr);
         }
 
-        // Clear the cache (maybe after a flush?)
-        // Note: The HashMap util doesn't have a clear(), so we just re-initialize
+        // Clear the cache (re-initializes the map)
         def clear() {
-                cache = HashMap<Pointer, CachedUpdate>.new(hash, equals);
+                cache = HashMap<Pointer, CachedUpdate>.new(hash, Pointer.==);
         }
+
+	// Flushes cached updates to actual memory
+	def applyToMemory() {
+		cache.apply(
+			fun (addr: Pointer, c: CachedUpdate) {
+				match (c.size) {
+					1 => addr.store<u8>(u8.view(c.value));
+					2 => addr.store<u16>(u16.view(c.value));
+					4 => addr.store<u32>(u32.view(c.value));
+					8 => addr.store<u64>(u64.view(c.value));
+					_ => ;
+				}
+			}
+		);
+	}
+
+	// Cannot have a generic read<T> because we can't cast u64 -> T generically
+
+	def readU8(addr: Pointer) -> u8 {
+		if (cache.has(addr)) return u8.view(cache[addr].value);
+		return addr.load<u8>();
+	}
+
+	def readI16(addr: Pointer) -> i16 {
+		if (cache.has(addr)) return i16.view(cache[addr].value);
+		return addr.load<i16>();
+	}
+
+	def readU64(addr: Pointer) -> u64 {
+		if (cache.has(addr)) return u64.view(cache[addr].value);
+		return addr.load<u64>();
+	}
+
+	def readI64(addr: Pointer) -> i64 {
+		if (cache.has(addr)) return i64.view(cache[addr].value);
+		return addr.load<i64>();
+	}
+
+	// Write BlockEntry.used (u1/bool stored as u8)
+	def writeU8(addr: Pointer, val: u8) {
+		writeHelper(addr, 1, u64.view(val));
+	}
+
+	// Write BlockEntry.listNum
+	def writeI16(addr: Pointer, val: i16) {
+		writeHelper(addr, 2, u64.view(u16.view(val)));
+	}
+
+	// Write ChunkHeader.offset, limit
+	def writeU64(addr: Pointer, val: u64) {
+		writeHelper(addr, 8, val);
+	}
+
+	// Write BlockEntry.prev, next, listPrev, listNext
+	def writeI64(addr: Pointer, val: i64) {
+		writeHelper(addr, 8, u64.view(val));
+	}
+
+	private def writeHelper(addr: Pointer, size: u4, val: u64) {
+		cache[addr] = CachedUpdate(val, size);
+	}
 
         // Hash function: Convert Pointer -> i32
         private def hash(p: Pointer) => i32.view(p - Pointer.NULL);
-
-        // Equality function
-        private def equals(a: Pointer, b: Pointer) => a == b;
 }
 
 component PWRegions {
