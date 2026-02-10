@@ -3,144 +3,160 @@
 
 def T = UnitTests.registerT("wal_cache:", _, WALCacheTester.new, _);
 def X = [
-	T("basic_write_read", test_basic_write_read),
-	T("cache_miss", test_cache_miss),
+	T("basic_u8_flow", test_basic_u8_flow),
+	T("basic_u64_flow", test_basic_u64_flow),
+	T("read_fallthrough", test_read_fallthrough),
+	T("apply_to_memory", test_apply_to_memory),
 	T("overwrite_update", test_overwrite_update),
 	T("is_dirty_check", test_is_dirty_check),
 	T("clear_cache", test_clear_cache),
-	T("multiple_entries", test_multiple_entries),
-	T("aligned_access_constraint", test_aligned_access_constraint),
+	T("misaligned_access", test_misaligned_access),
 	()
 ];
 
 class WALCacheTester(t: Tester) {
-	// Helper to create valid pointers for testing without a full heap region
-	def dummyData = Array<byte>.new(1024);
+	var cache: WALCache;
+	// Backing memory for the pointers to test read-through and write-back
+	var dummyData: Array<byte>; 
+
+	new() {
+		cache = WALCache.new();
+		dummyData = Array<byte>.new(1024);
+		// Initialize memory with a known pattern (0xAA) to detect changes/fallthroughs
+		for (i < 1024) dummyData[i] = 0xAAu8;
+	}
 	
 	def getPtr(offset: int) -> Pointer {
 		return Pointer.atElement(dummyData, offset);
 	}
 
-	// Helper to unpack the ADT and assert the value
-	def assert_value(expected: u64, actual: CachedUpdate) {
-		match (actual) {
-			Some(v, _) => t.assert_eq(expected, v);
-			None => t.fail("Expected CachedUpdate.Some, got None");
-		}
+	// Helper to read actual RAM (bypassing cache) to verify write-behind behavior
+	def readRamU8(offset: int) -> u8 {
+		return dummyData[offset];
 	}
 }
 
-// Test 1: Basic Write and Read flow
-def test_basic_write_read(tc: WALCacheTester) {
-	var cache = WALCache.new();
+// Test 1: Basic Write and Read flow for U8
+// Verifies that writing to cache allows reading from cache, but does not immediately touch RAM.
+def test_basic_u8_flow(tc: WALCacheTester) {
 	var ptr = tc.getPtr(0);
-	var val = 0xDEADBEEFCAFEBABEu64;
-	var size = 8u4;
+	var val = 0x11u8;
 
-	// Perform write
-	cache.write(ptr, val, size);
+	// 1. Write to cache
+	tc.cache.writeU8(ptr, val);
 
-	// Perform read
-	var result = cache.read(ptr);
+	// 2. Read back (should come from cache)
+	var readVal = tc.cache.readU8(ptr);
+	tc.t.assert_eq(val, readVal);
 
-	// Assertions using pattern matching
-	match (result) {
-		Some(v, s) => {
-			tc.t.assert_eq(val, v);
-			tc.t.assert_eq(size, s);
-		}
-		None => {
-			tc.t.fail("Expected result to be Some, found None");
-		}
-	}
+	// 3. Verify RAM is NOT updated yet (Write-Behind)
+	tc.t.assert_eq(0xAAu8, tc.readRamU8(0));
 }
 
-// Test 2: Reading an address that hasn't been written
-def test_cache_miss(tc: WALCacheTester) {
-	var cache = WALCache.new();
-	var ptr1 = tc.getPtr(0);
-	var ptr2 = tc.getPtr(8);
+// Test 2: Basic Write and Read flow for U64
+def test_basic_u64_flow(tc: WALCacheTester) {
+	var ptr = tc.getPtr(8);
+	var val = 0xDEAD_BEEF_CAFE_BABE_u64;
 
-	cache.write(ptr1, 100u64, 8u4);
-
-	// ptr2 was never written
-	var result = cache.read(ptr2);
-
-	tc.t.assert_eq(CachedUpdate.None, result);
+	tc.cache.writeU64(ptr, val);
+	
+	var readVal = tc.cache.readU64(ptr);
+	tc.t.assert_eq(val, readVal);
 }
 
-// Test 3: Overwriting an existing key updates the value
+// Test 3: Cache Miss (Fallthrough to Memory)
+// If the address is not in the cache, it should load the value currently in RAM.
+def test_read_fallthrough(tc: WALCacheTester) {
+	var ptr = tc.getPtr(16);
+	
+	// We haven't written to the cache for 'ptr'.
+	// RAM was initialized to 0xAA in setup.
+	
+	var val = tc.cache.readU8(ptr);
+	
+	// Should return value from memory, not 0 or null
+	tc.t.assert_eq(0xAAu8, val);
+	tc.t.assertz(false, tc.cache.isDirty(ptr));
+}
+
+// Test 4: Apply to Memory (Flushing)
+// Verifies that applyToMemory() commits cached changes to the underlying pointers.
+def test_apply_to_memory(tc: WALCacheTester) {
+	var ptr = tc.getPtr(20);
+	var val = 0xFFu8;
+
+	// Write to cache
+	tc.cache.writeU8(ptr, val);
+	
+	// RAM should still be old value
+	tc.t.assert_eq(0xAAu8, tc.readRamU8(20));
+
+	// Flush
+	tc.cache.applyToMemory();
+
+	// RAM should now be updated
+	tc.t.assert_eq(val, tc.readRamU8(20));
+}
+
+// Test 5: Overwriting updates the cache entry
 def test_overwrite_update(tc: WALCacheTester) {
-	var cache = WALCache.new();
 	var ptr = tc.getPtr(16);
 
-	// Initial write
-	cache.write(ptr, 10u64, 4u4);
-	tc.assert_value(10u64, cache.read(ptr));
+	tc.cache.writeU64(ptr, 100u64);
+	tc.t.assert_eq(100u64, tc.cache.readU64(ptr));
 
-	// Update write
-	cache.write(ptr, 99u64, 4u4);
-	tc.assert_value(99u64, cache.read(ptr));
+	tc.cache.writeU64(ptr, 200u64);
+	tc.t.assert_eq(200u64, tc.cache.readU64(ptr));
 }
 
-// Test 4: Verifying the isDirty boolean check
+// Test 6: Verifying the isDirty check
 def test_is_dirty_check(tc: WALCacheTester) {
-	var cache = WALCache.new();
 	var ptr = tc.getPtr(32);
 	var cleanPtr = tc.getPtr(40);
 
-	tc.t.assertz(false, cache.isDirty(ptr));
+	tc.t.assertz(false, tc.cache.isDirty(ptr));
 
-	cache.write(ptr, 1u64, 1u4);
+	tc.cache.writeI16(ptr, 123i16);
 
-	tc.t.assertz(true, cache.isDirty(ptr));
-	tc.t.assertz(false, cache.isDirty(cleanPtr));
+	tc.t.assertz(true, tc.cache.isDirty(ptr));
+	tc.t.assertz(false, tc.cache.isDirty(cleanPtr));
 }
 
-// Test 5: Clearing the cache wipes all data
+// Test 7: Clearing the cache discards updates
 def test_clear_cache(tc: WALCacheTester) {
-	var cache = WALCache.new();
-	var ptr = tc.getPtr(0);
+	var ptr = tc.getPtr(50);
+	var newVal = 0x55u8;
 
-	cache.write(ptr, 123u64, 8u4);
-	tc.t.assertz(true, cache.isDirty(ptr));
+	tc.cache.writeU8(ptr, newVal);
+	tc.t.assertz(true, tc.cache.isDirty(ptr));
 
-	cache.clear();
+	tc.cache.clear();
 
-	tc.t.assertz(false, cache.isDirty(ptr));
-	tc.t.assert_eq(CachedUpdate.None, cache.read(ptr));
+	tc.t.assertz(false, tc.cache.isDirty(ptr));
+	
+	// Reading now should fall through to original memory (0xAA), not the cached 0x55
+	tc.t.assert_eq(0xAAu8, tc.cache.readU8(ptr));
 }
 
-// Test 6: Handling multiple distinct entries
-def test_multiple_entries(tc: WALCacheTester) {
-	var cache = WALCache.new();
-	var p1 = tc.getPtr(0);
-	var p2 = tc.getPtr(8);
-	var p3 = tc.getPtr(16);
+// Test 8: Aligned/Spatial Access Constraints
+def test_misaligned_access(tc: WALCacheTester) {
+	var basePtr = tc.getPtr(60);
+	var offsetPtr = tc.getPtr(61);
 
-	cache.write(p1, 11u64, 8u4);
-	cache.write(p2, 22u64, 8u4);
-	cache.write(p3, 33u64, 8u4);
+	var val = 0x0102030405060708u64;
 
-	tc.assert_value(11u64, cache.read(p1));
-	tc.assert_value(22u64, cache.read(p2));
-	tc.assert_value(33u64, cache.read(p3));
-}
+	// Write 8 bytes to basePtr
+	tc.cache.writeU64(basePtr, val);
 
-// Test 7: Verify the "Aligned Access Only" Constraint
-// This test ensures that the HashMap behaves as expected: 
-// A write to base address does NOT satisfy a read to base + offset.
-def test_aligned_access_constraint(tc: WALCacheTester) {
-	var cache = WALCache.new();
-	var basePtr = tc.getPtr(100);
-	var offsetPtr = tc.getPtr(101); // 1 byte into the object
+	// Verify we can read the u64 back
+	tc.t.assert_eq(val, tc.cache.readU64(basePtr));
 
-	// Write an 8-byte value at base
-	cache.write(basePtr, 0xFFFFFFFFFFFFFFFFu64, 8u4);
-
-	// Try to read at offset (simulating an unaligned access)
-	// Because we use a HashMap of Pointers, this MUST return None.
-	var result = cache.read(offsetPtr);
-
-	tc.t.assert_eq(CachedUpdate.None, result);
+	// Try to read u8 at basePtr + 1. 
+	// Since the cache maps (Pointer) -> Entry, and (basePtr) != (offsetPtr),
+	// this should be a cache miss and fall through to memory (0xAA).
+	// It should NOT return 0x07 (the 2nd byte of the u64).
+	
+	var byteVal = tc.cache.readU8(offsetPtr);
+	
+	tc.t.assert_eq(0xAAu8, byteVal);
 }
