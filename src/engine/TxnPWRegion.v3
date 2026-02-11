@@ -596,41 +596,41 @@ class PWRegion {
 	def allocChunk(numBlocks: u32) -> ChunkHandle {
 		if (numBlocks == 1) {
 			// Try the small free block list
-			var firstHandle = smallSentinel.getListNext();
+			var firstHandle = smallSentinel.getListNextCached(walCache);
 			if (!firstHandle.isNull()) {
                                 // Note: removeFromList handles its own logging
 				removeFromList(firstHandle);
 
+                                firstHandle.setUsedCached(walCache, true);
                                 // LOG: BlockEntry Used Flag
                                 // Address: firstHandle.addr + BlockEntry.used (offset 2)
                                 // Size: 1 byte
                                 // New Value: 1 (true)
-				firstHandle.setUsed(true);
 
                                 // Note: createChunk handles logging of header initialization
 				return createChunk(firstHandle, 1);
 			}
 		}
-		var thisHandle = largeSentinel.getListNext();
+		var thisHandle = largeSentinel.getListNextCached(walCache);
 		while (!thisHandle.isNull()) {
 			var thisIndex = blockIndexOfEntry(thisHandle);
-			var nextHandle = thisHandle.getNext();
+			var nextHandle = thisHandle.getNextCached(walCache);
 			if (nextHandle.isNull()) return blankChunkHandle;
 			var nextIndex = blockIndexOfEntry(nextHandle);
 			var chunkBlocks = nextIndex - thisIndex;
 			if (numBlocks > chunkBlocks) {
-				thisHandle = thisHandle.getNext();
+				thisHandle = thisHandle.getNextCached(walCache);
 				continue;
 			}
 			if (numBlocks == chunkBlocks) {
                                 // Note: removeFromList handles its own logging
 				removeFromList(thisHandle);
 
+				thisHandle.setUsedCached(walCache, true);
                                 // LOG: BlockEntry Used Flag
                                 // Address: thisHandle.addr + BlockEntry.used (offset 2)
                                 // Size: 1 byte
                                 // New Value: 1 (true)
-				thisHandle.setUsed(true);
 
                                 // Note: createChunk handles logging of header initialization
 				return createChunk(thisHandle, numBlocks);
@@ -650,38 +650,38 @@ class PWRegion {
                         // 4. Next (Offset 8, 8 bytes): remHandle.toOffset(nextHandle)
                         // 5. ListPrev (Offset 24, 8 bytes): remHandle.toOffset(thisHandle)
                         // 6. ListNext (Offset 32, 8 bytes): remHandle.toOffset(nextHandle)
-			remHandle.setListNum(if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
-			remHandle.setUsed(false);
-			remHandle.setPrev(thisHandle);
-			remHandle.setNext(nextHandle);
-			remHandle.setListPrev(thisHandle);
-			remHandle.setListNext(nextHandle);
+			remHandle.setListNumCached(walCache, if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
+			remHandle.setUsedCached(walCache, false);
+			remHandle.setPrevCached(walCache, thisHandle);
+			remHandle.setNextCached(walCache, nextHandle);
+			remHandle.setListPrevCached(walCache, thisHandle);
+			remHandle.setListNextCached(walCache, nextHandle);
 
+			thisHandle.setNextCached(walCache, remHandle);
                         // LOG: Update 'this' block Next pointer
                         // Address: thisHandle.addr + BlockEntry.next (offset 16)
                         // Size: 8 bytes
                         // New Value: thisHandle.toOffset(remHandle)
-			thisHandle.setNext(remHandle);
 
+			thisHandle.setListNextCached(walCache, remHandle);
                         // LOG: Update 'this' block ListNext pointer
                         // Address: thisHandle.addr + BlockEntry.listNext (offset 32)
                         // Size: 8 bytes
                         // New Value: thisHandle.toOffset(remHandle)
-			thisHandle.setListNext(remHandle);
 
+			nextHandle.setPrevCached(walCache, remHandle);
                         // LOG: Update 'next' block Prev pointer
                         // Address: nextHandle.addr + BlockEntry.prev (offset 8)
                         // Size: 8 bytes
                         // New Value: nextHandle.toOffset(remHandle)
-			nextHandle.setPrev(remHandle);
 
-			var listNextHandle = thisHandle.getListNext();
-                        
+			var listNextHandle = thisHandle.getListNextCached(walCache);
+
+			listNextHandle.setListPrevCached(walCache, remHandle);
                         // LOG: Update 'listNext' block ListPrev pointer
                         // Address: listNextHandle.addr + BlockEntry.listPrev (offset 24)
                         // Size: 8 bytes
                         // New Value: listNextHandle.toOffset(remHandle)
-			listNextHandle.setListPrev(remHandle);
 
                         // Note: removeFromList handles its own logging
 			removeFromList(thisHandle);
