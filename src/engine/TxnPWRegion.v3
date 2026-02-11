@@ -695,74 +695,74 @@ class PWRegion {
 		if (chunk.isNull()) return;
 
 		// Map the chunk address back to the BlockEntry
-		var index = blockOfOffset(offsetInRegion(u64.view(chunk.addr - Pointer.NULL)));
+		def index = blockOfOffset(offsetInRegion(u64.view(chunk.addr - Pointer.NULL)));
 
 		// Retrieve the handle for the header of this block
 		var entry = blockTableHandle[long.view(index)];
 
 		// Ensure we aren't freeing an already free block
 		if (!entry.getUsed()) return;
-	
+
+		entry.setUsedCached(walCache, false);
                 // LOG: Mark Block as Unused
                 // Address: entry.addr + BlockEntry.used (offset 2)
                 // Size: 1 bytes
                 // New Value: 0 (false)
-		entry.setUsed(false);
 
 		// Coalesce Left
-		var prev = entry.getPrev();
-		if (!prev.isNull() && !prev.getUsed()) {
+		def prev = entry.getPrevCached(walCache);
+		if (!prev.isNull() && !prev.getUsedCached(walCache)) {
                         // Note: removeFromList handles its own logging
 			removeFromList(prev); // Remove prev from its specific free list
 
-			var next = entry.getNext();
-                        
+			def next = entry.getNextCached(walCache);
+
+			prev.setNextCached(walCache, next);
                         // LOG: Update Prev's Next pointer (Coalescing)
                         // Address: prev.addr + BlockEntry.next (offset 16)
                         // Size: 8 bytes
                         // New Value: prev.toOffset(next)
-			prev.setNext(next);
 
 			if (!next.isNull()) {
+				next.setPrevCached(walCache, prev);
                                 // LOG: Update Next's Prev pointer (Coalescing)
                                 // Address: next.addr + BlockEntry.prev (offset 8)
                                 // Size: 8 bytes
                                 // New Value: next.toOffset(prev)
-				next.setPrev(prev);
 			}
 			// Update local handle to point to 'prev' so subsequent logic works on the merged head.
 			entry = prev;
 		}
 
 		// Coalesce Right
-		var next = entry.getNext();
-		if (!next.isNull() && !next.getUsed()) {
+		def next = entry.getNextCached(walCache);
+		if (!next.isNull() && !next.getUsedCached(walCache)) {
                         // Note: removeFromList handles its own logging
 			removeFromList(next); // Remove next from its specific free list temporarily
-	    
-			var nextNext = next.getNext();
-                        
+
+			def nextNext = next.getNextCached(walCache);
+
+			entry.setNextCached(walCache, nextNext);
                         // LOG: Update Entry's Next pointer (Coalescing)
                         // Address: entry.addr + BlockEntry.next (offset 16)
                         // Size: 8 bytes
                         // New Value: entry.toOffset(nextNext)
-			entry.setNext(nextNext);
 
 			if (!nextNext.isNull()) {
+				nextNext.setPrevCached(walCache, entry);
                                 // LOG: Update NextNext's Prev pointer (Coalescing)
                                 // Address: nextNext.addr + BlockEntry.prev (offset 8)
                                 // Size: 8 bytes
                                 // New Value: nextNext.toOffset(entry)
-				nextNext.setPrev(entry);
 			}
 		}
 
 		// Calculate new size to determine which list to use
-		var startIndex = blockIndexOfEntry(entry);
-		var nextNeighbor = entry.getNext();
+		def startIndex = blockIndexOfEntry(entry);
+		def nextNeighbor = entry.getNext();
 		// If there is no next neighbor, the block extends to the end of the region (numBlocks)
-		var endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
-		var newSize = endIndex - startIndex;
+		def endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
+		def newSize = endIndex - startIndex;
 
                 // Note: insertAfter handles its own logging
 		if (newSize == 1) {
