@@ -90,6 +90,7 @@ layout PWRegionHeader {
 	+32	numDescs:	u64;
 	+40	metaData:	u64;	// relative offset to the metadata area
 	+48	metaDataDescs:	u64;	// relative offset to the metadata descriptors
+	// TODO: maybe add pointer to log chunk, because this will be needed for recovery
 	=56;				// size of header
 }
 
@@ -315,8 +316,6 @@ component BlockLists {
 				// METADATA, etc., do not have sentinels and not part of this count
 }
 
-type LogEntry(addr: Pointer) { }
-
 // Generic block-based region manager (platform-independent)
 class PWRegion {
 	def var backendRegion: BackendRegion;
@@ -333,8 +332,8 @@ class PWRegion {
 	def var blockTableHandle: BlockTableHandle;
 	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
 	def var logChunk: ChunkHandle;
-	def var logPointer: LogEntry;
 	def var walCache = WALCache.new();
+	def var walWriter: WALWriter;
 
 	new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64) {
 		var size = numBlocks * blockSize;
@@ -497,44 +496,49 @@ class PWRegion {
 		secondHandle.setNext(thirdHandle);
 		sanitizeOffset(blockLayouts.offset(2));
 		logChunk = chunkForBlockEntry(secondHandle);
+		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
 
-		sanitizeAddress(thirdHandle.addr);
-		thirdHandle.setListNum(ListKind.LARGE_FREE.code);
-		thirdHandle.setNext(metaHandle);
-		thirdHandle.setPrev(firstHandle);
-		thirdHandle.setListPrev(largeSentinel);
-		thirdHandle.setListNext(metaHandle);
-		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
-		sanitizeOffset(blockLayouts.offset(0));
-		sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
+		def recovered = recover();
 
-		sanitizeAddress(smallSentinel.addr);
-		// smallSentinel starts empty - points to null
-		smallSentinel.setListNext(nullBTE);
-		sanitizeOffset(blockLayouts.offset(0));
+		if (!recovered) {
+			sanitizeAddress(thirdHandle.addr);
+			thirdHandle.setListNum(ListKind.LARGE_FREE.code);
+			thirdHandle.setNext(metaHandle);
+			thirdHandle.setPrev(firstHandle);
+			thirdHandle.setListPrev(largeSentinel);
+			thirdHandle.setListNext(metaHandle);
+			sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
+			sanitizeOffset(blockLayouts.offset(0));
+			sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
 
-		sanitizeAddress(largeSentinel.addr);
+			sanitizeAddress(smallSentinel.addr);
+			// smallSentinel starts empty - points to null
+			smallSentinel.setListNext(nullBTE);
+			sanitizeOffset(blockLayouts.offset(0));
 
-		largeSentinel.setListNext(secondHandle);
-		largeSentinel.setListPrev(metaHandle);
-		sanitizeOffset(blockLayouts.offset(1));
-		
-		sanitizeAddress(metaHandle.addr);
-		metaHandle.setListNum(ListKind.METADATA.code);
-		metaHandle.setUsed(true);
-		metaHandle.setNext(lastHandle);
-		metaHandle.setPrev(secondHandle);
-		metaHandle.setListPrev(largeSentinel);
-		metaHandle.setListNext(nullBTE);
-		sanitizeOffset(blockLayouts.offset(numBlocks));
-		sanitizeOffset(blockLayouts.offset(1));
-		
-		sanitizeAddress(lastHandle.addr);
-		lastHandle.setListNum(ListKind.NONE.code);
-		lastHandle.setUsed(true);
-		lastHandle.setPrev(metaHandle);
-		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
-		
+			sanitizeAddress(largeSentinel.addr);
+
+			largeSentinel.setListNext(secondHandle);
+			largeSentinel.setListPrev(metaHandle);
+			sanitizeOffset(blockLayouts.offset(1));
+			
+			sanitizeAddress(metaHandle.addr);
+			metaHandle.setListNum(ListKind.METADATA.code);
+			metaHandle.setUsed(true);
+			metaHandle.setNext(lastHandle);
+			metaHandle.setPrev(secondHandle);
+			metaHandle.setListPrev(largeSentinel);
+			metaHandle.setListNext(nullBTE);
+			sanitizeOffset(blockLayouts.offset(numBlocks));
+			sanitizeOffset(blockLayouts.offset(1));
+			
+			sanitizeAddress(lastHandle.addr);
+			lastHandle.setListNum(ListKind.NONE.code);
+			lastHandle.setUsed(true);
+			lastHandle.setPrev(metaHandle);
+			sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
+		}
+			
 		// Initialize descs for subclasses that need to access metadata descriptors
 		descs = metadataDescs();
 	}
@@ -864,16 +868,92 @@ class PWRegion {
 			backendRegion = null;
 		}
 	}
+
+	def performCommit() {
+		// Transfer changes from DRAM Cache to PMEM Log
+		walCache.transferToLog(walWriter);
+
+		walWriter.commit();
+		walCache.applyToMemory();
+
+		// TODO: fence here
+		// CiRuntime.fence();
+
+		walWriter.clear();
+		walCache.clear();
+	}
+
+	private def recover() -> bool {
+		var logBase = chunkForBlockEntry(getBlockEntryHandle(blockLayouts[1])).addr;
+		var header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logBase, LogHeader.size));
+
+		if (header.status != 1) return false;
+
+		var expected = header.checksum;
+		var actual = calculateRecoveryChecksum(logBase + LogHeader.size, header.numEntries);
+
+		if (expected != actual) {
+			// Log checksum mismatch. Ignore corrupt log
+			header.status = 0;
+			return false;
+		}
+
+		var entryPtr = logBase + LogHeader.size;
+
+		for (i < header.numEntries) {
+			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(entryPtr, LogEntry.size));
+
+			var targetAddr = Pointer.atElement(rng, int.!(entry.offset));
+
+			match (entry.width) {
+				1 => targetAddr.store<u8>(u8.view(entry.value));
+				2 => targetAddr.store<u16>(u16.view(entry.value));
+				4 => targetAddr.store<u32>(u32.view(entry.value));
+				8 => targetAddr.store<u64>(u64.view(entry.value));
+				_ => ;
+			}
+			entryPtr = entryPtr + LogEntry.size;
+		}
+
+		header.status = 0;
+		// TODO
+		// CiRuntime.cacheWriteback(header, LogHeader.size);
+		// CiRuntime.fence();
+		return true;
+	}
+
+	// Helper for recovery checksum (copy of the WALWriter logic)
+	private def calculateRecoveryChecksum(base: Pointer, count: u32) -> u64 {
+		var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
+		var ptr = base;
+		for (i < count) {
+			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(ptr, LogEntry.size));
+			h = (h << 13) | (h >> 51);
+			h = h ^ entry.offset;
+			h = h ^ entry.value;
+			h = h ^ u64.view(entry.width);
+			ptr = ptr + LogEntry.size;
+		}
+		return h;
+	}
+}
+
+layout LogHeader {
+	+0	numEntries:	u32;	// Number of valid entries in this transaction
+	+4	status:		u8;	// 0 = Invalid, 1 = Committed
+	+8	checksum:	u64;	// Optional: Simple checksum for integrity
+	=32;				// Pad to 32 bytes
 }
 
 layout LogEntry {
 	+0	kind:		u8;	// what kind of log entry
-	+1	size:		u8;	// number of bytes being changed (1, 2, 4, 8)
-	+8	offset:		u64;	// offset of first changed byte, within the region
-	+16	old_val:	u64;
-	+24	new_val:	u64;
+	+1	offset:		u64;	// Relative offset of first changed byte, from the start of the Region
+	+16	value:		u64;	// The data to be written
+	+24	width:		u8;	// number of bytes being changed (1, 2, 4, 8)
 	=32;
 }
+
+type LogEntryHandle(addr: Pointer) { }
 
 // Wrapper ADT to store the cached value and its width (size)
 type CachedUpdate(value: u64, size: u4) #unboxed { }
@@ -889,25 +969,28 @@ type CachedUpdate(value: u64, size: u4) #unboxed { }
 //    will result in a cache miss, returning stale data.
 class WALCache {
         private var cache: HashMap<Pointer, CachedUpdate>;
+	private def addrs = Vector<Pointer>.new();
 
         new() {
                 cache = HashMap<Pointer, CachedUpdate>.new(hash, Pointer.==);
         }
 
-        // Check if an address is dirty (has cached changes)
-        def isDirty(addr: Pointer) -> bool {
-                return cache.has(addr);
+        def isDirty() -> bool {
+		return addrs.length != 0;
         }
 
         // Clear the cache (re-initializes the map)
         def clear() {
                 cache = HashMap<Pointer, CachedUpdate>.new(hash, Pointer.==);
+		addrs.clear();
         }
 
-	// Flushes cached updates to actual memory
+	// Flushes cached updates to actual Persistent memory
 	def applyToMemory() {
-		cache.apply(
-			fun (addr: Pointer, c: CachedUpdate) {
+		if (!isDirty()) return;
+		addrs.apply(
+			fun (addr: Pointer) {
+				def c: CachedUpdate = cache[addr];
 				match (c.size) {
 					1 => addr.store<u8>(u8.view(c.value));
 					2 => addr.store<u16>(u16.view(c.value));
@@ -915,6 +998,18 @@ class WALCache {
 					8 => addr.store<u64>(u64.view(c.value));
 					_ => ;
 				}
+				// TODO: do cache writeback here by giving addr and size
+				// CiRuntime.cacheWriteback(addr, c.size);
+			}
+		);
+	}
+
+	def transferToLog(writer: WALWriter) {
+		if (!isDirty()) return;
+		addrs.apply(
+			fun (addr: Pointer) {
+				def c: CachedUpdate = cache[addr];
+				writer.append(addr, c.value, u8.view(c.size));
 			}
 		);
 	}
@@ -962,11 +1057,90 @@ class WALCache {
 	}
 
 	private def writeHelper(addr: Pointer, size: u4, val: u64) {
+		if (!cache.has(addr)) {
+			addrs.put(addr);
+		}
 		cache[addr] = CachedUpdate(val, size);
 	}
 
         // Hash function: Convert Pointer -> i32
         private def hash(p: Pointer) => i32.view(p - Pointer.NULL);
+}
+
+class WALWriter {
+	def logChunk: ChunkHandle;
+	def regionStart: Pointer; // Needed to calculate relative offsets
+
+	// Pointers to the header and the start of the entry array
+	var header: Ref<LogHeader>;
+	var entryBase: Pointer;
+
+	// Local counter for the current transaction
+	def var currentEntryIndex: u32 = 0;
+
+	new(logChunk, regionStart) {
+		header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logChunk.addr, LogHeader.size));
+		entryBase = logChunk.addr + LogHeader.size;
+	}
+
+	// Records a change into the persistent log buffer (but does not fence yet)
+	def append(targetAddr: Pointer, value: u64, width: u8) {
+		def entryAddr = entryBase + (currentEntryIndex * u32.!(LogEntry.size));
+		var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(entryAddr, LogEntry.size));
+
+		entry.offset = u64.view(targetAddr - regionStart);
+		entry.value = value;
+		entry.width = width;
+
+		currentEntryIndex++;
+	}
+
+	// Persist the log entries themselves
+	def fenceLogData() {
+		// TODO
+		// CiRuntime.cacheWriteback(entryBase, currentEntryIndex * LogEntry.size);
+		// CiRuntime.fence()
+	}
+
+	// Commit the transaction
+	def commit() {
+		header.numEntries = currentEntryIndex;
+		header.checksum = calculateChecksum();
+
+		// Ensure data are persistent
+		fenceLogData();
+
+		header.status = 1;
+
+		// TODO: Persist the header
+		// CiRuntime.cacheWriteback(logChunk.addr, logHeader.size)
+	}
+
+	// Reset for next transaction
+	def clear() {
+		header.status = 0;
+		// TODO
+		// CiRuntime.fence();
+		currentEntryIndex = 0;
+	}
+
+	private def calculateChecksum() -> u64 {
+		var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64; // Seed
+		var ptr = entryBase;
+
+		for (i < currentEntryIndex) {
+			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(ptr, LogEntry.size));
+
+			// Rotate-left + XOR
+			h = (h << 13) | (h >> 51);
+			h = h ^ entry.offset;
+			h = h ^ entry.value;
+			h = h ^ u64.view(entry.width);
+
+			ptr = ptr + LogEntry.size;
+		}
+		return h;
+	}
 }
 
 component PWRegions {

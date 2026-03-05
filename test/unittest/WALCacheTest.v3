@@ -76,7 +76,7 @@ def test_read_fallthrough(tc: WALCacheTester) {
 	
 	// Should return value from memory, not 0 or null
 	tc.t.assert_eq(0xAAu8, val);
-	tc.t.assertz(false, tc.cache.isDirty(ptr));
+	tc.t.assertz(false, tc.cache.isDirty());
 }
 
 // Test 4: Apply to Memory (Flushing)
@@ -112,14 +112,11 @@ def test_overwrite_update(tc: WALCacheTester) {
 // Test 6: Verifying the isDirty check
 def test_is_dirty_check(tc: WALCacheTester) {
 	var ptr = tc.getPtr(32);
-	var cleanPtr = tc.getPtr(40);
 
-	tc.t.assertz(false, tc.cache.isDirty(ptr));
+	tc.t.assertz(false, tc.cache.isDirty());
 
 	tc.cache.writeI16(ptr, 123i16);
-
-	tc.t.assertz(true, tc.cache.isDirty(ptr));
-	tc.t.assertz(false, tc.cache.isDirty(cleanPtr));
+	tc.t.assertz(true, tc.cache.isDirty());
 }
 
 // Test 7: Clearing the cache discards updates
@@ -128,11 +125,11 @@ def test_clear_cache(tc: WALCacheTester) {
 	var newVal = 0x55u8;
 
 	tc.cache.writeU8(ptr, newVal);
-	tc.t.assertz(true, tc.cache.isDirty(ptr));
+	tc.t.assertz(true, tc.cache.isDirty());
 
 	tc.cache.clear();
 
-	tc.t.assertz(false, tc.cache.isDirty(ptr));
+	tc.t.assertz(false, tc.cache.isDirty());
 	
 	// Reading now should fall through to original memory (0xAA), not the cached 0x55
 	tc.t.assert_eq(0xAAu8, tc.cache.readU8(ptr));
