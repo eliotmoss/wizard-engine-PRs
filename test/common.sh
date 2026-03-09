@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -82,7 +82,7 @@ while [[ "$1" =~ ^\-.* ]]; do
 done
 
 if [ "$TEST_MODE" != "" ]; then
-    WIZENG_OPTS="$WIZENG_OPTS -mode=$TEST_MODE"
+    WIZENG_OPTS="$WIZENG_OPTS --mode=$TEST_MODE"
 fi
 
 if [[ "$1" =~ "-fatal-calls=" ]]; then
@@ -163,7 +163,7 @@ function print_testing() {
 #TODO    printf "%-13s " $ARG
     printf "%-13s "  $TEST_TARGET
     if [ "$TEST_MODE" != "" ]; then
-	mode="-mode=$TEST_MODE"
+	mode="--mode=$TEST_MODE"
     else
         mode=""
     fi

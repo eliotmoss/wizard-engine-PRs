@@ -277,27 +277,27 @@ enum Opcode(prefix: u8, code: u16, mnemonic: string, imms: Array<ImmKind>, sig: 
 	TABLE_FILL		(0xFC, 0x11, "table.fill", imm.TABLE, null),
 	// 0xFD prefix: vector instructions.
 	V128_LOAD			(0xFD, 0, "v128.load", imm.MEMARG, sig.i_s),
-	V128_LOAD_8X8_S			(0xFD, 1, "v128.load_8x8_s", imm.MEMARG, sig.i_s),
-	V128_LOAD_8X8_U			(0xFD, 2, "v128.load_8x8_u", imm.MEMARG, sig.i_s),
-	V128_LOAD_16X4_S		(0xFD, 3, "v128.load_16x4_s", imm.MEMARG, sig.i_s),
-	V128_LOAD_16X4_U		(0xFD, 4, "v128.load_16x4_u", imm.MEMARG, sig.i_s),
-	V128_LOAD_32X2_S		(0xFD, 5, "v128.load_32x2_s", imm.MEMARG, sig.i_s),
-	V128_LOAD_32X2_U		(0xFD, 6, "v128.load_32x2_u", imm.MEMARG, sig.i_s),
-	V128_LOAD_8_SPLAT		(0xFD, 7, "v128.load_8_splat", imm.MEMARG, sig.i_s),
-	V128_LOAD_16_SPLAT		(0xFD, 8, "v128.load_16_splat", imm.MEMARG, sig.i_s),
-	V128_LOAD_32_SPLAT		(0xFD, 9, "v128.load_32_splat", imm.MEMARG, sig.i_s),
-	V128_LOAD_64_SPLAT		(0xFD, 10, "v128.load_64_splat", imm.MEMARG, sig.i_s),
-	V128_LOAD_32_ZERO		(0xFD, 92, "v128.load_32_zero", imm.MEMARG, sig.i_s),
-	V128_LOAD_64_ZERO		(0xFD, 93, "v128.load_64_zero", imm.MEMARG, sig.i_s),
+	V128_LOAD_8X8_S			(0xFD, 1, "v128.load8x8_s", imm.MEMARG, sig.i_s),
+	V128_LOAD_8X8_U			(0xFD, 2, "v128.load8x8_u", imm.MEMARG, sig.i_s),
+	V128_LOAD_16X4_S		(0xFD, 3, "v128.load16x4_s", imm.MEMARG, sig.i_s),
+	V128_LOAD_16X4_U		(0xFD, 4, "v128.load16x4_u", imm.MEMARG, sig.i_s),
+	V128_LOAD_32X2_S		(0xFD, 5, "v128.load32x2_s", imm.MEMARG, sig.i_s),
+	V128_LOAD_32X2_U		(0xFD, 6, "v128.load32x2_u", imm.MEMARG, sig.i_s),
+	V128_LOAD_8_SPLAT		(0xFD, 7, "v128.load8_splat", imm.MEMARG, sig.i_s),
+	V128_LOAD_16_SPLAT		(0xFD, 8, "v128.load16_splat", imm.MEMARG, sig.i_s),
+	V128_LOAD_32_SPLAT		(0xFD, 9, "v128.load32_splat", imm.MEMARG, sig.i_s),
+	V128_LOAD_64_SPLAT		(0xFD, 10, "v128.load64_splat", imm.MEMARG, sig.i_s),
+	V128_LOAD_32_ZERO		(0xFD, 92, "v128.load32_zero", imm.MEMARG, sig.i_s),
+	V128_LOAD_64_ZERO		(0xFD, 93, "v128.load64_zero", imm.MEMARG, sig.i_s),
 	V128_STORE			(0xFD, 11, "v128.store", imm.MEMARG, sig.is_v),
-	V128_LOAD_8_LANE		(0xFD, 84, "v128.load_8_lane", imm.MEMARG_LANE, sig.is_s),
-	V128_LOAD_16_LANE		(0xFD, 85, "v128.load_16_lane", imm.MEMARG_LANE, sig.is_s),
-	V128_LOAD_32_LANE		(0xFD, 86, "v128.load_32_lane", imm.MEMARG_LANE, sig.is_s),
-	V128_LOAD_64_LANE		(0xFD, 87, "v128.load_64_lane", imm.MEMARG_LANE, sig.is_s),
-	V128_STORE_8_LANE		(0xFD, 88, "v128.store_8_lane", imm.MEMARG_LANE, sig.is_v),
-	V128_STORE_16_LANE		(0xFD, 89, "v128.store_16_lane", imm.MEMARG_LANE, sig.is_v),
-	V128_STORE_32_LANE		(0xFD, 90, "v128.store_32_lane", imm.MEMARG_LANE, sig.is_v),
-	V128_STORE_64_LANE		(0xFD, 91, "v128.store_64_lane", imm.MEMARG_LANE, sig.is_v),
+	V128_LOAD_8_LANE		(0xFD, 84, "v128.load8_lane", imm.MEMARG_LANE, sig.is_s),
+	V128_LOAD_16_LANE		(0xFD, 85, "v128.load16_lane", imm.MEMARG_LANE, sig.is_s),
+	V128_LOAD_32_LANE		(0xFD, 86, "v128.load32_lane", imm.MEMARG_LANE, sig.is_s),
+	V128_LOAD_64_LANE		(0xFD, 87, "v128.load64_lane", imm.MEMARG_LANE, sig.is_s),
+	V128_STORE_8_LANE		(0xFD, 88, "v128.store8_lane", imm.MEMARG_LANE, sig.is_v),
+	V128_STORE_16_LANE		(0xFD, 89, "v128.store16_lane", imm.MEMARG_LANE, sig.is_v),
+	V128_STORE_32_LANE		(0xFD, 90, "v128.store32_lane", imm.MEMARG_LANE, sig.is_v),
+	V128_STORE_64_LANE		(0xFD, 91, "v128.store64_lane", imm.MEMARG_LANE, sig.is_v),
 	V128_CONST			(0xFD, 12, "v128.const", imm.V128, sig.v_s),
 	I8X16_SHUFFLE			(0xFD, 13, "i8x16.shuffle", imm.LANEx16, sig.ss_s),
 	I8X16_EXTRACT_LANE_S		(0xFD, 21, "i8x16.extract_lane_s", imm.LANE, sig.s_i),
@@ -606,8 +606,9 @@ enum Opcode(prefix: u8, code: u16, mnemonic: string, imms: Array<ImmKind>, sig: 
 	CONT_BIND			(0x00, 0xE1, "cont.bind", imm.CONT_CONT, null),
 	SUSPEND				(0x00, 0xE2, "suspend", imm.TAG, null),
 	RESUME				(0x00, 0xE3, "resume", imm.CONT_HANDLE, null),
-	RESUME_THROW			(0x00, 0xE4, "resume.throw", imm.CONT_TAG_HANDLE, null),
-	SWITCH				(0x00, 0xE5, "switch", imm.CONT_TAG, null)
+	RESUME_THROW			(0x00, 0xE4, "resume_throw", imm.CONT_TAG_HANDLE, null),
+	RESUME_THROW_REF		(0x00, 0xE5, "resume_throw_ref", imm.CONT_HANDLE, null),
+	SWITCH				(0x00, 0xE6, "switch", imm.CONT_TAG, null)
 }
 
 // Enumeration of the different kinds of immediates to opcodes.
@@ -715,7 +716,8 @@ enum OpcodeAttribute {
 	INTERNAL,
 	VALID,
 	CONSTANT,
-	EXTENDED_CONSTANT
+	EXTENDED_CONSTANT,
+	PROBE
 }
 // A 256-entry page for dealing with prefixed opcodes.
 class OpcodePage(prefix: byte) {
@@ -804,10 +806,14 @@ component Opcodes {
 			init(op);
 		}
 		attributes[Opcode.INVALID.tag] = OpcodeAttribute.INTERNAL;
+		attributes[InternalOpcode.PROBE.code] = OpcodeAttribute.INTERNAL | OpcodeAttribute.PROBE;
+		attributes[InternalOpcode.WHAMM_PROBE.code] = OpcodeAttribute.INTERNAL | OpcodeAttribute.PROBE;
+		attributes[InternalOpcode.BREAK_PROBE.code] = OpcodeAttribute.INTERNAL | OpcodeAttribute.PROBE;
 
 		for (op in [Opcode.END, Opcode.I32_CONST, Opcode.I64_CONST, Opcode.F32_CONST, Opcode.F64_CONST, Opcode.GLOBAL_GET,
 				Opcode.REF_NULL, Opcode.REF_FUNC, Opcode.STRUCT_NEW, Opcode.STRUCT_NEW_DEFAULT,
 				Opcode.ARRAY_NEW, Opcode.ARRAY_NEW_DEFAULT, Opcode.ARRAY_NEW_FIXED, Opcode.ARRAY_NEW_DATA,
+				Opcode.ANY_CONVERT_EXTERN, Opcode.EXTERN_CONVERT_ANY,
 				Opcode.ARRAY_NEW_ELEM, Opcode.REF_I31, Opcode.V128_CONST]) {
 			attributes[op.tag] |= OpcodeAttribute.CONSTANT;
 		}
@@ -1179,7 +1185,7 @@ class InstrTracer {
 					out.put1("%d...", handlers.length);
 				}
 				SUS_HANDLERS => {
-					var handlers = parser.readSusHandlers();
+					var handlers = parser.readSuspensionHandlers();
 					out.put1("%d...", handlers.length);
 				}
 				CATCHES => {
@@ -1218,7 +1224,7 @@ class InstrTracer {
 				}
 				MEMARG => {
 					var memarg = parser.readMemoryArg();
-					var align = 1 << byte.!(memarg.flags >> 1);
+					var align = 1 << byte.view(memarg.flags >> 1);
 					if (memarg.memory_index > 0) out.put1("memory=%d,", memarg.memory_index);
 					out.put2("align=%d,offset=%d", align, memarg.offset);
 				}

@@ -25,7 +25,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	var source_loc: int = -1;		// current source location, if any
 	var newTrapLabel: TrapReason -> MasmLabel;
 	var embeddedRefOffsets: Vector<int>;
-	private var offsets: V3Offsets;
+	var offsets = Target.getOffsets();
 
 	new() {
 		unimplemented = fatalUnimplemented;
@@ -33,7 +33,6 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	}
 
 	def getOffsets() -> V3Offsets {
-		if (offsets == null) offsets = V3Offsets.new();
 		return offsets;
 	}
 	def curCodeBytes() -> u64 {
@@ -87,6 +86,8 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 		source_loc = src;
 	}
 
+	def recordRetSourceLoc();
+
 	def emit_intentional_crash() {
 	}
 
@@ -102,14 +103,18 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 		match (kind) {
 			I32 => emit_mov_s_i(slot, val);
 			I64 => emit_mov_s_l(slot, val);
-			REF => emit_mov_s_l(slot, val); // TODO: ref size, assert 0?
+			REF => emit_mov_s_ri(slot, val); // TODO: ref size, assert 0?
 			F32 => emit_mov_s_f(slot, u32.view(val));
 			F64 => emit_mov_s_d(slot, u64.view(long.view(val))); // TODO: zero extend?
 			V128 => emit_mov_s_q(slot, u64.view(long.view(val)), if(val < 0, u64.max, 0)); // TODO: zero extend?
+			REF_U64 => emit_mov_s_q(slot, u64.view(long.view(val)), 0);
 		}
 	}
 	def emit_mov_s_i(slot: u32, val: int) { // utility method
 		emit_mov_m_i(slotAddr(slot), val);
+	}
+	def emit_mov_s_ri(slot: u32, val: int) { // utility method
+		emit_mov_m_ri(slotAddr(slot), val);
 	}
 	def emit_mov_s_l(slot: u32, val: long) { // utility method
 		emit_mov_m_l(slotAddr(slot), val);
@@ -186,6 +191,9 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_FuncDecl_target_code_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().FuncDecl_target_code));
 	}
+	def emit_v3_FuncDecl_orig_bytecode_r_r(dst: Reg, ptr: Reg) {
+		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().FuncDecl_orig_bytecode));
+	}
 	def emit_v3_Instance_functions_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().Instance_functions));
 	}
@@ -198,7 +206,10 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_SigDecl_results_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().SigDecl_results));
 	}
-	
+	def emit_v3_Continuation_stack_r_r(dst: Reg, ptr: Reg) {
+		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, getOffsets().Continuation_stack));
+	}
+
 	// Must be overridden in architecture-specific subclass.
 	def emit_v3_Memory_start_r_r(dst: Reg, memobj: Reg);
 	def emit_v3_Memory_limit_r_r(dst: Reg, memobj: Reg);
@@ -206,18 +217,16 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_v3_X86_64Stack_rsp_r_r(dst: Reg, ptr: Reg);
 	def emit_v3_set_X86_64Stack_vsp_r_r(stk: Reg, vsp: Reg);
 	def emit_v3_set_X86_64Stack_rsp_r_r(stk: Reg, rsp: Reg);
-	
+
 	def emit_push_X86_64Stack_rsp_r_r(stk: Reg);
 	def emit_pop_X86_64Stack_rsp_r_r(stk: Reg);
-
-
 
 	def scaleOf(kind: ValueKind) -> int {
 		match (kind) {
 			I32, F32 => return 4;
 			I64, F64 => return 8;
 			REF => return 8; // override in subclasses if any 32-bit port
-			V128 => return 16; // TODO: abs kinds are considered 16 bytes?
+			V128, REF_U64 => return 16;
 		}
 	}
 	def logScaleOf(kind: ValueKind) -> u6 {
@@ -225,7 +234,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 			I32, F32 => return 2;
 			I64, F64 => return 3;
 			REF => return 3; // override in subclasses if any 32-bit port
-			V128 => return 4; // TODO: abs kinds are considered 16 bytes?
+			V128, REF_U64 => return 4;
 		}
 	}
 
@@ -248,10 +257,11 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 		match (kind) {
 			I32 => emit_mov_r_i(reg, val);
 			I64 => emit_mov_r_l32(reg, val);
-			REF => emit_mov_r_l32(reg, val); // TODO: ref size, assert 0?
+			REF => emit_mov_r_l(reg, u32.view(val));
 			F32 => emit_mov_r_f32(reg, u32.view(val));
 			F64 => emit_mov_r_d64(reg, u64.view(val));
 			V128 => emit_mov_r_q(reg, u64.view(long.view(val)), if(val < 0, u64.max, 0)); // TODO: zero extend?
+			REF_U64 => emit_mov_r_q(reg, u64.view(long.view(val)), 0);
 		}
 	}
 	def emit_mov_r_i(reg: Reg, val: int);
@@ -261,9 +271,14 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_mov_r_f32(reg: Reg, val: u32);
 	def emit_mov_r_d64(reg: Reg, val: u64);
 	def emit_mov_r_q(reg: Reg, low: u64, high: u64);
+	def emit_mov_r_Object(reg: Reg, obj: Object);
+	def emit_mov_r_Function(reg: Reg, func: Function);
+	def emit_mov_r_Instance(reg: Reg, instance: Instance);
+	def emit_mov_r_Continuation(reg: Reg, cont: Continuation);
 
 	def emit_mov_m_r(kind: ValueKind, addr: MasmAddr, reg: Reg);
 	def emit_mov_m_i(addr: MasmAddr, val: int);
+	def emit_mov_m_ri(addr: MasmAddr, val: int);
 	def emit_mov_m_l(addr: MasmAddr, val: long);
 	def emit_mov_m_f(addr: MasmAddr, bits: u32);
 	def emit_mov_m_d(addr: MasmAddr, bits: u64);
@@ -300,6 +315,7 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	def emit_br_table_r(reg: Reg, labels: Array<MasmLabel>);
 
+	def emit_call_label(label: MasmLabel);
 	def emit_call_r(reg: Reg);
 	def emit_jump_r(reg: Reg);
 
@@ -307,6 +323,10 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 	def emit_jump_HostCallStub();
 
 	def emit_call_runtime_callHost(func_arg: Reg);
+	def emit_call_runtime_SUSPEND();
+	def emit_call_runtime_SWITCH();
+	def emit_call_runtime_RESUME_THROW();
+	def emit_call_runtime_RESUME_THROW_REF();
 	def emit_jump_to_trap_at(reason: TrapReason);
 	def emit_call_runtime_op(op: Opcode);
 	def emit_get_curstack(r: Reg);
@@ -323,19 +343,79 @@ class MacroAssembler(valuerep: Tagging, regConfig: RegConfig) {
 
 	def emit_debugger_breakpoint();
 
+	def emit_ref_from_ref_u64(to: Reg, from: Reg);
+	def emit_u64_from_ref_u64(to: Reg, from: Reg);
+
+	def emit_mov_r_Cont(to: Reg, cont: Continuation);
 	// stk.state_ = state;
 	def emit_set_stack_state(stk: Reg, state: StackState);
-	// Validates {cont} and set {cont.used} to {true};
-	def emit_validate_and_consume_cont(cont: Reg);
 	// This should be called after all stack value transfers, but before the
 	// return address is pushed onto parent's {sp}.
 	// Chains {cont} on {parent} by:
 	// - setting the state of both {parent} and {cont}
 	// - setting {cont.parent} and {cont.parent_rsp_ptr}
 	// Destructive on {parent}.
-	def emit_chain_cont_to_parent(parent: Reg, cont: Reg);
+	def emit_cont_mv(from_vsp: Reg, contStack: Reg, n_vals: Reg, tmp1: Reg, tmp2: Reg, xmm0: Reg);
+
+	// Validates {cont} and:
+	// - Mark {cont} as used
+	// - Move {cont.stack} to {destContStack}
+	def emit_validate_and_consume_cont(destContStack: Reg, cont: Reg) {
+		var scratch = regConfig.scratch, offsets = getOffsets();
+		if (FeatureDisable.unboxedConts) { // boxed continuation mode
+			var contObj = destContStack;
+			// [contObj == destContStack] = cont[0]
+			emit_ref_from_ref_u64(contObj, cont);
+			// Check for {contObj == null}.
+			emit_br_r(contObj, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			// Check for {cont.stack == null} (true when {cont} is already used).
+			emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(contObj, offsets.Continuation_stack));
+			emit_br_r(scratch, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.USED_CONTINUATION));
+			// Consume {cont} by setting {cont.stack} to null.
+			emit_mov_m_l(MasmAddr(contObj, offsets.Continuation_stack), 0);
+			// Set {destContStack} to {cont.stack} (its value before being cleared).
+			emit_mov_r_r(ValueKind.REF, destContStack, scratch);
+		} else { // unboxed continuation mode
+			// Set {destContStack} to {cont.stack}
+			emit_ref_from_ref_u64(destContStack, cont);
+			// Check for {cont == null}.
+			emit_br_r(destContStack, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
+			emit_u64_from_ref_u64(scratch, cont);
+			// Check for {cont.stack == null} (true when {cont} is already used).
+			emit_validate_cont_version_unboxed(destContStack, scratch);
+			// Consume {cont} by incrementing {destContStack.version}.
+			emit_inc_stack_version(destContStack);
+		}
+	}
+	def emit_validate_cont_version_unboxed(stack: Reg, version: Reg);
+	def emit_inc_stack_version(stack: Reg);
+
 	// Called as the last step during resume. Switches {curStack} to the top of {cont}.
-	def emit_switch_curStack_to_cont(cont: Reg);
+	def emit_chain_cont_to_parent(parent: Reg, contStack: Reg) {
+		var scratch = regConfig.scratch, offsets = getOffsets();
+		emit_set_stack_state(parent, StackState.CALL_CHILD); // XXX: not needed for {switch}
+		emit_mov_r_r(ValueKind.REF, scratch, contStack);
+		emit_set_stack_state(scratch, StackState.RUNNING);
+
+		// cont.stack.cont_bottom.parent = parent;
+		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(scratch, offsets.X86_64Stack_bottom));
+		emit_mov_m_r(ValueKind.REF, MasmAddr(scratch, offsets.X86_64Stack_parent), parent);
+
+		// *(cont.stack.cont_bottom.parent_rsp_ptr) = parent.rsp;
+		emit_mov_r_m(ValueKind.REF, parent, MasmAddr(parent, offsets.X86_64Stack_rsp));
+		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(scratch, offsets.X86_64Stack_parent_rsp_ptr));
+		emit_mov_m_r(ValueKind.REF, MasmAddr(scratch, 0), parent);
+
+		// contStack.cont_bottom = null;
+		emit_mov_m_i(MasmAddr(contStack, offsets.X86_64Stack_bottom), 0);
+	}
+	def emit_switch_to_stack(r_stack: Reg) {
+		var scratch = regConfig.scratch;
+		emit_set_curstack(r_stack);
+		emit_v3_X86_64Stack_rsp_r_r(regConfig.sp, r_stack);
+		emit_pop_r(ValueKind.REF, scratch);
+		emit_jump_r(scratch);
+	}
 
 	def fatalUnimplemented();
 

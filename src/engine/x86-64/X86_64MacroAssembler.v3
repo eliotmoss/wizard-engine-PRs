@@ -20,7 +20,6 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def asm = X86_64Assemblers.create64(w);
 	var scratch: X86_64Gpr;
 	var jump_tables: Vector<(int, Array<X86_64Label>)>;
-	var offsets: V3Offsets;
 	var trap_stubs: X86_64SpcTrapsStub;
 
 	new(w, regConfig: RegConfig) super(Target.tagging, regConfig) {
@@ -75,7 +74,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def getScratchReg(kind: ValueKind) -> Reg {
 		match (kind) {
 			I32, I64, REF => return regConfig.scratch;
-			F32, F64, V128 => return X86_64MasmRegs.XMM15; // TODO: make configurable
+			F32, F64, V128, REF_U64 => return X86_64MasmRegs.XMM15; // TODO: make configurable
 		}
 	}
 	def getV3ParamReg(kind: ValueKind, index: int) -> Reg {
@@ -105,7 +104,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			F32 => asm.movss_s_m(X(dst), X86_64Addr.new(a, i, 4, getOffsets().Array_contents));
 			I64, REF => asm.movq_r_m(G(dst), X86_64Addr.new(a, i, 8, getOffsets().Array_contents));
 			F64 => asm.movsd_s_m(X(dst), X86_64Addr.new(a, i, 8, getOffsets().Array_contents));
-			V128 => asm.movdqu_s_m(X(dst), X86_64Addr.new(a, i, 16, getOffsets().Array_contents)); // TODO: can't scale by 16
+			V128, REF_U64 => asm.movdqu_s_m(X(dst), X86_64Addr.new(a, i, 16, getOffsets().Array_contents)); // TODO: can't scale by 16
 		}
 	}
 	def emit_v3_Array_bounds_check_rr(array: Reg, index: Reg, oob_label: MasmLabel) {
@@ -113,10 +112,10 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.jc_rel_far(X86_64Conds.GE, X86_64MasmLabel.!(oob_label).label);
 	}
 	def emit_v3_Memory_start_r_r(dst: Reg, memobj: Reg) {
-		asm.movq_r_m(G(dst), X86_64Addr.new(G(memobj), null, 1, getOffsets().X86_64Memory_start));
+		asm.movq_r_m(G(dst), X86_64Addr.new(G(memobj), null, 1, getOffsets().NativeWasmMemory_start));
 	}
 	def emit_v3_Memory_limit_r_r(dst: Reg, memobj: Reg) {
-		asm.movq_r_m(G(dst), X86_64Addr.new(G(memobj), null, 1, getOffsets().X86_64Memory_limit));
+		asm.movq_r_m(G(dst), X86_64Addr.new(G(memobj), null, 1, getOffsets().NativeWasmMemory_limit));
 	}
 	def emit_v3_X86_64Stack_vsp_r_r(dst: Reg, ptr: Reg) {
 		emit_mov_r_m(ValueKind.REF, dst, MasmAddr(ptr, offsets.X86_64Stack_vsp));
@@ -178,7 +177,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			REF, I64 => asm.movq_r_m(G(dst), X86_64Addr.new(G(base), t.0, 1, t.1));
 			F32 => asm.movss_s_m(X(dst), X86_64Addr.new(G(base), t.0, 1, t.1));
 			F64 => asm.movsd_s_m(X(dst), X86_64Addr.new(G(base), t.0, 1, t.1));
-			V128 => asm.movdqu_s_m(X(dst), X86_64Addr.new(G(base), t.0, 1, t.1));
+			V128, REF_U64 => asm.movdqu_s_m(X(dst), X86_64Addr.new(G(base), t.0, 1, t.1));
 		}
 	}
 	def emit_v128_load_lane_r_m<T>(dst: Reg, src: X86_64Addr, asm_mov_r_m: (X86_64Gpr, X86_64Addr) -> T) {
@@ -211,7 +210,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			REF, I64 => asm.movq_m_r(X86_64Addr.new(b, t.0, 1, t.1), G(val));
 			F32 => asm.movss_m_s(X86_64Addr.new(b, t.0, 1, t.1), X(val));
 			F64 => asm.movsd_m_s(X86_64Addr.new(b, t.0, 1, t.1), X(val));
-			V128 => asm.movdqu_m_s(X86_64Addr.new(b, t.0, 1, t.1), X(val));
+			V128, REF_U64 => asm.movdqu_m_s(X86_64Addr.new(b, t.0, 1, t.1), X(val));
 		}
 	}
 
@@ -234,7 +233,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		} else {
 			var xd = X(reg), xs = X(reg2);
 			if (xs != null) {
-				if (kind == ValueKind.V128) asm.movaps_s_s(xd, xs);
+				if (kind == ValueKind.V128 || kind == ValueKind.REF_U64) asm.movaps_s_s(xd, xs);
 				else asm.movsd_s_s(xd, xs);
 			} else {
 				asm.movq_s_r(xd, G(reg2));
@@ -248,7 +247,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			I64, REF => asm.movq_r_m(G(reg), addr);
 			F32 => asm.movss_s_m(X(reg), addr);
 			F64 => asm.movsd_s_m(X(reg), addr);
-			V128 => asm.movdqu_s_m(X(reg), addr);
+			V128, REF_U64 => asm.movdqu_s_m(X(reg), addr);
 		}
 	}
 	def emit_mov_r_i(reg: Reg, val: int) {
@@ -284,6 +283,26 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_mov_r_abs32(reg: Reg, abs: Pointer) {
 		asm.movd_r_i(G(reg), int.view(u32.!(abs - Pointer.NULL)));
 	}
+	def emit_mov_r_Object(reg: Reg, obj: Object) {
+		addEmbeddedRefOffset(asm.movq_r_p(G(reg), Pointer.atObject(obj) - Pointer.NULL));
+	}
+	def emit_mov_r_Function(reg: Reg, func: Function) {
+		addEmbeddedRefOffset(asm.movq_r_p(G(reg), Pointer.atObject(func) - Pointer.NULL));
+	}
+	def emit_mov_r_Instance(reg: Reg, instance: Instance) {
+		addEmbeddedRefOffset(asm.movq_r_p(G(reg), Pointer.atObject(instance) - Pointer.NULL));
+	}
+	def emit_mov_r_Continuation(reg: Reg, cont: Continuation) {
+		if (FeatureDisable.unboxedConts) {
+			addEmbeddedRefOffset(asm.movq_r_p(scratch, Pointer.atObject(cont.stack) - Pointer.NULL));
+			asm.pinsrq_s_r_i(X(reg), scratch, 0);
+		} else {
+			addEmbeddedRefOffset(asm.movq_r_p(scratch, Pointer.atObject(cont.stack) - Pointer.NULL));
+			asm.pinsrq_s_r_i(X(reg), scratch, 0);
+			asm.movq_r_i(scratch, int.view(Continuations.getStoredVersion(cont)));
+			asm.pinsrq_s_r_i(X(reg), scratch, 1);
+		}
+	}
 
 	def emit_mov_m_r(kind: ValueKind, ma: MasmAddr, reg: Reg) {
 		var addr = A(ma);
@@ -292,11 +311,15 @@ class X86_64MacroAssembler extends MacroAssembler {
 			I64, REF => asm.movq_m_r(addr, G(reg));
 			F32 => asm.movss_m_s(addr, X(reg));
 			F64 => asm.movsd_m_s(addr, X(reg));
-			V128 => asm.movdqu_m_s(addr, X(reg));
+			V128, REF_U64 => asm.movdqu_m_s(addr, X(reg));
 		}
 	}
 	def emit_mov_m_i(ma: MasmAddr, val: int) {
 		asm.movd_m_i(A(ma), val);
+	}
+	def emit_mov_m_ri(ma: MasmAddr, val: int) {
+		asm.movd_r_i(scratch, val);
+		asm.movq_m_r(A(ma), scratch);
 	}
 	def emit_mov_m_l(ma: MasmAddr, val: long) {
 		var addr = A(ma);
@@ -327,7 +350,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 				asm.movq_r_m(scratch, A(src));
 				asm.movq_m_r(A(dst), scratch);
 			}
-			V128 => {
+			V128, REF_U64 => {
 				var scratch = R.XMM15; // TODO
 				asm.movdqu_s_m(scratch, A(src));
 				asm.movdqu_m_s(A(dst), scratch);
@@ -537,6 +560,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 			I64, REF => asm.q.popq_r(G(reg));
 			F64 => { asm.q.popq_r(scratch);  asm.movq_s_r(X(reg), scratch); }
 			V128 => System.error("X86_64MacroAssembler", "cannot pop v128 type"); // TODO
+			REF_U64 => System.error("X86_64MacroAssembler", "cannot pop REF_U64 type"); // TODO
 		}
 	}
 	def emit_ret() {
@@ -568,7 +592,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		}
 	}
 	private def emit_i64_trunc_sat_f32_s(dst: X86_64Gpr, x1: X86_64Xmmr, xscratch: X86_64Xmmr) {
-		asm.movd_r_i(dst, int.view(Floats.f_1p63));
+		asm.movd_r_i(dst, int.view(FloatUtils.f_1p63));
 		asm.movd_s_r(xscratch, dst);
 		asm.ucomiss_s_s(x1, xscratch);
 		var is_nan = X86_64Label.new(), ovf_pos = X86_64Label.new(), done = X86_64Label.new();
@@ -586,7 +610,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.bind(done);
 	}
 	private def emit_i64_trunc_sat_f64_s(dst: X86_64Gpr, x1: X86_64Xmmr, xscratch: X86_64Xmmr) {
-		asm.movd_r_i(dst, int.view(Floats.d_1p63 >> 32));
+		asm.movd_r_i(dst, int.view(FloatUtils.d_1p63 >> 32));
 		asm.q.shl_r_i(dst, 32);
 		asm.movq_s_r(xscratch, dst);
 		asm.ucomisd_s_s(x1, xscratch);
@@ -618,7 +642,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 
 		if (config.isI64 && !config.isSigned) {
 			// handle u64 convert of 1p63 < v <= 1p64
-			config.mov_s_i(asm, xscratch, if(config.isF64, Floats.d_1p63, Floats.f_1p63), scratch);
+			config.mov_s_i(asm, xscratch, if(config.isF64, FloatUtils.d_1p63, FloatUtils.f_1p63), scratch);
 			config.ucomi_s_s(asm, x1, xscratch);
 			asm.jc_rel_near(C.C, not_big);
 			config.sub_s_s(asm, x1, xscratch);
@@ -666,7 +690,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.q.shr_r_i(r1, 1);
 		asm.q.or_r_r(r1, scratch);
 		asm.q.cvtsi2ss_s_r(x1, r1);
-		asm.movd_r_i(scratch, int.view(Floats.f_1p1)); // XXX: const could be in memory
+		asm.movd_r_i(scratch, int.view(FloatUtils.f_1p1)); // XXX: const could be in memory
 		asm.movd_s_r(xscratch, scratch);
 		asm.mulss_s_s(x1, xscratch);
 		// done
@@ -683,7 +707,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.q.shr_r_i(r1, 1);
 		asm.q.or_r_r(r1, scratch);
 		asm.q.cvtsi2sd_s_r(x1, r1);
-		asm.movd_r_i(scratch, int.view(Floats.d_1p1 >> 32));
+		asm.movd_r_i(scratch, int.view(FloatUtils.d_1p1 >> 32));
 		asm.q.shl_r_i(scratch, 32);
 		asm.movq_s_r(xscratch, scratch);
 		asm.mulsd_s_s(x1, xscratch);
@@ -766,6 +790,10 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.movq_r_l(scratch, abs - Pointer.NULL);
 		asm.icall_r(scratch);
 	}
+	def emit_call_label(label: MasmLabel) {
+		asm.call_rel_far(X86_64MasmLabel.!(label).label);
+		recordRetSourceLoc();
+	}
 	def emit_call_r(reg: Reg) {
 		asm.icall_r(G(reg));
 		recordRetSourceLoc();
@@ -790,7 +818,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_call_OperandProbe_i_v_fire(probe: OperandProbe_i_v, value_reg: Reg) {
 		var codePtr = CiRuntime.unpackClosure<OperandProbe_i_v, u32, void>(probe.fire_i).0;
-		var refOffset = asm.movq_r_p(Target.V3_PARAM_GPRS[0], Pointer.atObject(probe) - Pointer.NULL);
+		var refOffset = asm.movq_r_p(G(Target.V3_PARAM_GPRS[0]), Pointer.atObject(probe) - Pointer.NULL);
 		addEmbeddedRefOffset(refOffset);
 		asm.movq_r_l(scratch, codePtr - Pointer.NULL); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
@@ -798,7 +826,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_call_MemoryReadProbe_fire(probe: MemoryReadProbe) {
 		var codePtr = CiRuntime.unpackClosure<MemoryReadProbe, (u64, u64, u64), void>(probe.fire_probe).0;
-		var refOffset = asm.movq_r_p(Target.V3_PARAM_GPRS[0], Pointer.atObject(probe) - Pointer.NULL);
+		var refOffset = asm.movq_r_p(G(Target.V3_PARAM_GPRS[0]), Pointer.atObject(probe) - Pointer.NULL);
 		addEmbeddedRefOffset(refOffset);
 		asm.movq_r_l(scratch, codePtr - Pointer.NULL); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
@@ -832,6 +860,18 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_call_runtime_TRAP() {
 		emit_call_runtime(X86_64RT.runtime_TRAP);
+	}
+	def emit_call_runtime_SUSPEND() {
+		emit_call_runtime(X86_64RT.runtime_handle_suspend);
+	}
+	def emit_call_runtime_SWITCH() {
+		emit_call_runtime(X86_64RT.runtime_handle_switch);
+	}
+	def emit_call_runtime_RESUME_THROW() {
+		emit_call_runtime(X86_64RT.runtime_handle_resume_throw);
+	}
+	def emit_call_runtime_RESUME_THROW_REF() {
+		emit_call_runtime(X86_64RT.runtime_resume_throw_ref);
 	}
 	def emit_jump_to_trap_at(reason: TrapReason) {
 		var ip = trap_stubs.getIpForReason(reason);
@@ -874,6 +914,8 @@ class X86_64MacroAssembler extends MacroAssembler {
 			ARRAY_COPY => emit_call_runtime(RT.ARRAY_COPY);
 			ARRAY_INIT_DATA => emit_call_runtime(RT.ARRAY_INIT_DATA);
 			ARRAY_INIT_ELEM => emit_call_runtime(RT.ARRAY_INIT_ELEM);
+			CONT_NEW => emit_call_runtime(X86_64RT.runtime_CONT_NEW);
+			CONT_BIND => emit_call_runtime(RT.CONT_BIND);
 			_ => unimplemented();
 		}
 	}
@@ -886,14 +928,14 @@ class X86_64MacroAssembler extends MacroAssembler {
 	private def emit_call_runtime<P, R>(closure: P -> R) {
 		var ptr = CiRuntime.unpackClosure<X86_64Interpreter, P, R>(closure).0;
 		// Do an absolute call into the runtime
-		asm.movd_r_i(scratch, int.view(u32.!(ptr - Pointer.NULL))); // XXX: make direct call to runtime if within 2GB
+		asm.movq_r_l(scratch, ptr - Pointer.NULL); // XXX: make direct call to runtime if within 2GB
 		asm.icall_r(scratch);
 		recordRetSourceLoc();
 	}
 	private def emit_jump_runtime<P, R>(closure: P -> R) {
 		var ptr = CiRuntime.unpackClosure<X86_64Interpreter, P, R>(closure).0;
 		// Do an absolute call into the runtime
-		asm.movd_r_i(scratch, int.view(u32.!(ptr - Pointer.NULL))); // XXX: make direct jump to runtime if within 2GB
+		asm.movq_r_l(scratch, ptr - Pointer.NULL); // XXX: make direct jump to runtime if within 2GB
 		asm.ijmp_r(scratch);
 	}
 	def emit_value_copy(r_dst: X86_64Gpr, r_src: X86_64Gpr, r_count: X86_64Gpr, r_xmm0: X86_64Xmmr) {
@@ -996,13 +1038,13 @@ class X86_64MacroAssembler extends MacroAssembler {
 		asm.movq_r_l(tmp, long.view(mask.1));
 		asm.pinsrq_s_r_i(dst, tmp, 1);
 	}
-	def emit_v128_orps(dst: X86_64Xmmr, src: X86_64Xmmr) {
+	def emit_v128_orps(dst: X86_64Xmmr, src: X86_64Xmmr) { // XXX: inline
 		asm.orps_s_s(dst, src);
 	}
-	def emit_v128_xorps(dst: X86_64Xmmr, src: X86_64Xmmr) {
+	def emit_v128_xorps(dst: X86_64Xmmr, src: X86_64Xmmr) { // XXX: inline
 		asm.xorps_s_s(dst, src);
 	}
-	def emit_v128_andps(dst: X86_64Xmmr, src: X86_64Xmmr) {
+	def emit_v128_andps(dst: X86_64Xmmr, src: X86_64Xmmr) { // XXX: inline
 		asm.andps_s_s(dst, src);
 	}
 	def emit_v128_neg<T>(dst: X86_64Xmmr, scratch: X86_64Xmmr, f: (X86_64Xmmr, X86_64Xmmr) -> T) {
@@ -1022,7 +1064,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_i64x2_neg(dst: X86_64Xmmr, scratch: X86_64Xmmr) {
 		emit_v128_neg(dst, scratch, asm.psubq_s_s);
-  }
+	}
 	def emit_v128_not(dst: X86_64Xmmr, scratch: X86_64Xmmr) {
 		asm.pcmpeqd_s_s(scratch, scratch);
 		asm.xorps_s_s(dst, scratch);
@@ -1030,12 +1072,11 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def emit_v128_bitselect(dst: X86_64Xmmr, src: X86_64Xmmr, mask: X86_64Xmmr, scratch: X86_64Xmmr) {
 		// AND(v1, c)
 		asm.andpd_s_s(dst, mask);
-		// NOT(c)
-		emit_v128_not(mask, scratch);
-		// AND(v2, NOT(c))
-		asm.andpd_s_s(src, mask);
+		// AND-NOT(v2, c)
+		asm.movaps_s_s(scratch, mask);
+		asm.andnpd_s_s(scratch, src);
 		// OR
-		asm.orps_s_s(dst, src);
+		asm.orps_s_s(dst, scratch);
 	}
 	def emit_v128_negps(dst: X86_64Xmmr, tmp: X86_64Gpr, mask: X86_64Xmmr) {
 		load_v128_mask(mask, mask_v128_float_neg_constant, tmp);
@@ -1053,7 +1094,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 		load_v128_mask(mask, mask_v128_double_absolute_constant, tmp);
 		emit_v128_andps(dst, mask);
 	}
-	def emit_v128_zero(s: X86_64Xmmr) {
+	def emit_v128_zero(s: X86_64Xmmr) { // XXX: inline
 		emit_v128_xorps(s, s);
 	}
 	def emit_i64x2_mul(lhs: X86_64Xmmr, rhs: X86_64Xmmr, tmp1: X86_64Xmmr, tmp2: X86_64Xmmr) {
@@ -1479,7 +1520,7 @@ class X86_64MacroAssembler extends MacroAssembler {
 	}
 	def emit_f32x4_splat(dst: X86_64Xmmr, src: X86_64Gpr, scratch: X86_64Xmmr) {
 		asm.movd_s_r(scratch, src);
-		asm.shufps_s_s_i(dst, scratch, 0x0);
+		asm.pshufd_s_s_i(dst, scratch, 0x0);
 	}
 	def emit_f64x2_splat(dst: X86_64Xmmr, src: X86_64Gpr, scratch: X86_64Xmmr) {
 		asm.movq_s_r(scratch, src);
@@ -1508,51 +1549,19 @@ class X86_64MacroAssembler extends MacroAssembler {
 	def absPointer(ptr: Pointer) -> X86_64Addr {
 		return X86_64Addr.new(null, null, 1, int.view(u32.!(ptr - Pointer.NULL)));
 	}
-	def getOffsets() -> V3Offsets {
-		if (offsets == null) offsets = V3Offsets.new();
-		return offsets;
-	}
-	
+
 	def emit_set_stack_state(stk: Reg, state: StackState) {
 		emit_mov_m_i(MasmAddr(stk, offsets.X86_64Stack_state), state.tag);
 	}
-	def emit_validate_and_consume_cont(cont: Reg) {
-		var scratch = regConfig.scratch;
-		emit_br_r(cont, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_used));
-		emit_br_r(scratch, MasmBrCond.I64_NONZERO, newTrapLabel(TrapReason.USED_CONTINUATION));
-	  emit_mov_m_i(MasmAddr(cont, offsets.Continuation_used), 1);
-	}
-	def emit_chain_cont_to_parent(parent: Reg, cont: Reg) {
-		var scratch = regConfig.scratch;
-		emit_set_stack_state(parent, StackState.CALL_CHILD); // XXX: not needed for {switch}
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_top));
-		emit_set_stack_state(scratch, StackState.RUNNING);
-
-		// cont.bottom.parent = parent;
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_bottom));
-		emit_mov_m_r(ValueKind.REF, MasmAddr(scratch, offsets.X86_64Stack_parent), parent);
-
-		// *cont.bottom.parent_rsp_ptr = parent.rsp
-		emit_mov_r_m(ValueKind.REF, parent, MasmAddr(parent, offsets.X86_64Stack_rsp));
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(scratch, offsets.X86_64Stack_parent_rsp_ptr));
-		emit_mov_m_r(ValueKind.REF, MasmAddr(scratch, 0), parent);
-	}
-	def emit_switch_curStack_to_cont(cont: Reg) {
-		var scratch = regConfig.scratch;
-		var m_curStack = MasmAddr(Reg(0), int.!(offsets.X86_64Runtime_curStack - Pointer.NULL));
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_top));
-		emit_mov_m_r(ValueKind.REF, m_curStack, scratch);
-	}
 
 	// Moves values from the current stack to %cont.top.
-	def emit_cont_mv(from_vsp: Reg, cont: Reg, n_vals: Reg, tmp1: Reg, tmp2: Reg, xmm0: Reg) {
+	def emit_cont_mv(from_vsp: Reg, contStack: Reg, n_vals: Reg, tmp1: Reg, tmp2: Reg, xmm0: Reg) {
 		var scratch = regConfig.scratch;
 		var top_vsp = tmp1, mov_size = tmp2;
 		// %mov_size = %n_vals * Target.tagging.slot_size
 		emit_mov_r_r(ValueKind.I32, mov_size, n_vals);
 		asm.q.imul_r_i(G(mov_size), Target.tagging.slot_size);
-		emit_mov_r_m(ValueKind.REF, scratch, MasmAddr(cont, offsets.Continuation_top));
+		emit_mov_r_r(ValueKind.REF, scratch, contStack);
 		// mov %top_vsp, [(%scratch == %top).vsp]
 		emit_mov_r_m(ValueKind.REF, top_vsp, MasmAddr(scratch, offsets.X86_64Stack_vsp));
 		// [%top.vsp] += %mov_size
@@ -1560,6 +1569,57 @@ class X86_64MacroAssembler extends MacroAssembler {
 		// %vsp -= %mov_size
 		asm.q.sub_r_r(G(from_vsp), G(mov_size));
 		emit_value_copy(G(top_vsp), G(from_vsp), G(n_vals), X(xmm0));
+	}
+
+	def emit_validate_cont_version_unboxed(stack: Reg, version: Reg) {
+		asm.q.cmp_m_r(G(stack).plus(offsets.X86_64Stack_version), G(version));
+		asm.jc_rel_far(X86_64Conds.NZ, X86_64MasmLabel.!(newTrapLabel(TrapReason.USED_CONTINUATION)).label);
+	}
+
+	def emit_inc_stack_version(stack: Reg) {
+		asm.q.add_m_i(G(stack).plus(offsets.X86_64Stack_version), 1);
+	}
+
+	def emit_ref_from_ref_u64(to: Reg, from: Reg) {
+		asm.pextrq_r_s_i(G(to), X(from), 0);
+	}
+	def emit_u64_from_ref_u64(to: Reg, from: Reg) {
+		asm.pextrq_r_s_i(G(to), X(from), 1);
+	}
+
+	// Reads a 32- or 64-bit unsigned LEB from {rw_ptr} into {w_dest}.
+	def emit_read_uleb(w_dest: X86_64Gpr, rw_ptr: X86_64Gpr, w_scratch1: X86_64Gpr, w_scratch2: X86_64Gpr) -> this {
+		// TODO: handle w_dest = rcx
+		var done = X86_64Label.new(), loop = X86_64Label.new();
+		var saved_rcx: X86_64Gpr;
+		var w_scratch = w_scratch1;
+		if (w_scratch1 == R.RCX) {
+			w_scratch = w_scratch2;
+		} else if (w_scratch2 == R.RCX) {
+			w_scratch = w_scratch1;
+		} else {
+			saved_rcx = w_scratch2;
+			asm.movq_r_r(saved_rcx, R.RCX);
+		}
+		asm.movd_r_i(R.RCX, 0);				// first byte is shifted by 0
+		asm.movd_r_i(w_dest, 0);
+
+		asm.bind(loop);
+		asm.movbzx_r_m(w_scratch, rw_ptr.indirect());	// load byte
+		asm.q.inc_r(rw_ptr);				// increment pointer
+		asm.d.test_r_i(w_scratch, 0x80);		// test most-significant bit
+		asm.jc_rel_near(C.Z, done);			// break if not set
+		asm.d.and_r_i(w_scratch, 0x7F);			// mask off upper bit
+		asm.q.shl_r_cl(w_scratch);			// shift byte into correct bit pos
+		asm.q.or_r_r(w_dest, w_scratch);		// merge byte into val
+		asm.d.add_r_i(R.RCX, 7);			// compute next bit pos
+		asm.jmp_rel_near(loop);				// loop
+
+		asm.bind(done);
+		asm.q.shl_r_cl(w_scratch);			// shift last byte into correct bit pos
+		asm.q.or_r_r(w_dest, w_scratch);		// merge byte into val
+
+		if (saved_rcx != null) asm.movq_r_r(R.RCX, saved_rcx);
 	}
 }
 
@@ -1586,11 +1646,11 @@ class FloatTrunc(isI64: bool, isF64: bool, isSigned: bool) {
 	def mov_m_s = if(isF64, X86_64Assembler.movsd_m_s, X86_64Assembler.movss_m_s);
 	def maxv: u64 = if(isI64,
 				if(isSigned,
-					if(isF64, Floats.d_1p63, Floats.f_1p63),
-					if(isF64, Floats.d_1p64, Floats.f_1p64)),
+					if(isF64, FloatUtils.d_1p63, FloatUtils.f_1p63),
+					if(isF64, FloatUtils.d_1p64, FloatUtils.f_1p64)),
 				if(isSigned,
-					if(isF64, Floats.d_1p31, Floats.f_1p31),
-					if(isF64, Floats.d_1p32, Floats.f_1p32)));
+					if(isF64, FloatUtils.d_1p31, FloatUtils.f_1p31),
+					if(isF64, FloatUtils.d_1p32, FloatUtils.f_1p32)));
 	def minv: u64 = if(isI64, // XXX: share these constants with V3 interpreter
 				if(isSigned,
 					if(isF64, u64.view(-9.223372036854778E18d), u32.view(-9.223373e18f)),
@@ -1599,7 +1659,7 @@ class FloatTrunc(isI64: bool, isF64: bool, isSigned: bool) {
 					if(isF64, u64.view(-2147483649d), u32.view(-2.1474839E9f)),
 					if(isF64, u64.view(-1d), u32.view(-1f))));
 
-	def minus1: u64 = if(isF64, Floats.d_minus1, Floats.f_minus1);
+	def minus1: u64 = if(isF64, FloatUtils.d_minus1, FloatUtils.f_minus1);
 
 	def ceilv: u64 = if(isI64,
 				if(isSigned, u63.max, u64.max),

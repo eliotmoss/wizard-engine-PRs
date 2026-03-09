@@ -53,8 +53,9 @@ component SpcConsts {
 	def KIND_F64: byte = kindToFlags(ValueKind.F64);
 	def KIND_V128: byte = kindToFlags(ValueKind.V128);
 	def KIND_REF: byte = kindToFlags(ValueKind.REF);
+	def KIND_REF_U64: byte = kindToFlags(ValueKind.REF_U64);
 	def kinds: Array<ValueKind> = [ValueKind.I32, ValueKind.I64, ValueKind.F32, ValueKind.F64,
-					ValueKind.V128, ValueKind.REF];
+					ValueKind.V128, ValueKind.REF, ValueKind.REF_U64];
 	def kindToFlags(kind: ValueKind) -> byte {
 		return byte.view(kind.tag) << 4;
 	}
@@ -73,10 +74,11 @@ def KIND_F32 = SpcConsts.KIND_F32;
 def KIND_F64 = SpcConsts.KIND_F64;
 def KIND_V128 = SpcConsts.KIND_V128;
 def KIND_REF = SpcConsts.KIND_REF;
+def KIND_REF_U64 = SpcConsts.KIND_REF_U64;
 
 // Compiles Wasm bytecode to machine code in a single pass via a MacroAssembler.
 class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAlloc, extensions: Extension.set, limits: Limits) extends BytecodeVisitor {
-	def it = BytecodeIterator.new();
+	var it = BytecodeIterator.new();
 	def instrTracer = if(Trace.compiler, InstrTracer.new());
 	def config = masm.regConfig;
 	def regs = xenv;
@@ -104,6 +106,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	var ret_label: MasmLabel;
 	var last_probe = 0;
 	var skip_to_end: bool;
+	// XXX: hack
+	var handler_dest_info = Vector<SpcHandlerInfo>.new();
 
 	// when function is inlined, we continue using caller's abstract state, and
 	// push callee's params/locals as needed, thus we need to track the base sp of the locals
@@ -146,6 +150,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		success = true;
 		osr_offset = -1;
 		osr_state = null;
+		handler_dest_info.clear();
+		handler_dest_info.resize(func.handlers.handler_dests.length);
 
 		// Initialize parameters, locals, and first control stack entry.
 		var end_label = masm.newLabel(func.cur_bytecode.length);
@@ -174,13 +180,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			last_probe = 0;
 			masm.source_loc = it.pc;
 			it.dispatch(this);
+			unrefRegs();
 			if (Trace.compiler && Trace.asm) {
 				OUT.puts("JIT code: ");
 				masm.printCodeBytes(OUT, before_code_bytes, masm.curCodeBytes());
 				before_code_bytes = masm.curCodeBytes();
 				OUT.ln();
 			}
-			unrefRegs();
 			if (Debug.compiler) checkRegAlloc();
 			it.next();
 			if (skip_to_end) doSkipToEndOfBlock();
@@ -194,11 +200,60 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_jump_to_trap_at(e.0);
 		}
 
+		// Emit handler stubs.
+		if (Trace.exception) Trace.OUT.put1("Generating %d handler stubs", handler_dest_info.length).ln();
+		var handlers = func.handlers;
+		for (i < handler_dest_info.length) {
+			// Dummy destinations do not need a stub.
+			if (handlers.handler_dests[i].is_dummy) {
+				if (Trace.compiler) Trace.OUT.put1("  handler stub #%d: DUMMY", i).ln();
+				continue;
+			}
+			var info = handler_dest_info[i];
+			handlers.handler_dests[i].dest_label = info.dest_label;
+			handlers.handler_dests[i].stub_label = info.stub_label;
+
+			// TODO: impl this; this is only null when not implemented on SPC side
+			// - delegate
+			if (info.stub_label == null) continue;
+			masm.bindLabel(info.stub_label);
+			X86_64MasmLabel.!(info.stub_label).label.pos -= int.view(before_code_bytes);
+			if (Trace.compiler) {
+				Trace.OUT.put1("  handler stub #%d:", i).ln();
+				Trace.OUT.put1("    stub offset=+%d", X86_64MasmLabel.!(info.stub_label).label.pos).ln();
+				Trace.OUT.put1("    end of func=%s", if(info.func_end, "true", "false")).ln();
+			}
+
+			if (info.func_end) {
+				if (Trace.compiler) Trace.OUT.put1("    moving %d values to ($vfp)", func.sig.results.length).ln();
+				for (to_slot < u32.!(func.sig.results.length)) {
+					var from_slot = to_slot + func.num_locals;
+					var sv = info.merge_state[to_slot];
+					var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
+					var tv = SpcVal(typeToKindFlags(func.sig.results[i]) | IS_STORED, NO_REG, 0);
+					resolver.addMove((to_slot, tv), (from_slot, fv));
+				}
+			} else {
+				for (slot < u32.!(info.merge_state.length)) {
+					var sv = info.merge_state[slot];
+					if (!sv.inReg()) continue;
+					var fv = SpcVal(sv.kindFlags(IS_STORED), NO_REG, sv.const);
+					var tv = SpcVal(sv.kindFlags(IN_REG), sv.reg, sv.const);
+					resolver.addMove((slot, tv), (slot, fv));
+				}
+			}
+			emit_reload_regs();
+			resolver.emitMoves();
+
+			masm.emit_br(info.dest_label);
+		}
+
 		// Emit OSR entry.
 		if (osr_state != null) {
 			osr_entry_label = masm.newLabel(osr_pc);
 			emitOsrEntry(osr_entry_label, osr_state);
 		}
+
 		if (success) {
 			// Metric collection
 			Metrics.spc_in_bytes.val += u32.view(func.orig_bytecode.length);
@@ -281,6 +336,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_mov_m_r(ValueKind.REF, frame.instance_slot, regs.instance);
 		// Clear FrameAccessor
 		masm.emit_mov_m_l(frame.accessor_slot, 0); // XXX: value kind
+		// Clear inlined whamm instance
+		if (SpcTuning.inlineSmallFunc && SpcTuning.intrinsifyWhammProbe) {
+			masm.emit_mov_m_l(frame.inlined_instance_slot, 0);
+		}
 
 		// Compute VFP = VSP - sig.params.length * SLOT_SIZE
 		masm.emit_mov_r_r(ValueKind.REF, regs.vfp, regs.vsp); // XXX: use 3-addr adjustment of VFP
@@ -310,10 +369,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		bailout(Strings.format1("unsupported opcode: %s", opcode.name));
 	}
 
-	def visitProbe() {
-		var b = func.orig_bytecode[it.pc];
+	def visitProbe(orig_op: Opcode) {
 		last_probe = it.pc;
-		if (b != Opcode.LOOP.code && b != Opcode.END.code) emitProbe();
+		if (orig_op != Opcode.LOOP && orig_op != Opcode.END) emitProbe();
 	}
 	def emitProbe() {
 		if (last_probe == 0) return;
@@ -412,7 +470,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var callee_func = WasmFunction.!(probe.func);
 
 		if (SpcTuning.inlineSmallFunc) {
-			// TODO: can reuse when implementing inlining for SPC
 			inline_config = InlineConfig(probe.spc_swap_membase, probe.spc_swap_instance, probe.spc_inline_func);
 			if (!probe.inline_heuristic_checked) {
 				inline_config = funcCanInline(callee_func.decl);
@@ -423,8 +480,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			}
 
 			if (inline_config.swap_instance) { // push whamm instance onto abstract stack directly
-				var whamm_instance_addr = Pointer.atObject(callee_func.instance) - Pointer.NULL;
-				masm.emit_mov_m_l(frame.inlined_instance_slot, whamm_instance_addr);
+				masm.emit_mov_r_Instance(regs.scratch, callee_func.instance);
+				masm.emit_mov_m_r(ValueKind.REF, frame.inlined_instance_slot, regs.scratch);
 			}
 
 			// overwrite mem0_base with whamm instance's memory base, restore from frame slot later
@@ -463,75 +520,88 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 					kind = ValueKind.REF.code;
 				}
 				Val(val) => {
-					var is_v128 = false;
-					var low: u64, high: u64;
 					match (val) {
 						I31(v) => {
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.REF);
-								masm.emit_mov_r_i(reg, i32.view(v));
+								masm.emit_mov_r_i(reg, i32.view(v) << 1);
 								state.push(KIND_REF | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, u64.view(v) << 1);
 							}
-							low = v;
 							kind = ValueKind.REF.code;
 						}
 						I32(v) => {
-							low = v;
-							if (inline_config.can_inline) state.push(KIND_I32 | IS_CONST, NO_REG, i32.view(v));
+							if (inline_config.can_inline) {
+								state.push(KIND_I32 | IS_CONST, NO_REG, i32.view(v));
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
+							}
 							kind = ValueKind.I32.code;
 						}
 						I64(v) => {
-							low = v;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.I64);
 								masm.emit_mov_r_l(reg, i64.view(v));
 								state.push(KIND_I64 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
 							}
 							kind = ValueKind.I64.code;
 						}
 						F32(v) => {
-							low = v;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.F32);
 								masm.emit_mov_r_f32(reg, v);
 								state.push(KIND_F32 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
 							}
 							kind = ValueKind.F32.code;
 						}
 						F64(v) => {
-							low = v;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.F64);
 								masm.emit_mov_r_d64(reg, v);
 								state.push(KIND_F64 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, v);
 							}
 							kind = ValueKind.F64.code;
 						}
 						V128(l, h) => {
-							low = l;
-							high = h;
-							is_v128 = true;
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.V128);
-								masm.emit_mov_r_q(reg, low, high);
+								masm.emit_mov_r_q(reg, l, h);
 								state.push(KIND_V128 | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_m_d(slot_addr, l);
+								masm.emit_mov_m_d(slot_addr.plus(8), h);
 							}
 							kind = ValueKind.V128.code;
 						}
 						Ref(v) => {
-							low = u64.view(Pointer.atObject(v) - Pointer.NULL);
 							if (inline_config.can_inline) {
 								var reg = allocRegTos(ValueKind.REF);
-								masm.emit_mov_r_l(reg, i64.view(low));
+								masm.emit_mov_r_Object(reg, v);
 								state.push(KIND_REF | IN_REG, reg, 0);
+							} else {
+								masm.emit_mov_r_Object(regs.scratch, v);
+								masm.emit_mov_m_r(ValueKind.REF, slot_addr, regs.scratch);
 							}
 							kind = ValueKind.REF.code;
 						}
-					}
-					if (!inline_config.can_inline) {
-						masm.emit_mov_m_d(slot_addr, low);
-						if (is_v128) {
-							masm.emit_mov_m_d(slot_addr.plus(8), high);
+						Cont(v) => {
+							if (inline_config.can_inline) {
+								var reg = allocRegTos(ValueKind.REF_U64);
+								masm.emit_mov_r_Cont(reg, v);
+								state.push(KIND_REF_U64 | IN_REG, reg, 0);
+							} else {
+								// TODO[stack-switching]: designated xmm scratch register
+								// masm.emit_mov_r_Cont(regs.scratch, v);
+								// asm.movdqu_m_s(slot_addr, regs.scratch)
+							}
+							kind = ValueKind.REF.code;
 						}
 					}
 				}
@@ -563,10 +633,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		var whamm_module = whamm_instance.module;
 		var whamm_func_decl = callee_func.decl;
 		if (inline_config.can_inline) {
-			var orig_decl = it.func;
-			var orig_pc = it.pc;
+			var prev_it = it;
+			it = BytecodeIterator.new().reset(whamm_func_decl);
 			var orig_module = module;
-			var orig_sig = sig;
 
 			// prepare spc for inlining
 			this.local_base_sp = u31.view(new_local_base_sp);
@@ -575,7 +644,6 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			this.sig = whamm_func_decl.sig;
 
 			// inline codegen
-			it.reset(this.func);
 			it.dispatchLocalDecls(this);
 			this.is_inlined = true;
 			if (Trace.compiler) Trace.OUT.puts("Start compiling inlined whamm probe").ln();
@@ -597,12 +665,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			if (Trace.compiler) Trace.OUT.puts("Finished compiling inlined whamm probe").ln();
 
 			// restore spc after inlining
-			it.reset(orig_decl).at(orig_pc);
+			it  = prev_it;
 			this.local_base_sp = 0;
 			this.is_inlined = false;
 			this.module = orig_module;
-			this.func = orig_decl;
-			this.sig = orig_sig;
+			this.func = it.func;
+			this.sig = it.func.sig;
 			masm.emit_mov_r_m(ValueKind.REF, regs.mem0_base, frame.mem0_base_slot);
 
 			// clear callee params/locals from abstract state
@@ -613,7 +681,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var tmp = allocTmp(ValueKind.REF);
 
 			// Load the target code/entrypoint.
-			masm.emit_mov_r_l(func_reg, Pointer.atObject(whamm_instance.functions[func_id]) - Pointer.NULL);
+			masm.emit_mov_r_Function(func_reg, whamm_instance.functions[func_id]);
 			masm.emit_v3_WasmFunction_decl_r_r(tmp, func_reg);
 			masm.emit_v3_FuncDecl_target_code_r_r(tmp, tmp);
 			// adjust vsp_reg to compute the "true" VSP, accounting for args to WhammProbe's WasmFunction
@@ -673,6 +741,8 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_TRY(btc: BlockTypeCode) {
 		var pr = btc.toAbstractBlockType(module);
 		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
+		var ctl_top = state.ctl_stack.peek();
+		ctl_top.catch_reset_state = Arrays.range(state.state, 0, int.view(state.sp));
 	}
 	def visit_THROW(tag_index: u31) {
 		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
@@ -896,10 +966,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			return;
 		}
 		var vsp_reg = allocTmpFixed(ValueKind.REF, regs.vsp);
-		var tmp = allocTmp(ValueKind.REF);
 		sv = popFixedReg(regs.func_arg);
+		var tmp = allocTmp(ValueKind.REF);
 		var func_reg = sv.reg;
-		
+
 		emitCallToReg(sig, func_reg, vsp_reg, tmp, true, tailCall);
 	}
 	def visit_DROP() {
@@ -911,28 +981,107 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_SELECT_T(val_types: Range<ValueTypeCode>) {
 		emitSelect(u32.!(val_types.length));
 	}
+	def visit_CATCH(tag_code: u31) {
+		var tag = module.tags[tag_code];
+		setupCatchBlock(Strings.format1("#%d", tag.tag_index), tag.fields);
+	}
+	def visit_CATCH_ALL() {
+		setupCatchBlock("all", []);
+	}
+	private def setupCatchBlock(tag_display: string, tag_fields: Array<ValueType>) {
+		var handler_id = getHandlerIndex(it.pc, 0);
+		var dest_id = func.handlers.handler_dest_map[handler_id];
+		var dest_label = masm.newLabel(it.pc);
+		var ctl_top = state.ctl_stack.peek();
+		// End the try or previous catch block with a xfer to the end.
+		if (Trace.compiler) Trace.OUT.puts("    xfer to try end").ln();
+		state.emitTransfer(ctl_top, resolver);
+		masm.emit_br(ctl_top.label);
+		// Load reset state from {try} block.
+		var new_sp = int.view(ctl_top.val_stack_top) + tag_fields.length;
+		var reset_state = Array<SpcVal>.new(new_sp);
+		Arrays.copyInto(ctl_top.catch_reset_state, reset_state, 0);
+		// Push tag fields onto stack.
+		for (i < tag_fields.length) {
+			var slot = int.view(ctl_top.val_stack_top) + i;
+			reset_state[slot] = SpcVal(typeToKindFlags(tag_fields[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+		state.resetTo(u32.view(new_sp), reset_state);
+		masm.bindLabel(dest_label);
+		if (Trace.compiler) {
+			Trace.OUT.put1("    catch tag[%s]", tag_display).ln();
+			Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
+		}
+		handler_dest_info[dest_id] = SpcHandlerInfo(false, false, dest_label, masm.newLabel(it.pc), reset_state);
+		// Reset reachability.
+		ctl_top.reachable = true;
+	}
 	def visit_TRY_TABLE(btc: BlockTypeCode, catches: Range<BpCatchCode>) {
+		// record reachable label positions for handler stub
+		var pos = it.pc;
+		for (i < catches.length) {
+			var depth = catches[i].getLabel();
+			var control = state.getControl(depth);
+			buildHandlerDest(control, pos, i);
+		}
+
 		var pr = btc.toAbstractBlockType(module);
 		state.pushBlock(pr.0, pr.1, masm.newLabel(it.pc));
+	}
+	// Given a control to xfer to, set up the {SpcHandlerInfo} and the merge.
+	def buildHandlerDest(control: SpcControl, pc: int, inline_index: int) {
+		if (Trace.compiler) Trace.OUT.put2("Building handler at pc=%d inline_index=%d", pc, inline_index).ln();
+		var handler_id = getHandlerIndex(pc, inline_index);
+		var dest_id = func.handlers.handler_dest_map[handler_id];
+		var info = handler_dest_info[dest_id];
+
+		// If target has not been reached via merge, populate with stack state which has everything
+		// in memory. Otherwise, there will be a processed {merge_state} that we can use directly.
+		if (control.merge_count == 0) {
+			control.merge_state = state.getInMemoryMergeWithArgs(int.view(control.val_stack_top), labelArgs(control));
+		}
+		control.merge_count++;
+
+		// {control != null} guarantees a non-dummy handler, in which case {dest_label == null} only when it's
+		// not yet visited.
+		if (info.dest_label == null) {
+			if (Trace.compiler) {
+				Trace.OUT.put2("    handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
+			}
+			handler_dest_info[dest_id] = SpcHandlerInfo(false, control.opcode == Opcode.RETURN.code, control.label, masm.newLabel(it.pc), control.merge_state);
+		}
+	}
+	def buildSwitchHandler(pc: int, inline_index: int) {
+		var handler_id = getHandlerIndex(pc, inline_index);
+		var dest_id = func.handlers.handler_dest_map[handler_id];
+		if (Trace.compiler) {
+			Trace.OUT.put2("    dummy handler dest #%d recorded (handler=#%d)", dest_id, handler_id).ln();
+		}
+		handler_dest_info[dest_id] = SpcHandlerInfo(true, false, null, null, null);
 	}
 	def emitSelect(valcount: u32) {
 		var sv = pop();
 		var base: u32 = state.sp - valcount*2;
 		if (sv.isConst()) {
-			// XXX: select K* K* v => K* if all constants match
 			if (sv.const != 0) {
 				// select a* b* T => a*
 			} else {
 				// select a* b* 0 => b*
 				for (i < valcount) {
-					var ti = base + i;
-					var fi = ti + valcount;
-					var fv = state.state[fi];
-					unrefSlot(ti);
-					if (fv.inReg()) regAlloc.reassign(fv.reg, int.!(fi), int.!(ti));
-					var tv = state.state[ti];
-					state.state[ti] = SpcVal(tv.kindFlagsAndTag(fv.flags & (IN_REG | IS_CONST)), fv.reg, fv.const);
+					var ti = base + i, fi = ti + valcount;
+					var tv = state.state[ti], fv = state.state[fi];
+					if (tv.sameValue(fv)) continue;
+					unrefSlot(ti); // unref any register of dropped true values
+					if (fv.inReg()) {
+						regAlloc.reassign(fv.reg, int.!(fi), int.!(ti));
+						state.state[ti] = SpcVal(tv.kindFlagsAndTag(fv.flags & (IN_REG | IS_CONST)), fv.reg, fv.const);
+					} else {
+						var tv = SpcVal(tv.kindFlagsAndTag(IS_STORED | (fv.flags & IS_CONST)), NO_REG, fv.const);
+						resolver.addMove((ti, tv), (fi, fv));
+						state.state[ti] = tv;
+					}
 				}
+				resolver.emitMoves();
 			}
 			dropN(valcount);
 			return;
@@ -943,8 +1092,7 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			var fi = ti + valcount;
 			var fv = state.state[fi];
 			var tv = state.state[ti];
-			if ((fv.reg != NO_REG && fv.reg == tv.reg)
-				|| (fv.isConst() && tv.isConst() && (fv.const == tv.const))) {
+			if (tv.sameValue(fv)) {
 				// no move necessary on either side
 				state.state[fi] = tv;
 				if (Trace.compiler) Trace.OUT.put1("    sp=%d: no move necessary", ti).ln();
@@ -1125,9 +1273,10 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, reg, reg, int.!(memory_index));
 		masm.emit_v3_Memory_start_r_r(r2, reg);
 		masm.emit_v3_Memory_limit_r_r(r1, reg);
+		def is64 = module.memories[memory_index].size.is64;
 		masm.emit_subw_r_r(r1, r2);
 		masm.emit_shrw_r_i(r1, 16); // TODO(custom-page-sizes): load the log2 of pagesize from decl
-		state.push(KIND_I32 | IN_REG, r1, 0);
+		state.push(if(is64, KIND_I64, KIND_I32) | IN_REG, r1, 0);
 	}
 	def visit_MEMORY_GROW(memory_index: u31) {
 		def is64 = module.memories[memory_index].size.is64;
@@ -1171,8 +1320,18 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		state.push(KIND_V128 | IN_REG, reg, 0);
 	}
 
+	// In most cases this does not need to be specialized for REF_U64 due to
+	// constant folding, and in those cases assigning a REF tag to a REF_U64
+	// still elicit correct behavior. However when performing an in-assembly
+	// value transfer to another stack without going through the runtime,
+	// constant values must be tagged with the right type as the tag will be
+	// copied over onto the other stack.
 	def visit_REF_NULL(ht_val: int) {
-		state.push(KIND_REF | IS_CONST, NO_REG, 0);
+		if (ht_val >= 0 && ContDecl.?(module.heaptypes[ht_val])) {
+			state.push(KIND_REF_U64 | IS_CONST, NO_REG, 0); // push a REF_U64
+		} else {
+			state.push(KIND_REF | IS_CONST, NO_REG, 0); // push a REF
+		}
 	}
 	def visit_REF_FUNC(func_index: u31) {
 		var reg = allocRegTos(ValueKind.REF);
@@ -1199,6 +1358,325 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_br_r(reg, MasmBrCond.REF_NULL, newTrapLabel(TrapReason.NULL_DEREF));
 			state.overwrite(sv.kindFlagsAndTag(IN_REG | (sv.flags & IS_STORED)), reg, 0);
 		}
+	}
+	// ext: stack-switching
+	def visit_CONT_NEW(cont_index: u31) {
+		var decl = ContDecl.!(module.heaptypes[cont_index]);
+		emit_call_runtime_op1n(Opcode.CONT_NEW, cont_index, 1, ValueTypes.ONE_CONTREF_TYPE, true);
+	}
+	def visit_CONT_BIND(in_cont_id: u31, out_cont_id: u31) {
+		var in_cont = ContDecl.!(module.heaptypes[in_cont_id]);
+		var out_cont = ContDecl.!(module.heaptypes[out_cont_id]);
+		var n_binds = u32.!(in_cont.sig.params.length - out_cont.sig.params.length);
+		emit_call_runtime_op2n(Opcode.CONT_BIND, in_cont_id, out_cont_id, n_binds + 1, ValueTypes.ONE_CONTREF_TYPE, true);
+	}
+	def visit_RESUME(cont_id: u31, handlers: Range<SuspensionHandler>) {
+		var pos = it.pc;
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
+				Switch(tag_index) => buildSwitchHandler(pos, i);
+			}
+		}
+
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var top = popReg();
+		var cont = allocTmp(ValueKind.REF_U64);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, top.reg);
+		masm.emit_validate_and_consume_cont(contStack, cont);
+
+		// transfer params to child stack
+		// XXX: not necessary to store the entire value stack to memory
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		var curStack = allocTmp(ValueKind.REF);
+		var nvals = allocTmp(ValueKind.REF);
+		var tmp0 = allocTmp(ValueKind.REF);
+		var tmp1 = allocTmp(ValueKind.REF);
+		var tmp2 = allocTmp(ValueKind.V128);
+
+		// call to transfer
+		emit_compute_vsp(regs.vsp, state.sp);
+		masm.emit_mov_r_i(nvals, cont_decl.sig.params.length);
+		masm.emit_cont_mv(vsp, contStack, nvals, tmp0, tmp1, tmp2);
+		dropN(u32.!(cont_decl.sig.params.length));
+		state.emitRestoreAll(resolver);
+
+		// context switch: store to old stack
+		masm.emit_get_curstack(curStack);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+
+		// reserve space for call addr
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_chain_cont_to_parent(curStack, contStack);
+
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
+		masm.bindLabel(end);
+	}
+	def visit_SUSPEND(tag_index: u31) {
+		var stub_suspend = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_i(regs.runtime_arg2, tag_index);
+		masm.emit_call_runtime_SUSPEND();
+
+		var sig_index = module.tags[tag_index].sig_index;
+		state.popArgsAndPushResults(SigDecl.!(module.heaptypes[sig_index]));
+		masm.emit_call_label(stub_suspend);
+
+		/* === PARENT STACK RUNNING === */
+
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_suspend}
+		masm.emit_br(end);
+		masm.bindLabel(stub_suspend); {
+			// load new stack pointers
+			masm.emit_get_curstack(regs.scratch);
+			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
+			// shorthands, so manually popping %rsp is needed
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			// pop and go to handler stack's stub
+			masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		masm.bindLabel(end);
+	}
+	def visit_SWITCH(target_cont_idx: u31, tag_index: u31) {
+		var stub_switch = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_i(regs.runtime_arg2, target_cont_idx);
+		masm.emit_mov_r_i(regs.runtime_arg3, tag_index);
+		masm.emit_call_runtime_SWITCH();
+
+		// unraveling all relevant signatures
+		var target_cont_decl = ContDecl.!(module.heaptypes[target_cont_idx]);
+		var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
+		var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
+
+		state.pop(); // target_cont
+		state.sp -= u32.view(target_cont_decl.sig.params.length - 1); // params to target_cont
+		state.pushResults(this_cont_decl.sig.params); // params to this_cont
+		masm.emit_call_label(stub_switch);
+
+		// /* === SUSPENDED === */
+
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_switch}
+		masm.emit_br(end);
+		masm.bindLabel(stub_switch); {
+			// load new stack pointers
+			masm.emit_get_curstack(regs.scratch);
+			// unlike fast-int, the ptr offset for RT calls is done outside of the `call_runtime_...`
+			// shorthands, so manually popping %rsp is needed
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			// pop and go to handler stack's stub
+			masm.emit_v3_X86_64Stack_rsp_r_r(regs.sp, regs.scratch);
+			masm.emit_pop_X86_64Stack_rsp_r_r(regs.scratch);
+			masm.emit_pop_r(ValueKind.REF, xenv.scratch);
+			masm.emit_jump_r(xenv.scratch);
+		}
+		masm.bindLabel(end);
+	}
+	def visit_RESUME_THROW(cont_id: u31, tag_id: u31, handlers: Range<SuspensionHandler>) {
+		var pos = it.pc;
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
+				Switch(tag_index) => buildSwitchHandler(pos, i);
+			}
+		}
+
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		var tag = module.tags[tag_id];
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var curStack = allocTmp(ValueKind.REF);
+
+		var cont = allocTmp(ValueKind.REF_U64);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(contStack, cont);
+
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
+		masm.emit_mov_r_i(regs.runtime_arg3, tag_id);
+		masm.emit_call_runtime_RESUME_THROW();
+		dropN(u32.!(tag.fields.length));
+		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
+		// XXX: make RT function return {Continuation} directly
+		state.push(KIND_REF_U64 | TAG_STORED | IS_STORED, NO_REG, 0);
+
+		/* === only reachable when continuation handles the error === */
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		// contStack = cont.cont
+		masm.emit_ref_from_ref_u64(contStack, cont);
+		// contStack = [cont == contObj].stack (since cont.cont is the Continuation object)
+		if (FeatureDisable.unboxedConts) masm.emit_v3_Continuation_stack_r_r(contStack, contStack);
+
+		// save %vsp to frame
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+
+		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+
+		// reserve space for call addr
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_chain_cont_to_parent(curStack, contStack);
+
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
+		masm.bindLabel(end);
+	}
+	def visit_RESUME_THROW_REF(cont_id: u31, handlers: Range<SuspensionHandler>) {
+		var pos = it.pc;
+		// record reachable label positions for handler stub
+		for (i < handlers.length) {
+			var handler = handlers[i];
+			match (handler) {
+				Suspend(tag_index, depth) => buildHandlerDest(state.getControl(depth), pos, i);
+				Switch(tag_index) => buildSwitchHandler(pos, i);
+			}
+		}
+
+		var stub_resume = masm.newLabel(it.pc), end = masm.newLabel(it.pc);
+		var cont_decl = ContDecl.!(module.heaptypes[cont_id]);
+		if (checkForConstNull(state.peek())) return;
+
+		var vsp = allocTmpFixed(ValueKind.REF, regs.vsp);
+		var curStack = allocTmp(ValueKind.REF);
+
+		var cont = allocTmp(ValueKind.REF_U64);
+		var contStack = allocTmp(ValueKind.REF);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		masm.emit_validate_and_consume_cont(contStack, cont);
+
+		popFixedReg(regs.runtime_arg3);
+		state.emitSaveAll(resolver, SpillMode.SAVE_AND_FREE_REGS);
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+		masm.emit_store_curstack_vsp(regs.vsp);
+		masm.emit_get_curstack(regs.runtime_arg0);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(regs.runtime_arg0, regs.sp);
+		masm.emit_push_X86_64Stack_rsp_r_r(regs.runtime_arg0);
+		emit_load_instance(regs.runtime_arg1);
+		masm.emit_mov_r_r(ValueKind.REF, regs.runtime_arg2, contStack);
+		masm.emit_call_runtime_RESUME_THROW_REF();
+		// {RT.runtime_handle_resume_throw} returns a {Continuation} by pushing onto the stack
+		// XXX: make RT function return {Continuation} directly
+		state.push(KIND_REF | TAG_STORED | IS_STORED, NO_REG, 0);
+
+		/* === only reachable when continuation handles the error === */
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+		masm.emit_mov_r_r(ValueKind.REF_U64, cont, popReg().reg);
+		// contStack = cont.cont
+		masm.emit_ref_from_ref_u64(contStack, cont);
+		// contStack = [cont == contObj].stack (since cont.cont is the Continuation object)
+		if (FeatureDisable.unboxedConts) masm.emit_v3_Continuation_stack_r_r(contStack, contStack);
+
+		// save %vsp to frame
+		emit_compute_vsp(regs.vsp, state.sp);
+		emit_spill_vsp(xenv.vsp);
+
+		// chain {contStack} to {curStack}, then set {m_curStack} to {cont.top}.
+		masm.emit_get_curstack(curStack);
+		masm.emit_v3_set_X86_64Stack_vsp_r_r(curStack, xenv.vsp);
+		masm.emit_v3_set_X86_64Stack_rsp_r_r(curStack, xenv.sp);
+
+		// reserve space for call addr
+		masm.emit_push_X86_64Stack_rsp_r_r(curStack);
+		masm.emit_chain_cont_to_parent(curStack, contStack);
+
+		masm.emit_call_label(stub_resume);
+		/* === CHILD STACK RUNNING === */
+
+		// clean up after stack switch
+		state.pushResults(cont_decl.sig.results);
+		emit_reload_regs();
+		state.emitRestoreAll(resolver);
+
+		// skip {stub_resume}
+		masm.emit_br(end);
+		masm.bindLabel(stub_resume);
+		masm.emit_switch_to_stack(contStack);
+		masm.bindLabel(end);
+	}
+	private def checkForConstNull(sv: SpcVal) -> bool {
+		if (sv.isConst() && sv.const == 0) {
+			emitTrap(TrapReason.NULL_DEREF);
+			setUnreachable();
+			return true;
+		}
+		return false;
 	}
 	def visit_STRUCT_NEW(struct_index: u31) {
 		var decl = StructDecl.!(module.heaptypes[struct_index]);
@@ -1400,8 +1878,9 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 	def visit_TABLE_COPY(tindex1: u31, tindex2: u31) {
 		emit_call_runtime_op2(Opcode.TABLE_COPY, tindex1, tindex2, true);
 	}
-	def visit_TABLE_GROW(index: u31) {
-		emit_call_runtime_op1n(Opcode.TABLE_GROW, index, 2, [ValueType.I32], false);
+	def visit_TABLE_GROW(table_index: u31) {
+		var t = if(module.tables[table_index].size.is64, SigCache.arr_l, SigCache.arr_i);
+		emit_call_runtime_op1n(Opcode.TABLE_GROW, table_index, 2, t, false);
 	}
 	def visit_TABLE_SIZE(table_index: u31) {
 		var tmp = allocTmp(ValueKind.REF);
@@ -1411,14 +1890,19 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		masm.emit_v3_Array_elem_r_ri(ValueKind.REF, tmp, tmp, int.!(table_index));
 		masm.emit_v3_Table_elems_r_r(tmp, tmp);
 		masm.emit_v3_Array_length_r_r(r1, tmp);
-		state.push(KIND_I32 | IN_REG, r1, 0);
+		def is64 = module.tables[table_index].size.is64;
+		state.push(if(is64, KIND_I64 | IN_REG, KIND_I32 | IN_REG), r1, 0);
 	}
 	def visit_TABLE_FILL(index: u31) {
 		emit_call_runtime_op1n(Opcode.TABLE_FILL, index, 3, ValueTypes.NONE, true);
 	}
+	def visit_I8X16_RELAXED_LANESELECT() { visit_V128_BITSELECT(); }
+	def visit_I16X8_RELAXED_LANESELECT() { visit_V128_BITSELECT(); }
+	def visit_I32X4_RELAXED_LANESELECT() { visit_V128_BITSELECT(); }
+	def visit_I64X2_RELAXED_LANESELECT() { visit_V128_BITSELECT(); }
 
 	def emit_call_runtime_op1(op: Opcode, arg1: u31, canTrap: bool) {
-		var count = u32.!(op.sig.params.length);		
+		var count = u32.!(op.sig.params.length);
 		emit_call_runtime_op1n(op, arg1, count, op.sig.results, canTrap);
 	}
 	def emit_call_runtime_op2(op: Opcode, arg1: u31, arg2: u31, canTrap: bool) {
@@ -1470,12 +1954,12 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 				setUnreachable();
 			}
 		} else if (emptyTransfer) {
-			if (sv.inReg()) masm.emit_br_r(sv.reg, cond, label);
+			if (sv.inReg()) emitBrIfR(sv, cond, label);
 			else masm.emit_br_m(masm.slotAddr(state.sp), cond, label);
 			if (repush.not_taken) state.pushV(sv);
 		} else {
 			var skip = masm.newLabel(it.pc);
-			if (sv.inReg()) masm.emit_br_r(sv.reg, masm.negate(cond), skip);
+			if (sv.inReg()) emitBrIfR(sv, masm.negate(cond), skip);
 			else masm.emit_br_m(masm.slotAddr(state.sp), masm.negate(cond), skip);
 			if (repush.taken) state.pushV(sv);
 			state.emitTransfer(target, resolver);
@@ -1483,6 +1967,16 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.bindLabel(skip);
 			if (repush.taken) state.pop();
 			if (repush.not_taken) state.pushV(sv);
+		}
+	}
+	// If {sv} is a REF_U64, extract the REF part into %scratch and condition on that.
+	// Asserts {sv.inReg()}.
+	def emitBrIfR(sv: SpcVal, cond: MasmBrCond, label: MasmLabel) {
+		if (sv.kind() == ValueKind.REF_U64) {
+			masm.emit_ref_from_ref_u64(xenv.scratch, sv.reg);
+			masm.emit_br_r(xenv.scratch, cond, label);
+		} else {
+			masm.emit_br_r(sv.reg, cond, label);
 		}
 	}
 	def emitBrTable(sv: SpcVal, depths: Range<u31>) {
@@ -1527,11 +2021,11 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			for (i < results.length) {
 				var rtag = ValueTypes.kind(results[i]);
 				if (i < params.length && rtag == ValueTypes.kind(params[i])) continue; // tag already correct
-				masm.emit_mov_m_i(masm.tagAddr(u32.view(i)), rtag.code);
+				masm.emit_mov_m_i(masm.tagAddr(state.sp - u32.view(results.length) + u32.view(i)), rtag.code);
 			}
 		}
-		// Compute VSP = VFP + sig.results.length
-		emit_compute_vsp(regs.vsp, u32.view(results.length));
+		// Compute VSP = VFP + state.sp
+		emit_compute_vsp(regs.vsp, state.sp);
 		// Return to caller
 		masm.emit_mov_r_i(regs.ret_throw, 0);
 		// Deallocate stack frame
@@ -1674,41 +2168,26 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emitLoad(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ())  {
-		var base_reg = regs.mem0_base;
-		if (imm.memory_index != 0) {
-			// XXX: cache the base register for memories > 0
-			base_reg = allocTmp(ValueKind.REF);
-			emit_load_instance(base_reg);
-			masm.emit_v3_Instance_memories_r_r(base_reg, base_reg);
-			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, base_reg, base_reg, imm.memory_index);
-			masm.emit_v3_Memory_start_r_r(base_reg, base_reg);
-		}
 		var iv = pop();
-		var index_reg: Reg;
-		var offset = imm.offset;
-		if (iv.isConst()) {
-			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
-			offset = u32.view(sum);
-		} else {
-			index_reg = ensureReg(iv, state.sp);
-		}
+		var addr = emitComputeEffectiveAddress(imm, iv);
+		if (addr.oob) return; // statically OOB
 		var dest = allocRegTos(kind); // XXX: can reuse index reg if frequency == 1 and ValueKind.I32
-		meth(kind, dest, base_reg, index_reg, u32.!(offset)); // TODO: memory64
+		meth(kind, dest, addr.base_reg, addr.index_reg, addr.offset);
+		var indexKind = if(addr.is64, ValueKind.I64, ValueKind.I32);
 		var nflags = IN_REG | SpcConsts.kindToFlags(kind);
-		if (kind == ValueKind.I32) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
+		if (kind == indexKind) nflags |= (iv.flags & TAG_STORED); // tag may already be stored for index
 		state.push(nflags, dest, 0);
 
-		if (intrinsified_read_probe != null) {
+		if (intrinsified_read_probe != null) { // TODO(memory64)
 			// spill everything
 			state.emitSaveAll(resolver, probeSpillMode);
-
+			var index_reg = addr.index_reg;
 			// load RT args (addr, val) and call RT
-			if (index_reg.index == 0) { // fixed addr
+			if (addr.index_reg == NO_REG) { // fixed addr
 				index_reg = allocTmp(ValueKind.I32);
-				masm.emit_mov_r_i(index_reg, i32.!(offset));
+				masm.emit_mov_r_i(index_reg, int.view(addr.offset));
 			} else {
-				masm.emit_addw_r_i(index_reg, i32.!(offset));
+				masm.emit_addw_r_i(index_reg, int.view(addr.offset));
 			}
 			var arg1 = masm.getV3ParamReg(ValueKind.REF, 1);
 			var arg2 = masm.getV3ParamReg(ValueKind.REF, 2);
@@ -1721,6 +2200,14 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		}
 	}
 	def emitStore(kind: ValueKind, imm: MemArg, meth: (ValueKind, Reg, Reg, Reg, u32) -> ()) {
+		var sv = popReg();
+		var iv = pop();
+		var addr = emitComputeEffectiveAddress(imm, iv);
+		if (addr.oob) return; // statically OOB
+		meth(kind, sv.reg, addr.base_reg, addr.index_reg, addr.offset);
+	}
+	def emitComputeEffectiveAddress(imm: MemArg, iv: SpcVal) -> EffectiveAddr {
+		var mdecl = module.memories[imm.memory_index];
 		var base_reg = regs.mem0_base;
 		if (imm.memory_index != 0) {
 			// XXX: cache the base register for memories > 0
@@ -1730,32 +2217,38 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			masm.emit_v3_Array_elem_r_ri(ValueKind.REF, base_reg, base_reg, imm.memory_index);
 			masm.emit_v3_Memory_start_r_r(base_reg, base_reg);
 		}
-		var offset = imm.offset;
-		var sv = popReg();
-		var iv = state.peek();
 		var index_reg: Reg;
-		if (iv.isConst()) {
-			var sum = u64.view(offset) + u32.view(iv.const); // fold offset calculation
-			if (sum > u32.max) return emitTrap(TrapReason.MEM_OUT_OF_BOUNDS); // statically OOB
-			offset = u32.view(sum);
-			pop();
-		} else {
-			index_reg = popReg().reg;
+		var offset = imm.offset;
+		var limit = if(mdecl.size.is64, Target.limit_memory_size_64, Target.limit_memory_size);
+		if (offset >= limit) {
+			emitTrap(TrapReason.MEMORY_OOB); // statically OOB
+			return OOB_ADDR;
 		}
-		meth(kind, sv.reg, base_reg, index_reg, u32.!(offset)); // TODO: memory64
-	}
-
-	def emitIntrinsifiedMemoryReadProbe() {
-		// spill everything
-		state.emitSaveAll(resolver, probeSpillMode);
-		// compute VSP for potential frame access
-		emit_compute_vsp(regs.vsp, state.sp);
-		emit_spill_vsp(regs.vsp);
-		masm.emit_store_curstack_vsp(regs.vsp);
-
-
-		emit_reload_regs();
-		if (!probeSpillMode.free_regs) state.emitRestoreAll(resolver);
+		if (iv.isConst()) {
+			offset += u32.view(iv.const); // fold offset calculation
+			if (offset >= limit) {
+				emitTrap(TrapReason.MEMORY_OOB); // statically OOB
+				return OOB_ADDR;
+			}
+		} else {
+			index_reg = ensureReg(iv, state.sp);
+			if (mdecl.size.is64 && !SpcTuning.disableMemoryBoundsChecks) {
+				// emit a bounds check of (index >> N) != 0
+				var shift_reg = allocTmp(ValueKind.I64);
+				masm.emit_mov_r_r(ValueKind.I64, shift_reg, index_reg);
+				masm.emit_shrw_r_i(shift_reg, 34); // TODO: compute shift amount from max memory size
+				var oob_label = newTrapLabel(TrapReason.MEMORY_OOB);
+				masm.emit_br_r(shift_reg, MasmBrCond.I64_NONZERO, oob_label); // XXX: on x86, shift sets flags
+			}
+		}
+		if (u32.?(offset)) {
+			return EffectiveAddr(false, mdecl.size.is64, base_reg, index_reg, u32.!(offset));
+		} else {
+			var sum_reg = allocTmp(ValueKind.I64);
+			masm.emit_mov_r_l(sum_reg, long.view(offset));
+			if (index_reg != NO_REG) masm.emit_addw_r_r(sum_reg, index_reg);
+			return EffectiveAddr(false, mdecl.size.is64, base_reg, sum_reg, 0);
+		}
 	}
 
 	//====================================================================
@@ -1900,8 +2393,46 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 		if (sv.isConst()) {
 			masm.emit_mov_r_k(kind, reg, sv.const);
 		} else if (sv.reg != NO_REG) {
-			masm.emit_mov_r_r(sv.kind(), reg, sv.reg);
+			masm.emit_mov_r_r(kind, reg, sv.reg);
 			regAlloc.unassign(sv.reg, int.!(state.sp));
+		} else {
+			masm.emit_mov_r_s(kind, reg, state.sp);
+		}
+		return SpcVal(sv.flags | IN_REG, reg, sv.const);
+	}
+	// Pop the top of stack into a register and prepare for it to be reused at {delta} slots.
+	def popRegToReuse(delta: int) -> SpcVal {
+		var sv = state.pop(), tos = int.!(state.sp);
+		if (regAlloc.frequency(sv.reg) == 1) {
+			regAlloc.reassign(sv.reg, tos, tos + delta);
+			return sv; // can reuse reg immediately
+		}
+		var kind = sv.kind();
+		var reg = allocReg(kind, u32.!(tos + delta));
+		if (sv.isConst()) {
+			masm.emit_mov_r_k(kind, reg, sv.const);
+		} else if (sv.reg != NO_REG) {
+			masm.emit_mov_r_r(kind, reg, sv.reg);
+			regAlloc.unassign(sv.reg, tos);
+		} else {
+			masm.emit_mov_r_s(kind, reg, state.sp);
+		}
+		return SpcVal(sv.flags | IN_REG, reg, sv.const);
+	}
+	// Pop the top of stack into a register, but only temporarily, as it will be clobbered.
+	def popTmpReg() -> SpcVal {
+		var sv = state.pop(), reg = sv.reg;
+		if (regAlloc.frequency(reg) == 1) { // can use register as a temporary
+			regAlloc.reassign(reg, int.!(state.sp), TMP_SLOT);
+			unrefLater(reg, TMP_SLOT);
+			return sv;
+		}
+		var kind = sv.kind();
+		reg = allocTmp(kind);
+		if (sv.isConst()) {
+			masm.emit_mov_r_k(kind, reg, sv.const);
+		} else if (sv.reg != NO_REG) {
+			masm.emit_mov_r_r(kind, reg, sv.reg);
 		} else {
 			masm.emit_mov_r_s(kind, reg, state.sp);
 		}
@@ -1943,6 +2474,13 @@ class SinglePassCompiler(xenv: SpcExecEnv, masm: MacroAssembler, regAlloc: RegAl
 			OUT.ln();
 		}
 	}
+	// Gets the handler ID of the <inline_index>-th handler declared at pc.
+	private def getHandlerIndex(pc: int, inline_index: int) -> int {
+		var start = Ranges.binarySearchEq<(int, Array<int>)>(
+			func.handlers.handler_pc_index_map, (pc, null), fun (a, b) => a.0 < b.0
+		);
+		return func.handlers.handler_pc_index_map[start].1[inline_index];
+	}
 }
 // Different branch instructions have different repush
 enum BrRepush(taken: bool, not_taken: bool) {
@@ -1959,10 +2497,14 @@ enum SpillMode(free_regs: bool, remember_stored: bool) {
 	SAVE_AND_FREE_REGS(true, true),		// save registers and free all registers
 }
 
-// Compiler representation of (abstract) values on the WebAssembly value stack,
-// including its {ValueKind}, whether the value is stored into the corresponding slot,
-// whether the value tag (if tags enabled) is stored into the slot, which if any
-// register holds its value, and which constant value, if any, it is.
+// Used for computing memory load/store addresses
+type EffectiveAddr(oob: bool, is64: bool, base_reg: Reg, index_reg: Reg, offset: u32) #unboxed;
+def OOB_ADDR = EffectiveAddr(true, false, NO_REG, NO_REG, 0);
+
+// Compiler representation of slots containing abstract values on the WebAssembly value stack,
+// including the {ValueKind}, whether the value is stored into value stack memory, whether the
+// value tag is stored into value stack memory, which if any register holds its value, and which
+// constant value, if any, it is.
 type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 	def kind() -> ValueKind {
 		return SpcConsts.kinds[flags >> 4];
@@ -1983,6 +2525,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 		return (flags & IS_STORED) != 0;
 	}
 	def isConst() -> bool {
+		if (kind() == ValueKind.REF_U64) return (flags & IS_CONST) != 0 && const == 0;
 		return (flags & IS_CONST) != 0;
 	}
 	def inReg() -> bool {
@@ -2000,6 +2543,11 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 	def notConst() -> SpcVal {
 		return SpcVal(flags & ~IS_CONST, reg, 0);
 	}
+	def sameValue(that: SpcVal) -> bool {
+		if (((this.flags & that.flags & IS_CONST) != 0) && this.const == that.const) return true;
+		if (((this.flags & that.flags & IN_REG) != 0) && this.reg == that.reg) return true;
+		return false;
+	}
 	def render(buf: StringBuilder, regSet: RegSet) -> StringBuilder {
 		match (kind()) {
 			I32 => buf.puts("i");
@@ -2008,6 +2556,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 			F64 => buf.puts("d");
 			V128 => buf.puts("v");
 			REF => buf.puts("r");
+			REF_U64 => buf.puts("c");
 		}
 		buf.put2("%s%s",
 			if(tagStored(), "T", ""),
@@ -2029,6 +2578,7 @@ type SpcVal(flags: byte, reg: Reg, const: int) #unboxed {
 			F64 => buf.puts("d");
 			V128 => buf.puts("v");
 			REF => buf.puts("r");
+			REF_U64 => buf.puts("c");
 		}
 		if (!buf.hasColor(Color.BOLD) && tagStored()) buf.puts("T");
 		if (!buf.hasColor(Color.UNDERLINE) && isStored()) buf.puts("S");
@@ -2054,6 +2604,11 @@ class SpcControl {
 	var merge_state: Array<SpcVal>;
 	// the state used to reset back to before the true branch of an if
 	var reset_state: Array<SpcVal>;
+	// the state (up to val_stack_top, excluding tag fields) to reset back to before catch
+	// XXX: merge with {reset_state}?
+	var catch_reset_state: Array<SpcVal>;
+	// true if a SPC handler stub has already been recorded for this block
+	var recorded_as_handler = false;
 
 	def clearMerge() {
 		merge_count = 0;
@@ -2133,6 +2688,19 @@ class SpcState(regAlloc: RegAlloc) {
 	def doFirstTransferAndGetMerge(valcount: u32, popcount: u32, resolver: SpcMoveResolver) -> Array<SpcVal> {
 		return SpcMerger.new(state, num_locals, sp, regAlloc, resolver).createMerge(valcount, popcount);
 	}
+	// Get a merge that contains the current stack up to {val_stack_top} plus {args}, all stored in memory.
+	def getInMemoryMergeWithArgs(val_stack_top: int, args: Array<ValueType>) -> Array<SpcVal> {
+		var merge = Array<SpcVal>.new(val_stack_top + args.length);
+		for (slot < val_stack_top) {
+			var flags = state[slot].kindFlags(IS_STORED | TAG_STORED);
+			merge[slot] = SpcVal(flags, NO_REG, 0);
+		}
+		for (i < args.length) {
+			var slot = val_stack_top + i;
+			merge[slot] = SpcVal(typeToKindFlags(args[i]) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+		return merge;
+	}
 	def pushIf(params: Array<ValueType>, results: Array<ValueType>, else_label: MasmLabel, end_label: MasmLabel) -> SpcControl {
 		var ctl = pushControl(Opcode.IF.code, params, results, end_label);
 		ctl.else_label = else_label;
@@ -2155,11 +2723,15 @@ class SpcState(regAlloc: RegAlloc) {
 			resetTo(max, ctl.merge_state);
 		} else {
 			// merge not reached; push "bottom" value for all results
+			regAlloc.clear();
 			sp = ctl.val_stack_top;
+			for (i < sp) { // XXX: we clear register allocation state mostly for debug.
+				var sv = state[i];
+				if ((sv.flags & IN_REG) != 0) state[i] = SpcVal(sv.flags & ~IN_REG, NO_REG, 0);
+			}
 			for (r in ctl.results) {
 				push(typeToKindFlags(r) | IS_STORED | TAG_STORED | IS_CONST, NO_REG, 0);
 			}
-
 		}
 	}
 	def isTransferEmpty(target: SpcControl) -> bool {
@@ -2238,17 +2810,10 @@ class SpcState(regAlloc: RegAlloc) {
 		sp = max;
 	}
 	private def pushControl(opcode: u16, params: Array<ValueType>, results: Array<ValueType>, label: MasmLabel) -> SpcControl {
-		var ctl = ctl_stack.next();
+		// XXX: reimplement {SpcControl} caching without breaking handler links
 		var reachable = if(ctl_stack.top > 0, ctl_stack.peek().reachable, true);
-		if (ctl != null) { // FAST: reuse previous SpcControl object
-			ctl_stack.top++;
-			ctl.clearMerge();
-			ctl.clearReset();
-			ctl.else_label = null;
-		} else { // allocate and cache new SpcControl object
-			ctl = SpcControl.new();
-			ctl_stack.push(ctl);
-		}
+		var ctl = SpcControl.new();
+		ctl_stack.push(ctl);
 		ctl.opcode = opcode;
 		ctl.label = label;
 		ctl.params = params;
@@ -2273,6 +2838,8 @@ class SpcState(regAlloc: RegAlloc) {
 		if (sp >= state.length) grow(8 + state.length * 2);
 		state[sp] = v;
 		this.sp++;
+		// TODO: check that if .reg is non-zero, IN_REG is true
+		// TODO: check that if .reg is non-zero, regalloc assignment includes top of stack
 	}
 	def get(slot: u32) -> SpcVal {
 		return state[slot];
@@ -2289,6 +2856,11 @@ class SpcState(regAlloc: RegAlloc) {
 	def popArgsAndPushResults(sig: SigDecl) {
 		sp -= u32.view(sig.params.length); // note: assume registers have been freed
 		for (t in sig.results) {
+			push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
+		}
+	}
+	def pushResults(results: Range<ValueType>) {
+		for (t in results) {
 			push(typeToKindFlags(t) | TAG_STORED | IS_STORED, NO_REG, 0);
 		}
 	}
@@ -2313,10 +2885,6 @@ class SpcState(regAlloc: RegAlloc) {
 	def setUnreachable() {
 		ctl_stack.peek().reachable = false;
 	}
-	def setNoReg(slot: u32) {
-		var b = state[slot];
-		state[slot] = SpcVal(b.flags & ~IN_REG, NO_REG, b.const);
-	}
 	def grow(nlength: int) {
 		state = Arrays.grow(state, nlength);
 	}
@@ -2339,6 +2907,7 @@ def typeToKindFlags(vt: ValueType) -> byte {
 		F32 => return KIND_F32;
 		F64 => return KIND_F64;
 		V128 => return KIND_V128;
+		Ref(_, ht) => return if (HeapType.Cont.?(ht), KIND_REF_U64, KIND_REF);
 		_ => return KIND_REF;
 	}
 }
@@ -2631,3 +3200,10 @@ def funcCanInline(decl: FuncDecl) -> InlineConfig {
 }
 
 type InlineConfig(swap_membase: bool, swap_instance: bool, can_inline: bool);
+
+// Used to record the entry point of exception/suspension handlers. Jumping to {stub_label} allows
+// control transfer to its corresponding handler without falling back to fast-int.
+//
+// The SPC emits a stub at {stub_label} for each handler in the function. The stub restores the
+// expected state of the environment, then jumps to {dest_label} to continue execution at handler.
+type SpcHandlerInfo(is_dummy: bool, func_end: bool, dest_label: MasmLabel, stub_label: MasmLabel, merge_state: Array<SpcVal>);

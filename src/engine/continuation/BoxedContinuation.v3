@@ -1,0 +1,32 @@
+// Copyright 2025 Wizard authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+class Continuation extends Object {
+	var stack: WasmStack;
+
+	new(stack) { }
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.puts("cont");
+	}
+}
+
+component Continuations {
+	def NULL: Continuation = null;
+	def valueKind = ValueKind.REF;
+
+	def isNull(cont: Continuation) -> bool { return cont == null; }
+	def isUsed(cont: Continuation) -> bool { return cont.stack == null; }
+	def setUsed(cont: Continuation) { cont.stack = null; }
+
+	def makeContinuation(stack: WasmStack) -> Continuation {
+		return Continuation.new(stack);
+	}
+
+	def continuationWithVersion(stack: WasmStack, version: u64) -> Continuation {
+		return makeContinuation(stack);
+	}
+
+	def getStoredStack(cont: Continuation) -> WasmStack { return cont.stack; }
+	def getStoredVersion(cont: Continuation) -> u64 { return 0; } // boxed cont does not store version
+}

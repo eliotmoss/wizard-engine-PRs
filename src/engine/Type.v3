@@ -90,12 +90,14 @@ component ValueTypes {
 	def I31REF_NONNULL = ValueType.Ref(false, HeapType.I31);
 	def FUNCREF_NONNULL = ValueType.Ref(false, HeapType.Func(null));
 	def ARRAYREF_NONNULL = ValueType.Ref(false, HeapType.Array(null));
+	def EXNREF_NONNULL = ValueType.Ref(false, HeapType.EXN);
 
 	def NONE = Array<ValueType>.new(0);
 	def NO_HEAPTYPES = Array<HeapType>.new(0);
 
 	def ONE_STRUCTREF_TYPE: Array<ValueType> = [STRUCTREF];
 	def ONE_ARRAYREF_TYPE: Array<ValueType> = [ARRAYREF];
+	def ONE_CONTREF_TYPE: Array<ValueType> = [CONTREF];
 
 	// Helper utility for a final signature type with no supertypes.
 	def newSig = SigDecl.new(true, NO_HEAPTYPES, _, _);
@@ -200,6 +202,7 @@ component ValueTypes {
 			F32 => return ValueKind.F32;
 			F64 => return ValueKind.F64;
 			V128 => return ValueKind.V128;
+			Ref(nullable, ht) => return if(HeapType.Cont.?(ht), Continuations.valueKind, ValueKind.REF);
 			_ => return ValueKind.REF;
 		}
 	}

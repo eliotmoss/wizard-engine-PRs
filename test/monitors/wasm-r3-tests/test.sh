@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -26,7 +26,7 @@ function run_fe_tests {
         testcase=$(basename "${file%.wasm}")
         echo "##+$testcase (frontend)"
         trace_file="${file%.*}.r3"
-        $WIZENG_CMD -colors=false '--monitors=r3{exclude=r3*}' $file | v3i $VIRGIL_LIB_UTIL/*.v3 validate-trace.v3 $trace_file
+        $WIZENG_CMD --colors=false '--monitors=r3{exclude=r3*}' $file | v3i $VIRGIL_LIB_UTIL/*.v3 validate-trace.v3 $trace_file
         if [ $? -ne 0 ]; then
             echo "##-fail"
         else

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -13,7 +13,7 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 make_wizeng || exit $?
 
 cd $HERE
-CMD="$WIZENG_LOC/$BINARY -colors=false"
+CMD="$WIZENG_LOC/$BINARY --colors=false"
 
 if [ $# -gt 0 ]; then
     MONITORS=($@)
@@ -25,7 +25,7 @@ else
         "hotness" "hotness{c}"
         "globals" 
         "memstats"
-        "profile_bytecode{switch_size=16}")
+	"profile_bytecode{switch_size=16}")
 fi
 
 # generate output files from all .wasm in a folder

@@ -38,7 +38,7 @@ class ExeTester(t: Tester, tiering: ExecutionStrategy) extends ModuleBuilder {
 		var err = ErrorGen.new(module.filename);
 		var v = CodeValidator.new(extensions, Limits.new().set(extensions), module, err);
 		tiering.onFuncValidationStart(module, func);
-		var r = v.validateFunc(func);
+		var r = v.validateFunc(func, 0);
 		tiering.onFuncValidationFinish(module, func, err);
 		match (r) {
 			Ok => ;
@@ -163,8 +163,8 @@ class ExeTester(t: Tester, tiering: ExecutionStrategy) extends ModuleBuilder {
 		var got = run(args).1;
 		match (got) {
 			Value(vals) => match (vals[0]) {
-				F32(bits) => if (Floats.isNan32(bits)) return;
-				F64(bits) => if (Floats.isNan64(bits)) return;
+				F32(bits) => if (FloatUtils.isNan32(bits)) return;
+				F64(bits) => if (FloatUtils.isNan64(bits)) return;
 				_ => ;
 			}
 			_ => ;

@@ -3,6 +3,9 @@
 
 // Parses and updates monitor options based on arguments.
 component MonitorOptions {
+	// Debug verification/check options.
+	def enableCheckMonitors = false;
+
 	var group = OptionsRegistry.newGroup("MONITOR", printHelp);
 	def CSV = group.newBoolOption("csv", false, "Enable comma-separated value output for monitors.");
 	def X_ = OptionsRegistry.addParseFunc(parse);
@@ -13,6 +16,12 @@ component MonitorOptions {
 	// if the argument was matched and parsed successfully.
 	def parse(arg: string, err: ErrorGen) -> bool {
 		if (!Strings.startsWith(arg, "--monitors=")) return false;
+
+		// Debug monitors.
+		if (enableCheckMonitors) {
+			if (!addMonitor("debug:stackChecker", null, err)) return false;
+		}
+
 		var s = 11, pos = s;
 		var inArg = false;
 		while (pos < arg.length) {
@@ -56,13 +65,13 @@ component MonitorOptions {
 			// to be instantiated for each application module.
 			var engine = Engine.new();
 			engine.extensions = Extension.set.all;
-			var tiering_override = if(SpcTuning.compileWhammModules, ExecuteOptions.getModeOrDefault("jit"));
+			var tiering_override = if(SpcTuning.compileWhammModules, ExecuteOptions.getModeOrDefault("jit"), ExecuteOptions.getModeOrDefault("int"));
 			var named_modules = Array<NamedModule>.new(moduleNames.length);
 			for (i < moduleNames.length) {
 				var name = moduleNames[i];
 				var module = engine.loadWasmFile(name, err, tiering_override, null);
 				if (err.error()) return false; // Something bad happened during load
-				var nm = NamedModule(PathUtil.extractName(name, false), module);
+				var nm = NamedModule(name, PathUtil.extractName(name, false), module);
 				named_modules[i] = nm;
 			}
 			monitors.put(WhammMonitor.new(named_modules));
@@ -86,15 +95,17 @@ component MonitorOptions {
 			match (args[pos]) {
 				',' => {
 					arg = Arrays.prepend('-', Arrays.range(args, s, pos));
-					entry.options.o.parseOption(arg);
+					var options = entry.options.o;
+					options.setOption(options.parseOption(arg));
 					s = ++pos;
 				}
 				_ => pos++;
 			}
 		}
 		if (s < args.length) {
-			arg =Arrays.prepend('-', Arrays.range(args, s, args.length));
-			var result = entry.options.o.parseOption(arg);
+			arg = Arrays.prepend('-', Arrays.range(args, s, args.length));
+			var options = entry.options.o;
+			var result = options.setOption(options.parseOption(arg));
 		}
 	}
 	// Get the monitors, if any, configured by the above.
@@ -104,7 +115,7 @@ component MonitorOptions {
 	def printHelp(out: TraceBuilder) {
 		var H = out.putsln, L = out.ln;
 		H("Wizard offers instrumentation and dynamic analyses of Wasm programs via monitors.");
-		H("Multiple monitors can enabled simultaneously using the command-line flag.");
+		H("Multiple monitors can be enabled simultaneously using the command-line flag.");
 		L();
 		H("   --monitors=<monitor>{<opts>}[,<monitor>{<opts>}]");
 		L();
@@ -122,13 +133,11 @@ component MonitorOptions {
 		H("Example usage:");
 		L();
 		H("   --monitors=loops,coverage{code=instr}");
-		out.ln();
 
 		L();
-		H("A Whamm monitor can also be used, which is provided as a path to a Wasm module.");
-		H("If the module must be dynamically linked with support libraries, append paths to");
-		H("those libraries delimited with '+'.");
-		H("The Whamm monitor module should come FIRST in this list.");
+		H("Wizard also supports Whamm monitors in the form of Wasm modules and supports");
+		H("dynamically linking monitor modules together by specifying their paths joined ");
+		H("with the '+' character, with the monitor module first in the list.");
 		L();
 		H("Example usage:");
 		L();

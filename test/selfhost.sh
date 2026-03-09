@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -18,7 +18,7 @@ GUEST_WIZENG=$BINARY
 
 cd $WIZENG_LOC
 
-CMD="$HOST_WIZENG $GUEST_WIZENG -expected=$WIZENG_TEST/unittest.failures -expected=$WIZENG_TEST/unittest.failures.wasm"
+CMD="$HOST_WIZENG $GUEST_WIZENG --expected=$WIZENG_TEST/unittest.failures --expected=$WIZENG_TEST/unittest.failures.wasm"
 
 print_testing
 

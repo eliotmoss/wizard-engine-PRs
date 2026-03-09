@@ -5,15 +5,18 @@
 // memories and the execution strategy. The {V3} target (this file) provides a pure-Virgil
 // interpreter-only mode suitable (but slow) for any compilation target.
 component Target {
-	def limit_memory_pages = 30000u;
+	def limit_memory_size = 30000uL * 0x1_0000u;
+	def limit_memory_size_64 = 30000uL * 0x1_0000u;
+	
 	def newMemory = V3Memory.new;
 	def newWasmStack = V3Interpreter.new;
 	var unused_ = ExecuteOptions.registerDefaultMode("v3-int", V3InterpreterOnlyStrategy.new(), "slow interpreter only");
 
-	def forceGC() { } // nop
-	def ticksNs() -> u64 { return u32.view(System.ticksNs()); }
-	def rdtsc() -> u64 { return u32.view(System.ticksNs()); }
-	def getRdtsc() -> (void -> u64) { return rdtsc; }
+	def forceGC() { }	// nop
+	def ticksNs() => u64.view(u32.view(System.ticksNs()));
+	def rdtsc() => u64.view(u32.view(System.ticksNs()));
+	def getRdtsc() => rdtsc;
+
 	def pregenIntoFile(filename: string) -> ErrorBuilder {
 		return ErrorBuilder.new().puts("interpreter generator: nothing to generate for this target");
 	}
@@ -55,21 +58,7 @@ class V3InterpreterOnlyStrategy extends ExecutionStrategy {
 			//   terminates.
 			// - Switches the current stack based on the stack switch request
 			//   in the execution `Result`.
-
-			// Runs the stack until a result is produced.
-			var r: Result;
-			var state = stack.state();
-			if (Trace.stack) Trace.OUT.put1("resume[state=%s]", state.name).ln();
-			match (state) {
-				RESUMABLE => r = stack.resume();
-				THROWING => r = stack.clearAndThrow();
-				_ => {
-					var msg = Strings.format1("unexpected state %s", state.name);
-					return Result.Throw(Trap.new(TrapReason.INVALID_RESUME, msg, null));
-				}
-			}
-
-			match (r) {
+			match (stack.resume()) {
 				// The stack terminated. If there is no parent stack in the
 				// execution stack chain, return the values as the result.
 				// Otherwise add the values to the stack.
@@ -83,13 +72,8 @@ class V3InterpreterOnlyStrategy extends ExecutionStrategy {
 					stack.onChildTerminate(vals);
 				}
 				Throw(thrown) => {
-					if (Trace.stack) Trace.OUT.put1("throw %q", thrown.render).ln();
-					if (stack.parent == null) {
-						if (cached_stack == null) cached_stack = stack;
-						return Result.Throw(thrown);
-					}
-					stack = popStackInChain(stack);
-					stack.onChildThrow(thrown);
+					if (cached_stack == null) cached_stack = stack;
+					return Result.Throw(thrown);
 				}
 				Switch(new_stack) => stack = V3Interpreter.!(new_stack);
 			}
@@ -113,3 +97,4 @@ type TargetFrame(frame: V3Frame) #unboxed {
 		return frame.accessor;
 	}
 }
+class TargetHandlerDest(is_dummy: bool) { }

@@ -18,7 +18,8 @@
 class BackendRegion {
 	def range: Range<byte>;  // The actual bytes of the region
 	def backend: TxnRegionBackend;  // Reference to the backend that created this
-	var mapping: Mapping;  // Keeps the Mapping alive so GC finalizer doesn't unmap prematurely
+// Mapping exists only on certain targets
+//	var mapping: Mapping;  // Keeps the Mapping alive so GC finalizer doesn't unmap prematurely
 	
 	new(range, backend) { }
 	
@@ -103,6 +104,7 @@ class VolatileBackend extends TxnRegionBackend {
 }
 
 // Mmap-based memory backend (platform-independent, uses POSIX mmap)
+/* must be restricted to specific platforms, e.g., x86-64-linux
 class MmapBackend extends TxnRegionBackend {
 	def allocate(size: u64, prot: int) -> BackendRegion {
 		var mmapProt = convertProt(prot);
@@ -152,11 +154,12 @@ class MmapBackend extends TxnRegionBackend {
 		return mmapProt;
 	}
 }
+*/
 
 // Global instances of platform-independent backends
 component Backends {
 	private var volatileBackend: VolatileBackend;
-	private var mmapBackend: MmapBackend;
+//	private var mmapBackend: MmapBackend;
 	
 	def getVolatile() -> TxnRegionBackend {
 		if (volatileBackend == null) {
@@ -165,11 +168,14 @@ component Backends {
 		return volatileBackend;
 	}
 	
+	def getMmap() -> TxnRegionBackend;
+/* must be restricted to specific back ends, e.g., x86-64-linux
 	def getMmap() -> TxnRegionBackend {
 		if (mmapBackend == null) {
 			mmapBackend = MmapBackend.new();
 		}
 		return mmapBackend;
 	}
+*/
 }
 

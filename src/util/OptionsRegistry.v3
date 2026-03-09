@@ -5,12 +5,12 @@
 // which is used to print out help for all command-line options.
 component OptionsRegistry {
 	def ALL = BasicOptions.new();
-//	def ALL = BasicOptions.new(null);
+	private var unused_ = ALL.numHyphens = 2;
 	var groups: List<(OptionGroup, TraceBuilder -> void)>;
 	var funcs: List<(string, ErrorGen) -> bool>;
 
 	def newGroup(name: string, printHelp: TraceBuilder -> void) -> OptionGroup {
-		var g = OptionGroup.new(name, ALL);
+		var g =OptionGroup.new(name, ALL);
 		groups = List.new((g, printHelp), groups);
 		return g;
 	}
@@ -33,7 +33,6 @@ component OptionsRegistry {
 	}
 	def parse(arg: string, err: ErrorGen) -> bool {
 		if (ALL.setOption(ALL.parseOption(arg))) return true;
-//		if (ALL.parseOption(arg)) return true;
 		for (l = funcs; l != null; l = l.tail) {
 			if (l.head(arg, err)) return true;
 		}
@@ -45,13 +44,6 @@ component OptionsRegistry {
 			if (a == null || a.length < 1 || a[0] != '-') continue;
 			if (parse(a, err)) args[i] = null;
 		}
-	}
-	def matchesPrefixWithOptionalEquals(arg: string, prefix: string) -> (bool, Range<byte>) {
-		if (!Strings.startsWith(arg, prefix)) return (false, null);
-		var sub = arg[prefix.length ...];
-		if (sub.length == 0) return (true, null);
-		if (sub.length > 0 && sub[0] == '=') return (true, sub[1 ...]);
-		return (false, null);
 	}
 }
 
@@ -98,7 +90,7 @@ class OptionGroup(name: string, o: BasicOptions) {
 	def addAlias<T>(opt: Option<T>, alias: string) -> Option<T> {
 		for (l = list; l != null; l = l.tail) {
 			if (Option<T>.?(l.head.opt) && Option<T>.!(l.head.opt) == opt) {
-				l.head.display_name = Strings.format2("%s|%s", l.head.display_name, alias);
+				l.head.displayName = Strings.format2("%s|%s", l.head.displayName, alias);
 				var new_opt = o.newOption(alias, opt.init, opt.parseFun);
 				new_opt.onSet(syncOptionSet(_, opt.onSetFun, opt));
 				opt.onSet(syncOptionSet(_, opt.onSetFun, new_opt));
@@ -110,17 +102,19 @@ class OptionGroup(name: string, o: BasicOptions) {
 	def parseEmpty(str: string) -> bool {
 		return str == null;
 	}
-	def print(buf: StringBuilder, is_monitor_opt: bool) {
+	def print(buf: StringBuilder, isMonitorOpt: bool) {
 		for (l = Lists.reverse(list); l != null; l = l.tail) {
 			var t = l.head;
-			if (is_monitor_opt) {
-				buf.put3("                      {%s%s} %s\n", t.display_name, t.type_name, t.help);
+			if (isMonitorOpt) {
+				buf.put3("                      {%s%s} %s\n", t.displayName, t.typeName, t.help);
 			} else {
-				buf.put2("    -%s%s\n", t.display_name, t.type_name);
+				buf.puts("    ");
+				for (i < o.numHyphens) buf.putc('-');
+				buf.puts(t.displayName).puts(t.typeName).ln();
 				buf.put1("        %s\n", t.help);
 			}
 		}
-		if (!is_monitor_opt) buf.ln();
+		if (!isMonitorOpt) buf.ln();
 	}
 }
 
@@ -134,4 +128,4 @@ def setFlag(str: string, onParse: string -> void) -> bool {
 	return str == null || Strings.equal(str, "true");
 }
 
-class OptionGroupEntry(opt: Opt, var display_name: string, type_name: string, help: string) {}
+class OptionGroupEntry(opt: Opt, var displayName: string, typeName: string, help: string) { }

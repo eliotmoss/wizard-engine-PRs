@@ -6,7 +6,7 @@ component X86_64MasmRegs {
 	// local state used during building of {SET} and {CONFIG}
 	def NO_REG = Reg(0);
 	private def GPRS = Array<X86_64Gpr>.new(256);	// fast mapping byte -> GPR
-	private def XMMS = Array<X86_64Xmmr>.new(256);	// fast mapping byte -> XMM
+	def XMMS = Array<X86_64Xmmr>.new(256);	// fast mapping byte -> XMM
 	private var all = Vector<Reg>.new().grow(32).put(NO_REG);
 	private var ints = Vector<Reg>.new().grow(16);
 	private var floats = Vector<Reg>.new().grow(16);
@@ -61,6 +61,7 @@ component X86_64MasmRegs {
 	def CONFIG = (fun() -> RegConfig {
 		var config = RegConfig.new(SET);
 		config.vfp = R11;
+		config.sp = RSP;
 		config.scratch = RBP;
 
 		var poolMap = PoolMap.new(SET, 2);
@@ -81,6 +82,7 @@ component X86_64MasmRegs {
 		poolMap.kindToPool[ValueKind.F64.tag] = 1;
 		poolMap.kindToPool[ValueKind.V128.tag] = 1;
 		poolMap.kindToPool[ValueKind.REF.tag] = 0;
+		poolMap.kindToPool[ValueKind.REF_U64.tag] = 1;
 
 		config.poolMap = poolMap;
 		return config;

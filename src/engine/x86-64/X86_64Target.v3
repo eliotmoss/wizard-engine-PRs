@@ -8,15 +8,19 @@ def MMAP_RETRIES = 1;
 def REDZONE_RETRIES = 1;
 // Contains target-specific factory functions.
 component Target {
-	def V3_PARAM_GPRS = [X86_64Regs.RDI, X86_64Regs.RSI, X86_64Regs.RDX, X86_64Regs.RCX, X86_64Regs.R8, X86_64Regs.R9]; 		// System-V
-	def V3_RET_GPRS = [X86_64Regs.RAX, X86_64Regs.RDX, X86_64Regs.RCX, X86_64Regs.RSI]; 			// System-V + 2
+	def V3_PARAM_GPRS = X86_64MasmRegs.PARAM_GPRS; // System-V
+	def V3_RET_GPRS = X86_64MasmRegs.RET_GPRS; // System-V + 2
 
-	def limit_memory_pages = 65536u;
-	def newMemory = X86_64Memory.new;
+	def limit_memory_size = 0x1_0000uL * 0x1_0000uL;
+	def limit_memory_size_64 = 0x4_0000uL * 0x1_0000uL;
+
+	def newMemory = NativeWasmMemory.new;
 	def forceGC = RiGc.forceGC;
 	def newWasmStack = X86_64StackManager.getFreshStack;
 	def recycleWasmStack = X86_64StackManager.recycleStack;
 	def tagging = Tagging.new(!FeatureDisable.valueTags, !FeatureDisable.simd);
+
+	private var offsets: V3Offsets;
 
 	new() {
 		if (!SpcTuning.disable) {
@@ -29,6 +33,11 @@ component Target {
 			"use fast interpreter only");
 		Instrumentation.probes.onEnable = X86_64Interpreter.onProbeEnable;
 		Instrumentation.probes.onDisable = X86_64Interpreter.onProbeDisable;
+	}
+
+	def getOffsets() -> V3Offsets {
+		if (offsets == null) offsets = V3Offsets.new();
+		return offsets;
 	}
 
 	def getTestTiers() -> List<(string, ExecutionStrategy)> {
@@ -144,12 +153,20 @@ component Target {
 type TargetOsrInfo(spc_entry: Pointer, osr_entries: List<(int, int)>) #unboxed { }
 type TargetCode(spc_entry: Pointer) #unboxed { }
 type TargetModule(spc_code: X86_64SpcModuleCode) #unboxed { }
+// TODO: immutable cache for frame accessor
 type TargetFrame(sp: Pointer) #unboxed {
 	def getFrameAccessor() -> X86_64FrameAccessor {
 		return X86_64Stacks.getFrameAccessor(sp);
 	}
 }
 type SpcResultForStub(wf: WasmFunction, entrypoint: Pointer, thrown: Throwable) #unboxed { }
+class TargetHandlerDest(is_dummy: bool) {
+	var stub_label: MasmLabel;
+	var dest_label: MasmLabel;
+
+	// Full signature of the stack at dest.
+	var dest_stack: Array<ValueType>;
+}
 
 class X86_64ExecutionStrategy extends ExecutionStrategy {
 	// Call a function with arguments and return a result.
@@ -163,6 +180,9 @@ class X86_64ExecutionStrategy extends ExecutionStrategy {
 	def onTestModule(module: Module) {
 		Target.setTieredEntrypoint(module);
 	}
+	def disableLazyNameDecodingDuringGC(module: Module) {
+		if (module.names != null) module.names.lazyDecodeDisabled = RiGc.inGC;
+	}
 }
 
 // One tier: fast-int, modules require no pre-processing.
@@ -171,6 +191,9 @@ class X86_64InterpreterOnlyStrategy extends X86_64ExecutionStrategy {
 		return X86_64StackManager.runOnFreshStack(func, args);
 	}
 
+	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
+		disableLazyNameDecodingDuringGC(module);
+	}
 	def onFuncValidationFinish(module: Module, func: FuncDecl, err: ErrorGen) {
 		if (err != null && !err.ok()) return;
 		Target.setUnconditionalInterpreterEntryIfMultiTier(func);
@@ -262,6 +285,7 @@ class X86_64SpcAotStrategy(interpreter_fallback: bool) extends X86_64SpcStrategy
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		// defer compilation for AOT mode until after monitors have been installed
 		if (!hasMonitors) compileEntireModule(module, size, interpreter_fallback, err, 1024);
+		disableLazyNameDecodingDuringGC(module);
 	}
 	// Called after monitors have processed a module.
 	def onMonitorsFinish(module: Module, err: ErrorGen) {
@@ -340,6 +364,7 @@ class X86_64SpcLazyStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		installStubForModule(module, X86_64Spc.setLazyCompileFor);
+		disableLazyNameDecodingDuringGC(module);
 	}
 	// Called before a test function is run.
 	def onTestRun(wf: WasmFunction, err: ErrorGen) { // TODO: move this to onFuncValidationFinish
@@ -354,6 +379,16 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 	// Called after a module is parsed.
 	def onModuleFinish(module: Module, size: u32, err: ErrorGen) {
 		installStubForModule(module, X86_64Spc.setTierUpFor);
+		disableLazyNameDecodingDuringGC(module);
+		if (Debug.runtime) {
+			for (i < module.functions.length) {
+				var func = module.functions[i];
+				Trace.OUT.put2(
+					"Compiled function #%d: addr(target_code) = 0x%x", i,
+					Pointer.atObject(func) + Target.getOffsets().FuncDecl_target_code - Pointer.NULL
+				).ln();
+			}
+		}
 	}
 	// Called before a test function is run.
 	def onTestRun(wf: WasmFunction, err: ErrorGen) {
@@ -384,6 +419,7 @@ class X86_64DynamicStrategy extends X86_64SpcStrategy {
 		if (Trace.compiler) Trace.OUT.put3("func[%d].osr_entry (+%d): break *0x%x", wf.decl.func_index, pc, (entrypoint + offset) - Pointer.NULL).ln();
 		if (X86_64Interpreter.inCode(wf.decl.target_code.spc_entry)) {
 			// Install code into function if its entrypoint still goes to interpreter
+			if (Debug.runtime) Trace.OUT.put2("Installing code [0x%x, 0x%x)", entrypoint - Pointer.NULL, entrypoint + codeSize - Pointer.NULL).ln();
 			Target.setTargetCode(wf.decl, entrypoint, entrypoint + codeSize);
 		}
 		// Reset tierup trigger to recompile right away (e.g. other activations stuck in loop).
@@ -413,7 +449,7 @@ def allocateCodeForModule(module: Module, codeSize: int) {
 }
 
 def applyJitFilter(module: Module, func: FuncDecl, how: string) -> bool {
-	var filter = EngineOptions.JIT_FILTER.get();
+	var filter = CompilerOptions.JIT_FILTER.get();
 	if (filter == null || filter.matches(module, func)) return true;
 	if (Trace.compiler) Trace.OUT.put2("func[%d] %s compile suppressed by filter", func.func_index, how).ln();
 	return false;

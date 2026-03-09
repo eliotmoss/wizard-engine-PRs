@@ -10,9 +10,11 @@ component SigCache {
 	def arr_ii: Array<ValueType> = [ValueType.I32, ValueType.I32];
 	def arr_iii: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32];
 	def arr_iiii: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32];
+	def arr_iiil: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I64];
 	def arr_iiiii: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32];
 	def arr_iiiiii: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32];
 	def arr_iiiiiii: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32];
+	def arr_iiiiiiii: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32, ValueType.I32];
 	def arr_ili: Array<ValueType> = [ValueType.I32, ValueType.I64, ValueType.I32];
 	def arr_il: Array<ValueType> = [ValueType.I32, ValueType.I64];
 	def arr_llllll: Array<ValueType> = [ValueType.I64, ValueType.I64, ValueType.I64, ValueType.I64, ValueType.I64, ValueType.I64];
@@ -37,6 +39,7 @@ component SigCache {
 	def arr_rrr: Array<ValueType> = [ValueTypes.ANYREF, ValueTypes.ANYREF, ValueTypes.ANYREF];
 	def arr_r: Array<ValueType> = [ValueTypes.ANYREF];
 	def arr_g: Array<ValueType> = [ValueTypes.FUNCREF];
+	def arr_iig: Array<ValueType> = [ValueType.I32, ValueType.I32, ValueTypes.FUNCREF];
 
 	def arr_ll: Array<ValueType> = [ValueType.I64, ValueType.I64];
 	def arr_l: Array<ValueType> = [ValueType.I64];
@@ -61,6 +64,8 @@ component SigCache {
 
 	def arr_c: Array<ValueType> = [ValueTypes.CONTREF];
 
+	private def S = Canon.sigPR;
+
 	// Very commonly used signatures.
 	def v_v = S(arr_v, arr_v);
 
@@ -80,6 +85,8 @@ component SigCache {
 	def iii_i = S(arr_iii, arr_i);
 	def iii_v = S(arr_iii, arr_v);
 	def iiii_v = S(arr_iiii, arr_v);
+	def iiil_i = S(arr_iiil, arr_i);
+	def iiil_l = S(arr_iiil, arr_l);
 	def iiii_i = S(arr_iiii, arr_i);
 	def iiii_l = S(arr_iiii, arr_l);
 	def iiiii_i = S(arr_iiiii, arr_i);
@@ -87,6 +94,7 @@ component SigCache {
 	def iiiiii_i = S(arr_iiiiii, arr_i);
 	def iiiiii_l = S(arr_iiiiii, arr_l);
 	def iiiiiii_i = S(arr_iiiiiii, arr_i);
+	def iiiiiiii_l = S(arr_iiiiiiii, arr_l); 
 	def ii_v = S(arr_ii, arr_v);
 	def il_v = S(arr_il, arr_v);
 	def if_v = S(arr_if, arr_v);
@@ -143,6 +151,7 @@ component SigCache {
 	def e_i = S(arr_e, arr_i);
 	def g_i = S(arr_g, arr_i);
 	def i_g = S(arr_i, arr_g);
+	def iig_i = S(arr_iig, arr_i);
 
 	def r_i = S(arr_r, arr_i);
 	def r_r = S(arr_r, arr_r);
@@ -178,10 +187,4 @@ component SigCache {
 
 	def x_v = S(arr_x, arr_v);
 	def v_x = S(arr_v, arr_x);
-
-	private def S(params: Array<ValueType>, results: Array<ValueType>) -> SigDecl {
-		var sig = SigDecl.new(true, ValueTypes.NO_HEAPTYPES, params, results);
-		Canon.globalCache.insert(sig);
-		return sig;
-	}
 }

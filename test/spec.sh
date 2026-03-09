@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
-  HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+   HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
   SOURCE="$(readlink "$SOURCE")"
   [[ $SOURCE != /* ]] && SOURCE="$HERE/$SOURCE"
 done
@@ -15,19 +15,26 @@ if [ "$PROPOSALS" = "" ]; then
     PROPOSALS=spec
 fi
 
-make_binary spectest || exit $?
+make_binary wizeng || exit $?
+
+IGNORE_MEMORY64=0
 
 function run {
     p=$1
     cd $WIZENG_LOC
 
-    TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast')
-
-    if [[ "$p" != "spec" && "$p" != "" ]]; then
-	EXT_OPTS="-ext:$p"
+    if [[ "$p" = spec && "$IGNORE_MEMORY64" = 1 && "$TEST_TARGET" = "x86-64-linux" ]]; then
+        # TODO: remove workaround for incomplete memory64 support on x86-64-linux
+        TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast' | grep -v memory64)
+    else
+        TESTS=$(find test/wasm-spec/bin/$p -name '*.bin.wast')
     fi
 
-    run_batched $BATCHING "$WIZENG_LOC/bin/spectest.$TEST_TARGET $WIZENG_OPTS $EXT_OPTS" $TESTS
+    if [[ "$p" != "spec" && "$p" != "" ]]; then
+	EXT_OPTS="--ext:$p"
+    fi
+
+    run_batched $BATCHING "$WIZENG_LOC/bin/wizeng.$TEST_TARGET $WIZENG_OPTS $EXT_OPTS" $TESTS
 }
 
 FAIL=0

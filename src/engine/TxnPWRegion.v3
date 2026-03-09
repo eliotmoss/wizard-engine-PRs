@@ -98,7 +98,7 @@ type BlockTableHandle(addr: Pointer, size: u64) #unboxed {
 	def [n: i64] -> BlockEntryHandle {
 		return if(
 			u64.view(n) < size, 
-			BlockEntryHandle(addr + n * BlockEntry.size), 
+			BlockEntryHandle(addr + n * i64.!(BlockEntry.size)), 
 			BlockEntryHandle(Pointer.NULL));
 	}
 }

@@ -1,11 +1,17 @@
 // Copyright 2021 Ben L. Titzer. All rights reserved.
 // See LICENSE for details of Apache 2.0 license.
 
+component WizengModes {
+	// (engine, monitors, files, programArgs) -> exit_code
+	var runWasm: (Engine, Range<Monitor>, Range<string>, Array<string>) -> int;
+	var runWast: (Engine, Range<Monitor>, Range<string>, Array<string>) -> int;
+}
+
 // Parses and runs binary .wasm files.
-var print_result = false;
 def main(args: Array<string>) -> int {
 	var engine = Engine.new();
-	var wasmFiles: Range<string>;
+	var wasm = Vector<string>.new();
+	var wast = Vector<string>.new();
 	var pos = 0;
 	var err = ErrorGen.new("wizeng");
 
@@ -33,276 +39,84 @@ def main(args: Array<string>) -> int {
 					.exit(1);
 			}
 		}
-		engine.extensions = EngineOptions.extensions;
 		pos++;
 	}
-	// Find range of all .wasm files
+	engine.extensions = EngineOptions.extensions;
+	// Find range of all .wasm or .bin.wast files
 	var before = pos;
 	var skip = 0;
 	while (pos < args.length) {
 		var a = args[pos];
 		if (a.length == 0) break;
 		if (Strings.equal("--", a)) { skip = 1; break; } // skip argument separator
-		if (!Strings.endsWith(a, ".wasm")) break;
+		if (!Strings.endsWith(a, ".wasm") && !Strings.endsWith(a, ".bin.wast")) break;
 		pos++;
 	}
-	wasmFiles = args[before ... pos];
+	for (i = before; i < pos; i++) {
+		if (Strings.endsWith(args[i], ".wasm")) wasm.put(args[i]);
+		else wast.put(args[i]);
+	}
 	// Program arguments remain after .wasm files or after "--"
 	var v = Vector<string>.new();
-	if (wasmFiles.length > 0) v.put(wasmFiles[wasmFiles.length - 1]);
+	if (wasm.length > 0) v.put(wasm[wasm.length - 1]);
 	v.putr(args[(pos + skip) ...]);
 	var programArgs = v.extract();
 
 	if (WizengOptions.PREGEN_FILE.val != null) {
 		var error = Target.pregenIntoFile(WizengOptions.PREGEN_FILE.val);
 		if (error != null) return error.exit(2);
-		if (wasmFiles.length == 0) return 0; // all done
+		if (wasm.length == 0) return 0; // all done
 	}
 
-	if (WizengOptions.helped) return 0;  // printed help, nothing more to do
+	if (WizengOptions.helped) return 0;  // printed help or version, nothing more to do
 
-	if (wasmFiles.length == 0) return ErrorBuilder.new()
+	if (wasm.length == 0 && wast.length == 0) return ErrorBuilder.new()
 		.puts("wizeng: no input files\n")
 		.exit(3);
 
 	// Expose the wizeng HostModule if it's an activated extension
 	if (engine.extensions.WIZENG) ModuleRegistry.expose("wizeng");
-	err = ErrorGen.new(wasmFiles[wasmFiles.length - 1]);
-	var linker = ModuleLinker.new(engine, programArgs, err);
-	linker.lookup.put(ModuleRegistry.get);
-	linker.binder = if(BasicTracing.moduleFilter != null, ImportTracer.new(BasicTracing.moduleFilter).wrap);
 
-	for (i < wasmFiles.length) {
-		var path = wasmFiles[i];
-		if (!Strings.endsWith(path, ".wasm")) return ErrorBuilder.new()
-			.puts(path)
-			.puts(": unknown file format, expected .wasm\n")
-			.exit(4);
-	}
 	var monitors = MonitorOptions.getMonitors().extract();
-	var hasMonitors = monitors.length > 0 || BasicTracing.requiresInstrumentation();
-
-	if (hasMonitors) Execute.tiering.onMonitorsStart();
-
-	// If any of the monitors is a Whamm module, an outline may be needed for reflection.
-	var makeOutline = false;
-	for (m in monitors) makeOutline |= WhammMonitor.?(m);
-
-	for (i < wasmFiles.length) {
-		var path = wasmFiles[i];
-		// Parse the binary module
-		var err = ErrorGen.new(path);
-		var outline = if(makeOutline, ModuleOutline.new());
-		var module = engine.loadWasmFile(path, err, null, outline);
-		if (err.error()) return ErrorBuilder.new()
-			.render(err.error_code, path, err.section, err.error_index, err.error_pos, err.error_msg)
-			.exit(3);
-		BasicTracing.instrumentModule(module);
-		var nm = NamedModule(PathUtil.extractName(path, false), module);
-		linker.named_modules.put(nm);
-	}
-	// Call monitors for all modules
-	for (i < linker.named_modules.length) {
-		var nm = linker.named_modules[i];
-		for (i < monitors.length) {
-			def gen = ErrorGen.new("monitor");
-			monitors[i].onParse(nm.module, gen);
-			if (gen.error()) {  // error in monitor run on parsed module
-				return ErrorBuilder.new()
-					.render(gen.error_code, gen.filename, gen.error_section, gen.error_index, gen.error_pos, gen.error_msg)
-					.exit(3);
-			}
-		}
-		if (hasMonitors) Execute.tiering.onMonitorsFinish(nm.module, err);
-	}
-
-	var all_instantiators = linker.link();
-	if (!err.ok()) return ErrorBuilder.new()
-		.render(err.error_code,
-			if(u32.view(err.index) < wasmFiles.length, wasmFiles[err.index], wasmFiles[wasmFiles.length - 1]),
-			err.section,
-			err.error_index,
-			err.error_pos,
-			err.error_msg)
-		.exit(6);
-
-	// Call monitors for all instances on instantiate
-	for (instantiator in all_instantiators) for (monitor in monitors) monitor.onInstantiate(instantiator.instance);
-
-	// Try to find the main entrypoint for all modules.
+	var wasmFiles = wasm.extract();
+	var wastFiles = wast.extract();
 	var exit_code = 0;
-	for (i < all_instantiators.length) {
-		var path = wasmFiles[i];
-		var instantiator = all_instantiators[i];
-		var ins = instantiator.instance;
-		var module = ins.module;
-		var invokeName = WizengOptions.ENTRYPOINT.val;
-		var entry: (Function, Array<Value>);
-		for (j < instantiator.processors.length) {
-			var p = instantiator.processors[j];
-			if (HostModule.?(p)) {
-				entry = HostModule.!(p).getMain(ins);
-				if (entry.0 != null) break;
-			}
-		}
-
-		if (entry.0 == null || invokeName != null) {
-			entry = findEntrypoint(ins);
-		}
-
-		if (i == all_instantiators.length - 1 && entry.0 == null) return ErrorBuilder.new()
-			.puts(path)
-			.puts(": no entrypoint found in module\n")
-			.exit(7);
-
-		// Execute the start function, if any.
-		if (module.start_function >= 0) {
-			var start = ins.functions[module.start_function];
-			for (monitor in monitors) monitor.onStart(start);
-			var r = Metrics.start_time_us.run(Execute.call, (start, Values.NONE));
-			match (r) {
-				Throw(thrown) => {
-					// Start function trapped or exited, return
-					TraceUtil.renderThrowable(Trace.OUT, thrown);
-					MonitorRegistry.runReports();
-					Metrics.report();
-					return -1;
-				}
-				_ => ; // ignore return value and break
-			}
-		}
-
-		// Execute the main entrypoint.
-		if (entry.0 != null) {
-			for (monitor in monitors) monitor.onMain(entry.0, entry.1);
-			var before_us = Metrics.main_time_us.ticks();
-			var before_cycles = Metrics.main_time_cycles.ticks();
-			var r = Execute.call(entry.0, entry.1);
-			Metrics.main_time_cycles.updateDiff(before_cycles);
-			Metrics.main_time_us.updateDiff(before_us);
-
-			match (r) {
-				Value(vals) => {
-					if (vals.length == 1) {
-						match (vals[0]) {
-							I32(val) => exit_code = int.view(val);
-							I64(val) => exit_code = int.view(val);
-							_ => ;
-						}
-					}
-					if (print_result) {
-						for (i < vals.length) {
-							if (i > 0) Trace.OUT.sp();
-							Trace.OUT.putv(vals[i]);
-						}
-						Trace.OUT.ln();
-					}
-				}
-				Throw(thrown) => match (thrown) {
-					x: Exit => {
-						exit_code = int.view(x.code);
-					}
-					_ => {
-						TraceUtil.renderThrowable(Trace.OUT, thrown);
-						exit_code = -1;
-					}
-				}
-				Switch => {
-					// TraceUtil.renderThrowable(Trace.OUT, info.parent.trap(TrapReason.INVALID_SUSPEND));
-					// UNREACHABLE as far as V3Interpreter is concerned.
-					// TODO[ss]: check how to make this better
-					exit_code = -1;
-				}
-			}
-			// Call monitors on finish
-			for (monitor in monitors) monitor.onFinish(ins, r);
-			MonitorRegistry.runReports();
-			Metrics.report();
-		}
+	
+	if (wasmFiles.length > 0) {
+		if (WizengModes.runWasm == null) return ErrorBuilder.new()
+			.puts("wizeng: wasm mode was not built\n")
+			.exit(3);
+		exit_code = WizengModes.runWasm(engine, monitors, wasmFiles, programArgs);
+		if (exit_code != 0) return exit_code;
 	}
+	if (wastFiles.length > 0) {
+		if (WizengModes.runWast == null) return ErrorBuilder.new()
+			.puts("wizeng: spectest mode was not built\n")
+			.exit(3);
+		exit_code = WizengModes.runWast(engine, monitors, wastFiles, programArgs);
+		if (exit_code != 0) return exit_code;
+	}
+
+	MonitorRegistry.runReports();
+	Metrics.report();
 	return exit_code;
-}
-
-def putWizeng(out: StringBuilder) -> StringBuilder {
-	return out.puts("Wizard Engine ").puts(Version.version).putc('.').putd(Version.minorVersion);
-}
-
-// Wraps imported functions with tracing. Can apply a filter to be selective on which imports to trace.
-class ImportTracer(var filter: DeclFilter) {
-	def wrap(decl: Decl, ex: Exportable) -> Exportable {
-		if (!Function.?(ex)) return ex;
-		var func = Function.!(ex);
-		var imp = decl.imp;
-		if (!filter.matchesStr(imp.module_name, imp.field_name)) return ex;
-		var name = Strings.format1("trace(%q)", func.render);
-		func = HostFunction.new(name, func.sig, traceCall(imp, func, _));
-		return func;
-	}
-	def traceCall(imp: ImportInfo, f: Function, args: Range<Value>) -> HostResult {
-		var out = Trace.OUT;
-		out.puts(imp.module_name);
-		out.putc('.');
-		out.puts(imp.field_name);
-		Values.renderVals(out, args);
-		out.ln();
-		match (f) {
-			wf: WasmFunction => {
-				var result = Execute.call(wf, args);
-				out.puts("  ==> ");
-				result.render(out);
-				out.ln();
-				match (result) {
-					Value(vals) => return HostResult.ValueN(vals);
-					Throw(thrown) => return HostResult.Throw(thrown);
-					Switch => {
-						return HostResult.Value0;
-						// TODO[ss]: handle this better
-						// return HostResult.Throw(info.parent.trap(TrapReason.INVALID_SUSPEND));
-					}
-				}
-			}
-			hf: HostFunction => {
-				if (Trace.interpreter) Execute.traceCallHostFunction(hf);
-				var result = hf.invoke(args);
-				out.puts("  ==> ");
-				match (result) {
-					Value0 => {
-					}
-					Value1(val) => {
-						out.putv(val);
-					}
-					ValueN(vals) => {
-						if (vals.length == 1) {
-							out.putv(vals[0]);
-						} else {
-							Values.renderVals(out, vals);
-						}
-					}
-					Throw(thrown) => thrown.render(out);
-					TailCall(func, args) => out.puts("<tailcall>");
-				}
-				out.ln();
-				return result;
-			}
-			_ => return HostResult.Throw(null); // TODO: should not happen
-		}
-	}
 }
 
 // Options specific to the "wizeng" executable.
 component WizengOptions {
 	def group = OptionsRegistry.newGroup("WIZENG", null);
 	def HELP = group.newFlag("help", printHelp, "Print command-line help.");
-	def HELP2 = group.newFlag("-help", printHelp, "Print command-line help.");
-	def VERSION = group.newFlag("-version", printVersion, "Print build version.");
+	def VERSION = group.newFlag("version", printVersion, "Print build version.");
 	def PREGEN_FILE = group.newPathOption("pregen", null, "Pre-generate assembly interpreter and stubs into the given file.");
-	def EXPOSE = group.newStringOption("-expose", null, "Expose the given host module's functionality to programs.")
+	def EXPOSE = group.newStringOption("expose", null, "Expose the given host module's functionality to programs.")
 		.onSet(ModuleRegistry.expose);
-	def PRINT_RESULT = group.newBoolOption("-print-result", false, "Print the result of the main function upon exit.");
-	def ENTRYPOINT = group.newStringOption("-invoke", null, "Invoke the given function.");
+	def PRINT_RESULT = group.newBoolOption("print-result", false, "Print the result of the main function upon exit.");
+	def ENTRYPOINT = group.newStringOption("invoke", null, "Invoke the given function.");
+	def REPEAT = group.newIntOption("repeat", 1, "Execute the program the given number of times.");
 	var helped = false;
 
 	def printVersion(str: string) {
+		helped = true;
 		putWizeng(Trace.OUT).ln();
 		if (Version.buildData != null) Trace.OUT.puts("Build data: ").puts(Version.buildData).ln();
 		Trace.OUT.flush();
@@ -314,31 +128,7 @@ component WizengOptions {
 		OptionsRegistry.print();
 	}
 }
-def findEntrypoint(instance: Instance) -> (Function, Array<Value>) {
-	var module = instance.module;
-	var exports = module.exports;
-	var found: Function;
-	var invokeName = if(WizengOptions.ENTRYPOINT.val != null, WizengOptions.ENTRYPOINT.val, "main");
-	for (j < exports.length) {
-		var mex = module.exports[j], iex = instance.exports[j];
-		if (!Function.?(iex)) continue;
-		found = Function.!(iex);
-		if (Strings.equal(invokeName, mex.0)) {
-			return (found, Arrays.map(found.sig.params, Values.default));
-		}
-	}
-	return (null, null);
-}
-def parseArgs(input: string) -> Vector<string> {
-	var args = Vector<string>.new();
-	var sb = StringBuilder.new();
-	for (c in input) {
-		if (c == ',') {
-			args.put(sb.toString());
-		} else {
-			sb.putc(c);
-		}
-	}
-	args.put(sb.toString());
-	return args;
+
+def putWizeng(out: StringBuilder) -> StringBuilder {
+	return out.puts("Wizard Engine ").puts(Version.version).putc('.').putd(Version.minorVersion);
 }

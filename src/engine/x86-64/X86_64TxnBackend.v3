@@ -2,6 +2,8 @@
 
 // Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
 class MmapPersistentBackend extends TxnRegionBackend {
+	var mapping: Mapping;
+
 	def path: string;  // Path to PMEM device or DAX file
 	
 	new(path) { }
@@ -15,15 +17,15 @@ class MmapPersistentBackend extends TxnRegionBackend {
 		if (mapping == null) return null;
 		var range = CiRuntime.forgeRange<byte>(mapping.range.start, int.!(size));
 		var region = BackendRegion.new(range, this);
-		region.mapping = mapping;  // Keep mapping alive to prevent premature GC/unmapping
+		this.mapping = mapping;  // Keep mapping alive to prevent premature GC/unmapping
 		return region;
 	}
 	
 	def deallocate(region: BackendRegion) {
 		// Explicitly unmap and clear reference
-		if (region.mapping != null) {
-			region.mapping.range.unmap();
-			region.mapping = null;
+		if (mapping != null) {
+			mapping.range.unmap();
+			mapping = null;
 		}
 	}
 	

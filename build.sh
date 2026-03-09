@@ -1,8 +1,20 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|spectest|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
+}
+
+# Append a comma-separated string to the given variable.
+append_comma_sep() {
+    local varname=$1
+    local newpair=$2
+    local current="${!varname}"
+    if [ -z "$current" ]; then
+        eval "$varname=\"$newpair\""
+    else
+        eval "$varname=\"$current,$newpair\""
+    fi
 }
 
 if [ "$#" -lt 2 ]; then
@@ -30,14 +42,17 @@ if [ ! -e "$VIRGIL_LIB/util/Vector.v3" ]; then
     echo "  VIRGIL_LIB, to point directly to root of the library"
     exit 1
 fi
-    
+
 ENGINE="src/engine/*.v3 src/util/*.v3 $VIRGIL_LIB/util/*.v3"
 MONITORS="src/monitors/*.v3"
+TEST_MONITORS="src/monitors/test/*.v3"
+DEBUG_MONITORS="src/monitors/debug/*.v3"
 TARGET_V3="src/engine/v3/*.v3"
-TARGET_X86_64="src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
+TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
-SPECTEST="test/wasm-spec/*.v3 test/spectest.main.v3"
+SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
+WASM_MODE="src/WasmMode.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
 WAVE="src/modules/wave/*.v3"
 WASI="src/modules/wasi/*.v3"
@@ -46,8 +61,60 @@ WALI="src/modules/wali/*.v3"
 WALI_X86_64_LINUX="src/modules/wali/x86-64-linux/*.v3 $VIRGIL_LIB/wasm-linux/*.v3"
 MODULES="src/modules/*.v3"
 
+TARGET_CBD_SLOW="src/engine/cbd/slow/*.v3"
+TARGET_CBD_FAST="src/engine/cbd/fast/*.v3"
+
+CONTINUATION="src/engine/continuation/UnboxedContinuation.v3"
+CONTINUATION_X86_64="src/engine/x86-64/continuation/X86_64UnboxedContinuation.v3"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --nojit)
+            append_comma_sep REDEFS "SpcTuning.disable=true"
+            ;;
+        --test-monitors)
+            MONITORS="$MONITORS $TEST_MONITORS"
+            ;;
+        --debug)
+            MONITORS="$MONITORS $DEBUG_MONITORS"
+            append_comma_sep REDEFS "MonitorOptions.enableCheckMonitors=true"
+            ;;
+        --debug-gc)
+            DEBUG_GC=1
+            ;;
+        --no-spec-test)
+            SPECTEST_MODE=""
+            ;;
+        --no-wasm-run)
+            WASM_MODE=""
+            ;;
+        --boxed-continuation)
+            append_comma_sep REDEFS "FeatureDisable.unboxedConts=true"
+            CONTINUATION="src/engine/continuation/BoxedContinuation.v3"
+            CONTINUATION_X86_64="src/engine/x86-64/continuation/X86_64BoxedContinuation.v3"
+            ;;
+        *)
+            break
+            ;;
+    esac
+    shift
+done
+
+ENGINE="$ENGINE $CONTINUATION"
+TARGET_X86_64="$TARGET_X86_64 $CONTINUATION_X86_64"
+
+CBD=false
+if [[ "$1" = "--cbd" ]]; then
+    CBD=true
+    shift
+fi
+
 PROGRAM=$1
 TARGET=$2
+
+if [[ "$TARGET" =~ x86 && $DEBUG_GC = 1 ]]; then
+    V3C_OPTS="$V3C_OPTS -redef-field=RiGc.debug=true"
+fi
 
 function make_build_file() {
 	local target=$TARGET
@@ -71,12 +138,10 @@ function make_build_file() {
 
 # compute sources
 if [ "$PROGRAM" = "wizeng" ]; then
-    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $WIZENG"
+    SOURCES="$ENGINE $WAVE $WASI $WALI $MONITORS $SPECTEST_MODE $WASM_MODE $WIZENG"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $WASI_X86_64_LINUX $WALI_X86_64_LINUX"
     fi
-elif [ "$PROGRAM" = "spectest" ]; then
-    SOURCES="$ENGINE $SPECTEST"
 elif [ "$PROGRAM" = "unittest" ]; then
     SOURCES="$ENGINE $UNITTEST"
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
@@ -94,15 +159,22 @@ BUILD_FILE=$(make_build_file)
 PREGEN=${PREGEN:=1}
 
 LANG_OPTS="-fun-exprs -simple-bodies"
+if [ "$REDEFS" != "" ]; then
+    V3C_OPTS="$V3C_OPTS -redef-field=$REDEFS"
+fi
 
 # build
 exe=${PROGRAM}.${TARGET}
 if [[ "$TARGET" = "x86-linux" || "$TARGET" = "x86_linux" ]]; then
-    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    TARGET_SRC=$TARGET_V3
+    if "$CBD"; then TARGET_SRC="$TARGET_CBD_SLOW $TARGET_V3"; fi
+    exec v3c-x86-linux -symbols -heap-size=512m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-linux -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
 elif [[ "$TARGET" = "x86-64-darwin" || "$TARGET" = "x86_64_darwin" ]]; then
     exec v3c-x86-64-darwin -symbols -heap-size=700m -stack-size=1m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.x86-64-darwin -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
-    v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${exe} -output=bin/ $SOURCES $BUILD_FILE $TARGET_X86_64
+    TARGET_SRC=$TARGET_X86_64
+    if "$CBD"; then TARGET_SRC="$TARGET_CBD_FAST $TARGET_X86_64"; fi
+    exec v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.${TARGET} -output=bin/ $SOURCES $BUILD_FILE $TARGET_SRC
     STATUS=$?
     if [ $STATUS != 0 ]; then
 	exit $STATUS
@@ -113,7 +185,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 	if [[ "$PREGEN" != 0 && "$HOSTS" =~ "x86-64-linux" ]]; then
 	    # try running pregen if the host platform can run the pregen binary
             cp $E $E.pregen
-            $E.pregen -pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
+            $E.pregen --pregen=$E > /tmp/wizeng.$(whoami).pregen.out 2>&1
 	    STATUS=$?
 	    if [ $STATUS != 0 ]; then
 		echo "error: running $E.pregen failed"
@@ -124,7 +196,7 @@ elif [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
 	fi
     fi
 elif [ "$TARGET" = "jvm" ]; then
-    v3c-jar $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
+    exec v3c-jar $LANG_OPTS $V3C_OPTS -program-name=${PROGRAM}.jvm -output=bin/ $SOURCES $BUILD_FILE $TARGET_V3
 elif [[ "$TARGET" == wasm-* ]]; then
     # Compile to a wasm target
     V3C_PATH=$(which v3c)
@@ -150,7 +222,7 @@ elif [ "$TARGET" = "v3i" ]; then
 	fi
 	LIST="$LIST $(ls $f)"
     done
-    echo '#!/bin/bash' > bin/$PROGRAM.v3i
+    echo '#!/usr/bin/env bash' > bin/$PROGRAM.v3i
     echo "v3i $LANG_OPTS \$V3C_OPTS $LIST" '$@' >> bin/$PROGRAM.v3i
     chmod 755 bin/$PROGRAM.v3i
     # run v3c just to check for compile errors

@@ -11,14 +11,14 @@ component X86_64Runtime {
 	// is handled by returning a non-null {Throwable} and tail-calling a {WasmFunction} is handled
 	// by returning that function to the (Wasm) caller, with the stack already containing its arguments.
 	def runtime_callHost(stack: X86_64Stack, hf: HostFunction) -> (Throwable, WasmFunction) {
-		var stack = stack; // XXX: accept as parameter?
 		var args: Range<Value> = stack.popN(hf.sig.params);
 		while (hf != null) {
 			if (Trace.interpreter) Execute.traceCallHostFunction(hf);
 			var result = hf.invoke(args);
 			match (result) {
 				Throw(thrown) => {
-					stack.throw(thrown).prependHostFunction(hf);
+					// TODO: case for ThrowResult.Handled
+					ThrowResult.Unhandled.!(stack.throw(thrown)).thrown.prependHostFunction(hf);
 					return (thrown, null);
 				}
 				Value0 => {
@@ -52,13 +52,13 @@ component X86_64Runtime {
 	def runtime_PROBE_loop(stack: X86_64Stack, func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(stack.rsp + Pointer.SIZE);
 		var ret = Instrumentation.fireGlobalProbes(DynamicLoc(func, pc, frame));
-		if (ret != null) return stack.throw(ret);
+		if (ret != null) return ThrowResult.Unhandled.!(stack.throw(ret)).thrown;
 		return ret;
 	}
 	def runtime_PROBE_instr(stack: X86_64Stack, func: WasmFunction, pc: int) -> Throwable {
 		var frame = TargetFrame(stack.rsp + Pointer.SIZE);
 		var ret = Instrumentation.fireLocalProbes(DynamicLoc(func, pc, frame));
-		if (ret != null) return stack.throw(ret);
+		if (ret != null) return ThrowResult.Unhandled.!(stack.throw(ret)).thrown;
 		return ret;
 	}
 	def runtime_GET_LOCAL_PROBE(func: WasmFunction, pc: int) -> Probe {
@@ -81,7 +81,7 @@ component X86_64Runtime {
 			if (l.head.0 == pc) {
 				var entrypoint = osr.spc_entry + l.head.1;
 				if (Debug.runtime) Trace.OUT.put1("  tierup to 0x%x", entrypoint - Pointer.NULL).ln();
-				var retaddr_ptr = CiRuntime.callerSp() + -Pointer.SIZE;
+				var retaddr_ptr = stack.rsp;
 				retaddr_ptr.store<Pointer>(entrypoint); // overwrite return address to return to JIT code
 				return;
 			}
@@ -91,54 +91,86 @@ component X86_64Runtime {
 		var tag = instance.tags[tag_index];
 		var args = stack.popN(tag.sig.params);
 		var ex = Exception.new(tag, args, null);
-		return stack.throw(ex);
+		match (stack.throw(ex)) {
+			Handled(stack) => { curStack = X86_64Stack.!(stack); return null; }
+			Unhandled(t) => return t;
+		}
 	}
 	def runtime_THROW_REF(stack: X86_64Stack, thrown: Throwable) -> Throwable {
-		return stack.throw(thrown);
+		match (stack.throw(thrown)) {
+			Handled(stack) => { curStack = X86_64Stack.!(stack); return null; }
+			Unhandled(t) => return t;
+		}
 	}
 	def runtime_CONT_NEW(stack: X86_64Stack, instance: Instance, cont_index: u31) -> Throwable {
-		return Runtime.CONT_NEW(stack, instance, cont_index, make_new_x86_stack);
+		return Runtime.CONT_NEW(stack, instance, cont_index);
 	}
-	def runtime_process_resume_throw(stack: X86_64Stack, instance: Instance, cont: Continuation, tag: Tag) -> Pointer {
-		var ps = tag.sig.params;
-		var vals = stack.popN(ps);
-		var ex = Exception.new(tag, vals, null);
-		var top = X86_64Stack.!(cont.top);
-		top.rsp += Pointer.SIZE;
-		top.throw(ex);
-		top.throw_on_resume = ex;
-		top.state_ = StackState.RUNNING;
-		return Pointer.atObject(cont);
+	// If the given continuation handles the thrown error, a modified {Continuation} is pushed
+	// onto the value stack. Otherwise, trap on the current stack.
+	// XXX: eliminate returning {Throwable}?
+	def runtime_handle_resume_throw(stack: X86_64Stack, instance: Instance, contStack: X86_64Stack, tag_index: u31) -> Throwable {
+		var tag = instance.tags[tag_index];
+		var ex: Throwable = Exception.new(tag, stack.popN(tag.sig.params), null);
+		return runtime_resume_throw_ref(stack, instance, contStack, ex);
+	}
+	def runtime_resume_throw_ref(stack: X86_64Stack, instance: Instance, contStack: X86_64Stack, ex: Throwable) -> Throwable {
+		if (Trace.stack) Trace.OUT
+			.put2("resume_throw %q @ contStack[addr=0x%x] ", ex.render, Pointer.atObject(contStack) - Pointer.NULL)
+			.put1("on stack[rsp=0x%x]", stack.rsp - Pointer.NULL).ln();
+
+		// search for handler in continuation
+		var result = contStack.throw(ex);
+		match (result) {
+			Handled(handler) => {
+				X86_64Stack.!(handler).state_ = StackState.RESUMABLE;
+				handler.cont_bottom = contStack.cont_bottom;
+				stack.push(Value.Cont(Continuations.makeContinuation(handler)));
+				return null;
+			}
+			Unhandled(t) => return runtime_THROW_REF(stack, t);
+		}
 	}
 	// Unwinds the stack chain and sets {curStack} to the stack that can handle
 	// the suspension (or throw an error on the top-most stack if no such handler
 	// is found). Then, the tag parameters and the continuation is pushed onto
 	// the handler stack.
 	def runtime_handle_suspend(stack: X86_64Stack, instance: Instance, tag_id: u31) -> Throwable {
-		var stack = X86_64Stack.!(stack);
 		var tag = instance.tags[tag_id];
 		var vals = stack.popN(tag.sig.params);
 		var cont = Runtime.unwindStackChain(stack, instance, tag_id, WasmStack.tryHandleSuspension);
-		if (cont == null) return stack.trap(TrapReason.INVALID_SUSPEND);
+		if (Continuations.isNull(cont)) return stack.trap(TrapReason.INVALID_SUSPEND);
 		// set stack params arity
 		stack.params_arity = tag.sig.results.length;
 		stack.state_ = StackState.SUSPENDED;
 		stack.bind([]); // dummy bind with 0 values to update stack state
 
 		// set up new stack configuration
-		curStack = X86_64Stack.!(cont.bottom.parent);
+		var old_stack = curStack;
+		var bottom = cont.stack.cont_bottom;
+		curStack = X86_64Stack.!(bottom.parent);
 		curStack.state_ = StackState.RUNNING;
 		curStack.pushN(vals);
-		curStack.push(Value.Ref(cont));
-		cont.bottom.parent = null;
-		if (Trace.stack) Trace.OUT.put1("suspending to stack[rsp=0x%x]", curStack.rsp - Pointer.NULL).ln();
+		curStack.push(Value.Cont(cont));
+		bottom.parent = null;
+		if (Trace.stack) {
+			var ip = curStack.rsp.load<Pointer>();
+			Trace.OUT.put1("suspend called on curStack=0x%x:", Pointer.atObject(old_stack) - Pointer.NULL).ln();
+			Trace.OUT.put3(
+				"  to_stack[addr=0x%x, rsp=0x%x, *($rsp)=0x%x]",
+				Pointer.atObject(curStack) - Pointer.NULL,
+				curStack.rsp - Pointer.NULL,
+				ip - Pointer.NULL
+			).ln();
+		}
+		// RT calls will pop off the top value of {curStack.rsp} on return; push a
+		// value so that the return address is not popped off.
+		curStack.pushRspPointer(Pointer.NULL);
 		return null;
 	}
 	// Suspends this stack and sets {curStack} to the stack to switch to (or
 	// throw an error on the top-most stack if no such handler is found). Then,
 	// the tag parameters and the continuation is pushed onto the target stack.
 	def runtime_handle_switch(stack: X86_64Stack, instance: Instance, target_cont_idx: int, tag_id: u31) -> Throwable {
-		var stack = X86_64Stack.!(stack);
 		var tag = instance.tags[tag_id];
 
 		// unraveling all relevant signatures
@@ -146,17 +178,18 @@ component X86_64Runtime {
 		var target_top_val = target_cont_decl.sig.params[target_cont_decl.sig.params.length - 1];
 		var this_cont_decl = ContDecl.!(HeapType.Cont.!(ValueType.Ref.!(target_top_val).heap).cont);
 		// unload target continuation and values from {curStack}
-		var target_cont = Continuation.!(stack.popObject());
+		var target_cont = stack.popContinuation();
 		var target_params = target_cont_decl.sig.params;
 		var vals = stack.popN(target_params[0 ... target_params.length - 1]);
 
-		if (target_cont == null) return stack.trap(TrapReason.NULL_DEREF);
-		if (target_cont.used) return stack.trap(TrapReason.USED_CONTINUATION);
-		target_cont.used = true;
+		if (Continuations.isNull(target_cont)) return stack.trap(TrapReason.NULL_DEREF);
+		if (Continuations.isUsed(target_cont)) return stack.trap(TrapReason.USED_CONTINUATION);
+		var target_stack = target_cont.stack;
+		Continuations.setUsed(target_cont);
 
 		var this_cont = Runtime.unwindStackChain(stack, instance, tag_id, WasmStack.tryHandleSwitch);
-		if (this_cont == null) return stack.trap(TrapReason.INVALID_SUSPEND);
-		var prev = X86_64Stack.!(this_cont.bottom);
+		if (Continuations.isNull(this_cont)) return stack.trap(TrapReason.INVALID_SUSPEND);
+		var prev = X86_64Stack.!(this_cont.stack.cont_bottom);
 		// set stack params arity
 		stack.params_arity = this_cont_decl.sig.params.length;
 		stack.state_ = StackState.SUSPENDED;
@@ -164,34 +197,26 @@ component X86_64Runtime {
 		stack.bind([]);
 
 		// overwrite {parent_rsp_ptr}
-		var bottom = X86_64Stack.!(target_cont.bottom);
+		var bottom = X86_64Stack.!(target_stack.cont_bottom);
 		bottom.parent = prev.parent;
 		bottom.parent_rsp_ptr.store<Pointer>(prev.parent_rsp_ptr.load<Pointer>());
 		// set up new stack configuration
 		prev.parent = null;
 		prev.parent_rsp_ptr.store<Pointer>(Pointer.NULL);
-		curStack = X86_64Stack.!(target_cont.top);
+		curStack = X86_64Stack.!(target_stack);
 		curStack.state_ = StackState.RUNNING;
 		curStack.pushN(vals);
-		curStack.push(Value.Ref(this_cont));
-		// push extra dummy RET_ADDR to counteract RT call-site's %sp increment
-		// after a RT call returns
-		// XXX: revisit this design and clean up
-		curStack.rsp += -Pointer.SIZE;
+		curStack.push(Value.Cont(this_cont));
+		// RT calls will pop off the top value of {curStack.rsp} on return; push a
+		// value so that the return address is not popped off.
+		curStack.pushRspPointer(Pointer.NULL);
 		return null;
 	}
 	def runtime_doCast(stack: X86_64Stack, instance: Instance, nullable: byte, ht_val: int) -> bool {
 		var val = stack.peekRef();
 		return Runtime.cast(instance, (nullable & 2) != 0, ht_val, val);
 	}
-	private def make_new_x86_stack(func: Function) -> X86_64Stack {
-		var stack = X86_64Stack.new(EngineOptions.STACK_SIZE.get());
-		stack.reset(func);
-		if (Trace.stack) Trace.OUT.put1("created continuation with stack[rsp=0x%x]", stack.rsp - Pointer.NULL).ln();
-		return stack;
-	}
 	def runtime_checkFuncSigSubtyping(instance: Instance, sig_index: u31, func: Function) -> Function {
-//		Trace.OUT.put2("checkFuncSig %d %q", sig_index, func.sig.render).ln();
 		var expected = SigDecl.!(instance.heaptypes[sig_index]);	// cast not strictly necessary; for debugging
 		return if(ValueTypes.isAssignableHeap(func.sig, expected), func, null);
 	}

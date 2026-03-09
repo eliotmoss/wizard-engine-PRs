@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
@@ -10,9 +10,9 @@ HERE="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
 
 . $HERE/common.sh regress
 
-make_binary spectest || exit $?
+make_binary wizeng || exit $?
 
-CMD="$BINARY $WIZENG_OPTS -expected=$WIZENG_LOC/test/regress.failures -expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET} -expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET}.${TEST_MODE}"
+CMD="$BINARY $WIZENG_OPTS --expected=$WIZENG_LOC/test/regress.failures --expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET} --expected=$WIZENG_LOC/test/regress.failures.${TEST_TARGET}.${TEST_MODE}"
 
 cd $WIZENG_LOC
 
@@ -31,10 +31,10 @@ function run_tests() {
 
 	for ext in $(find test/regress -type d) ; do
 	if [[ $ext =~ test/regress/(ext:.*) ]]; then
-		arg="-${BASH_REMATCH[1]}"
+		arg="--${BASH_REMATCH[1]}"
 		# TODO: handle tests with multiple extensions properly
-		if [ $arg = "-ext:stack-switching" ]; then
-		    arg="-ext:all"
+		if [ $arg = "--ext:stack-switching" ]; then
+		    arg="--ext:all"
 		fi
 		TESTS="$ext/*.bin.wast"
 		$CMD $arg $TESTS

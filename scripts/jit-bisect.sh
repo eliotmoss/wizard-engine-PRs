@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 CYAN='[0;36m'
 RED='[0;31m'
@@ -12,13 +12,13 @@ if [ "$1" = "--skip-int" ]; then
     # skip collecting the ground truth
     shift
 else
-    # collect the ground truth by running with -mode=int
-    wizeng -mode=int "$@" > $T/int.out 2>$T/int.err
+    # collect the ground truth by running with --mode=int
+    wizeng --mode=int "$@" > $T/int.out 2>$T/int.err
     echo $? > $T/int.exit
 fi
 
 # collect the JIT results
-wizeng -mode=jit "$@" > $T/jit.out 2>$T/jit.err
+wizeng --mode=jit "$@" > $T/jit.out 2>$T/jit.err
 echo $? > $T/jit.exit
 
 function check() {
@@ -37,10 +37,10 @@ function check() {
 
 # Check for differences between int and jit mode.
 if [ "$(check $T/int $T/jit)" = 0 ]; then
-    echo No difference between -mode=int and -mode=jit
+    echo No difference between --mode=int and --mode=jit
     exit 0
 else
-    echo Detected a difference between -mode=int and -mode=jit
+    echo Detected a difference between --mode=int and --mode=jit
 fi
 
 function count_funcs() {
@@ -66,16 +66,16 @@ count_funcs "$@"
 min=$MIN_FUNC
 max=$MAX_FUNC
 
-# TODO: -jit-filter is inclusive of the end. Fix.
+# TODO: --jit-filter is inclusive of the end. Fix.
 while (( min < max )); do
     mid=$(( (min + max) / 2 ))
 
     # Check lower half
-    FILTER="-jit-filter=#${min}...${mid}"
+    FILTER="--jit-filter=#${min}...${mid}"
     printf "Testing %s " "$FILTER"
 
     F="$T/jit-#${min}...${mid}"
-    wizeng -mode=jit $FILTER "$@" > $F.out 2>$F.err
+    wizeng --mode=jit $FILTER "$@" > $F.out 2>$F.err
     echo $? > $F.exit
 
     if [ "$(check $T/int $F)" = 0 ]; then

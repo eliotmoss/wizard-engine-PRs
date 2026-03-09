@@ -1,0 +1,37 @@
+// Copyright 2023 Wizard Authors. All rights reserved.
+// See LICENSE for details of Apache 2.0 license.
+
+def monitor_ = MonitorRegistry.add(
+	"test:stacktrace", "Instruments all calls to print stack traces.",
+	StackTracer.new());
+
+class StackTracer extends Monitor {
+	def onParse(module: Module, err: ErrorGen) {
+		var mm = ModuleInstrumenter.new(module);
+		mm.beforeAllFuncExec(traceCall);
+	}
+	private def traceCall(dynamicLoc: DynamicLoc) -> ProbeAction {
+		dynamicLoc.func.render(Trace.OUT);
+		Trace.OUT.puts(" <- ");
+		var accessor = dynamicLoc.frame.getFrameAccessor();
+		var caller = accessor.caller();
+		while (true) {
+			match (caller) {
+				None => break;
+				Wasm(func, pc, frame) => {
+					func.render(Trace.OUT);
+					Trace.OUT.put1("+%d ", pc);
+					accessor = frame.getFrameAccessor();
+					caller = accessor.caller();
+				}
+				Host(func, frame) => {
+					func.render(Trace.OUT);
+					Trace.OUT.sp();
+					caller = frame.caller();
+				}
+			}
+		}
+		Trace.OUT.ln();
+		return ProbeAction.Continue;
+	}
+}
