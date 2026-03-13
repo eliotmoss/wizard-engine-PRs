@@ -1,92 +1,25 @@
-// TODO: reorder placement of code in this file
-
 // TODO: write tests!
 
 
-// Really want to write something like this, Virgil does not support it:
-//
-// class LayoutRange<Ref<L>> {
-//	def var rng: Range<byte>;
-//	new(rng);
-//	def [index: u64] => Ref<L>.at(rng[index * L.size ..+ L.size]);
-// }
+// =============================================================================
+// Section 1: Configuration and Constants
+// =============================================================================
 
-// Layout ranges may go into a Virgil library once tested and refined
-
-// The concept is essentially an array/range of a layout, i.e., multiple
-// copies of the same layout up against each other.  The "at" function does
-// the actual indexing and constructs a Ref, so this class does little actual
-// work (but see the companion component, LayoutRanges).
-
-// TODO: code for LayoutRange is probably obsolete, try to refactor and remove it
-class LayoutRange<T> {
-	def var rng: Range<byte>;  // the underlying range of bytes
-	def at: (Range<byte>, u64) -> T;  // a function to index that range and return a Ref
-	def offset: u64 -> u64;  // a function to go from index to offset
-	def [index: u64] -> T { return at(rng, index); }  // indexing that supports [i] notation
-	new(rng, at, offset) { }
+component PWRegions {
+	def MAGIC = 0x50_57_41_53_4Du64; // "PWASM" in hex
+	def blockSize: u64 = 256u64 * 1024u64;
+	def sanitize = true;
 }
 
-// This component provides several functions that can be used to index a
-// LayoutRange with different semantics for the index passed in.
-
-component LayoutRanges {
-
-	// atIndex interprets the index as indicating which element of the
-	// range is desired.  Thus, an index of 2 indicates the third element
-	// of the range.  atIndex requires the size in order to calculate the
-	// byte offset.
-	def atIndex<T>(rng: Range<byte>, index: u64, size: int, at: Range<byte> -> T) -> T {
-		return at(rng[index * u64.!(size) ..+ size]);
-	}
-
-	// atByte interprets the index as indicating the starting byte.  Thus, an index
-	// of 2 indicates to start at the third *byte* on the range.  It uses the size
-	// only to determine the size of the subrange passed to "at".
-	def atByte<T>(rng: Range<byte>, pos: u64, size: int, at: Range<byte> -> T) -> T {
-		return at(rng[pos ..+ size]);
-	}
-
-	// forOffset takes an offset (into some other range of bytes) and
-	// converts that into a suitable index in this LayoutRange based on
-	// their being one layout per some number of bytes in the other range.
-	// Here an offset of 2 means to convert from that offset in the
-	// original range.  To perform the computation, forOffset requires a
-	// "divisor" (the number of bytes in the other range per layout in
-	// this range) and the size of each layout in this range.
-	def forOffset<T>(rng: Range<byte>, offset: u64, divisor: u64, size: int,
-			at: Range<byte> -> T) -> T {
-		return at(rng[(offset / divisor) * u64.!(size) ..+ size]);
-	}
-
-	private def offset(base: u64, size: int, index: u64) -> u64 {
-		return base + index * u64.!(size);
-	}
-	// Creates a LayoutRange that uses the atIndex accessor and gives offset as within the original range
-	// Example: LayoutRanges.subrangeByIndex(rng, start, L.size, count, Ref<L>.at)
-	def subrangeByIndex<T>(rng: Range<byte>, base: u64, size: int, count: u64, atFunc: Range<byte> -> T) -> LayoutRange<T> {
-		var sub = rng[base ..+ count * u64.!(size)];
-		return LayoutRange<T>.new(sub, LayoutRanges.atIndex(_, _, size, atFunc), offset(base, size, _));
-	}
-
-	// Creates a LayoutRange that uses the atIndex accessor
-	// Example: LayoutRanges.byIndex(rng, L.size, Ref<L>.at)
-	def byIndex<T>(rng: Range<byte>, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.atIndex(_, _, size, atFunc), u64.*(u64.!(size),_));
-	}
-
-	// Creates a LayoutRange that uses the atByte accessor
-	// Example: LayoutRanges.byByte(rng, L.size, Ref<L>.at)
-	def byByte<T>(rng: Range<byte>, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.atByte(_, _, size, atFunc), u64.*(u64.!(size),_));
-	}
-
-	// Creates a LayoutRange that uses the forOffset accessor
-	// Example: LayoutRanges.byOffset(rng, otherUnit, L.size, Ref<L>.at)
-	def byOffset<T>(rng: Range<byte>, divisor: u64, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.forOffset(_, _, divisor, size, atFunc), u64.*(u64.!(size),_));
-	}
+component BlockLists {
+	def MAX_LISTS = 8;	// maximum number of lists == number of list sentinels
+				// METADATA, etc., do not have sentinels and not part of this count
 }
+
+
+// =============================================================================
+// Section 2: On-Memory Layouts (raw data structures)
+// =============================================================================
 
 layout PWRegionHeader {
 	+0	blockTable:	u64;	// relative offset to the block table
@@ -102,13 +35,23 @@ layout PWRegionHeader {
 	=64;				// size of header
 }
 
-type BlockTableHandle(addr: Pointer, size: u64) #unboxed {
-	def [n: i64] -> BlockEntryHandle {
-		return if(
-			u64.view(n) < size, 
-			BlockEntryHandle(addr + n * i64.!(BlockEntry.size)), 
-			BlockEntryHandle(Pointer.NULL));
-	}
+layout BlockEntry {
+	+0	listNum:	i16;  // which list is this entry part of
+	+2	used:		u1;   // is this block in use? // TODO: Use bool after the compiler is fixed
+				      // gap
+	+8	prev:		i64;  // prev entry in memory;
+	+16	next:		i64;  // next entry in memory order
+	+24	listPrev:	i64;  // prev entry on same list
+	+32	listNext:	i64;  // next entry on same list
+	=40;			      // size of block entry
+}
+
+layout ChunkHeader {
+	+0	offset:		u64; // offset in chunk for next allocation
+	+8	limit:		u64; // offset just beyond last available byte in chunk
+	+16	chunk_limit:	u64; // offset just beyond end of the chunk
+	+24	linemarks:	u64; // offset to first link mark of the chunk
+	=32;			     // size of chunk header
 }
 
 layout MetaDataDesc {
@@ -121,6 +64,53 @@ layout MetaDataDesc {
 	=32;
 }
 
+layout LineMark {
+	+0	mark:		u8;	// line mark info
+	=1;
+}
+
+layout LogHeader {
+	+0	numEntries:	u32;	// Number of valid entries in this transaction
+	+4	status:		u8;	// 0 = Invalid, 1 = Committed
+	+8	checksum:	u64;	// Optional: Simple checksum for integrity
+	=32;				// Pad to 32 bytes
+}
+
+layout LogEntry {
+	+0	kind:		u8;	// what kind of log entry
+	+1	offset:		u64;	// Relative offset of first changed byte, from the start of the Region
+	+16	value:		u64;	// The data to be written
+	+24	width:		u8;	// number of bytes being changed (1, 2, 4, 8)
+	=32;
+}
+
+
+// =============================================================================
+// Section 3: Enumerations
+// =============================================================================
+
+enum ListKind(code: i16) {
+	METADATA(-1),
+	NONE(-2),
+	USED(-3),
+	SMALL_FREE(0),
+	LARGE_FREE(1)
+}
+
+
+// =============================================================================
+// Section 4: Handle Types (wrappers around layouts for convenient access)
+// =============================================================================
+
+type BlockTableHandle(addr: Pointer, size: u64) #unboxed {
+	def [n: i64] -> BlockEntryHandle {
+		return if(
+			u64.view(n) < size,
+			BlockEntryHandle(addr + n * i64.!(BlockEntry.size)),
+			BlockEntryHandle(Pointer.NULL));
+	}
+}
+
 type BlockEntryHandle(addr: Pointer) #unboxed {
 	def isNull() -> bool {
 		return addr == Pointer.NULL;
@@ -129,7 +119,7 @@ type BlockEntryHandle(addr: Pointer) #unboxed {
 	def toHandle(offset: i64) -> BlockEntryHandle {
 		// Never need to point to ourselves
 		return BlockEntryHandle(addr + offset);
-	} 
+	}
 
 	def toOffset(handle: BlockEntryHandle) -> i64 {
 		return handle.addr - this.addr;
@@ -292,727 +282,12 @@ type ChunkHandle(addr: Pointer) #unboxed {
 	}
 }
 
-layout BlockEntry {
-	+0	listNum:	i16;  // which list is this entry part of
-	+2	used:		u1;   // is this block in use? // TODO: Use bool after the compiler is fixed
-				      // gap
-	+8	prev:		i64;  // prev entry in memory;
-	+16	next:		i64;  // next entry in memory order
-	+24	listPrev:	i64;  // prev entry on same list
-	+32	listNext:	i64;  // next entry on same list
-	=40;			      // size of block entry
-}
-
-layout ChunkHeader {
-	+0	offset:		u64; // offset in chunk for next allocation
-	+8	limit:		u64; // offset just beyond last available byte in chunk
-	+16	chunk_limit:	u64; // offset just beyond end of the chunk
-	+24	linemarks:	u64; // offset to first link mark of the chunk
-	=32;			     // size of chunk header
-}
-
-enum ListKind(code: i16) {
-	METADATA(-1),
-	NONE(-2),
-	USED(-3),
-	SMALL_FREE(0),
-	LARGE_FREE(1)
-}
-
-component BlockLists {
-	def MAX_LISTS = 8;	// maximum number of lists == number of list sentinels
-				// METADATA, etc., do not have sentinels and not part of this count
-}
-
-// Generic block-based region manager (platform-independent)
-class PWRegion {
-	def var backendRegion: BackendRegion;
-	def var rng: Range<byte>;  // the actual bytes of the region
-	def numBlocks: u64;
-	def blockSize: u64;  // Size of each block
-	def metaDataDescs: Range<Ref<MetaDataDesc>>;
-	def var descs: LayoutRange<Ref<MetaDataDesc>>;
-	def var sentinels: BlockTableHandle;
-	def var smallSentinel: BlockEntryHandle;
-	def var largeSentinel: BlockEntryHandle;
-	def blankChunkHeader = Array<byte>.new(ChunkHeader.size);  // so we can return *something* when allocation fails
-	def blankChunkHandle = ChunkHandle(Pointer.atElement(blankChunkHeader, 0));
-	def var blockTableHandle: BlockTableHandle;
-	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
-	def var logChunk: ChunkHandle;
-	def var walCache = WALCache.new();
-	def var walWriter: WALWriter;
-
-	new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64) {
-		var size = numBlocks * blockSize;
-		var prot = BackendProt.READ | BackendProt.WRITE;
-		backendRegion = backend.allocate(size, prot);
-		if (backendRegion == null) {
-			// Allocation failed
-			return;
-		}
-		rng = backendRegion.range;
-		init(blockSize);
-	}
-	
-	private def sanitizeOffset(offset: u64) {
-		if (PWRegions.sanitize) {
-			var addr: long = Pointer.atElement(rng, 0) - Pointer.NULL;
-			if (offset < rng.length) {
-				Trace.OUT.put3("offset %d is good for region at 0x%x of length %d", long.view(offset), addr, rng.length).ln();
-			} else {
-				Trace.OUT.put3("offset %d is bad for region at 0x%x of length %d", long.view(offset), addr, rng.length).ln();
-			}
-		}
-	}
-	
-	private def sanitizeAddress(addr: Pointer) {
-		if (PWRegions.sanitize) {
-			var delta: long = addr - Pointer.atElement(rng, 0);
-			var addrAsLong: long = addr - Pointer.NULL;
-			var baseAddrAsLong: long = Pointer.atElement(rng, 0) - Pointer.NULL;
-			if (delta < 0 || delta >= rng.length) {
-				Trace.OUT.put3("address 0x%x is bad for region at 0x%x of length %d", addrAsLong, baseAddrAsLong, rng.length).ln();
-			} else {
-				Trace.OUT.put3("address 0x%x is good for region at 0x%x of length %d", addrAsLong, baseAddrAsLong, rng.length).ln();
-			}
-		}
-	}
-	
-	def offsetInRegion(addr: u64) -> u64 {
-		return addr - u64.view((Pointer.atElement(rng, 0) - Pointer.NULL));
-	}
-
-	def blockOfOffset(offset: u64) -> u64 {
-		return offset / blockSize;
-	}
-
-	def blockIndexOf(bte: BlockEntryHandle) -> u64 {
-		return u64.view((bte.addr - blockTableHandle.addr) / BlockEntry.size);
-	}
-
-	def chunkForBlockEntry(blk: BlockEntryHandle) -> ChunkHandle {
-		return ChunkHandle(Pointer.atElement(rng, 0) + long.view(blockSize * blockIndexOf(blk)));
-	}
-
-	private def init(blockSize: u64) {
-		// TODO: add force format flag to still format the pmem region, even if it's already initialized
-		var hdr = getHeader();
-		if (hdr.magic == PWRegions.MAGIC) {
-			// TODO: blockSize passed in may not match the blockSize already in the header
-			mount(blockSize);
-		} else {
-			format(blockSize);
-		}
-	}
-
-	// Mounts an existing, fully formatted region
-	private def mount(blockSize: u64) {
-		def hdr = getHeader();
-
-		// TODO: add check whether blockSize matches what's already in the hdr
-
-		if (this.numBlocks != hdr.numBlocks) {
-			// TODO: The physical region doesn't match the requested software geometry
-			// Handle abort/exit
-		}
-
-		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
-		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
-		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
-
-		def numBlockTableEntries = hdr.numBlocks + 1;
-		def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
-		
-		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.blockTable)), numBlockTableEntries);
-		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
-			rng[hdr.blockTable ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
-
-		descs = metadataDescs();
-
-		def secondRef = blockLayouts[1];
-		def secondHandle = getBlockEntryHandle(secondRef);
-		logChunk = chunkForBlockEntry(secondHandle);
-		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
-
-		recover();
-	}
-
-	// Formats a completely uninitialized region of memory
-	private def format(blockSize: u64) {
-		def nullBTE = BlockEntryHandle(Pointer.NULL);
-		var size = numBlocks * blockSize;
-		var hdr = getHeader();
-		sanitizeAddress(Pointer.atRef(hdr));
-
-		hdr.numBlocks = this.numBlocks;
-		hdr.numBytes = size;
-
-		var currentRegionEnd = size;
-
-		// set up list sentinels just after the header
-		hdr.sentinels = u64.!(PWRegionHeader.size);
-		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
-		sanitizeOffset(hdr.sentinels);
-		sanitizeOffset(hdr.sentinels + u64.!(sentinels.size));
-		for (i < BlockLists.MAX_LISTS) {
-			var entryHandle = sentinels[i];
-			entryHandle.setListNum(0);
-			entryHandle.setUsed(false);
-			entryHandle.setPrev(nullBTE);
-			entryHandle.setNext(nullBTE);
-			entryHandle.setListPrev(nullBTE);
-			entryHandle.setListNext(nullBTE);
-		}
-
-		// take space for block table, + 1 for the marker block at the end
-		var numBlockTableEntries = numBlocks + 1;
-		var blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
-		currentRegionEnd -= blockTableSize;
-		hdr.blockTable = currentRegionEnd;
-		sanitizeOffset(currentRegionEnd);
-		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(currentRegionEnd)), numBlockTableEntries);
-		
-		// Initialize blockLayouts as a LayoutRange
-		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
-			rng[currentRegionEnd ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
-
-		// clear block table entries (filled in better later)
-		for (i < numBlockTableEntries) {
-			var entryHandle = blockTableHandle[i64.!(i)];
-			entryHandle.setListNum(0);
-			entryHandle.setUsed(false);
-			entryHandle.setPrev(nullBTE);
-			entryHandle.setNext(nullBTE);
-			entryHandle.setListPrev(nullBTE);
-			entryHandle.setListNext(nullBTE);
-		}
-
-		// take space for metadata descriptors
-		def metaDataDescsSize = metaDataDescs.length * MetaDataDesc.size;
-		currentRegionEnd -= u64.!(metaDataDescsSize);
-		sanitizeOffset(currentRegionEnd);
-		hdr.metaDataDescs = currentRegionEnd;
-		hdr.numDescs = u64.!(metaDataDescs.length);
-
-		var metaDataLayouts = LayoutRanges.byIndex<Ref<MetaDataDesc>>(
-					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
-
-		// fill metadata descriptors and allocate metadata space
-		for (i < metaDataDescs.length) {
-			var desc = metaDataDescs[i];
-			var metaDataSize = u64.!(desc.fixedBytes);
-			var numUnits = (size + desc.unitSize - 1) / desc.unitSize;
-			metaDataSize += numUnits * desc.bytesPerUnit;
-			currentRegionEnd -= metaDataSize;
-			sanitizeOffset(currentRegionEnd);
-
-			var newDesc = metaDataLayouts[u64.!(i)];
-			newDesc.kind = desc.kind;
-			newDesc.fixedBytes = desc.fixedBytes;
-			newDesc.unitSize = desc.unitSize;
-			newDesc.bytesPerUnit = desc.bytesPerUnit;
-			newDesc.offset = currentRegionEnd;
-		}
-
-		var metaDataBytes = u64.!(rng.length) - currentRegionEnd;
-		var metaDataBlocks = (metaDataBytes + (blockSize - 1)) / blockSize;
-		var userDataBlocks = numBlocks - (metaDataBlocks + 1);
-
-		// set up block lists
-		// TODO: give more meaningful names rather than first, second, third ref/handle
-		var firstRef = blockLayouts[0];
-		var firstHandle = getBlockEntryHandle(firstRef);
-
-		var secondRef = blockLayouts[1];
-		var secondHandle = getBlockEntryHandle(secondRef);
-	
-		var thirdRef = blockLayouts[2];
-		var thirdHandle = getBlockEntryHandle(thirdRef);
-
-		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
-
-		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
-
-		var metaRef = blockLayouts[userDataBlocks + 1];
-		var metaHandle = getBlockEntryHandle(metaRef);
-
-		var lastRef = blockLayouts[numBlocks];
-		var lastHandle = getBlockEntryHandle(lastRef);
-
-		sanitizeAddress(firstHandle.addr);
-		firstHandle.setListNum(ListKind.METADATA.code);
-		firstHandle.setUsed(true);
-		firstHandle.setNext(secondHandle);
-		sanitizeOffset(blockLayouts.offset(1));
-
-		sanitizeAddress(secondHandle.addr);  // log block
-		secondHandle.setListNum(ListKind.METADATA.code);
-		secondHandle.setUsed(true);
-		secondHandle.setNext(thirdHandle);
-		sanitizeOffset(blockLayouts.offset(2));
-
-		logChunk = chunkForBlockEntry(secondHandle);
-		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
-
-		sanitizeAddress(thirdHandle.addr);
-		thirdHandle.setListNum(ListKind.LARGE_FREE.code);
-		thirdHandle.setNext(metaHandle);
-		thirdHandle.setPrev(firstHandle);
-		thirdHandle.setListPrev(largeSentinel);
-		thirdHandle.setListNext(metaHandle);
-		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
-		sanitizeOffset(blockLayouts.offset(0));
-		sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
-
-		sanitizeAddress(smallSentinel.addr);
-		// smallSentinel starts empty - points to null
-		smallSentinel.setListNext(nullBTE);
-		sanitizeOffset(blockLayouts.offset(0));
-
-		sanitizeAddress(largeSentinel.addr);
-		largeSentinel.setListNext(secondHandle);
-		largeSentinel.setListPrev(metaHandle);
-		sanitizeOffset(blockLayouts.offset(1));
-		
-		sanitizeAddress(metaHandle.addr);
-		metaHandle.setListNum(ListKind.METADATA.code);
-		metaHandle.setUsed(true);
-		metaHandle.setNext(lastHandle);
-		metaHandle.setPrev(secondHandle);
-		metaHandle.setListPrev(largeSentinel);
-		metaHandle.setListNext(nullBTE);
-		sanitizeOffset(blockLayouts.offset(numBlocks));
-		sanitizeOffset(blockLayouts.offset(1));
-		
-		sanitizeAddress(lastHandle.addr);
-		lastHandle.setListNum(ListKind.NONE.code);
-		lastHandle.setUsed(true);
-		lastHandle.setPrev(metaHandle);
-		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
-			
-		// Initialize descs for subclasses that need to access metadata descriptors
-		descs = metadataDescs();
-
-		// TODO: CiRuntime.fence() here to ensure all structures are physically in PMEM
-
-		hdr.magic = PWRegions.MAGIC;
-
-		// TODO: CiRuntime.cacheWriteback & fence for the header
-	}
-	
-	def getHeader() -> Ref<PWRegionHeader> {
-		return Ref<PWRegionHeader>.of(rng[0 ..+ PWRegionHeader.size]);
-	}
-	
-	def regionHeaderSize() -> int {
-		return PWRegionHeader.size;
-	}
-	
-	def getBlockSize() -> u64 {
-		return blockSize;
-	}
-	
-	def metadataDescs() -> LayoutRange<Ref<MetaDataDesc>> {
-		var hdr = getHeader();
-		var metaDataDescsSize = hdr.numDescs * u64.!(MetaDataDesc.size);
-		return LayoutRanges.byIndex<Ref<MetaDataDesc>>(
-					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
-	}
-	
-	def blockIndexOfEntry(entry: BlockEntryHandle) -> u64 {
-		var hdr = getHeader();
-		var blkTablePtr = Pointer.atElement(rng, int.!(hdr.blockTable));
-		var entryPtr = entry.addr;
-		var index = u64.!((entryPtr - blkTablePtr) / BlockEntry.size);
-		return index;
-	}
-	
-	def blockOffsetOfIndex(index: u64) -> u64 {
-		return index * getBlockSize();
-	}
-
-	def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
-		var blockIndex = blockIndexOfEntry(startEntry);
-		var blockOffset = blockOffsetOfIndex(blockIndex);
-
-	        var ptr = Pointer.atElement(rng, int.!(blockOffset));
-	        var chunk = ChunkHandle(ptr);
-
-		chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
-                // LOG: Chunk Header Initialization
-                // Address: chunk.addr + ChunkHeader.offset (offset 0)
-                // Size: 8 bytes
-                // New Value: ChunkHeader.size
-
-		chunk.setLimitCached(walCache, numBlocks * getBlockSize());
-                // LOG: Chunk Header Limit
-                // Address: chunk.addr + ChunkHeader.limit (offset 8)
-                // Size: 8 bytes
-                // New Value: numBlocks * getBlockSize()
-
-		// TODO link mark field
-		return chunk;
-	}
-	
-	def allocChunk(numBlocks: u32) -> ChunkHandle {
-		if (numBlocks == 1) {
-			// Try the small free block list
-			var firstHandle = smallSentinel.getListNextCached(walCache);
-			if (!firstHandle.isNull()) {
-                                // Note: removeFromList handles its own logging
-				removeFromList(firstHandle);
-
-                                firstHandle.setUsedCached(walCache, true);
-                                // LOG: BlockEntry Used Flag
-                                // Address: firstHandle.addr + BlockEntry.used (offset 2)
-                                // Size: 1 byte
-                                // New Value: 1 (true)
-
-                                // Note: createChunk handles logging of header initialization
-				return createChunk(firstHandle, 1);
-			}
-		}
-		var thisHandle = largeSentinel.getListNextCached(walCache);
-		while (!thisHandle.isNull()) {
-			var thisIndex = blockIndexOfEntry(thisHandle);
-			var nextHandle = thisHandle.getNextCached(walCache);
-			if (nextHandle.isNull()) return blankChunkHandle;
-			var nextIndex = blockIndexOfEntry(nextHandle);
-			var chunkBlocks = nextIndex - thisIndex;
-			if (numBlocks > chunkBlocks) {
-				thisHandle = thisHandle.getNextCached(walCache);
-				continue;
-			}
-			if (numBlocks == chunkBlocks) {
-                                // Note: removeFromList handles its own logging
-				removeFromList(thisHandle);
-
-				thisHandle.setUsedCached(walCache, true);
-                                // LOG: BlockEntry Used Flag
-                                // Address: thisHandle.addr + BlockEntry.used (offset 2)
-                                // Size: 1 byte
-                                // New Value: 1 (true)
-
-                                // Note: createChunk handles logging of header initialization
-				return createChunk(thisHandle, numBlocks);
-			}
-
-                        // --- Splitting Block Logic ---
-
-			var remIndex = thisIndex + u64.!(numBlocks);
-			var remRef = blockLayouts[remIndex];
-			var remHandle = getBlockEntryHandle(remRef);
-			var remBlocks = nextIndex - remIndex;
-
-                        // LOG: Remainder Block Metadata Initialization
-                        // 1. ListNum (Offset 0, 2 bytes): SMALL_FREE or LARGE_FREE
-                        // 2. Used (Offset 2, 1 byte): 0 (false)
-                        // 3. Prev (Offset 8, 8 bytes): remHandle.toOffset(thisHandle)
-                        // 4. Next (Offset 8, 8 bytes): remHandle.toOffset(nextHandle)
-                        // 5. ListPrev (Offset 24, 8 bytes): remHandle.toOffset(thisHandle)
-                        // 6. ListNext (Offset 32, 8 bytes): remHandle.toOffset(nextHandle)
-			remHandle.setListNumCached(walCache, if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
-			remHandle.setUsedCached(walCache, false);
-			remHandle.setPrevCached(walCache, thisHandle);
-			remHandle.setNextCached(walCache, nextHandle);
-			remHandle.setListPrevCached(walCache, thisHandle);
-			remHandle.setListNextCached(walCache, nextHandle);
-
-			thisHandle.setNextCached(walCache, remHandle);
-                        // LOG: Update 'this' block Next pointer
-                        // Address: thisHandle.addr + BlockEntry.next (offset 16)
-                        // Size: 8 bytes
-                        // New Value: thisHandle.toOffset(remHandle)
-
-			thisHandle.setListNextCached(walCache, remHandle);
-                        // LOG: Update 'this' block ListNext pointer
-                        // Address: thisHandle.addr + BlockEntry.listNext (offset 32)
-                        // Size: 8 bytes
-                        // New Value: thisHandle.toOffset(remHandle)
-
-			nextHandle.setPrevCached(walCache, remHandle);
-                        // LOG: Update 'next' block Prev pointer
-                        // Address: nextHandle.addr + BlockEntry.prev (offset 8)
-                        // Size: 8 bytes
-                        // New Value: nextHandle.toOffset(remHandle)
-
-			var listNextHandle = thisHandle.getListNextCached(walCache);
-
-			listNextHandle.setListPrevCached(walCache, remHandle);
-                        // LOG: Update 'listNext' block ListPrev pointer
-                        // Address: listNextHandle.addr + BlockEntry.listPrev (offset 24)
-                        // Size: 8 bytes
-                        // New Value: listNextHandle.toOffset(remHandle)
-
-                        // Note: removeFromList handles its own logging
-			removeFromList(thisHandle);
-
-			return createChunk(thisHandle, numBlocks);
-		}
-		return blankChunkHandle;
-	}
-
-	def freeChunk(chunk: ChunkHandle) {
-		if (chunk.isNull()) return;
-
-		// Map the chunk address back to the BlockEntry
-		def index = blockOfOffset(offsetInRegion(u64.view(chunk.addr - Pointer.NULL)));
-
-		// Retrieve the handle for the header of this block
-		var entry = blockTableHandle[long.view(index)];
-
-		if (entry.isNull()) return;
-
-		// Ensure we aren't freeing an already free block
-		if (!entry.getUsed()) return;
-
-		entry.setUsedCached(walCache, false);
-                // LOG: Mark Block as Unused
-                // Address: entry.addr + BlockEntry.used (offset 2)
-                // Size: 1 bytes
-                // New Value: 0 (false)
-
-		// Coalesce Left
-		def prev = entry.getPrevCached(walCache);
-		if (!prev.isNull() && !prev.getUsedCached(walCache)) {
-                        // Note: removeFromList handles its own logging
-			removeFromList(prev); // Remove prev from its specific free list
-
-			def next = entry.getNextCached(walCache);
-
-			prev.setNextCached(walCache, next);
-                        // LOG: Update Prev's Next pointer (Coalescing)
-                        // Address: prev.addr + BlockEntry.next (offset 16)
-                        // Size: 8 bytes
-                        // New Value: prev.toOffset(next)
-
-			if (!next.isNull()) {
-				next.setPrevCached(walCache, prev);
-                                // LOG: Update Next's Prev pointer (Coalescing)
-                                // Address: next.addr + BlockEntry.prev (offset 8)
-                                // Size: 8 bytes
-                                // New Value: next.toOffset(prev)
-			}
-			// Update local handle to point to 'prev' so subsequent logic works on the merged head.
-			entry = prev;
-		}
-
-		// Coalesce Right
-		def next = entry.getNextCached(walCache);
-		if (!next.isNull() && !next.getUsedCached(walCache)) {
-                        // Note: removeFromList handles its own logging
-			removeFromList(next); // Remove next from its specific free list temporarily
-
-			def nextNext = next.getNextCached(walCache);
-
-			entry.setNextCached(walCache, nextNext);
-                        // LOG: Update Entry's Next pointer (Coalescing)
-                        // Address: entry.addr + BlockEntry.next (offset 16)
-                        // Size: 8 bytes
-                        // New Value: entry.toOffset(nextNext)
-
-			if (!nextNext.isNull()) {
-				nextNext.setPrevCached(walCache, entry);
-                                // LOG: Update NextNext's Prev pointer (Coalescing)
-                                // Address: nextNext.addr + BlockEntry.prev (offset 8)
-                                // Size: 8 bytes
-                                // New Value: nextNext.toOffset(entry)
-			}
-		}
-
-		// Calculate new size to determine which list to use
-		def startIndex = blockIndexOfEntry(entry);
-		def nextNeighbor = entry.getNext();
-		// If there is no next neighbor, the block extends to the end of the region (numBlocks)
-		def endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
-		def newSize = endIndex - startIndex;
-
-                // Note: insertAfter handles its own logging
-		if (newSize == 1) {
-			insertAfter(smallSentinel, entry, ListKind.SMALL_FREE);
-		} else {
-			insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
-		}
-	}
-
-	// Helper to insert an entry into a list immediately after the sentinel (Head insertion)
-	def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
-		entry.setListNumCached(walCache, kind.code);
-                // LOG: Set List Kind
-                // Address: entry.addr + BlockEntry.listNum (offset 0)
-                // Size: 2 bytes
-                // New Value: kind.code
-	
-		var listNext = sentinel.getListNextCached(walCache);
-	
-		// Link: sentinel -> entry -> listNext
-
-		sentinel.setListNextCached(walCache, entry);
-                // LOG: Link Sentinel to Entry
-                // Address: sentinel.addr + BlockEntry.listNext (offset 32)
-                // Size: 8 bytes
-                // New Value: sentinel.toOffset(entry)
-                
-		entry.setListPrevCached(walCache, sentinel);
-                // LOG: Link Entry to Sentinel (Prev)
-                // Address: entry.addr + BlockEntry.listPrev (offset 24)
-                // Size: 8 bytes
-                // New Value: entry.toOffset(sentinel)
-        
-	  	entry.setListNextCached(walCache, listNext);
-                // LOG: Link Entry to listNext (Next)
-                // Address: entry.addr + BlockEntry.listNext (offset 32)
-                // Size: 8 bytes
-                // New Value: entry.toOffset(listNext)
-	
-		if (!listNext.isNull()) {
-			listNext.setListPrevCached(walCache, entry);
-                        // LOG: Link listNext back to Entry (Prev)
-                        // Address: listNext.addr + BlockEntry.listPrev (offset 24)
-                        // Size: 8 bytes
-                        // New Value: listNext.toOffset(entry)
-		}
-	}
-
-	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
-		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
-	}
-	
-	def removeFromList(blk: BlockEntryHandle) {
-		var listPrev = blk.getListPrevCached(walCache);
-		var listNext = blk.getListNextCached(walCache);
-
-		if (!listPrev.isNull()) {
-			listPrev.setListNextCached(walCache, listNext);
-                        // LOG: Update listPrev's ListNext
-                        // Address: listPrev.addr + BlockEntry.listNext (offset 32)
-                        // Size: 8 bytes
-                        // New Value: listNextOffsetFromListPrev 
-			// listPrev.setListNext(listNext);
-		}
-
-		if (!listNext.isNull()) {
-			listNext.setListPrevCached(walCache, listPrev);
-                        // LOG: Update listNext's ListPrev
-                        // Address: listNext.addr + BlockEntry.listPrev (offset 24)
-                        // Size: 8 bytes
-                        // New Value: listPrevOffsetFromListNext
-		}
-
-		def nullBTE = BlockEntryHandle(Pointer.NULL);
-                
-		blk.setListPrevCached(walCache, nullBTE);
-                // LOG: Clear blk ListPrev
-                // Address: blk.addr + BlockEntry.listPrev (offset 24)
-                // Size: 8 bytes
-                // New Value: null (0)
-
-		blk.setListNextCached(walCache, nullBTE);
-                // LOG: Clear blk ListNext
-                // Address: blk.addr + BlockEntry.listNext (offset 32)
-                // Size: 8 bytes
-                // New Value: null (0)
-
-		blk.setListNumCached(walCache, ListKind.NONE.code);
-                // LOG: Clear blk ListNum
-                // Address: blk.addr + BlockEntry.listNum (offset 0)
-                // Size: 2 bytes
-                // New Value: ListKind.NONE.code (-2)
-	}
-	
-	// Deallocate this region
-	def deallocate() {
-		if (backendRegion != null) {
-			backendRegion.backend.deallocate(backendRegion);
-			backendRegion = null;
-		}
-	}
-
-	def performCommit() {
-		// Transfer changes from DRAM Cache to PMEM Log
-		walCache.transferToLog(walWriter);
-
-		walWriter.commit();
-		walCache.applyToMemory();
-
-		// TODO: fence here
-		// CiRuntime.fence();
-
-		walWriter.clear();
-		walCache.clear();
-	}
-
-	private def recover() {
-		var logBase = chunkForBlockEntry(getBlockEntryHandle(blockLayouts[1])).addr;
-		var header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logBase, LogHeader.size));
-
-		if (header.status != 1) return;
-
-		var expected = header.checksum;
-		var actual = calculateRecoveryChecksum(logBase + LogHeader.size, header.numEntries);
-
-		if (expected != actual) {
-			// Log checksum mismatch. Ignore corrupt log
-			header.status = 0;
-			return;
-		}
-
-		var entryPtr = logBase + LogHeader.size;
-
-		for (i < header.numEntries) {
-			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(entryPtr, LogEntry.size));
-
-			var targetAddr = Pointer.atElement(rng, int.!(entry.offset));
-
-			match (entry.width) {
-				1 => targetAddr.store<u8>(u8.view(entry.value));
-				2 => targetAddr.store<u16>(u16.view(entry.value));
-				4 => targetAddr.store<u32>(u32.view(entry.value));
-				8 => targetAddr.store<u64>(u64.view(entry.value));
-				_ => ;
-			}
-			entryPtr = entryPtr + LogEntry.size;
-		}
-
-		header.status = 0;
-		// TODO
-		// CiRuntime.cacheWriteback(header, LogHeader.size);
-		// CiRuntime.fence();
-	}
-
-	// Helper for recovery checksum (copy of the WALWriter logic)
-	private def calculateRecoveryChecksum(base: Pointer, count: u32) -> u64 {
-		var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
-		var ptr = base;
-		for (i < count) {
-			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(ptr, LogEntry.size));
-			h = (h << 13) | (h >> 51);
-			h = h ^ entry.offset;
-			h = h ^ entry.value;
-			h = h ^ u64.view(entry.width);
-			ptr = ptr + LogEntry.size;
-		}
-		return h;
-	}
-}
-
-layout LogHeader {
-	+0	numEntries:	u32;	// Number of valid entries in this transaction
-	+4	status:		u8;	// 0 = Invalid, 1 = Committed
-	+8	checksum:	u64;	// Optional: Simple checksum for integrity
-	=32;				// Pad to 32 bytes
-}
-
-layout LogEntry {
-	+0	kind:		u8;	// what kind of log entry
-	+1	offset:		u64;	// Relative offset of first changed byte, from the start of the Region
-	+16	value:		u64;	// The data to be written
-	+24	width:		u8;	// number of bytes being changed (1, 2, 4, 8)
-	=32;
-}
-
 type LogEntryHandle(addr: Pointer) { }
+
+
+// =============================================================================
+// Section 5: WAL Infrastructure (write-behind cache and write-ahead log)
+// =============================================================================
 
 // Wrapper ADT to store the cached value and its width (size)
 type CachedUpdate(value: u64, size: u4) #unboxed { }
@@ -1206,27 +481,789 @@ class WALWriter {
 	}
 }
 
-component PWRegions {
-	def MAGIC = 0x50_57_41_53_4Du64; // "PWASM" in hex
-	def blockSize: u64 = 256u64 * 1024u64;
-	def sanitize = true;
+
+// =============================================================================
+// Section 6: LayoutRange Utilities
+// =============================================================================
+
+// Really want to write something like this, Virgil does not support it:
+//
+// class LayoutRange<Ref<L>> {
+//	def var rng: Range<byte>;
+//	new(rng);
+//	def [index: u64] => Ref<L>.at(rng[index * L.size ..+ L.size]);
+// }
+
+// Layout ranges may go into a Virgil library once tested and refined
+
+// The concept is essentially an array/range of a layout, i.e., multiple
+// copies of the same layout up against each other.  The "at" function does
+// the actual indexing and constructs a Ref, so this class does little actual
+// work (but see the companion component, LayoutRanges).
+
+// TODO: code for LayoutRange is probably obsolete, try to refactor and remove it
+class LayoutRange<T> {
+	def var rng: Range<byte>;  // the underlying range of bytes
+	def at: (Range<byte>, u64) -> T;  // a function to index that range and return a Ref
+	def offset: u64 -> u64;  // a function to go from index to offset
+	def [index: u64] -> T { return at(rng, index); }  // indexing that supports [i] notation
+	new(rng, at, offset) { }
 }
 
-layout LineMark {
-	+0	mark:		u8;	// line mark info
-	=1;
+// This component provides several functions that can be used to index a
+// LayoutRange with different semantics for the index passed in.
+
+component LayoutRanges {
+
+	// atIndex interprets the index as indicating which element of the
+	// range is desired.  Thus, an index of 2 indicates the third element
+	// of the range.  atIndex requires the size in order to calculate the
+	// byte offset.
+	def atIndex<T>(rng: Range<byte>, index: u64, size: int, at: Range<byte> -> T) -> T {
+		return at(rng[index * u64.!(size) ..+ size]);
+	}
+
+	// atByte interprets the index as indicating the starting byte.  Thus, an index
+	// of 2 indicates to start at the third *byte* on the range.  It uses the size
+	// only to determine the size of the subrange passed to "at".
+	def atByte<T>(rng: Range<byte>, pos: u64, size: int, at: Range<byte> -> T) -> T {
+		return at(rng[pos ..+ size]);
+	}
+
+	// forOffset takes an offset (into some other range of bytes) and
+	// converts that into a suitable index in this LayoutRange based on
+	// their being one layout per some number of bytes in the other range.
+	// Here an offset of 2 means to convert from that offset in the
+	// original range.  To perform the computation, forOffset requires a
+	// "divisor" (the number of bytes in the other range per layout in
+	// this range) and the size of each layout in this range.
+	def forOffset<T>(rng: Range<byte>, offset: u64, divisor: u64, size: int,
+			at: Range<byte> -> T) -> T {
+		return at(rng[(offset / divisor) * u64.!(size) ..+ size]);
+	}
+
+	private def offset(base: u64, size: int, index: u64) -> u64 {
+		return base + index * u64.!(size);
+	}
+	// Creates a LayoutRange that uses the atIndex accessor and gives offset as within the original range
+	// Example: LayoutRanges.subrangeByIndex(rng, start, L.size, count, Ref<L>.at)
+	def subrangeByIndex<T>(rng: Range<byte>, base: u64, size: int, count: u64, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		var sub = rng[base ..+ count * u64.!(size)];
+		return LayoutRange<T>.new(sub, LayoutRanges.atIndex(_, _, size, atFunc), offset(base, size, _));
+	}
+
+	// Creates a LayoutRange that uses the atIndex accessor
+	// Example: LayoutRanges.byIndex(rng, L.size, Ref<L>.at)
+	def byIndex<T>(rng: Range<byte>, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.atIndex(_, _, size, atFunc), u64.*(u64.!(size),_));
+	}
+
+	// Creates a LayoutRange that uses the atByte accessor
+	// Example: LayoutRanges.byByte(rng, L.size, Ref<L>.at)
+	def byByte<T>(rng: Range<byte>, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.atByte(_, _, size, atFunc), u64.*(u64.!(size),_));
+	}
+
+	// Creates a LayoutRange that uses the forOffset accessor
+	// Example: LayoutRanges.byOffset(rng, otherUnit, L.size, Ref<L>.at)
+	def byOffset<T>(rng: Range<byte>, divisor: u64, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
+		return LayoutRange<T>.new(rng, LayoutRanges.forOffset(_, _, divisor, size, atFunc), u64.*(u64.!(size),_));
+	}
 }
+
+
+// =============================================================================
+// Section 7: Core Region Implementation
+// =============================================================================
+
+// Generic block-based region manager (platform-independent)
+class PWRegion {
+	def var backendRegion: BackendRegion;
+	def var rng: Range<byte>;  // the actual bytes of the region
+	def numBlocks: u64;
+	def blockSize: u64;  // Size of each block
+	def metaDataDescs: Range<Ref<MetaDataDesc>>;
+	def var descs: LayoutRange<Ref<MetaDataDesc>>;
+	def var sentinels: BlockTableHandle;
+	def var smallSentinel: BlockEntryHandle;
+	def var largeSentinel: BlockEntryHandle;
+	def blankChunkHeader = Array<byte>.new(ChunkHeader.size);  // so we can return *something* when allocation fails
+	def blankChunkHandle = ChunkHandle(Pointer.atElement(blankChunkHeader, 0));
+	def var blockTableHandle: BlockTableHandle;
+	var blockLayouts: LayoutRange<Ref<BlockEntry>>;
+	def var logChunk: ChunkHandle;
+	def var walCache = WALCache.new();
+	def var walWriter: WALWriter;
+
+	new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64) {
+		var size = numBlocks * blockSize;
+		var prot = BackendProt.READ | BackendProt.WRITE;
+		backendRegion = backend.allocate(size, prot);
+		if (backendRegion == null) {
+			// Allocation failed
+			return;
+		}
+		rng = backendRegion.range;
+		init(blockSize);
+	}
+
+	private def sanitizeOffset(offset: u64) {
+		if (PWRegions.sanitize) {
+			var addr: long = Pointer.atElement(rng, 0) - Pointer.NULL;
+			if (offset < rng.length) {
+				Trace.OUT.put3("offset %d is good for region at 0x%x of length %d", long.view(offset), addr, rng.length).ln();
+			} else {
+				Trace.OUT.put3("offset %d is bad for region at 0x%x of length %d", long.view(offset), addr, rng.length).ln();
+			}
+		}
+	}
+
+	private def sanitizeAddress(addr: Pointer) {
+		if (PWRegions.sanitize) {
+			var delta: long = addr - Pointer.atElement(rng, 0);
+			var addrAsLong: long = addr - Pointer.NULL;
+			var baseAddrAsLong: long = Pointer.atElement(rng, 0) - Pointer.NULL;
+			if (delta < 0 || delta >= rng.length) {
+				Trace.OUT.put3("address 0x%x is bad for region at 0x%x of length %d", addrAsLong, baseAddrAsLong, rng.length).ln();
+			} else {
+				Trace.OUT.put3("address 0x%x is good for region at 0x%x of length %d", addrAsLong, baseAddrAsLong, rng.length).ln();
+			}
+		}
+	}
+
+	def offsetInRegion(addr: u64) -> u64 {
+		return addr - u64.view((Pointer.atElement(rng, 0) - Pointer.NULL));
+	}
+
+	def blockOfOffset(offset: u64) -> u64 {
+		return offset / blockSize;
+	}
+
+	def blockIndexOf(bte: BlockEntryHandle) -> u64 {
+		return u64.view((bte.addr - blockTableHandle.addr) / BlockEntry.size);
+	}
+
+	def chunkForBlockEntry(blk: BlockEntryHandle) -> ChunkHandle {
+		return ChunkHandle(Pointer.atElement(rng, 0) + long.view(blockSize * blockIndexOf(blk)));
+	}
+
+	private def init(blockSize: u64) {
+		// TODO: add force format flag to still format the pmem region, even if it's already initialized
+		var hdr = getHeader();
+		if (hdr.magic == PWRegions.MAGIC) {
+			// TODO: blockSize passed in may not match the blockSize already in the header
+			mount(blockSize);
+		} else {
+			format(blockSize);
+		}
+	}
+
+	// Mounts an existing, fully formatted region
+	private def mount(blockSize: u64) {
+		def hdr = getHeader();
+
+		// TODO: add check whether blockSize matches what's already in the hdr
+
+		if (this.numBlocks != hdr.numBlocks) {
+			// TODO: The physical region doesn't match the requested software geometry
+			// Handle abort/exit
+		}
+
+		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
+		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
+		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
+
+		def numBlockTableEntries = hdr.numBlocks + 1;
+		def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
+
+		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.blockTable)), numBlockTableEntries);
+		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
+			rng[hdr.blockTable ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
+
+		descs = metadataDescs();
+
+		def secondRef = blockLayouts[1];
+		def secondHandle = getBlockEntryHandle(secondRef);
+		logChunk = chunkForBlockEntry(secondHandle);
+		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
+
+		recover();
+	}
+
+	// Formats a completely uninitialized region of memory
+	private def format(blockSize: u64) {
+		def nullBTE = BlockEntryHandle(Pointer.NULL);
+		var size = numBlocks * blockSize;
+		var hdr = getHeader();
+		sanitizeAddress(Pointer.atRef(hdr));
+
+		hdr.numBlocks = this.numBlocks;
+		hdr.numBytes = size;
+
+		var currentRegionEnd = size;
+
+		// set up list sentinels just after the header
+		hdr.sentinels = u64.!(PWRegionHeader.size);
+		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
+		sanitizeOffset(hdr.sentinels);
+		sanitizeOffset(hdr.sentinels + u64.!(sentinels.size));
+		for (i < BlockLists.MAX_LISTS) {
+			var entryHandle = sentinels[i];
+			entryHandle.setListNum(0);
+			entryHandle.setUsed(false);
+			entryHandle.setPrev(nullBTE);
+			entryHandle.setNext(nullBTE);
+			entryHandle.setListPrev(nullBTE);
+			entryHandle.setListNext(nullBTE);
+		}
+
+		// take space for block table, + 1 for the marker block at the end
+		var numBlockTableEntries = numBlocks + 1;
+		var blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
+		currentRegionEnd -= blockTableSize;
+		hdr.blockTable = currentRegionEnd;
+		sanitizeOffset(currentRegionEnd);
+		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(currentRegionEnd)), numBlockTableEntries);
+
+		// Initialize blockLayouts as a LayoutRange
+		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
+			rng[currentRegionEnd ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
+
+		// clear block table entries (filled in better later)
+		for (i < numBlockTableEntries) {
+			var entryHandle = blockTableHandle[i64.!(i)];
+			entryHandle.setListNum(0);
+			entryHandle.setUsed(false);
+			entryHandle.setPrev(nullBTE);
+			entryHandle.setNext(nullBTE);
+			entryHandle.setListPrev(nullBTE);
+			entryHandle.setListNext(nullBTE);
+		}
+
+		// take space for metadata descriptors
+		def metaDataDescsSize = metaDataDescs.length * MetaDataDesc.size;
+		currentRegionEnd -= u64.!(metaDataDescsSize);
+		sanitizeOffset(currentRegionEnd);
+		hdr.metaDataDescs = currentRegionEnd;
+		hdr.numDescs = u64.!(metaDataDescs.length);
+
+		var metaDataLayouts = LayoutRanges.byIndex<Ref<MetaDataDesc>>(
+					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
+
+		// fill metadata descriptors and allocate metadata space
+		for (i < metaDataDescs.length) {
+			var desc = metaDataDescs[i];
+			var metaDataSize = u64.!(desc.fixedBytes);
+			var numUnits = (size + desc.unitSize - 1) / desc.unitSize;
+			metaDataSize += numUnits * desc.bytesPerUnit;
+			currentRegionEnd -= metaDataSize;
+			sanitizeOffset(currentRegionEnd);
+
+			var newDesc = metaDataLayouts[u64.!(i)];
+			newDesc.kind = desc.kind;
+			newDesc.fixedBytes = desc.fixedBytes;
+			newDesc.unitSize = desc.unitSize;
+			newDesc.bytesPerUnit = desc.bytesPerUnit;
+			newDesc.offset = currentRegionEnd;
+		}
+
+		var metaDataBytes = u64.!(rng.length) - currentRegionEnd;
+		var metaDataBlocks = (metaDataBytes + (blockSize - 1)) / blockSize;
+		var userDataBlocks = numBlocks - (metaDataBlocks + 1);
+
+		// set up block lists
+		// TODO: give more meaningful names rather than first, second, third ref/handle
+		var firstRef = blockLayouts[0];
+		var firstHandle = getBlockEntryHandle(firstRef);
+
+		var secondRef = blockLayouts[1];
+		var secondHandle = getBlockEntryHandle(secondRef);
+
+		var thirdRef = blockLayouts[2];
+		var thirdHandle = getBlockEntryHandle(thirdRef);
+
+		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
+
+		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
+
+		var metaRef = blockLayouts[userDataBlocks + 1];
+		var metaHandle = getBlockEntryHandle(metaRef);
+
+		var lastRef = blockLayouts[numBlocks];
+		var lastHandle = getBlockEntryHandle(lastRef);
+
+		sanitizeAddress(firstHandle.addr);
+		firstHandle.setListNum(ListKind.METADATA.code);
+		firstHandle.setUsed(true);
+		firstHandle.setNext(secondHandle);
+		sanitizeOffset(blockLayouts.offset(1));
+
+		sanitizeAddress(secondHandle.addr);  // log block
+		secondHandle.setListNum(ListKind.METADATA.code);
+		secondHandle.setUsed(true);
+		secondHandle.setNext(thirdHandle);
+		sanitizeOffset(blockLayouts.offset(2));
+
+		logChunk = chunkForBlockEntry(secondHandle);
+		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
+
+		sanitizeAddress(thirdHandle.addr);
+		thirdHandle.setListNum(ListKind.LARGE_FREE.code);
+		thirdHandle.setNext(metaHandle);
+		thirdHandle.setPrev(firstHandle);
+		thirdHandle.setListPrev(largeSentinel);
+		thirdHandle.setListNext(metaHandle);
+		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
+		sanitizeOffset(blockLayouts.offset(0));
+		sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
+
+		sanitizeAddress(smallSentinel.addr);
+		// smallSentinel starts empty - points to null
+		smallSentinel.setListNext(nullBTE);
+		sanitizeOffset(blockLayouts.offset(0));
+
+		sanitizeAddress(largeSentinel.addr);
+		largeSentinel.setListNext(secondHandle);
+		largeSentinel.setListPrev(metaHandle);
+		sanitizeOffset(blockLayouts.offset(1));
+
+		sanitizeAddress(metaHandle.addr);
+		metaHandle.setListNum(ListKind.METADATA.code);
+		metaHandle.setUsed(true);
+		metaHandle.setNext(lastHandle);
+		metaHandle.setPrev(secondHandle);
+		metaHandle.setListPrev(largeSentinel);
+		metaHandle.setListNext(nullBTE);
+		sanitizeOffset(blockLayouts.offset(numBlocks));
+		sanitizeOffset(blockLayouts.offset(1));
+
+		sanitizeAddress(lastHandle.addr);
+		lastHandle.setListNum(ListKind.NONE.code);
+		lastHandle.setUsed(true);
+		lastHandle.setPrev(metaHandle);
+		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
+
+		// Initialize descs for subclasses that need to access metadata descriptors
+		descs = metadataDescs();
+
+		// TODO: CiRuntime.fence() here to ensure all structures are physically in PMEM
+
+		hdr.magic = PWRegions.MAGIC;
+
+		// TODO: CiRuntime.cacheWriteback & fence for the header
+	}
+
+	def getHeader() -> Ref<PWRegionHeader> {
+		return Ref<PWRegionHeader>.of(rng[0 ..+ PWRegionHeader.size]);
+	}
+
+	def regionHeaderSize() -> int {
+		return PWRegionHeader.size;
+	}
+
+	def getBlockSize() -> u64 {
+		return blockSize;
+	}
+
+	def metadataDescs() -> LayoutRange<Ref<MetaDataDesc>> {
+		var hdr = getHeader();
+		var metaDataDescsSize = hdr.numDescs * u64.!(MetaDataDesc.size);
+		return LayoutRanges.byIndex<Ref<MetaDataDesc>>(
+					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
+	}
+
+	def blockIndexOfEntry(entry: BlockEntryHandle) -> u64 {
+		var hdr = getHeader();
+		var blkTablePtr = Pointer.atElement(rng, int.!(hdr.blockTable));
+		var entryPtr = entry.addr;
+		var index = u64.!((entryPtr - blkTablePtr) / BlockEntry.size);
+		return index;
+	}
+
+	def blockOffsetOfIndex(index: u64) -> u64 {
+		return index * getBlockSize();
+	}
+
+	def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
+		var blockIndex = blockIndexOfEntry(startEntry);
+		var blockOffset = blockOffsetOfIndex(blockIndex);
+
+	        var ptr = Pointer.atElement(rng, int.!(blockOffset));
+	        var chunk = ChunkHandle(ptr);
+
+		chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
+                // LOG: Chunk Header Initialization
+                // Address: chunk.addr + ChunkHeader.offset (offset 0)
+                // Size: 8 bytes
+                // New Value: ChunkHeader.size
+
+		chunk.setLimitCached(walCache, numBlocks * getBlockSize());
+                // LOG: Chunk Header Limit
+                // Address: chunk.addr + ChunkHeader.limit (offset 8)
+                // Size: 8 bytes
+                // New Value: numBlocks * getBlockSize()
+
+		// TODO link mark field
+		return chunk;
+	}
+
+	def allocChunk(numBlocks: u32) -> ChunkHandle {
+		if (numBlocks == 1) {
+			// Try the small free block list
+			var firstHandle = smallSentinel.getListNextCached(walCache);
+			if (!firstHandle.isNull()) {
+                                // Note: removeFromList handles its own logging
+				removeFromList(firstHandle);
+
+                                firstHandle.setUsedCached(walCache, true);
+                                // LOG: BlockEntry Used Flag
+                                // Address: firstHandle.addr + BlockEntry.used (offset 2)
+                                // Size: 1 byte
+                                // New Value: 1 (true)
+
+                                // Note: createChunk handles logging of header initialization
+				return createChunk(firstHandle, 1);
+			}
+		}
+		var thisHandle = largeSentinel.getListNextCached(walCache);
+		while (!thisHandle.isNull()) {
+			var thisIndex = blockIndexOfEntry(thisHandle);
+			var nextHandle = thisHandle.getNextCached(walCache);
+			if (nextHandle.isNull()) return blankChunkHandle;
+			var nextIndex = blockIndexOfEntry(nextHandle);
+			var chunkBlocks = nextIndex - thisIndex;
+			if (numBlocks > chunkBlocks) {
+				thisHandle = thisHandle.getNextCached(walCache);
+				continue;
+			}
+			if (numBlocks == chunkBlocks) {
+                                // Note: removeFromList handles its own logging
+				removeFromList(thisHandle);
+
+				thisHandle.setUsedCached(walCache, true);
+                                // LOG: BlockEntry Used Flag
+                                // Address: thisHandle.addr + BlockEntry.used (offset 2)
+                                // Size: 1 byte
+                                // New Value: 1 (true)
+
+                                // Note: createChunk handles logging of header initialization
+				return createChunk(thisHandle, numBlocks);
+			}
+
+                        // --- Splitting Block Logic ---
+
+			var remIndex = thisIndex + u64.!(numBlocks);
+			var remRef = blockLayouts[remIndex];
+			var remHandle = getBlockEntryHandle(remRef);
+			var remBlocks = nextIndex - remIndex;
+
+                        // LOG: Remainder Block Metadata Initialization
+                        // 1. ListNum (Offset 0, 2 bytes): SMALL_FREE or LARGE_FREE
+                        // 2. Used (Offset 2, 1 byte): 0 (false)
+                        // 3. Prev (Offset 8, 8 bytes): remHandle.toOffset(thisHandle)
+                        // 4. Next (Offset 8, 8 bytes): remHandle.toOffset(nextHandle)
+                        // 5. ListPrev (Offset 24, 8 bytes): remHandle.toOffset(thisHandle)
+                        // 6. ListNext (Offset 32, 8 bytes): remHandle.toOffset(nextHandle)
+			remHandle.setListNumCached(walCache, if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
+			remHandle.setUsedCached(walCache, false);
+			remHandle.setPrevCached(walCache, thisHandle);
+			remHandle.setNextCached(walCache, nextHandle);
+			remHandle.setListPrevCached(walCache, thisHandle);
+			remHandle.setListNextCached(walCache, nextHandle);
+
+			thisHandle.setNextCached(walCache, remHandle);
+                        // LOG: Update 'this' block Next pointer
+                        // Address: thisHandle.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: thisHandle.toOffset(remHandle)
+
+			thisHandle.setListNextCached(walCache, remHandle);
+                        // LOG: Update 'this' block ListNext pointer
+                        // Address: thisHandle.addr + BlockEntry.listNext (offset 32)
+                        // Size: 8 bytes
+                        // New Value: thisHandle.toOffset(remHandle)
+
+			nextHandle.setPrevCached(walCache, remHandle);
+                        // LOG: Update 'next' block Prev pointer
+                        // Address: nextHandle.addr + BlockEntry.prev (offset 8)
+                        // Size: 8 bytes
+                        // New Value: nextHandle.toOffset(remHandle)
+
+			var listNextHandle = thisHandle.getListNextCached(walCache);
+
+			listNextHandle.setListPrevCached(walCache, remHandle);
+                        // LOG: Update 'listNext' block ListPrev pointer
+                        // Address: listNextHandle.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: listNextHandle.toOffset(remHandle)
+
+                        // Note: removeFromList handles its own logging
+			removeFromList(thisHandle);
+
+			return createChunk(thisHandle, numBlocks);
+		}
+		return blankChunkHandle;
+	}
+
+	def freeChunk(chunk: ChunkHandle) {
+		if (chunk.isNull()) return;
+
+		// Map the chunk address back to the BlockEntry
+		def index = blockOfOffset(offsetInRegion(u64.view(chunk.addr - Pointer.NULL)));
+
+		// Retrieve the handle for the header of this block
+		var entry = blockTableHandle[long.view(index)];
+
+		if (entry.isNull()) return;
+
+		// Ensure we aren't freeing an already free block
+		if (!entry.getUsed()) return;
+
+		entry.setUsedCached(walCache, false);
+                // LOG: Mark Block as Unused
+                // Address: entry.addr + BlockEntry.used (offset 2)
+                // Size: 1 bytes
+                // New Value: 0 (false)
+
+		// Coalesce Left
+		def prev = entry.getPrevCached(walCache);
+		if (!prev.isNull() && !prev.getUsedCached(walCache)) {
+                        // Note: removeFromList handles its own logging
+			removeFromList(prev); // Remove prev from its specific free list
+
+			def next = entry.getNextCached(walCache);
+
+			prev.setNextCached(walCache, next);
+                        // LOG: Update Prev's Next pointer (Coalescing)
+                        // Address: prev.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: prev.toOffset(next)
+
+			if (!next.isNull()) {
+				next.setPrevCached(walCache, prev);
+                                // LOG: Update Next's Prev pointer (Coalescing)
+                                // Address: next.addr + BlockEntry.prev (offset 8)
+                                // Size: 8 bytes
+                                // New Value: next.toOffset(prev)
+			}
+			// Update local handle to point to 'prev' so subsequent logic works on the merged head.
+			entry = prev;
+		}
+
+		// Coalesce Right
+		def next = entry.getNextCached(walCache);
+		if (!next.isNull() && !next.getUsedCached(walCache)) {
+                        // Note: removeFromList handles its own logging
+			removeFromList(next); // Remove next from its specific free list temporarily
+
+			def nextNext = next.getNextCached(walCache);
+
+			entry.setNextCached(walCache, nextNext);
+                        // LOG: Update Entry's Next pointer (Coalescing)
+                        // Address: entry.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: entry.toOffset(nextNext)
+
+			if (!nextNext.isNull()) {
+				nextNext.setPrevCached(walCache, entry);
+                                // LOG: Update NextNext's Prev pointer (Coalescing)
+                                // Address: nextNext.addr + BlockEntry.prev (offset 8)
+                                // Size: 8 bytes
+                                // New Value: nextNext.toOffset(entry)
+			}
+		}
+
+		// Calculate new size to determine which list to use
+		def startIndex = blockIndexOfEntry(entry);
+		def nextNeighbor = entry.getNext();
+		// If there is no next neighbor, the block extends to the end of the region (numBlocks)
+		def endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOfEntry(nextNeighbor));
+		def newSize = endIndex - startIndex;
+
+                // Note: insertAfter handles its own logging
+		if (newSize == 1) {
+			insertAfter(smallSentinel, entry, ListKind.SMALL_FREE);
+		} else {
+			insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
+		}
+	}
+
+	// Helper to insert an entry into a list immediately after the sentinel (Head insertion)
+	def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
+		entry.setListNumCached(walCache, kind.code);
+                // LOG: Set List Kind
+                // Address: entry.addr + BlockEntry.listNum (offset 0)
+                // Size: 2 bytes
+                // New Value: kind.code
+
+		var listNext = sentinel.getListNextCached(walCache);
+
+		// Link: sentinel -> entry -> listNext
+
+		sentinel.setListNextCached(walCache, entry);
+                // LOG: Link Sentinel to Entry
+                // Address: sentinel.addr + BlockEntry.listNext (offset 32)
+                // Size: 8 bytes
+                // New Value: sentinel.toOffset(entry)
+
+		entry.setListPrevCached(walCache, sentinel);
+                // LOG: Link Entry to Sentinel (Prev)
+                // Address: entry.addr + BlockEntry.listPrev (offset 24)
+                // Size: 8 bytes
+                // New Value: entry.toOffset(sentinel)
+
+	  	entry.setListNextCached(walCache, listNext);
+                // LOG: Link Entry to listNext (Next)
+                // Address: entry.addr + BlockEntry.listNext (offset 32)
+                // Size: 8 bytes
+                // New Value: entry.toOffset(listNext)
+
+		if (!listNext.isNull()) {
+			listNext.setListPrevCached(walCache, entry);
+                        // LOG: Link listNext back to Entry (Prev)
+                        // Address: listNext.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: listNext.toOffset(entry)
+		}
+	}
+
+	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
+		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
+	}
+
+	def removeFromList(blk: BlockEntryHandle) {
+		var listPrev = blk.getListPrevCached(walCache);
+		var listNext = blk.getListNextCached(walCache);
+
+		if (!listPrev.isNull()) {
+			listPrev.setListNextCached(walCache, listNext);
+                        // LOG: Update listPrev's ListNext
+                        // Address: listPrev.addr + BlockEntry.listNext (offset 32)
+                        // Size: 8 bytes
+                        // New Value: listNextOffsetFromListPrev
+			// listPrev.setListNext(listNext);
+		}
+
+		if (!listNext.isNull()) {
+			listNext.setListPrevCached(walCache, listPrev);
+                        // LOG: Update listNext's ListPrev
+                        // Address: listNext.addr + BlockEntry.listPrev (offset 24)
+                        // Size: 8 bytes
+                        // New Value: listPrevOffsetFromListNext
+		}
+
+		def nullBTE = BlockEntryHandle(Pointer.NULL);
+
+		blk.setListPrevCached(walCache, nullBTE);
+                // LOG: Clear blk ListPrev
+                // Address: blk.addr + BlockEntry.listPrev (offset 24)
+                // Size: 8 bytes
+                // New Value: null (0)
+
+		blk.setListNextCached(walCache, nullBTE);
+                // LOG: Clear blk ListNext
+                // Address: blk.addr + BlockEntry.listNext (offset 32)
+                // Size: 8 bytes
+                // New Value: null (0)
+
+		blk.setListNumCached(walCache, ListKind.NONE.code);
+                // LOG: Clear blk ListNum
+                // Address: blk.addr + BlockEntry.listNum (offset 0)
+                // Size: 2 bytes
+                // New Value: ListKind.NONE.code (-2)
+	}
+
+	// Deallocate this region
+	def deallocate() {
+		if (backendRegion != null) {
+			backendRegion.backend.deallocate(backendRegion);
+			backendRegion = null;
+		}
+	}
+
+	def performCommit() {
+		// Transfer changes from DRAM Cache to PMEM Log
+		walCache.transferToLog(walWriter);
+
+		walWriter.commit();
+		walCache.applyToMemory();
+
+		// TODO: fence here
+		// CiRuntime.fence();
+
+		walWriter.clear();
+		walCache.clear();
+	}
+
+	private def recover() {
+		var logBase = chunkForBlockEntry(getBlockEntryHandle(blockLayouts[1])).addr;
+		var header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logBase, LogHeader.size));
+
+		if (header.status != 1) return;
+
+		var expected = header.checksum;
+		var actual = calculateRecoveryChecksum(logBase + LogHeader.size, header.numEntries);
+
+		if (expected != actual) {
+			// Log checksum mismatch. Ignore corrupt log
+			header.status = 0;
+			return;
+		}
+
+		var entryPtr = logBase + LogHeader.size;
+
+		for (i < header.numEntries) {
+			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(entryPtr, LogEntry.size));
+
+			var targetAddr = Pointer.atElement(rng, int.!(entry.offset));
+
+			match (entry.width) {
+				1 => targetAddr.store<u8>(u8.view(entry.value));
+				2 => targetAddr.store<u16>(u16.view(entry.value));
+				4 => targetAddr.store<u32>(u32.view(entry.value));
+				8 => targetAddr.store<u64>(u64.view(entry.value));
+				_ => ;
+			}
+			entryPtr = entryPtr + LogEntry.size;
+		}
+
+		header.status = 0;
+		// TODO
+		// CiRuntime.cacheWriteback(header, LogHeader.size);
+		// CiRuntime.fence();
+	}
+
+	// Helper for recovery checksum (copy of the WALWriter logic)
+	private def calculateRecoveryChecksum(base: Pointer, count: u32) -> u64 {
+		var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
+		var ptr = base;
+		for (i < count) {
+			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(ptr, LogEntry.size));
+			h = (h << 13) | (h >> 51);
+			h = h ^ entry.offset;
+			h = h ^ entry.value;
+			h = h ^ u64.view(entry.width);
+			ptr = ptr + LogEntry.size;
+		}
+		return h;
+	}
+}
+
+
+// =============================================================================
+// Section 8: Immix Extensions
+// =============================================================================
 
 class ImmixPWRegion extends PWRegion {
 	new(backend: TxnRegionBackend, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, blockSize: u64)
 		super(backend, numBlocks, metaDataDescs, blockSize) {
 		lineMarks = getLineMarks();
 	}
-	
+
 	// Line mark definitions
 	def var lineMarks: LayoutRange<Ref<LineMark>>;
 	def var numLineMarks: u64;
-	
+
 	private def getLineMarks() -> LayoutRange<Ref<LineMark>> {
 		var hdr = getHeader();
 		for (i < hdr.numDescs) {
@@ -1240,7 +1277,7 @@ class ImmixPWRegion extends PWRegion {
 		}
 		return null;
 	}
-	
+
 	def resetAllLineMarks() {
 		var lineSize = u64.!(ImmixPWRegions.ImmixLineSize);
 		var offset: u64 = 0;
