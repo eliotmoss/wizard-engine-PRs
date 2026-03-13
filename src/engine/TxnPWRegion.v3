@@ -1,3 +1,8 @@
+// TODO: reorder placement of code in this file
+
+// TODO: write tests!
+
+
 // Really want to write something like this, Virgil does not support it:
 //
 // class LayoutRange<Ref<L>> {
@@ -13,6 +18,7 @@
 // the actual indexing and constructs a Ref, so this class does little actual
 // work (but see the companion component, LayoutRanges).
 
+// TODO: code for LayoutRange is probably obsolete, try to refactor and remove it
 class LayoutRange<T> {
 	def var rng: Range<byte>;  // the underlying range of bytes
 	def at: (Range<byte>, u64) -> T;  // a function to index that range and return a Ref
@@ -90,8 +96,10 @@ layout PWRegionHeader {
 	+32	numDescs:	u64;
 	+40	metaData:	u64;	// relative offset to the metadata area
 	+48	metaDataDescs:	u64;	// relative offset to the metadata descriptors
+	+56	magic:		u64;	// Identifier to confirm region is formatted
+	// TODO: add blockSize field within the header
 	// TODO: maybe add pointer to log chunk, because this will be needed for recovery
-	=56;				// size of header
+	=64;				// size of header
 }
 
 type BlockTableHandle(addr: Pointer, size: u64) #unboxed {
@@ -280,7 +288,7 @@ type ChunkHandle(addr: Pointer) #unboxed {
 	}
 
 	def setLimitCached(cache: WALCache, v: u64) {
-		cache.writeU64(Pointer.atField(getRef().offset), v);
+		cache.writeU64(Pointer.atField(getRef().limit), v);
 	}
 }
 
@@ -388,12 +396,58 @@ class PWRegion {
 	}
 
 	private def init(blockSize: u64) {
+		// TODO: add force format flag to still format the pmem region, even if it's already initialized
+		var hdr = getHeader();
+		if (hdr.magic == PWRegions.MAGIC) {
+			// TODO: blockSize passed in may not match the blockSize already in the header
+			mount(blockSize);
+		} else {
+			format(blockSize);
+		}
+	}
+
+	// Mounts an existing, fully formatted region
+	private def mount(blockSize: u64) {
+		def hdr = getHeader();
+
+		// TODO: add check whether blockSize matches what's already in the hdr
+
+		if (this.numBlocks != hdr.numBlocks) {
+			// TODO: The physical region doesn't match the requested software geometry
+			// Handle abort/exit
+		}
+
+		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
+		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
+		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
+
+		def numBlockTableEntries = hdr.numBlocks + 1;
+		def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
+		
+		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.blockTable)), numBlockTableEntries);
+		blockLayouts = LayoutRanges.byIndex<Ref<BlockEntry>>(
+			rng[hdr.blockTable ..+ blockTableSize], BlockEntry.size, Ref<BlockEntry>.of);
+
+		descs = metadataDescs();
+
+		def secondRef = blockLayouts[1];
+		def secondHandle = getBlockEntryHandle(secondRef);
+		logChunk = chunkForBlockEntry(secondHandle);
+		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
+
+		recover();
+	}
+
+	// Formats a completely uninitialized region of memory
+	private def format(blockSize: u64) {
 		def nullBTE = BlockEntryHandle(Pointer.NULL);
 		var size = numBlocks * blockSize;
 		var hdr = getHeader();
 		sanitizeAddress(Pointer.atRef(hdr));
+
 		hdr.numBlocks = this.numBlocks;
 		hdr.numBytes = size;
+
 		var currentRegionEnd = size;
 
 		// set up list sentinels just after the header
@@ -435,11 +489,12 @@ class PWRegion {
 		}
 
 		// take space for metadata descriptors
-		var metaDataDescsSize = metaDataDescs.length * MetaDataDesc.size;
+		def metaDataDescsSize = metaDataDescs.length * MetaDataDesc.size;
 		currentRegionEnd -= u64.!(metaDataDescsSize);
 		sanitizeOffset(currentRegionEnd);
 		hdr.metaDataDescs = currentRegionEnd;
 		hdr.numDescs = u64.!(metaDataDescs.length);
+
 		var metaDataLayouts = LayoutRanges.byIndex<Ref<MetaDataDesc>>(
 					rng[hdr.metaDataDescs ..+ metaDataDescsSize], MetaDataDesc.size, Ref<MetaDataDesc>.of);
 
@@ -451,6 +506,7 @@ class PWRegion {
 			metaDataSize += numUnits * desc.bytesPerUnit;
 			currentRegionEnd -= metaDataSize;
 			sanitizeOffset(currentRegionEnd);
+
 			var newDesc = metaDataLayouts[u64.!(i)];
 			newDesc.kind = desc.kind;
 			newDesc.fixedBytes = desc.fixedBytes;
@@ -462,9 +518,9 @@ class PWRegion {
 		var metaDataBytes = u64.!(rng.length) - currentRegionEnd;
 		var metaDataBlocks = (metaDataBytes + (blockSize - 1)) / blockSize;
 		var userDataBlocks = numBlocks - (metaDataBlocks + 1);
-		
 
 		// set up block lists
+		// TODO: give more meaningful names rather than first, second, third ref/handle
 		var firstRef = blockLayouts[0];
 		var firstHandle = getBlockEntryHandle(firstRef);
 
@@ -495,52 +551,54 @@ class PWRegion {
 		secondHandle.setUsed(true);
 		secondHandle.setNext(thirdHandle);
 		sanitizeOffset(blockLayouts.offset(2));
+
 		logChunk = chunkForBlockEntry(secondHandle);
 		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
 
-		def recovered = recover();
+		sanitizeAddress(thirdHandle.addr);
+		thirdHandle.setListNum(ListKind.LARGE_FREE.code);
+		thirdHandle.setNext(metaHandle);
+		thirdHandle.setPrev(firstHandle);
+		thirdHandle.setListPrev(largeSentinel);
+		thirdHandle.setListNext(metaHandle);
+		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
+		sanitizeOffset(blockLayouts.offset(0));
+		sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
 
-		if (!recovered) {
-			sanitizeAddress(thirdHandle.addr);
-			thirdHandle.setListNum(ListKind.LARGE_FREE.code);
-			thirdHandle.setNext(metaHandle);
-			thirdHandle.setPrev(firstHandle);
-			thirdHandle.setListPrev(largeSentinel);
-			thirdHandle.setListNext(metaHandle);
-			sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
-			sanitizeOffset(blockLayouts.offset(0));
-			sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
+		sanitizeAddress(smallSentinel.addr);
+		// smallSentinel starts empty - points to null
+		smallSentinel.setListNext(nullBTE);
+		sanitizeOffset(blockLayouts.offset(0));
 
-			sanitizeAddress(smallSentinel.addr);
-			// smallSentinel starts empty - points to null
-			smallSentinel.setListNext(nullBTE);
-			sanitizeOffset(blockLayouts.offset(0));
-
-			sanitizeAddress(largeSentinel.addr);
-
-			largeSentinel.setListNext(secondHandle);
-			largeSentinel.setListPrev(metaHandle);
-			sanitizeOffset(blockLayouts.offset(1));
-			
-			sanitizeAddress(metaHandle.addr);
-			metaHandle.setListNum(ListKind.METADATA.code);
-			metaHandle.setUsed(true);
-			metaHandle.setNext(lastHandle);
-			metaHandle.setPrev(secondHandle);
-			metaHandle.setListPrev(largeSentinel);
-			metaHandle.setListNext(nullBTE);
-			sanitizeOffset(blockLayouts.offset(numBlocks));
-			sanitizeOffset(blockLayouts.offset(1));
-			
-			sanitizeAddress(lastHandle.addr);
-			lastHandle.setListNum(ListKind.NONE.code);
-			lastHandle.setUsed(true);
-			lastHandle.setPrev(metaHandle);
-			sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
-		}
+		sanitizeAddress(largeSentinel.addr);
+		largeSentinel.setListNext(secondHandle);
+		largeSentinel.setListPrev(metaHandle);
+		sanitizeOffset(blockLayouts.offset(1));
+		
+		sanitizeAddress(metaHandle.addr);
+		metaHandle.setListNum(ListKind.METADATA.code);
+		metaHandle.setUsed(true);
+		metaHandle.setNext(lastHandle);
+		metaHandle.setPrev(secondHandle);
+		metaHandle.setListPrev(largeSentinel);
+		metaHandle.setListNext(nullBTE);
+		sanitizeOffset(blockLayouts.offset(numBlocks));
+		sanitizeOffset(blockLayouts.offset(1));
+		
+		sanitizeAddress(lastHandle.addr);
+		lastHandle.setListNum(ListKind.NONE.code);
+		lastHandle.setUsed(true);
+		lastHandle.setPrev(metaHandle);
+		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
 			
 		// Initialize descs for subclasses that need to access metadata descriptors
 		descs = metadataDescs();
+
+		// TODO: CiRuntime.fence() here to ensure all structures are physically in PMEM
+
+		hdr.magic = PWRegions.MAGIC;
+
+		// TODO: CiRuntime.cacheWriteback & fence for the header
 	}
 	
 	def getHeader() -> Ref<PWRegionHeader> {
@@ -703,6 +761,8 @@ class PWRegion {
 
 		// Retrieve the handle for the header of this block
 		var entry = blockTableHandle[long.view(index)];
+
+		if (entry.isNull()) return;
 
 		// Ensure we aren't freeing an already free block
 		if (!entry.getUsed()) return;
@@ -883,11 +943,11 @@ class PWRegion {
 		walCache.clear();
 	}
 
-	private def recover() -> bool {
+	private def recover() {
 		var logBase = chunkForBlockEntry(getBlockEntryHandle(blockLayouts[1])).addr;
 		var header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logBase, LogHeader.size));
 
-		if (header.status != 1) return false;
+		if (header.status != 1) return;
 
 		var expected = header.checksum;
 		var actual = calculateRecoveryChecksum(logBase + LogHeader.size, header.numEntries);
@@ -895,7 +955,7 @@ class PWRegion {
 		if (expected != actual) {
 			// Log checksum mismatch. Ignore corrupt log
 			header.status = 0;
-			return false;
+			return;
 		}
 
 		var entryPtr = logBase + LogHeader.size;
@@ -919,7 +979,6 @@ class PWRegion {
 		// TODO
 		// CiRuntime.cacheWriteback(header, LogHeader.size);
 		// CiRuntime.fence();
-		return true;
 	}
 
 	// Helper for recovery checksum (copy of the WALWriter logic)
@@ -987,7 +1046,6 @@ class WALCache {
 
 	// Flushes cached updates to actual Persistent memory
 	def applyToMemory() {
-		if (!isDirty()) return;
 		addrs.apply(
 			fun (addr: Pointer) {
 				def c: CachedUpdate = cache[addr];
@@ -1005,7 +1063,6 @@ class WALCache {
 	}
 
 	def transferToLog(writer: WALWriter) {
-		if (!isDirty()) return;
 		addrs.apply(
 			fun (addr: Pointer) {
 				def c: CachedUpdate = cache[addr];
@@ -1015,8 +1072,14 @@ class WALCache {
 	}
 
 	// Cannot have a generic read<T> because we can't cast u64 -> T generically
+	// Could pass in View operator as a function
+	def read<T>(addr: Pointer, rf: u64 -> T) -> T {
+		if (cache.has(addr)) return rf(cache[addr].value);
+		return addr.load<T>();
+	}
 
 	def readU8(addr: Pointer) -> u8 {
+		// return read<u8>(addr, u8.view);
 		if (cache.has(addr)) return u8.view(cache[addr].value);
 		return addr.load<u8>();
 	}
@@ -1144,6 +1207,7 @@ class WALWriter {
 }
 
 component PWRegions {
+	def MAGIC = 0x50_57_41_53_4Du64; // "PWASM" in hex
 	def blockSize: u64 = 256u64 * 1024u64;
 	def sanitize = true;
 }
