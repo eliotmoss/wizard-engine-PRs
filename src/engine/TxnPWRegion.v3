@@ -29,10 +29,10 @@ layout PWRegionHeader {
 	+32	numDescs:	u64;
 	+40	metaData:	u64;	// relative offset to the metadata area
 	+48	metaDataDescs:	u64;	// relative offset to the metadata descriptors
-	+56	magic:		u64;	// Identifier to confirm region is formatted
-	// TODO: add blockSize field within the header
+	+56	magic:		u64;	// identifier to confirm region is formatted
+	+64	blockSize:	u64;	// block size this region was formatted with
 	// TODO: maybe add pointer to log chunk, because this will be needed for recovery
-	=64;
+	=72;
 }
 
 layout BlockEntry {
@@ -650,7 +650,6 @@ class PWRegion {
 	private def init(blockSize: u64, forceFormat: bool) {
 		var hdr = getHeader();
 		if (!forceFormat && hdr.magic == PWRegions.MAGIC) {
-			// TODO: blockSize passed in may not match the blockSize already in the header
 			mount(blockSize);
 		} else {
 			format(blockSize);
@@ -661,7 +660,11 @@ class PWRegion {
 	private def mount(blockSize: u64) {
 		def hdr = getHeader();
 
-		// TODO: add check whether blockSize matches what's already in the hdr
+		if (blockSize != hdr.blockSize) {
+			Trace.OUT.put2("blockSize mismatch: requested %d, stored %d",
+				long.view(blockSize), long.view(hdr.blockSize)).ln();
+			return;
+		}
 
 		if (this.numBlocks != hdr.numBlocks) {
 			// TODO: The physical region doesn't match the requested software geometry
@@ -698,6 +701,7 @@ class PWRegion {
 
 		hdr.numBlocks = this.numBlocks;
 		hdr.numBytes = size;
+		hdr.blockSize = blockSize;
 
 		var currentRegionEnd = size;
 
