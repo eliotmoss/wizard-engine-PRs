@@ -685,9 +685,9 @@ class PWRegion {
 
 		descs = metadataDescs();
 
-		def secondRef = blockLayouts[1];
-		def secondHandle = getBlockEntryHandle(secondRef);
-		logChunk = chunkForBlockEntry(secondHandle);
+		def logBlockRef = blockLayouts[1];
+		def logBlockHandle = getBlockEntryHandle(logBlockRef);
+		logChunk = chunkForBlockEntry(logBlockHandle);
 		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
 
 		recover();
@@ -776,15 +776,14 @@ class PWRegion {
 		var userDataBlocks = numBlocks - (metaDataBlocks + 1);
 
 		// set up block lists
-		// TODO: give more meaningful names rather than first, second, third ref/handle
-		var firstRef = blockLayouts[0];
-		var firstHandle = getBlockEntryHandle(firstRef);
+		var headerBlockRef = blockLayouts[0];
+		var headerBlockHandle = getBlockEntryHandle(headerBlockRef);
 
-		var secondRef = blockLayouts[1];
-		var secondHandle = getBlockEntryHandle(secondRef);
+		var logBlockRef = blockLayouts[1];
+		var logBlockHandle = getBlockEntryHandle(logBlockRef);
 
-		var thirdRef = blockLayouts[2];
-		var thirdHandle = getBlockEntryHandle(thirdRef);
+		var firstFreeBlockRef = blockLayouts[2];
+		var firstFreeBlockHandle = getBlockEntryHandle(firstFreeBlockRef);
 
 		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
 
@@ -796,27 +795,27 @@ class PWRegion {
 		var lastRef = blockLayouts[numBlocks];
 		var lastHandle = getBlockEntryHandle(lastRef);
 
-		sanitizeAddress(firstHandle.addr);
-		firstHandle.setListNum(ListKind.METADATA.code);
-		firstHandle.setUsed(true);
-		firstHandle.setNext(secondHandle);
+		sanitizeAddress(headerBlockHandle.addr);
+		headerBlockHandle.setListNum(ListKind.METADATA.code);
+		headerBlockHandle.setUsed(true);
+		headerBlockHandle.setNext(logBlockHandle);
 		sanitizeOffset(blockLayouts.offset(1));
 
-		sanitizeAddress(secondHandle.addr);  // log block
-		secondHandle.setListNum(ListKind.METADATA.code);
-		secondHandle.setUsed(true);
-		secondHandle.setNext(thirdHandle);
+		sanitizeAddress(logBlockHandle.addr);
+		logBlockHandle.setListNum(ListKind.METADATA.code);
+		logBlockHandle.setUsed(true);
+		logBlockHandle.setNext(firstFreeBlockHandle);
 		sanitizeOffset(blockLayouts.offset(2));
 
-		logChunk = chunkForBlockEntry(secondHandle);
+		logChunk = chunkForBlockEntry(logBlockHandle);
 		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
 
-		sanitizeAddress(thirdHandle.addr);
-		thirdHandle.setListNum(ListKind.LARGE_FREE.code);
-		thirdHandle.setNext(metaHandle);
-		thirdHandle.setPrev(firstHandle);
-		thirdHandle.setListPrev(largeSentinel);
-		thirdHandle.setListNext(metaHandle);
+		sanitizeAddress(firstFreeBlockHandle.addr);
+		firstFreeBlockHandle.setListNum(ListKind.LARGE_FREE.code);
+		firstFreeBlockHandle.setNext(metaHandle);
+		firstFreeBlockHandle.setPrev(headerBlockHandle);
+		firstFreeBlockHandle.setListPrev(largeSentinel);
+		firstFreeBlockHandle.setListNext(metaHandle);
 		sanitizeOffset(blockLayouts.offset(userDataBlocks + 1));
 		sanitizeOffset(blockLayouts.offset(0));
 		sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
@@ -827,7 +826,7 @@ class PWRegion {
 		sanitizeOffset(blockLayouts.offset(0));
 
 		sanitizeAddress(largeSentinel.addr);
-		largeSentinel.setListNext(secondHandle);
+		largeSentinel.setListNext(logBlockHandle);
 		largeSentinel.setListPrev(metaHandle);
 		sanitizeOffset(blockLayouts.offset(1));
 
@@ -835,7 +834,7 @@ class PWRegion {
 		metaHandle.setListNum(ListKind.METADATA.code);
 		metaHandle.setUsed(true);
 		metaHandle.setNext(lastHandle);
-		metaHandle.setPrev(secondHandle);
+		metaHandle.setPrev(logBlockHandle);
 		metaHandle.setListPrev(largeSentinel);
 		metaHandle.setListNext(nullBTE);
 		sanitizeOffset(blockLayouts.offset(numBlocks));
