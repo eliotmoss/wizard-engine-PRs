@@ -3,24 +3,24 @@
 
 // Volatile memory region using mmap with anonymous memory
 class X86_64PWMemRegion extends PWRegion {
-	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>) 
-		super(X86_64Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize) { }
+	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
+		super(X86_64Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
 
 // Non-volatile (persistent) region using PMEM/DAX
 class X86_64PWNVRegion extends PWRegion {
-	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>) 
-		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize) { }
+	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
+		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
 
 // Immix-specific volatile region
 class X86_64ImmixPWMemRegion extends ImmixPWRegion {
-	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>)
-		super(X86_64Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize) { }
+	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
+		super(X86_64Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
 
 // Immix-specific persistent region
 class X86_64ImmixPWNVRegion extends ImmixPWRegion {
-	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>)
-		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize) { }
+	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
+		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
