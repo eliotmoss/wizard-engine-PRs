@@ -667,8 +667,9 @@ class PWRegion {
 		}
 
 		if (this.numBlocks != hdr.numBlocks) {
-			// TODO: The physical region doesn't match the requested software geometry
-			// Handle abort/exit
+			Trace.OUT.put2("numBlocks mismatch: requested %d, stored %d",
+				long.view(this.numBlocks), long.view(hdr.numBlocks)).ln();
+			return;
 		}
 
 		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
