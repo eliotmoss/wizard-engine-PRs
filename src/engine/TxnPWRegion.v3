@@ -602,7 +602,7 @@ class PWRegion {
 		return u64.view((bte.addr - blockTableHandle.addr) / BlockEntry.size);
 	}
 
-	def chunkForBlockEntry(blk: BlockEntryHandle) -> ChunkHandle {
+	def blockEntryToChunk(blk: BlockEntryHandle) -> ChunkHandle {
 		return ChunkHandle(Pointer.atElement(rng, 0) + long.view(blockSize * blockIndexOf(blk)));
 	}
 
@@ -647,7 +647,7 @@ class PWRegion {
 		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.blockTable)), numBlockTableEntries);
 
 		def logBlockHandle = blockTableHandle[1];
-		logChunk = chunkForBlockEntry(logBlockHandle);
+		logChunk = blockEntryToChunk(logBlockHandle);
 		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
 
 		recover();
@@ -756,7 +756,7 @@ class PWRegion {
 		logBlockHandle.setNext(firstFreeBlockHandle);
 		sanitizeOffset(hdr.blockTable + 2u64 * u64.!(BlockEntry.size));
 
-		logChunk = chunkForBlockEntry(logBlockHandle);
+		logChunk = blockEntryToChunk(logBlockHandle);
 		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0));
 
 		sanitizeAddress(firstFreeBlockHandle.addr);
@@ -1139,7 +1139,7 @@ class PWRegion {
 	}
 
 	private def recover() {
-		var logBase = chunkForBlockEntry(blockTableHandle[1]).addr;
+		var logBase = blockEntryToChunk(blockTableHandle[1]).addr;
 		var header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logBase, LogHeader.size));
 
 		if (header.status != 1) return;
