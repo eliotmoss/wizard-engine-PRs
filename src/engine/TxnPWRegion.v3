@@ -8,12 +8,12 @@
 component PWRegions {
 	def MAGIC = 0x50_57_41_53_4Du64; // "PWASM" in hex
 	def blockSize: u64 = 256u64 * 1024u64;
-	def sanitize = true;
+	def sanitize = false;
 }
 
 component BlockLists {
-	def MAX_LISTS = 8;	// maximum number of lists == number of list sentinels
-				// METADATA, etc., do not have sentinels and not part of this count
+	def MAX_LISTS = 8;      // maximum number of lists == number of list sentinels
+	                        // METADATA, etc., do not have sentinels and not part of this count
 }
 
 
@@ -22,66 +22,66 @@ component BlockLists {
 // =============================================================================
 
 layout PWRegionHeader {
-	+0	blockTable:	u64;	// relative offset to the block table
-	+8	sentinels:	u64;	// offset of the sentinels (whatever type are!)
-	+16	numBlocks:	u64;
-	+24	numBytes:	u64;
-	+32	numDescs:	u64;
-	+40	metaData:	u64;	// relative offset to the metadata area
-	+48	metaDataDescs:	u64;	// relative offset to the metadata descriptors
-	+56	magic:		u64;	// identifier to confirm region is formatted
-	+64	blockSize:	u64;	// block size this region was formatted with
+	+0      blockTable:     u64;    // relative offset to the block table
+	+8      sentinels:      u64;    // offset of the sentinels (whatever type are!)
+	+16     numBlocks:      u64;
+	+24     numBytes:       u64;
+	+32     numDescs:       u64;
+	+40     metaData:       u64;    // relative offset to the metadata area
+	+48     metaDataDescs:  u64;    // relative offset to the metadata descriptors
+	+56     magic:          u64;    // identifier to confirm region is formatted
+	+64     blockSize:      u64;    // block size this region was formatted with
 	// TODO: maybe add pointer to log chunk, because this will be needed for recovery
 	=72;
 }
 
 layout BlockEntry {
-	+0	listNum:	i16;  // which list is this entry part of
-	+2	used:		u1;   // is this block in use? // TODO: Use bool after the compiler is fixed
-				      // gap
-	+8	prev:		i64;  // prev entry in memory;
-	+16	next:		i64;  // next entry in memory order
-	+24	listPrev:	i64;  // prev entry on same list
-	+32	listNext:	i64;  // next entry on same list
+	+0      listNum:        i16;    // which list is this entry part of
+	+2      used:           u1;     // is this block in use? // TODO: Use bool after the compiler is fixed
+                                        // gap
+	+8      prev:           i64;    // prev entry in memory;
+	+16     next:           i64;    // next entry in memory order
+	+24     listPrev:       i64;    // prev entry on same list
+	+32     listNext:       i64;    // next entry on same list
 	=40;
 }
 
 layout ChunkHeader {
-	+0	offset:		u64; // offset in chunk for next allocation
-	+8	limit:		u64; // offset just beyond last available byte in chunk
-	+16	chunk_limit:	u64; // offset just beyond end of the chunk
-	+24	linemarks:	u64; // offset to first link mark of the chunk
-	=32;			     // size of chunk header
+	+0      offset:         u64;    // offset in chunk for next allocation
+	+8      limit:          u64;    // offset just beyond last available byte in chunk
+	+16     chunk_limit:    u64;    // offset just beyond end of the chunk
+	+24     linemarks:      u64;    // offset to first link mark of the chunk
+	=32;                            // size of chunk header
 }
 
 layout MetaDataDesc {
-	+0	kind:		u64;  // unique code, identifying the kind of metadata
-	+8	fixedBytes:	u32;  // single-copy data at beginning of metadata block
-	+12	unitSize:	u32;  // number of bytes of data space per metadata item
-	+16	bytesPerUnit:	u32;  // size of each metadata item, in bytes
-				      // gap
-	+24	offset:		u64;  // offset in region of the actual metadata
+	+0      kind:           u64;    // unique code, identifying the kind of metadata
+	+8      fixedBytes:     u32;    // single-copy data at beginning of metadata block
+	+12     unitSize:       u32;    // number of bytes of data space per metadata item
+	+16     bytesPerUnit:   u32;    // size of each metadata item, in bytes
+	                                // gap
+	+24     offset:         u64;    // offset in region of the actual metadata
 	=32;
 }
 
 layout LineMark {
-	+0	mark:		u8;	// line mark info
+	+0      mark:           u8;     // line mark info
 	=1;
 }
 
 layout LogHeader {
-	+0	numEntries:	u32;	// Number of valid entries in this transaction
-	+4	status:		u8;	// 0 = Invalid, 1 = Committed
-	+8	checksum:	u64;	// Optional: Simple checksum for integrity
-	=32;				// Pad to 32 bytes
+	+0      numEntries:     u32;    // Number of valid entries in this transaction
+	+4      status:         u8;     // 0 = Invalid, 1 = Committed
+	+8      checksum:       u64;    // Optional: Simple checksum for integrity
+	=32;                            // Pad to 32 bytes
 }
 
 layout LogEntry {
-	+0	kind:		u8;	// what kind of log entry
-					// gap
-	+8	offset:		u64;	// Relative offset of first changed byte, from the start of the Region
-	+16	value:		u64;	// The data to be written
-	+24	width:		u8;	// number of bytes being changed (1, 2, 4, 8)
+	+0      kind:           u8;     // what kind of log entry
+                                        // gap
+	+8      offset:         u64;    // Relative offset of first changed byte, from the start of the Region
+	+16     value:          u64;    // The data to be written
+	+24     width:          u8;     // number of bytes being changed (1, 2, 4, 8)
 	=32;
 }
 
@@ -491,9 +491,9 @@ class WALWriter {
 // Really want to write something like this, Virgil does not support it:
 //
 // class LayoutRange<Ref<L>> {
-//	def var rng: Range<byte>;
-//	new(rng);
-//	def [index: u64] => Ref<L>.at(rng[index * L.size ..+ L.size]);
+//      def var rng: Range<byte>;
+//      new(rng);
+//      def [index: u64] => Ref<L>.at(rng[index * L.size ..+ L.size]);
 // }
 
 // Layout ranges may go into a Virgil library once tested and refined
@@ -523,7 +523,7 @@ component LayoutRanges {
 	// "divisor" (the number of bytes in the other range per layout in
 	// this range) and the size of each layout in this range.
 	def forOffset<T>(rng: Range<byte>, offset: u64, divisor: u64, size: int,
-			at: Range<byte> -> T) -> T {
+                        at: Range<byte> -> T) -> T {
 		return at(rng[(offset / divisor) * u64.!(size) ..+ size]);
 	}
 
@@ -1058,7 +1058,7 @@ class PWRegion {
                 // Size: 8 bytes
                 // New Value: entry.toOffset(sentinel)
 
-	  	entry.setListNextCached(walCache, listNext);
+                entry.setListNextCached(walCache, listNext);
                 // LOG: Link Entry to listNext (Next)
                 // Address: entry.addr + BlockEntry.listNext (offset 32)
                 // Size: 8 bytes
