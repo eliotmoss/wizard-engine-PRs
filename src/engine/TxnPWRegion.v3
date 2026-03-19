@@ -606,6 +606,12 @@ class PWRegion {
 		return ChunkHandle(Pointer.atElement(rng, 0) + long.view(blockSize * blockIndexOf(blk)));
 	}
 
+	def chunkToBlockEntry(chunk: ChunkHandle) -> BlockEntryHandle {
+		var addrU64 = u64.view(chunk.addr - Pointer.NULL);
+		var index = blockOfOffset(offsetInRegion(addrU64));
+		return blockTableHandle[long.view(index)];
+	}
+
 	private def init(blockSize: u64, forceFormat: bool) {
 		var hdr = getHeader();
 		if (!forceFormat && hdr.magic == PWRegions.MAGIC) {
@@ -948,11 +954,8 @@ class PWRegion {
 	def freeChunk(chunk: ChunkHandle) {
 		if (chunk.isNull()) return;
 
-		// Map the chunk address back to the BlockEntry
-		def index = blockOfOffset(offsetInRegion(u64.view(chunk.addr - Pointer.NULL)));
-
 		// Retrieve the handle for the header of this block
-		var entry = blockTableHandle[long.view(index)];
+		var entry = chunkToBlockEntry(chunk);
 
 		if (entry.isNull()) return;
 
