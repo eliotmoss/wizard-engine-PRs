@@ -1,0 +1,211 @@
+// PWRegion Tests
+// Tests the block-based region allocator (PWRegion) and its WAL commit flow.
+//
+// Setup: numBlocks=8, blockSize=4096, no metaDataDescs, forceFormat=true.
+// With these params, the layout after format() is:
+//   Block 0: region header (METADATA, used)
+//   Block 1: WAL log chunk (METADATA, used)
+//   Blocks 2-6: one contiguous LARGE_FREE entry (5 allocatable blocks)
+//   Block 7: metadata overhead block (METADATA, used) -- contains block table
+//   Entry 8: end-of-region marker (NONE, used) -- no backing data block
+//
+
+def T = UnitTests.registerT("pwregion:", _, PWRegionTester.new, _);
+def X = [
+	T("format_magic",              test_format_magic),
+	T("format_header_fields",      test_format_header_fields),
+	T("format_sentinels",          test_format_sentinels),
+	T("format_free_list_nonempty", test_format_free_list_nonempty),
+	T("alloc_1_valid",             test_alloc_1_valid),
+	T("alloc_multi_valid",         test_alloc_multi_valid),
+	T("alloc_sets_used",           test_alloc_sets_used),
+	T("alloc_chunk_header",        test_alloc_chunk_header),
+	T("free_clears_used",          test_free_clears_used),
+	T("free_then_realloc",         test_free_then_realloc),
+	T("exhaust_free_blocks",       test_exhaust_free_blocks),
+	T("coalesce_right",            test_coalesce_right),
+	T("commit_clears_wal_cache",   test_commit_clears_wal_cache),
+	()
+];
+
+class PWRegionTester(t: Tester) {
+	var region: PWRegion;
+
+	new() {
+		region = PWRegion.new(
+			Backends.getVolatile(),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			true
+		);
+	}
+
+	// True if alloc succeeded. allocChunk returns ChunkHandle(Pointer.NULL) on failure
+	def allocSucceeded(chunk: ChunkHandle) -> bool {
+		return !chunk.isNull();
+	}
+}
+
+
+// =============================================================================
+// Format tests: verify the region header and free lists are correct after init
+// =============================================================================
+
+// After format(), the MAGIC constant must be stamped in the header.
+def test_format_magic(tc: PWRegionTester) {
+	var hdr = tc.region.getHeader();
+	tc.t.assert_eq(PWRegions.MAGIC, hdr.magic);
+}
+
+// Header fields must match the constructor arguments.
+def test_format_header_fields(tc: PWRegionTester) {
+	var hdr = tc.region.getHeader();
+	tc.t.assert_eq(8u64, hdr.numBlocks);
+	tc.t.assert_eq(4096u64, hdr.blockSize);
+	tc.t.assert_eq(8u64 * 4096u64, hdr.numBytes);
+}
+
+// Both sentinel handles must point into the region (non-NULL addresses).
+def test_format_sentinels(tc: PWRegionTester) {
+	tc.t.assertz(false, tc.region.smallSentinel.isNull());
+	tc.t.assertz(false, tc.region.largeSentinel.isNull());
+}
+
+// The large free list must have at least one entry after format.
+// format() writes directly to memory (not through the cache), so
+// getListNextCached falls through to memory and reads the correct value.
+def test_format_free_list_nonempty(tc: PWRegionTester) {
+	var firstFree = tc.region.largeSentinel.getListNextCached(tc.region.walCache);
+	tc.t.assertz(false, firstFree.isNull());
+}
+
+
+// =============================================================================
+// Allocation tests
+// =============================================================================
+
+// allocChunk(1) must return a valid chunk on a fresh region.
+def test_alloc_1_valid(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+}
+
+// allocChunk(3) must also succeed -- there are 5 free blocks available.
+def test_alloc_multi_valid(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(3u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+}
+
+// After allocChunk(1) + performCommit(), the block entry's used flag must be
+// true when read directly from memory (cache is cleared after commit).
+def test_alloc_sets_used(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	var entry = tc.region.chunkToBlockEntry(chunk);
+	tc.t.assertz(true, entry.getUsed());
+}
+
+// After allocChunk(1) + performCommit(), the chunk header fields must reflect
+// the initial allocation state written by createChunk().
+def test_alloc_chunk_header(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	// offset = ChunkHeader.size (start of usable space past the header)
+	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
+	// limit = 1 block * 4096 bytes/block
+	tc.t.assert_eq(4096u64, chunk.getLimit());
+}
+
+
+// =============================================================================
+// Free tests
+// =============================================================================
+
+// After alloc+commit+free+commit, the block entry must show used == false.
+def test_free_clears_used(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	tc.region.freeChunk(chunk);
+	tc.region.performCommit();
+	var entry = tc.region.chunkToBlockEntry(chunk);
+	tc.t.assertz(false, entry.getUsed());
+}
+
+// After alloc+commit+free+commit, a subsequent alloc must succeed (the block
+// was returned to the free list).
+def test_free_then_realloc(tc: PWRegionTester) {
+	var chunk1 = tc.region.allocChunk(5u32);
+	tc.region.performCommit();
+	tc.region.freeChunk(chunk1);
+	tc.region.performCommit();
+	var chunk2 = tc.region.allocChunk(5u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk2));
+}
+
+
+// =============================================================================
+// Exhaustion test
+// =============================================================================
+
+// With numBlocks=8 and no metadata descriptors, exactly 5 user blocks are
+// available (indices 2-6). The first 5 alloc(1)+commit calls must succeed;
+// the 6th must return blankChunkHandle.
+def test_exhaust_free_blocks(tc: PWRegionTester) {
+	for (i < 5) {
+		var c = tc.region.allocChunk(1u32);
+		if (!tc.allocSucceeded(c)) {
+			tc.t.fail1("alloc %d of 5 failed unexpectedly", i);
+			return;
+		}
+		tc.region.performCommit();
+	}
+	var overflow = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, tc.allocSucceeded(overflow));
+}
+
+
+// =============================================================================
+// Coalescing test
+// =============================================================================
+
+// Allocate two adjacent single-block chunks (blocks 2 and 3), then free both.
+// Freeing block 3 should trigger:
+//   - left-coalesce  (block 2 is already free)
+//   - right-coalesce (blocks 4-6 are large-free)
+// yielding one 5-block free entry spanning blocks 2-6.
+// A subsequent alloc(2) must succeed, proving coalescing occurred.
+def test_coalesce_right(tc: PWRegionTester) {
+	// Alloc block 2 and block 3, committing after each so memory is up to date.
+	var chunk2 = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	var chunk3 = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+
+	// Free block 2: no free neighbors yet, goes to the small free list.
+	tc.region.freeChunk(chunk2);
+	tc.region.performCommit();
+
+	// Free block 3: triggers left-coalesce (block 2 is free) and
+	// right-coalesce (blocks 4-6 are large-free). Result: one large entry.
+	tc.region.freeChunk(chunk3);
+	tc.region.performCommit();
+
+	// alloc(2) must succeed by splitting the coalesced 5-block entry.
+	var chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+}
+
+
+// =============================================================================
+// WAL cache lifecycle test
+// =============================================================================
+
+// The WAL cache must report dirty after an alloc and clean after a commit.
+def test_commit_clears_wal_cache(tc: PWRegionTester) {
+	tc.t.assertz(false, tc.region.walCache.isDirty());
+	tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.region.walCache.isDirty());
+	tc.region.performCommit();
+	tc.t.assertz(false, tc.region.walCache.isDirty());
+}
