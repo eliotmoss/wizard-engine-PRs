@@ -1,6 +1,3 @@
-// TODO: write tests!
-
-
 // =============================================================================
 // Section 1: Configuration and Constants
 // =============================================================================
@@ -107,8 +104,33 @@ type BlockTableHandle(addr: Pointer, size: u64) #unboxed {
 	def [n: i64] -> BlockEntryHandle {
 		return if(
 			u64.view(n) < size,
-			BlockEntryHandle(addr + n * i64.!(BlockEntry.size)),
+			BlockEntryHandle(Pointer.NULL + (i64.view(addr) + n * i64.!(BlockEntry.size))),
 			BlockEntryHandle(Pointer.NULL));
+	}
+}
+
+// TODO: add a LineMarkTableHandle so we can remove the LayoutRange utility entirely
+// Have an addr and a size
+type LineMarkTableHandle(addr: u64, size: u64) #unboxed {
+	def [n: u64] -> LineMarkHandle {
+		return if(
+			u64.view(n) < size,
+			LineMarkHandle(addr + n * u64.!(LineMark.size)),
+			LineMarkHandle(0));
+	}
+}
+
+type LineMarkHandle(addr: u64) #unboxed {
+	def getRef() -> Ref<LineMark> {
+		return Ref<LineMark>.of(CiRuntime.forgeRange<byte>(Pointer.NULL + i64.view(addr), LineMark.size));
+	}
+
+	def getMark() -> u8 {
+		return getRef().mark;
+	}
+
+	def setMark(mark: u8) {
+		getRef().mark = mark;
 	}
 }
 
@@ -906,29 +928,29 @@ class PWRegion {
 			var remHandle = blockTableHandle[long.view(remIndex)];
 			var remBlocks = nextIndex - remIndex;
 
-                        // LOG: Remainder Block Metadata Initialization
-                        // 1. ListNum (Offset 0, 2 bytes): SMALL_FREE or LARGE_FREE
-                        // 2. Used (Offset 2, 1 byte): 0 (false)
-                        // 3. Prev (Offset 8, 8 bytes): remHandle.toOffset(thisHandle)
-                        // 4. Next (Offset 8, 8 bytes): remHandle.toOffset(nextHandle)
-                        // 5. ListPrev (Offset 24, 8 bytes): remHandle.toOffset(thisHandle)
-                        // 6. ListNext (Offset 32, 8 bytes): remHandle.toOffset(nextHandle)
-			remHandle.setListNumCached(walCache, if(remBlocks == 1, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code));
+			// 1. Set remainder's memory-order links
 			remHandle.setUsedCached(walCache, false);
-			remHandle.setPrevCached(walCache, thisHandle);
-			remHandle.setNextCached(walCache, nextHandle);
-			remHandle.setListPrevCached(walCache, thisHandle);
-			remHandle.setListNextCached(walCache, nextHandle);
+                        // LOG: Remainder Block Used Flag
+                        // Address: remHandle.addr + BlockEntry.used (offset 2)
+                        // Size: 1 byte
+                        // New Value: 0 (false)
 
+			remHandle.setPrevCached(walCache, thisHandle);
+                        // LOG: Remainder Block Prev pointer
+                        // Address: remHandle.addr + BlockEntry.prev (offset 8)
+                        // Size: 8 bytes
+                        // New Value: remHandle.toOffset(thisHandle)
+
+			remHandle.setNextCached(walCache, nextHandle);
+                        // LOG: Remainder Block Next pointer
+                        // Address: remHandle.addr + BlockEntry.next (offset 16)
+                        // Size: 8 bytes
+                        // New Value: remHandle.toOffset(nextHandle)
+
+			// 2. Update neighbors' memory-order links
 			thisHandle.setNextCached(walCache, remHandle);
                         // LOG: Update 'this' block Next pointer
                         // Address: thisHandle.addr + BlockEntry.next (offset 16)
-                        // Size: 8 bytes
-                        // New Value: thisHandle.toOffset(remHandle)
-
-			thisHandle.setListNextCached(walCache, remHandle);
-                        // LOG: Update 'this' block ListNext pointer
-                        // Address: thisHandle.addr + BlockEntry.listNext (offset 32)
                         // Size: 8 bytes
                         // New Value: thisHandle.toOffset(remHandle)
 
@@ -938,16 +960,24 @@ class PWRegion {
                         // Size: 8 bytes
                         // New Value: nextHandle.toOffset(remHandle)
 
-			var listNextHandle = thisHandle.getListNextCached(walCache);
-
-			listNextHandle.setListPrevCached(walCache, remHandle);
-                        // LOG: Update 'listNext' block ListPrev pointer
-                        // Address: listNextHandle.addr + BlockEntry.listPrev (offset 24)
-                        // Size: 8 bytes
-                        // New Value: listNextHandle.toOffset(remHandle)
-
+                        // 3. Remove thisHandle from free list
                         // Note: removeFromList handles its own logging
 			removeFromList(thisHandle);
+
+			// 4. Insert remainder into the correct free list
+                        // Note: insertAfter handles its own logging
+			if (remBlocks == 1) {
+				insertAfter(smallSentinel, remHandle, ListKind.SMALL_FREE);
+			} else {
+				insertAfter(largeSentinel, remHandle, ListKind.LARGE_FREE);
+			}
+
+			// 5. Mark allocated block as used
+			thisHandle.setUsedCached(walCache, true);
+                        // LOG: BlockEntry Used Flag
+                        // Address: thisHandle.addr + BlockEntry.used (offset 2)
+                        // Size: 1 byte
+                        // New Value: 1 (true)
 
 			return createChunk(thisHandle, numBlocks);
 		}
@@ -1192,10 +1222,10 @@ class ImmixPWRegion extends PWRegion {
 	}
 
 	// Line mark definitions
-	def var lineMarks: LayoutRange<Ref<LineMark>>;
+	def var lineMarks: LineMarkTableHandle;
 	def var numLineMarks: u64;
 
-	private def getLineMarks() -> LayoutRange<Ref<LineMark>> {
+	private def getLineMarks() -> LineMarkTableHandle {
 		var hdr = getHeader();
 		for (i < hdr.numDescs) {
 			var r = getMetaDataDesc(u64.!(i));
@@ -1203,18 +1233,16 @@ class ImmixPWRegion extends PWRegion {
 				var spaceSize = numBlocks * getBlockSize();
 				numLineMarks = spaceSize / u64.!(ImmixPWRegions.ImmixLineSize);
 				var lmrng = this.rng[r.offset ..+ numLineMarks * u64.!(LineMark.size)];
-				return LayoutRanges.byOffset(lmrng, u64.!(ImmixPWRegions.ImmixLineSize), LineMark.size, Ref<LineMark>.of);
+				return LineMarkTableHandle(u64.view(Pointer.atElement(lmrng, 0) - Pointer.NULL), numLineMarks);
 			}
 		}
-		return null;
+		return LineMarkTableHandle(0, 0);
 	}
 
 	def resetAllLineMarks() {
 		var lineSize = u64.!(ImmixPWRegions.ImmixLineSize);
-		var offset: u64 = 0;
-		while (offset < numLineMarks * lineSize) {
-			lineMarks[offset].mark = ImmixPWRegions.ImmixLineMarkResetValue;
-			offset = offset + lineSize;
+		for (index < numLineMarks) {
+			lineMarks[index].getRef().mark = ImmixPWRegions.ImmixLineMarkResetValue;
 		}
 	}
 }
