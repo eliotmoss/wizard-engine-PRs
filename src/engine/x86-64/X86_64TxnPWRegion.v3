@@ -97,59 +97,48 @@ enum ListKind(code: i16) {
 
 
 // =============================================================================
-// Section 4: Handle Types (wrappers around layouts for convenient access)
+// Section 4: Pointer utilities
 // =============================================================================
 
-type BlockTableHandle(addr: Pointer, size: u64) #unboxed {
-	def [n: i64] -> BlockEntryHandle {
+def pointerFromU64(n: u64) -> Pointer {
+	return Pointer.NULL + i64.!(n);
+}
+
+def pointerFromI64(n: i64) -> Pointer {
+	return Pointer.NULL + n;
+}
+
+
+// =============================================================================
+// Section 5: Handle Types (wrappers around layouts for convenient access)
+// =============================================================================
+
+type BlockTableHandle(addr: u64, size: u64) #unboxed {
+	def [n: u64] -> BlockEntryHandle {
 		return if(
-			u64.view(n) < size,
-			BlockEntryHandle(Pointer.NULL + (i64.view(addr) + n * i64.!(BlockEntry.size))),
-			BlockEntryHandle(Pointer.NULL));
+			n < size,
+			BlockEntryHandle(addr + (n * u64.!(BlockEntry.size))),
+			BlockEntryHandle(0)
+		);
 	}
 }
 
-// TODO: add a LineMarkTableHandle so we can remove the LayoutRange utility entirely
-// Have an addr and a size
-type LineMarkTableHandle(addr: u64, size: u64) #unboxed {
-	def [n: u64] -> LineMarkHandle {
-		return if(
-			u64.view(n) < size,
-			LineMarkHandle(addr + n * u64.!(LineMark.size)),
-			LineMarkHandle(0));
-	}
-}
-
-type LineMarkHandle(addr: u64) #unboxed {
-	def getRef() -> Ref<LineMark> {
-		return Ref<LineMark>.of(CiRuntime.forgeRange<byte>(Pointer.NULL + i64.view(addr), LineMark.size));
-	}
-
-	def getMark() -> u8 {
-		return getRef().mark;
-	}
-
-	def setMark(mark: u8) {
-		getRef().mark = mark;
-	}
-}
-
-type BlockEntryHandle(addr: Pointer) #unboxed {
+type BlockEntryHandle(addr: u64) #unboxed {
 	def isNull() -> bool {
-		return addr == Pointer.NULL;
+		return addr == 0;
 	}
 
 	def toHandle(offset: i64) -> BlockEntryHandle {
 		// Never need to point to ourselves
-		return BlockEntryHandle(addr + offset);
+		return BlockEntryHandle(u64.view(i64.!(addr) + offset));
 	}
 
-	def toOffset(handle: BlockEntryHandle) -> i64 {
-		return handle.addr - this.addr;
+	def toOffset(other: BlockEntryHandle) -> i64 {
+		return i64.!(other.addr) - i64.!(this.addr);
 	}
 
 	def getRef() -> Ref<BlockEntry> {
-		return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(addr, BlockEntry.size));
+		return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(addr), BlockEntry.size));
 	}
 
 	def getListNum() -> i16 {
@@ -177,91 +166,87 @@ type BlockEntryHandle(addr: Pointer) #unboxed {
 	}
 
 	def getListNumCached(cache: WALCache) -> i16 {
-		return cache.readI16(Pointer.atField(getRef().listNum));
+		return cache.readI16(u64.view(Pointer.atField(getRef().listNum)));
 	}
 
 	def getUsedCached(cache:WALCache) -> bool {
-		def used = cache.readU8(Pointer.atField(getRef().used));
+		def used = cache.readU8(u64.view(Pointer.atField(getRef().used)));
 		return used == 1u1;
 	}
 
 	def getPrevCached(cache: WALCache) -> BlockEntryHandle {
-		return toHandle(cache.readI64(Pointer.atField(getRef().prev)));
+		return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().prev))));
 	}
 
 	def getNextCached(cache: WALCache) -> BlockEntryHandle {
-		return toHandle(cache.readI64(Pointer.atField(getRef().next)));
+		return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().next))));
 	}
 
 	def getListPrevCached(cache: WALCache) -> BlockEntryHandle {
-		return toHandle(cache.readI64(Pointer.atField(getRef().listPrev)));
+		return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().listPrev))));
 	}
 
 	def getListNextCached(cache: WALCache) -> BlockEntryHandle {
-		return toHandle(cache.readI64(Pointer.atField(getRef().listNext)));
+		return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().listNext))));
 	}
 
-	def setListNum(listNum: i16) {
-		getRef().listNum = listNum;
+	def setListNum(v: i16) {
+		getRef().listNum = v;
 	}
 
-	def setUsed(used: bool) {
-		getRef().used = if(used, 1u1, 0u1);
+	def setUsed(v: bool) {
+		getRef().used = if(v, 1u1, 0u1);
 	}
 
-	def setPrev(prev: BlockEntryHandle) {
-		getRef().prev = toOffset(prev);
+	def setPrev(v: BlockEntryHandle) {
+		getRef().prev = toOffset(v);
 	}
 
-	def setNext(next: BlockEntryHandle) {
-		getRef().next = toOffset(next);
+	def setNext(v: BlockEntryHandle) {
+		getRef().next = toOffset(v);
 	}
 
-	def setListPrev(listPrev: BlockEntryHandle) {
-		getRef().listPrev = toOffset(listPrev);
+	def setListPrev(v: BlockEntryHandle) {
+		getRef().listPrev = toOffset(v);
 	}
 
-	def setListNext(listNext: BlockEntryHandle) {
-		getRef().listNext = toOffset(listNext);
+	def setListNext(v: BlockEntryHandle) {
+		getRef().listNext = toOffset(v);
 	}
 
-	def setListNumCached(cache: WALCache, listNum: i16) {
-		cache.writeI16(Pointer.atField(getRef().listNum), listNum);
+	def setListNumCached(cache: WALCache, v: i16) {
+		cache.writeI16(u64.view(Pointer.atField(getRef().listNum)), v);
 	}
 
-	def setUsedCached(cache: WALCache, used: bool) {
-		def value = if(used, 1u1, 0u1);
-		cache.writeU8(Pointer.atField(getRef().used), value);
+	def setUsedCached(cache: WALCache, v: bool) {
+		def num = if(v, 1u1, 0u1);
+		cache.writeU8(u64.view(Pointer.atField(getRef().used)), num);
 	}
 
-	def setPrevCached(cache: WALCache, prev: BlockEntryHandle) {
-		cache.writeI64(Pointer.atField(getRef().prev), toOffset(prev));
+	def setPrevCached(cache: WALCache, v: BlockEntryHandle) {
+		cache.writeI64(u64.view(Pointer.atField(getRef().prev)), toOffset(v));
 	}
 
-	def setNextCached(cache: WALCache, next: BlockEntryHandle) {
-		cache.writeI64(Pointer.atField(getRef().next), toOffset(next));
+	def setNextCached(cache: WALCache, v: BlockEntryHandle) {
+		cache.writeI64(u64.view(Pointer.atField(getRef().next)), toOffset(v));
 	}
 
-	def setListPrevCached(cache: WALCache, listPrev: BlockEntryHandle) {
-		cache.writeI64(Pointer.atField(getRef().listPrev), toOffset(listPrev));
+	def setListPrevCached(cache: WALCache, v: BlockEntryHandle) {
+		cache.writeI64(u64.view(Pointer.atField(getRef().listPrev)), toOffset(v));
 	}
 
-	def setListNextCached(cache: WALCache, listNext: BlockEntryHandle) {
-		cache.writeI64(Pointer.atField(getRef().listNext), toOffset(listNext));
+	def setListNextCached(cache: WALCache, v: BlockEntryHandle) {
+		cache.writeI64(u64.view(Pointer.atField(getRef().listNext)), toOffset(v));
 	}
 }
 
-def getBlockEntryHandle(r: Ref<BlockEntry>) -> BlockEntryHandle {
-	return BlockEntryHandle(Pointer.atRef(r));
-}
-
-type ChunkHandle(addr: Pointer) #unboxed {
+type ChunkHandle(addr: u64) #unboxed {
 	def isNull() -> bool {
-		return addr == Pointer.NULL;
+		return addr == 0;
 	}
 
 	def getRef() -> Ref<ChunkHeader> {
-		return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(addr, ChunkHeader.size));
+		return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(pointerFromU64(addr), ChunkHeader.size));
 	}
 
 	def getOffset() -> u64 {
@@ -297,23 +282,47 @@ type ChunkHandle(addr: Pointer) #unboxed {
 	}
 
 	def setOffsetCached(cache: WALCache, v: u64) {
-		cache.writeU64(Pointer.atField(getRef().offset), v);
+		cache.writeU64(u64.view(Pointer.atField(getRef().offset)), v);
 	}
 
 	def setLimitCached(cache: WALCache, v: u64) {
-		cache.writeU64(Pointer.atField(getRef().limit), v);
+		cache.writeU64(u64.view(Pointer.atField(getRef().limit)), v);
 	}
 
 	def setChunkLimitCached(cache: WALCache, v: u64) {
-		cache.writeU64(Pointer.atField(getRef().chunk_limit), v);
+		cache.writeU64(u64.view(Pointer.atField(getRef().chunk_limit)), v);
 	}
 }
 
-type LogEntryHandle(addr: Pointer) { }
+type LineMarkTableHandle(addr: u64, size: u64) #unboxed {
+	def [n: u64] -> LineMarkHandle {
+		return if(
+			n < size,
+			LineMarkHandle(addr + n * u64.!(LineMark.size)),
+			LineMarkHandle(0)
+		);
+	}
+}
+
+type LineMarkHandle(addr: u64) #unboxed {
+	def getRef() -> Ref<LineMark> {
+		return Ref<LineMark>.of(CiRuntime.forgeRange<byte>(pointerFromU64(addr), LineMark.size));
+	}
+
+	def getMark() -> u8 {
+		return getRef().mark;
+	}
+
+	def setMark(v: u8) {
+		getRef().mark = v;
+	}
+}
+
+type LogEntryHandle(addr: u64) { }
 
 
 // =============================================================================
-// Section 5: WAL Infrastructure (write-behind cache and write-ahead log)
+// Section 6: WAL Infrastructure (write-behind cache and write-ahead log)
 // =============================================================================
 
 // Wrapper ADT to store the cached value and its width (size)
@@ -329,11 +338,11 @@ type CachedUpdate(value: u64, size: u4) #unboxed { }
 // 2. Mixed-width accesses (e.g., writing 8 bytes at 0x10, then reading 1 byte at 0x11)
 //    will result in a cache miss, returning stale data.
 class WALCache {
-        private var cache: HashMap<Pointer, CachedUpdate>;
-	private def addrs = Vector<Pointer>.new();
+        private var cache: HashMap<u64, CachedUpdate>;
+	private def addrs = Vector<u64>.new();
 
         new() {
-                cache = HashMap<Pointer, CachedUpdate>.new(hash, Pointer.==);
+                cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
         }
 
         def isDirty() -> bool {
@@ -342,20 +351,20 @@ class WALCache {
 
         // Clear the cache (re-initializes the map)
         def clear() {
-                cache = HashMap<Pointer, CachedUpdate>.new(hash, Pointer.==);
+                cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
 		addrs.clear();
         }
 
 	// Flushes cached updates to actual Persistent memory
 	def applyToMemory() {
 		addrs.apply(
-			fun (addr: Pointer) {
+			fun (addr: u64) {
 				def c: CachedUpdate = cache[addr];
 				match (c.size) {
-					1 => addr.store<u8>(u8.view(c.value));
-					2 => addr.store<u16>(u16.view(c.value));
-					4 => addr.store<u32>(u32.view(c.value));
-					8 => addr.store<u64>(u64.view(c.value));
+					1 => pointerFromU64(addr).store<u8>(u8.view(c.value));
+					2 => pointerFromU64(addr).store<u16>(u16.view(c.value));
+					4 => pointerFromU64(addr).store<u32>(u32.view(c.value));
+					8 => pointerFromU64(addr).store<u64>(u64.view(c.value));
 					_ => ;
 				}
 				// TODO: do cache writeback here by giving addr and size
@@ -366,54 +375,54 @@ class WALCache {
 
 	def transferToLog(writer: WALWriter) {
 		addrs.apply(
-			fun (addr: Pointer) {
+			fun (addr: u64) {
 				def c: CachedUpdate = cache[addr];
 				writer.append(addr, c.value, u8.view(c.size));
 			}
 		);
 	}
 
-	def readU8(addr: Pointer) -> u8 {
+	def readU8(addr: u64) -> u8 {
 		if (cache.has(addr)) return u8.view(cache[addr].value);
-		return addr.load<u8>();
+		return pointerFromU64(addr).load<u8>();
 	}
 
-	def readI16(addr: Pointer) -> i16 {
+	def readI16(addr: u64) -> i16 {
 		if (cache.has(addr)) return i16.view(cache[addr].value);
-		return addr.load<i16>();
+		return pointerFromU64(addr).load<i16>();
 	}
 
-	def readU64(addr: Pointer) -> u64 {
+	def readU64(addr: u64) -> u64 {
 		if (cache.has(addr)) return u64.view(cache[addr].value);
-		return addr.load<u64>();
+		return pointerFromU64(addr).load<u64>();
 	}
 
-	def readI64(addr: Pointer) -> i64 {
+	def readI64(addr: u64) -> i64 {
 		if (cache.has(addr)) return i64.view(cache[addr].value);
-		return addr.load<i64>();
+		return pointerFromU64(addr).load<i64>();
 	}
 
 	// Write BlockEntry.used (u1/bool stored as u8)
-	def writeU8(addr: Pointer, val: u8) {
+	def writeU8(addr: u64, val: u8) {
 		writeHelper(addr, 1, u64.view(val));
 	}
 
 	// Write BlockEntry.listNum
-	def writeI16(addr: Pointer, val: i16) {
+	def writeI16(addr: u64, val: i16) {
 		writeHelper(addr, 2, u64.view(u16.view(val)));
 	}
 
 	// Write ChunkHeader.offset, limit
-	def writeU64(addr: Pointer, val: u64) {
+	def writeU64(addr: u64, val: u64) {
 		writeHelper(addr, 8, val);
 	}
 
 	// Write BlockEntry.prev, next, listPrev, listNext
-	def writeI64(addr: Pointer, val: i64) {
+	def writeI64(addr: u64, val: i64) {
 		writeHelper(addr, 8, u64.view(val));
 	}
 
-	private def writeHelper(addr: Pointer, size: u4, val: u64) {
+	private def writeHelper(addr: u64, size: u4, val: u64) {
 		if (!cache.has(addr)) {
 			addrs.put(addr);
 		}
@@ -421,44 +430,44 @@ class WALCache {
 	}
 
         // Hash function: Convert Pointer -> i32
-        private def hash(p: Pointer) => i32.view(p - Pointer.NULL);
+        private def hash(addr: u64) => i32.view(addr);
 }
 
 // Shared checksum for WAL log entries. Used by both WALWriter (on commit)
 // and PWRegion (on recovery) to ensure they stay in sync.
-def calculateLogChecksum(base: Pointer, count: u32) -> u64 {
+def calculateLogChecksum(base: u64, count: u32) -> u64 {
 	var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
 	var ptr = base;
 	for (i < count) {
-		var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(ptr, LogEntry.size));
+		var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(ptr), LogEntry.size));
 		h = (h << 13) | (h >> 51);
 		h = h ^ entry.offset;
 		h = h ^ entry.value;
 		h = h ^ u64.view(entry.width);
-		ptr = ptr + LogEntry.size;
+		ptr = ptr + u64.!(LogEntry.size);
 	}
 	return h;
 }
 
 class WALWriter {
 	def logChunk: ChunkHandle;
-	def regionStart: Pointer; // Needed to calculate relative offsets
+	def regionStart: u64; // Needed to calculate relative offsets
 
 	// Pointers to the header and the start of the entry array
 	var header: Ref<LogHeader>;
-	var entryBase: Pointer;
+	var entryBase: u64;
 	def maxEntries: u32;  // capacity of the log chunk in entries
 
 	// Local counter for the current transaction
 	def var currentEntryIndex: u32 = 0;
 
 	new(logChunk, regionStart, maxEntries) {
-		header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logChunk.addr, LogHeader.size));
-		entryBase = logChunk.addr + LogHeader.size;
+		header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(pointerFromU64(logChunk.addr), LogHeader.size));
+		entryBase = logChunk.addr + u64.!(LogHeader.size);
 	}
 
 	// Records a change into the persistent log buffer (but does not fence yet)
-	def append(targetAddr: Pointer, value: u64, width: u8) {
+	def append(targetAddr: u64, value: u64, width: u8) {
 		if (currentEntryIndex >= maxEntries) {
 			// TODO:
 			// Log chunk is full; cannot record this entry. This indicates a
@@ -466,9 +475,9 @@ class WALWriter {
 			return;
 		}
 		def entryAddr = entryBase + (currentEntryIndex * u32.!(LogEntry.size));
-		var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(entryAddr, LogEntry.size));
+		var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(entryAddr), LogEntry.size));
 
-		entry.offset = u64.view(targetAddr - regionStart);
+		entry.offset = targetAddr - regionStart;
 		entry.value = value;
 		entry.width = width;
 
@@ -507,57 +516,6 @@ class WALWriter {
 
 
 // =============================================================================
-// Section 6: LayoutRange Utilities
-// =============================================================================
-
-// Really want to write something like this, Virgil does not support it:
-//
-// class LayoutRange<Ref<L>> {
-//      def var rng: Range<byte>;
-//      new(rng);
-//      def [index: u64] => Ref<L>.at(rng[index * L.size ..+ L.size]);
-// }
-
-// Layout ranges may go into a Virgil library once tested and refined
-
-// The concept is essentially an array/range of a layout, i.e., multiple
-// copies of the same layout up against each other.  The "at" function does
-// the actual indexing and constructs a Ref, so this class does little actual
-// work (but see the companion component, LayoutRanges).
-
-class LayoutRange<T> {
-	def var rng: Range<byte>;  // the underlying range of bytes
-	def at: (Range<byte>, u64) -> T;  // a function to index that range and return a Ref
-	def [index: u64] -> T { return at(rng, index); }  // indexing that supports [i] notation
-	new(rng, at) { }
-}
-
-// This component provides several functions that can be used to index a
-// LayoutRange with different semantics for the index passed in.
-
-component LayoutRanges {
-
-	// forOffset takes an offset (into some other range of bytes) and
-	// converts that into a suitable index in this LayoutRange based on
-	// their being one layout per some number of bytes in the other range.
-	// Here an offset of 2 means to convert from that offset in the
-	// original range.  To perform the computation, forOffset requires a
-	// "divisor" (the number of bytes in the other range per layout in
-	// this range) and the size of each layout in this range.
-	def forOffset<T>(rng: Range<byte>, offset: u64, divisor: u64, size: int,
-                        at: Range<byte> -> T) -> T {
-		return at(rng[(offset / divisor) * u64.!(size) ..+ size]);
-	}
-
-	// Creates a LayoutRange that uses the forOffset accessor
-	// Example: LayoutRanges.byOffset(rng, otherUnit, L.size, Ref<L>.at)
-	def byOffset<T>(rng: Range<byte>, divisor: u64, size: int, atFunc: Range<byte> -> T) -> LayoutRange<T> {
-		return LayoutRange<T>.new(rng, LayoutRanges.forOffset(_, _, divisor, size, atFunc));
-	}
-}
-
-
-// =============================================================================
 // Section 7: Core Region Implementation
 // =============================================================================
 
@@ -571,7 +529,7 @@ class PWRegion {
 	def var sentinels: BlockTableHandle;
 	def var smallSentinel: BlockEntryHandle;
 	def var largeSentinel: BlockEntryHandle;
-	def blankChunkHandle = ChunkHandle(Pointer.NULL);
+	def blankChunkHandle = ChunkHandle(0);
 	def var blockTableHandle: BlockTableHandle;
 	def var logChunk: ChunkHandle;
 	def var walCache = WALCache.new();
@@ -591,24 +549,27 @@ class PWRegion {
 
 	private def sanitizeOffset(offset: u64) {
 		if (PWRegions.sanitize) {
-			var addr: long = Pointer.atElement(rng, 0) - Pointer.NULL;
+			def addr = u64.view(Pointer.atElement(rng, 0));
 			if (offset < rng.length) {
-				Trace.OUT.put3("offset %d is good for region at 0x%x of length %d", long.view(offset), addr, rng.length).ln();
+				Trace.OUT.put3("offset %d is good for region at 0x%x of length %d",
+					offset, addr, rng.length).ln();
 			} else {
-				Trace.OUT.put3("offset %d is bad for region at 0x%x of length %d", long.view(offset), addr, rng.length).ln();
+				Trace.OUT.put3("offset %d is bad for region at 0x%x of length %d",
+					offset, addr, rng.length).ln();
 			}
 		}
 	}
 
-	private def sanitizeAddress(addr: Pointer) {
+	private def sanitizeAddress(addr: u64) {
 		if (PWRegions.sanitize) {
-			var delta: long = addr - Pointer.atElement(rng, 0);
-			var addrAsLong: long = addr - Pointer.NULL;
-			var baseAddrAsLong: long = Pointer.atElement(rng, 0) - Pointer.NULL;
+			def delta: long = i64.view(addr) - i64.view(Pointer.atElement(rng, 0));
+			def baseAddr = u64.view(Pointer.atElement(rng, 0));
 			if (delta < 0 || delta >= rng.length) {
-				Trace.OUT.put3("address 0x%x is bad for region at 0x%x of length %d", addrAsLong, baseAddrAsLong, rng.length).ln();
+				Trace.OUT.put3("address 0x%x is bad for region at 0x%x of length %d",
+					addr, baseAddr, rng.length).ln();
 			} else {
-				Trace.OUT.put3("address 0x%x is good for region at 0x%x of length %d", addrAsLong, baseAddrAsLong, rng.length).ln();
+				Trace.OUT.put3("address 0x%x is good for region at 0x%x of length %d",
+					addr, baseAddr, rng.length).ln();
 			}
 		}
 	}
@@ -621,18 +582,17 @@ class PWRegion {
 		return offset / blockSize;
 	}
 
-	def blockIndexOf(bte: BlockEntryHandle) -> u64 {
-		return u64.view((bte.addr - blockTableHandle.addr) / BlockEntry.size);
+	def blockIndexOf(blk: BlockEntryHandle) -> u64 {
+		return (blk.addr - blockTableHandle.addr) / u64.!(BlockEntry.size);
 	}
 
 	def blockEntryToChunk(blk: BlockEntryHandle) -> ChunkHandle {
-		return ChunkHandle(Pointer.atElement(rng, 0) + long.view(blockSize * blockIndexOf(blk)));
+		return ChunkHandle(u64.view(Pointer.atElement(rng, 0)) + (blockSize * blockIndexOf(blk)));
 	}
 
 	def chunkToBlockEntry(chunk: ChunkHandle) -> BlockEntryHandle {
-		var addrU64 = u64.view(chunk.addr - Pointer.NULL);
-		var index = blockOfOffset(offsetInRegion(addrU64));
-		return blockTableHandle[long.view(index)];
+		var index = blockOfOffset(offsetInRegion(chunk.addr));
+		return blockTableHandle[index];
 	}
 
 	private def init(blockSize: u64, forceFormat: bool) {
@@ -650,39 +610,39 @@ class PWRegion {
 
 		if (blockSize != hdr.blockSize) {
 			Trace.OUT.put2("blockSize mismatch: requested %d, stored %d",
-				long.view(blockSize), long.view(hdr.blockSize)).ln();
+				blockSize, hdr.blockSize).ln();
 			return;
 		}
 
 		if (this.numBlocks != hdr.numBlocks) {
 			Trace.OUT.put2("numBlocks mismatch: requested %d, stored %d",
-				long.view(this.numBlocks), long.view(hdr.numBlocks)).ln();
+				this.numBlocks, hdr.numBlocks).ln();
 			return;
 		}
 
-		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
-		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
-		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
+		sentinels = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.sentinels))), u64.!(BlockLists.MAX_LISTS));
+		smallSentinel = sentinels[u64.!(ListKind.SMALL_FREE.code)];
+		largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
 
 		def numBlockTableEntries = hdr.numBlocks + 1;
 		def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
 
-		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.blockTable)), numBlockTableEntries);
+		blockTableHandle = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.blockTable))), numBlockTableEntries);
 
 		def logBlockHandle = blockTableHandle[1];
 		logChunk = blockEntryToChunk(logBlockHandle);
 		def maxEntriesInLog = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
-		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0), maxEntriesInLog);
+		walWriter = WALWriter.new(logChunk, u64.view(Pointer.atElement(rng, 0)), maxEntriesInLog);
 
 		recover();
 	}
 
 	// Formats a completely uninitialized region of memory
 	private def format(blockSize: u64) {
-		def nullBTE = BlockEntryHandle(Pointer.NULL);
-		var size = numBlocks * blockSize;
-		var hdr = getHeader();
-		sanitizeAddress(Pointer.atRef(hdr));
+		def nullBTE = BlockEntryHandle(0);
+		def size = numBlocks * blockSize;
+		def hdr = getHeader();
+		sanitizeAddress(u64.view(Pointer.atRef(hdr)));
 
 		hdr.numBlocks = this.numBlocks;
 		hdr.numBytes = size;
@@ -692,11 +652,11 @@ class PWRegion {
 
 		// set up list sentinels just after the header
 		hdr.sentinels = u64.!(PWRegionHeader.size);
-		sentinels = BlockTableHandle(Pointer.atElement(rng, int.!(hdr.sentinels)), u64.!(BlockLists.MAX_LISTS));
+		sentinels = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.sentinels))), u64.!(BlockLists.MAX_LISTS));
 		sanitizeOffset(hdr.sentinels);
 		sanitizeOffset(hdr.sentinels + u64.!(sentinels.size));
-		for (i < BlockLists.MAX_LISTS) {
-			var entryHandle = sentinels[i];
+		for (i < u64.!(BlockLists.MAX_LISTS)) {
+			def entryHandle = sentinels[i];
 			entryHandle.setListNum(0);
 			entryHandle.setUsed(false);
 			entryHandle.setPrev(nullBTE);
@@ -706,16 +666,16 @@ class PWRegion {
 		}
 
 		// take space for block table, + 1 for the marker block at the end
-		var numBlockTableEntries = numBlocks + 1;
-		var blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
+		def numBlockTableEntries = numBlocks + 1;
+		def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
 		currentRegionEnd -= blockTableSize;
 		hdr.blockTable = currentRegionEnd;
 		sanitizeOffset(currentRegionEnd);
-		blockTableHandle = BlockTableHandle(Pointer.atElement(rng, int.!(currentRegionEnd)), numBlockTableEntries);
+		blockTableHandle = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(currentRegionEnd))), numBlockTableEntries);
 
 		// clear block table entries (filled in better later)
 		for (i < numBlockTableEntries) {
-			var entryHandle = blockTableHandle[i64.!(i)];
+			def entryHandle = blockTableHandle[i];
 			entryHandle.setListNum(0);
 			entryHandle.setUsed(false);
 			entryHandle.setPrev(nullBTE);
@@ -725,8 +685,8 @@ class PWRegion {
 		}
 
 		// take space for metadata descriptors
-		def metaDataDescsSize = metaDataDescs.length * MetaDataDesc.size;
-		currentRegionEnd -= u64.!(metaDataDescsSize);
+		def metaDataDescsSize = u64.!(metaDataDescs.length * MetaDataDesc.size);
+		currentRegionEnd -= metaDataDescsSize;
 		sanitizeOffset(currentRegionEnd);
 		hdr.metaDataDescs = currentRegionEnd;
 		hdr.numDescs = u64.!(metaDataDescs.length);
@@ -759,13 +719,13 @@ class PWRegion {
 
 		var firstFreeBlockHandle = blockTableHandle[2];
 
-		smallSentinel = sentinels[i64.!(ListKind.SMALL_FREE.code)];
+		smallSentinel = sentinels[u64.!(ListKind.SMALL_FREE.code)];
 
-		largeSentinel = sentinels[i64.!(ListKind.LARGE_FREE.code)];
+		largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
 
-		var metaHandle = blockTableHandle[long.view(userDataBlocks + 1)];
+		var metaHandle = blockTableHandle[u64.!(userDataBlocks + 1)];
 
-		var lastHandle = blockTableHandle[long.view(numBlocks)];
+		var lastHandle = blockTableHandle[u64.!(numBlocks)];
 
 		sanitizeAddress(headerBlockHandle.addr);
 		headerBlockHandle.setListNum(ListKind.METADATA.code);
@@ -782,7 +742,7 @@ class PWRegion {
 
 		logChunk = blockEntryToChunk(logBlockHandle);
 		def maxEntriesInLog = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
-		walWriter = WALWriter.new(logChunk, Pointer.atElement(rng, 0), maxEntriesInLog);
+		walWriter = WALWriter.new(logChunk, u64.view(Pointer.atElement(rng, 0)), maxEntriesInLog);
 
 		sanitizeAddress(firstFreeBlockHandle.addr);
 		firstFreeBlockHandle.setListNum(ListKind.LARGE_FREE.code);
@@ -831,14 +791,6 @@ class PWRegion {
 		return Ref<PWRegionHeader>.of(rng[0 ..+ PWRegionHeader.size]);
 	}
 
-	def regionHeaderSize() -> int {
-		return PWRegionHeader.size;
-	}
-
-	def getBlockSize() -> u64 {
-		return blockSize;
-	}
-
 	def getMetaDataDesc(i: u64) -> Ref<MetaDataDesc> {
 		var hdr = getHeader();
 		return Ref<MetaDataDesc>.of(rng[hdr.metaDataDescs + i * u64.!(MetaDataDesc.size) ..+ MetaDataDesc.size]);
@@ -846,22 +798,23 @@ class PWRegion {
 
 	def blockIndexOfEntry(entry: BlockEntryHandle) -> u64 {
 		var hdr = getHeader();
-		var blkTablePtr = Pointer.atElement(rng, int.!(hdr.blockTable));
-		var entryPtr = entry.addr;
-		var index = u64.!((entryPtr - blkTablePtr) / BlockEntry.size);
+		var index = (entry.addr - hdr.blockTable) / u64.!(BlockEntry.size);
 		return index;
 	}
 
 	def blockOffsetOfIndex(index: u64) -> u64 {
-		return index * getBlockSize();
+		return index * blockSize;
+	}
+
+	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
+		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
 	}
 
 	def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
 		var blockIndex = blockIndexOfEntry(startEntry);
 		var blockOffset = blockOffsetOfIndex(blockIndex);
 
-	        var ptr = Pointer.atElement(rng, int.!(blockOffset));
-	        var chunk = ChunkHandle(ptr);
+	        var chunk = ChunkHandle(blockOffset);
 
 		chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
                 // LOG: Chunk Header Initialization
@@ -869,11 +822,11 @@ class PWRegion {
                 // Size: 8 bytes
                 // New Value: ChunkHeader.size
 
-		chunk.setLimitCached(walCache, numBlocks * getBlockSize());
+		chunk.setLimitCached(walCache, numBlocks * blockSize);
                 // LOG: Chunk Header Limit
                 // Address: chunk.addr + ChunkHeader.limit (offset 8)
                 // Size: 8 bytes
-                // New Value: numBlocks * getBlockSize()
+                // New Value: numBlocks * blockSize
 
 		// TODO link mark field
 		return chunk;
@@ -924,8 +877,8 @@ class PWRegion {
 
                         // --- Splitting Block Logic ---
 
-			var remIndex = thisIndex + u64.!(numBlocks);
-			var remHandle = blockTableHandle[long.view(remIndex)];
+			var remIndex = thisIndex + numBlocks;
+			var remHandle = blockTableHandle[remIndex];
 			var remBlocks = nextIndex - remIndex;
 
 			// 1. Set remainder's memory-order links
@@ -1103,10 +1056,6 @@ class PWRegion {
 		}
 	}
 
-	def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
-		return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
-	}
-
 	def removeFromList(blk: BlockEntryHandle) {
 		var listPrev = blk.getListPrevCached(walCache);
 		var listNext = blk.getListNextCached(walCache);
@@ -1128,7 +1077,7 @@ class PWRegion {
                         // New Value: listPrevOffsetFromListNext
 		}
 
-		def nullBTE = BlockEntryHandle(Pointer.NULL);
+		def nullBTE = BlockEntryHandle(0);
 
 		blk.setListPrevCached(walCache, nullBTE);
                 // LOG: Clear blk ListPrev
@@ -1172,13 +1121,13 @@ class PWRegion {
 	}
 
 	private def recover() {
-		var logBase = blockEntryToChunk(blockTableHandle[1]).addr;
-		var header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(logBase, LogHeader.size));
+		def logBase = blockEntryToChunk(blockTableHandle[1]).addr;
+		def header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(pointerFromU64(logBase), LogHeader.size));
 
 		if (header.status != 1) return;
 
-		var expected = header.checksum;
-		var actual = calculateLogChecksum(logBase + LogHeader.size, header.numEntries);
+		def expected = header.checksum;
+		def actual = calculateLogChecksum(logBase + u64.!(LogHeader.size), header.numEntries);
 
 		if (expected != actual) {
 			// Log checksum mismatch. Ignore corrupt log
@@ -1186,12 +1135,12 @@ class PWRegion {
 			return;
 		}
 
-		var entryPtr = logBase + LogHeader.size;
+		var entryAddr = logBase + u64.view(LogHeader.size);
 
 		for (i < header.numEntries) {
-			var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(entryPtr, LogEntry.size));
+			def entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(entryAddr), LogEntry.size));
 
-			var targetAddr = Pointer.atElement(rng, int.!(entry.offset));
+			def targetAddr = Pointer.atElement(rng, int.!(entry.offset));
 
 			match (entry.width) {
 				1 => targetAddr.store<u8>(u8.view(entry.value));
@@ -1200,7 +1149,7 @@ class PWRegion {
 				8 => targetAddr.store<u64>(u64.view(entry.value));
 				_ => ;
 			}
-			entryPtr = entryPtr + LogEntry.size;
+			entryAddr = entryAddr + u64.!(LogEntry.size);
 		}
 
 		header.status = 0;
@@ -1230,7 +1179,7 @@ class ImmixPWRegion extends PWRegion {
 		for (i < hdr.numDescs) {
 			var r = getMetaDataDesc(u64.!(i));
 			if (r.kind == ImmixPWRegions.ImmixLineMarkMetaKind) {
-				var spaceSize = numBlocks * getBlockSize();
+				var spaceSize = numBlocks * blockSize;
 				numLineMarks = spaceSize / u64.!(ImmixPWRegions.ImmixLineSize);
 				var lmrng = this.rng[r.offset ..+ numLineMarks * u64.!(LineMark.size)];
 				return LineMarkTableHandle(u64.view(Pointer.atElement(lmrng, 0) - Pointer.NULL), numLineMarks);
