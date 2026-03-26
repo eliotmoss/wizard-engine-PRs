@@ -74,11 +74,9 @@ layout LogHeader {
 }
 
 layout LogEntry {
-        +0      kind:           u8;     // what kind of log entry
-                                        // gap
-        +8      offset:         u64;    // Relative offset of first changed byte, from the start of the Region
-        +16     value:          u64;    // The data to be written
-        +24     width:          u8;     // number of bytes being changed (1, 2, 4, 8)
+        +0      offset:         u64;    // Relative offset of first changed byte, from the start of the Region
+        +8      value:          u64;    // The data to be written
+        +16     width:          u8;     // number of bytes being changed (1, 2, 4, 8)
         =32;
 }
 
@@ -174,7 +172,7 @@ type BlockEntryHandle(addr: u64) #unboxed {
 
         def getUsedCached(cache:WALCache) -> bool {
                 def used = cache.readU8(u64.view(Pointer.atField(getRef().used)));
-                return used == 1u1;
+                return used == 1;
         }
 
         def getPrevCached(cache: WALCache) -> BlockEntryHandle {
@@ -222,7 +220,7 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def setUsedCached(cache: WALCache, v: bool) {
-                def num = if(v, 1u1, 0u1);
+                def num: u8 = if(v, 1, 0);
                 cache.writeU8(u64.view(Pointer.atField(getRef().used)), num);
         }
 
@@ -432,8 +430,8 @@ class WALCache {
                 cache[addr] = CachedUpdate(val, size);
         }
 
-        // Hash function: Convert Pointer -> i32
-        private def hash(addr: u64) => i32.view(addr);
+        // Hash function: Convert u64 -> i32
+        private def hash(addr: u64) => i32.view(addr ^ (addr >> 32));
 }
 
 // Shared checksum for WAL log entries. Used by both WALWriter (on commit)
@@ -766,7 +764,6 @@ class PWRegion {
 
                 sanitizeAddress(largeSentinel.addr);
                 largeSentinel.setListNext(firstFreeBlockHandle);
-                largeSentinel.setListPrev(firstFreeBlockHandle);
                 sanitizeOffset(hdr.blockTable + u64.!(BlockEntry.size));
 
                 // Metadata block (METADATA, used)
@@ -811,8 +808,8 @@ class PWRegion {
                 var chunk = ChunkHandle(u64.view(Pointer.atElement(rng, 0)) + blockIndexOf(startEntry) * blockSize);
 
                 chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
-                chunk.setLimitCached(walCache, numBlocks * blockSize);
-                chunk.setChunkLimitCached(walCache, numBlocks * blockSize);
+                chunk.setLimitCached(walCache, u64.!(numBlocks) * blockSize);
+                chunk.setChunkLimitCached(walCache, u64.!(numBlocks) * blockSize);
 
                 // TODO link mark field
                 return chunk;
