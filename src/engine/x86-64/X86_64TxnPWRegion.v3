@@ -775,7 +775,7 @@ class PWRegion {
                 metaHandle.setUsed(true);
                 metaHandle.setNext(lastHandle);
                 metaHandle.setPrev(firstFreeBlockHandle);
-                metaHandle.setListPrev(firstFreeBlockHandle);
+                metaHandle.setListPrev(NULL_BLOCK_ENTRY);
                 metaHandle.setListNext(NULL_BLOCK_ENTRY);
                 sanitizeOffset(hdr.blockTable + numBlocks * u64.!(BlockEntry.size));
                 sanitizeOffset(hdr.blockTable + u64.!(BlockEntry.size));
@@ -808,10 +808,11 @@ class PWRegion {
         }
 
         def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
-                var chunk = ChunkHandle(blockIndexOf(startEntry) * blockSize);
+                var chunk = ChunkHandle(u64.view(Pointer.atElement(rng, 0)) + blockIndexOf(startEntry) * blockSize);
 
                 chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
                 chunk.setLimitCached(walCache, numBlocks * blockSize);
+                chunk.setChunkLimitCached(walCache, numBlocks * blockSize);
 
                 // TODO link mark field
                 return chunk;
@@ -835,7 +836,7 @@ class PWRegion {
                         var nextIndex = blockIndexOf(nextHandle);
                         var chunkBlocks = nextIndex - thisIndex;
                         if (numBlocks > chunkBlocks) {
-                                thisHandle = thisHandle.getNextCached(walCache);
+                                thisHandle = thisHandle.getListNextCached(walCache);
                                 continue;
                         }
                         if (numBlocks == chunkBlocks) {
@@ -880,7 +881,7 @@ class PWRegion {
 
                 var entry = chunkToBlockEntry(chunk);
                 if (entry.isNull()) return;
-                if (!entry.getUsed()) return;
+                if (!entry.getUsedCached(walCache)) return;
 
                 entry.setUsedCached(walCache, false);
 
