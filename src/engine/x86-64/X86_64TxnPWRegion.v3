@@ -99,7 +99,7 @@ enum ListKind(code: i16) {
 // =============================================================================
 
 def pointerFromU64(n: u64) -> Pointer {
-        return Pointer.NULL + i64.!(n);
+        return Pointer.NULL + i64.view(n);
 }
 
 def pointerFromI64(n: i64) -> Pointer {
@@ -131,11 +131,11 @@ type BlockEntryHandle(addr: u64) #unboxed {
 
         def toHandle(offset: i64) -> BlockEntryHandle {
                 // Never need to point to ourselves
-                return BlockEntryHandle(u64.view(i64.!(addr) + offset));
+                return BlockEntryHandle(u64.view(i64.view(addr) + offset));
         }
 
         def toOffset(other: BlockEntryHandle) -> i64 {
-                return i64.!(other.addr) - i64.!(this.addr);
+                return i64.view(other.addr) - i64.view(this.addr);
         }
 
         def getRef() -> Ref<BlockEntry> {
@@ -167,28 +167,28 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def getListNumCached(cache: WALCache) -> i16 {
-                return cache.readI16(u64.view(Pointer.atField(getRef().listNum)));
+                return cache.readI16(addr + u64.view(BlockEntry.listNum.offset));
         }
 
         def getUsedCached(cache:WALCache) -> bool {
-                def used = cache.readU8(u64.view(Pointer.atField(getRef().used)));
+                def used = cache.readU8(addr + u64.view(BlockEntry.used.offset));
                 return used == 1;
         }
 
         def getPrevCached(cache: WALCache) -> BlockEntryHandle {
-                return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().prev))));
+                return toHandle(cache.readI64(addr + u64.view(BlockEntry.prev.offset)));
         }
 
         def getNextCached(cache: WALCache) -> BlockEntryHandle {
-                return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().next))));
+                return toHandle(cache.readI64(addr + u64.view(BlockEntry.next.offset)));
         }
 
         def getListPrevCached(cache: WALCache) -> BlockEntryHandle {
-                return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().listPrev))));
+                return toHandle(cache.readI64(addr + u64.view(BlockEntry.listPrev.offset)));
         }
 
         def getListNextCached(cache: WALCache) -> BlockEntryHandle {
-                return toHandle(cache.readI64(u64.view(Pointer.atField(getRef().listNext))));
+                return toHandle(cache.readI64(addr + u64.view(BlockEntry.listNext.offset)));
         }
 
         def setListNum(v: i16) {
@@ -216,28 +216,28 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def setListNumCached(cache: WALCache, v: i16) {
-                cache.writeI16(u64.view(Pointer.atField(getRef().listNum)), v);
+                cache.writeI16(addr + u64.view(BlockEntry.listNum.offset), v);
         }
 
         def setUsedCached(cache: WALCache, v: bool) {
                 def num: u8 = if(v, 1, 0);
-                cache.writeU8(u64.view(Pointer.atField(getRef().used)), num);
+                cache.writeU8(addr + u64.view(BlockEntry.used.offset), num);
         }
 
         def setPrevCached(cache: WALCache, v: BlockEntryHandle) {
-                cache.writeI64(u64.view(Pointer.atField(getRef().prev)), toOffset(v));
+                cache.writeI64(addr + u64.view(BlockEntry.prev.offset), toOffset(v));
         }
 
         def setNextCached(cache: WALCache, v: BlockEntryHandle) {
-                cache.writeI64(u64.view(Pointer.atField(getRef().next)), toOffset(v));
+                cache.writeI64(addr + u64.view(BlockEntry.next.offset), toOffset(v));
         }
 
         def setListPrevCached(cache: WALCache, v: BlockEntryHandle) {
-                cache.writeI64(u64.view(Pointer.atField(getRef().listPrev)), toOffset(v));
+                cache.writeI64(addr + u64.view(BlockEntry.listPrev.offset), toOffset(v));
         }
 
         def setListNextCached(cache: WALCache, v: BlockEntryHandle) {
-                cache.writeI64(u64.view(Pointer.atField(getRef().listNext)), toOffset(v));
+                cache.writeI64(addr + u64.view(BlockEntry.listNext.offset), toOffset(v));
         }
 }
 
@@ -283,15 +283,19 @@ type ChunkHandle(addr: u64) #unboxed {
         }
 
         def setOffsetCached(cache: WALCache, v: u64) {
-                cache.writeU64(u64.view(Pointer.atField(getRef().offset)), v);
+                cache.writeU64(addr + u64.view(ChunkHeader.offset.offset), v);
         }
 
         def setLimitCached(cache: WALCache, v: u64) {
-                cache.writeU64(u64.view(Pointer.atField(getRef().limit)), v);
+                cache.writeU64(addr + u64.view(ChunkHeader.limit.offset), v);
         }
 
         def setChunkLimitCached(cache: WALCache, v: u64) {
-                cache.writeU64(u64.view(Pointer.atField(getRef().chunk_limit)), v);
+                cache.writeU64(addr + u64.view(ChunkHeader.chunk_limit.offset), v);
+        }
+
+        def setLinemarksCached(cache: WALCache, v: u64) {
+                cache.writeU64(addr + u64.view(ChunkHeader.linemarks.offset), v);
         }
 }
 
