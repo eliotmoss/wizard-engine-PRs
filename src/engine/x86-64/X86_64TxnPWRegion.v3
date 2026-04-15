@@ -826,7 +826,9 @@ class PWRegion {
                         if (!firstHandle.isNull()) {
                                 removeFromList(firstHandle);
                                 firstHandle.setUsedCached(walCache, true);
-                                return createChunk(firstHandle, 1);
+                                var chunk = createChunk(firstHandle, 1);
+                                performCommit();
+                                return chunk;
                         }
                 }
                 var thisHandle = largeSentinel.getListNextCached(walCache);
@@ -843,7 +845,9 @@ class PWRegion {
                         if (numBlocks == chunkBlocks) {
                                 removeFromList(thisHandle);
                                 thisHandle.setUsedCached(walCache, true);
-                                return createChunk(thisHandle, numBlocks);
+                                var chunk = createChunk(thisHandle, numBlocks);
+                                performCommit();
+                                return chunk;
                         }
 
                         // Split: allocate numBlocks from front, remainder stays free
@@ -872,7 +876,9 @@ class PWRegion {
 
                         // Mark allocated block as used
                         thisHandle.setUsedCached(walCache, true);
-                        return createChunk(thisHandle, numBlocks);
+                        var chunk = createChunk(thisHandle, numBlocks);
+                        performCommit();
+                        return chunk;
                 }
                 return blankChunkHandle;
         }
@@ -920,6 +926,7 @@ class PWRegion {
                 } else {
                         insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
                 }
+                performCommit();
         }
 
         // Insert entry into list immediately after sentinel (head insertion)
