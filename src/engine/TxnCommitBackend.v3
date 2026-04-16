@@ -39,6 +39,17 @@ class TxnCommitBackend {
 	def recover() -> bool;
 
 	// --- Lifecycle ---
+
+	// Initialize backend with region information after allocation.
+	// Called before format/mount for externally-provided backends.
+	// File-backed backends use this to set regionStart and load data from disk.
+	def initRegion(regionStart: u64, rng: Range<byte>) { }
+
+	// Sync in-memory region to persistent storage.
+	// Called after format to persist initial layout for file-backed backends.
+	// No-op for in-memory backends (PMEM, volatile).
+	def syncRegion(rng: Range<byte>) { }
+
 	// Release resources held by this backend.
 	def close();
 }

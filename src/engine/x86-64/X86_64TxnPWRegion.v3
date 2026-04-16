@@ -148,11 +148,12 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def toHandle(offset: i64) -> BlockEntryHandle {
-                // Never need to point to ourselves
+                if (offset == 0) return NULL_BLOCK_ENTRY;
                 return BlockEntryHandle(u64.view(i64.view(addr) + offset));
         }
 
         def toOffset(other: BlockEntryHandle) -> i64 {
+                if (other.isNull()) return 0;
                 return i64.view(other.addr) - i64.view(this.addr);
         }
 
@@ -473,7 +474,7 @@ class PWRegion {
         def var regionStart: u64;
         def var walCache: WALCache;
 
-        new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
+        new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool, extCommitBackend: TxnCommitBackend) {
                 var size = numBlocks * blockSize;
                 var prot = BackendProt.READ | BackendProt.WRITE;
                 backendRegion = backend.allocate(size, prot);
@@ -483,6 +484,10 @@ class PWRegion {
                 }
                 rng = backendRegion.range;
                 regionStart = u64.view(Pointer.atElement(rng, 0));
+                if (extCommitBackend != null) {
+                        commitBackend = extCommitBackend;
+                        commitBackend.initRegion(regionStart, rng);
+                }
                 init(blockSize, forceFormat);
                 walCache = WALCache.new(commitBackend, regionStart);
         }
@@ -571,7 +576,9 @@ class PWRegion {
 
                 def logBlockHandle = blockTableHandle[1];
                 logChunk = blockEntryToChunk(logBlockHandle);
-                commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
+                if (commitBackend == null) {
+                        commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
+                }
 
                 commitBackend.recover();
         }
@@ -681,7 +688,9 @@ class PWRegion {
                 sanitizeOffset(hdr.blockTable + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
-                commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
+                if (commitBackend == null) {
+                        commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
+                }
 
                 // Block 2: first free block (LARGE_FREE)
                 sanitizeAddress(firstFreeBlockHandle.addr);
@@ -724,6 +733,9 @@ class PWRegion {
                 // TODO: CiRuntime.fence() here to ensure all structures are physically in PMEM
 
                 hdr.magic = PWRegions.MAGIC;
+
+                // Sync formatted region to persistent storage for file-backed backends
+                commitBackend.syncRegion(rng);
 
                 // TODO: CiRuntime.cacheWriteback & fence for the header
         }
@@ -922,7 +934,7 @@ class PWRegion {
 
 class ImmixPWRegion extends PWRegion {
         new(backend: TxnRegionBackend, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, blockSize: u64, forceFormat: bool)
-                super(backend, numBlocks, metaDataDescs, blockSize, forceFormat) {
+                super(backend, numBlocks, metaDataDescs, blockSize, forceFormat, null) {
                 lineMarks = getLineMarks();
         }
 

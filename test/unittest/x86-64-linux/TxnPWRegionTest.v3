@@ -37,7 +37,8 @@ class PWRegionTester(t: Tester) {
 			8u64,
 			Array<Ref<MetaDataDesc>>.new(0),
 			4096u64,
-			true
+			true,
+			null
 		);
 	}
 
@@ -207,4 +208,158 @@ def test_commit_clears_wal_cache(tc: PWRegionTester) {
 	tc.t.assertz(false, tc.region.walCache.isDirty());
 	tc.region.allocChunk(1u32);
 	tc.t.assertz(false, tc.region.walCache.isDirty());
+}
+
+
+// =============================================================================
+// Block device backend tests
+// =============================================================================
+
+def BD_DATA_PATH = "/tmp/wiz_test_bd_data";
+def BD_WAL_PATH = "/tmp/wiz_test_bd_wal";
+
+def BT = UnitTests.registerT("pwregion_bd:", _, BlockDevicePWRegionTester.new, _);
+def BX = [
+	BT("format_magic",          test_bd_format_magic),
+	BT("alloc_valid",           test_bd_alloc_valid),
+	BT("alloc_sets_used",       test_bd_alloc_sets_used),
+	BT("free_clears_used",      test_bd_free_clears_used),
+	BT("coalesce",              test_bd_coalesce),
+	BT("persist_and_remount",   test_bd_persist_and_remount),
+	BT("remount_alloc_state",   test_bd_remount_alloc_state),
+	()
+];
+
+class BlockDevicePWRegionTester(t: Tester) {
+	var region: PWRegion;
+
+	new() {
+		// Clean up leftover files from prior runs
+		BlockDeviceIO.unlink(BD_DATA_PATH);
+		BlockDeviceIO.unlink(BD_WAL_PATH);
+
+		def dataFd = BlockDeviceIO.openOrCreate(BD_DATA_PATH);
+		def walFd = BlockDeviceIO.openOrCreate(BD_WAL_PATH);
+		def backend = BlockDeviceCommitBackend.new(dataFd, walFd, 4096u64);
+
+		region = PWRegion.new(
+			Backends.getVolatile(),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			true,
+			backend
+		);
+	}
+
+	def allocSucceeded(chunk: ChunkHandle) -> bool {
+		return !chunk.isNull();
+	}
+
+	def cleanup() {
+		region.commitBackend.close();
+		BlockDeviceIO.unlink(BD_DATA_PATH);
+		BlockDeviceIO.unlink(BD_WAL_PATH);
+	}
+
+	// Open a fresh region over existing files (mount, not format)
+	def remount() -> PWRegion {
+		region.commitBackend.close();
+		def dataFd = BlockDeviceIO.openOrCreate(BD_DATA_PATH);
+		def walFd = BlockDeviceIO.openOrCreate(BD_WAL_PATH);
+		def backend = BlockDeviceCommitBackend.new(dataFd, walFd, 4096u64);
+		return PWRegion.new(
+			Backends.getVolatile(),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			false,
+			backend
+		);
+	}
+}
+
+// After format(), the MAGIC constant must be stamped in the header.
+def test_bd_format_magic(tc: BlockDevicePWRegionTester) {
+	var hdr = tc.region.getHeader();
+	tc.t.assert_eq(PWRegions.MAGIC, hdr.magic);
+	tc.cleanup();
+}
+
+// allocChunk(1) must return a valid chunk on a fresh region.
+def test_bd_alloc_valid(tc: BlockDevicePWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+	tc.cleanup();
+}
+
+// After allocChunk(1), the block entry's used flag must be true.
+def test_bd_alloc_sets_used(tc: BlockDevicePWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	var entry = tc.region.chunkToBlockEntry(chunk);
+	tc.t.assertz(true, entry.getUsed());
+	tc.cleanup();
+}
+
+// After alloc+free, the block entry must show used == false.
+def test_bd_free_clears_used(tc: BlockDevicePWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	tc.region.freeChunk(chunk);
+	tc.region.performCommit();
+	var entry = tc.region.chunkToBlockEntry(chunk);
+	tc.t.assertz(false, entry.getUsed());
+	tc.cleanup();
+}
+
+// Coalescing must work with block device backend.
+def test_bd_coalesce(tc: BlockDevicePWRegionTester) {
+	var chunk2 = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+	var chunk3 = tc.region.allocChunk(1u32);
+	tc.region.performCommit();
+
+	tc.region.freeChunk(chunk2);
+	tc.region.performCommit();
+	tc.region.freeChunk(chunk3);
+	tc.region.performCommit();
+
+	// After coalescing, alloc(2) must succeed.
+	var chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+	tc.cleanup();
+}
+
+// After format + close + remount, the magic must be present.
+def test_bd_persist_and_remount(tc: BlockDevicePWRegionTester) {
+	// Region was formatted in constructor. Remount it.
+	var region2 = tc.remount();
+	tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+	region2.commitBackend.close();
+	BlockDeviceIO.unlink(BD_DATA_PATH);
+	BlockDeviceIO.unlink(BD_WAL_PATH);
+}
+
+// After alloc + close + remount, allocation state must be preserved.
+// If 1 block was allocated (out of 5 free), remount should have 4 free.
+def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
+	// Allocate 1 block (leaves 4 free)
+	var chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+
+	// Remount
+	var region2 = tc.remount();
+
+	// Should be able to alloc 4 blocks (all remaining free space)
+	var chunk2 = region2.allocChunk(4u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk2));
+
+	// Should NOT be able to alloc 1 more (exhausted)
+	var chunk3 = region2.allocChunk(1u32);
+	tc.t.assertz(false, tc.allocSucceeded(chunk3));
+
+	region2.commitBackend.close();
+	BlockDeviceIO.unlink(BD_DATA_PATH);
+	BlockDeviceIO.unlink(BD_WAL_PATH);
 }
