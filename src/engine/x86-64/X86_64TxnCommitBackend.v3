@@ -1,0 +1,142 @@
+// PMEM commit backend: WAL lives in block 1 of the mmap'd region.
+// All I/O is via Pointer.store/Pointer.load + cache-line flush/fence.
+// This absorbs the logic previously in WALWriter and PWRegion.recover().
+
+class PmemCommitBackend extends TxnCommitBackend {
+        def regionStart: u64;              // absolute address of region byte 0
+        def logChunkAddr: u64;             // absolute address of the log chunk (block 1)
+        def backendRegion: BackendRegion;
+
+        // Log header and entry base (derived from logChunkAddr)
+        def var header: Ref<LogHeader>;
+        def var entryBase: u64;
+        def var maxEntries: u32;
+
+        // Local counter for the current transaction
+        def var currentEntryIndex: u32 = 0;
+
+        new(regionStart, logChunkAddr, blockSize: u64, backendRegion) {
+                header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(logChunkAddr), LogHeader.size));
+                entryBase = logChunkAddr + u64.!(LogHeader.size);
+                maxEntries = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
+        }
+
+        // --- WAL operations ---
+
+        def walAppend(offset: u64, value: u64, width: u8) {
+                if (currentEntryIndex >= maxEntries) {
+                        // Log chunk is full; cannot record this entry.
+                        // TODO: return error instead of silently dropping
+                        return;
+                }
+                def entryAddr = entryBase + u64.view(currentEntryIndex * u32.!(LogEntry.size));
+                var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(entryAddr), LogEntry.size));
+
+                entry.offset = offset;
+                entry.value = value;
+                entry.width = width;
+
+                currentEntryIndex++;
+        }
+
+        def walCommit() {
+                header.numEntries = currentEntryIndex;
+                header.checksum = PWRegionUtils.calculateLogChecksum(entryBase, currentEntryIndex);
+
+                // Flush log entries to persistent storage
+                if (backendRegion != null) {
+                        def entryBytes = u64.view(currentEntryIndex) * u64.!(LogEntry.size);
+                        backendRegion.flush(entryBase - regionStart + u64.!(LogHeader.size), entryBytes);
+                        backendRegion.fence();
+                }
+
+                header.status = 1;
+
+                // Flush the header
+                if (backendRegion != null) {
+                        backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                        backendRegion.fence();
+                }
+        }
+
+        def walClear() {
+                header.status = 0;
+                if (backendRegion != null) {
+                        backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                        backendRegion.fence();
+                }
+                currentEntryIndex = 0;
+        }
+
+        // --- Data application ---
+
+        def applyUpdate(offset: u64, value: u64, width: u8) {
+                def addr = PWRegionUtils.pointerFromU64(regionStart + offset);
+                match (width) {
+                        1 => addr.store<u8>(u8.view(value));
+                        2 => addr.store<u16>(u16.view(value));
+                        4 => addr.store<u32>(u32.view(value));
+                        8 => addr.store<u64>(value);
+                        _ => ;
+                }
+        }
+
+        def applyFence() {
+                if (backendRegion != null) {
+                        backendRegion.fence();
+                }
+        }
+
+        // --- Read (cache-miss fallthrough) ---
+
+        def readU8(offset: u64) -> u8 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u8>();
+        }
+
+        def readI16(offset: u64) -> i16 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i16>();
+        }
+
+        def readU64(offset: u64) -> u64 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u64>();
+        }
+
+        def readI64(offset: u64) -> i64 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i64>();
+        }
+
+        // --- Recovery ---
+
+        def recover() -> bool {
+                if (header.status != 1) return false;
+
+                def expected = header.checksum;
+                def actual = PWRegionUtils.calculateLogChecksum(entryBase, header.numEntries);
+
+                if (expected != actual) {
+                        // Checksum mismatch -- corrupt log, ignore
+                        header.status = 0;
+                        return false;
+                }
+
+                var entryAddr = entryBase;
+                for (i < header.numEntries) {
+                        def entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(entryAddr), LogEntry.size));
+                        applyUpdate(entry.offset, entry.value, entry.width);
+                        entryAddr = entryAddr + u64.!(LogEntry.size);
+                }
+
+                header.status = 0;
+                if (backendRegion != null) {
+                        backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                        backendRegion.fence();
+                }
+                return true;
+        }
+
+        // --- Lifecycle ---
+
+        def close() {
+                // No-op: memory is managed by TxnRegionBackend
+        }
+}

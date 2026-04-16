@@ -95,15 +95,33 @@ enum ListKind(code: i16) {
 
 
 // =============================================================================
-// Section 4: Pointer utilities
+// Section 4: Utilities
 // =============================================================================
 
-def pointerFromU64(n: u64) -> Pointer {
-        return Pointer.NULL + i64.view(n);
-}
+component PWRegionUtils {
+        def pointerFromU64(n: u64) -> Pointer {
+                return Pointer.NULL + i64.view(n);
+        }
 
-def pointerFromI64(n: i64) -> Pointer {
-        return Pointer.NULL + n;
+        def pointerFromI64(n: i64) -> Pointer {
+                return Pointer.NULL + n;
+        }
+
+        // Shared checksum for WAL log entries. Used by commit backends
+        // (on commit) and on recovery to ensure integrity.
+        def calculateLogChecksum(base: u64, count: u32) -> u64 {
+                var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
+                var ptr = base;
+                for (i < count) {
+                        var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(ptr), LogEntry.size));
+                        h = (h << 13) | (h >> 51);
+                        h = h ^ entry.offset;
+                        h = h ^ entry.value;
+                        h = h ^ u64.view(entry.width);
+                        ptr = ptr + u64.!(LogEntry.size);
+                }
+                return h;
+        }
 }
 
 
@@ -139,7 +157,7 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def getRef() -> Ref<BlockEntry> {
-                return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(addr), BlockEntry.size));
+                return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), BlockEntry.size));
         }
 
         def getListNum() -> i16 {
@@ -247,7 +265,7 @@ type ChunkHandle(addr: u64) #unboxed {
         }
 
         def getRef() -> Ref<ChunkHeader> {
-                return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(pointerFromU64(addr), ChunkHeader.size));
+                return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), ChunkHeader.size));
         }
 
         def getOffset() -> u64 {
@@ -311,7 +329,7 @@ type LineMarkTableHandle(addr: u64, size: u64) #unboxed {
 
 type LineMarkHandle(addr: u64) #unboxed {
         def getRef() -> Ref<LineMark> {
-                return Ref<LineMark>.of(CiRuntime.forgeRange<byte>(pointerFromU64(addr), LineMark.size));
+                return Ref<LineMark>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LineMark.size));
         }
 
         def getMark() -> u8 {
@@ -331,7 +349,7 @@ type LogEntryHandle(addr: u64) { }
 // =============================================================================
 
 // Wrapper ADT to store the cached value and its width (size)
-type CachedUpdate(value: u64, size: u4) #unboxed { }
+type CachedUpdate(value: u64, size: u8) #unboxed { }
 
 // A write-behind cache for the Write Ahead Log (WAL).
 // This component buffers writes in DRAM.
@@ -345,8 +363,10 @@ type CachedUpdate(value: u64, size: u4) #unboxed { }
 class WALCache {
         private var cache: HashMap<u64, CachedUpdate>;
         private def addrs = Vector<u64>.new();
+        def commitBackend: TxnCommitBackend;
+        def regionStart: u64;
 
-        new() {
+        new(commitBackend, regionStart) {
                 cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
         }
 
@@ -360,51 +380,43 @@ class WALCache {
                 addrs.clear();
         }
 
-        // Flushes cached updates to actual Persistent memory
-        def applyToMemory() {
+        // Flushes cached updates via the commit backend
+        def applyTo(backend: TxnCommitBackend) {
                 addrs.apply(
                         fun (addr: u64) {
                                 def c: CachedUpdate = cache[addr];
-                                match (c.size) {
-                                        1 => pointerFromU64(addr).store<u8>(u8.view(c.value));
-                                        2 => pointerFromU64(addr).store<u16>(u16.view(c.value));
-                                        4 => pointerFromU64(addr).store<u32>(u32.view(c.value));
-                                        8 => pointerFromU64(addr).store<u64>(u64.view(c.value));
-                                        _ => ;
-                                }
-                                // TODO: do cache writeback here by giving addr and size
-                                // CiRuntime.cacheWriteback(addr, c.size);
+                                backend.applyUpdate(addr - regionStart, c.value, c.size);
                         }
                 );
         }
 
-        def transferToLog(writer: WALWriter) {
+        def transferToLog(backend: TxnCommitBackend) {
                 addrs.apply(
                         fun (addr: u64) {
                                 def c: CachedUpdate = cache[addr];
-                                writer.append(addr, c.value, u8.view(c.size));
+                                backend.walAppend(addr - regionStart, c.value, c.size);
                         }
                 );
         }
 
         def readU8(addr: u64) -> u8 {
                 if (cache.has(addr)) return u8.view(cache[addr].value);
-                return pointerFromU64(addr).load<u8>();
+                return commitBackend.readU8(addr - regionStart);
         }
 
         def readI16(addr: u64) -> i16 {
                 if (cache.has(addr)) return i16.view(cache[addr].value);
-                return pointerFromU64(addr).load<i16>();
+                return commitBackend.readI16(addr - regionStart);
         }
 
         def readU64(addr: u64) -> u64 {
                 if (cache.has(addr)) return u64.view(cache[addr].value);
-                return pointerFromU64(addr).load<u64>();
+                return commitBackend.readU64(addr - regionStart);
         }
 
         def readI64(addr: u64) -> i64 {
                 if (cache.has(addr)) return i64.view(cache[addr].value);
-                return pointerFromU64(addr).load<i64>();
+                return commitBackend.readI64(addr - regionStart);
         }
 
         // Write BlockEntry.used (u1/bool stored as u8)
@@ -427,7 +439,7 @@ class WALCache {
                 writeHelper(addr, 8, u64.view(val));
         }
 
-        private def writeHelper(addr: u64, size: u4, val: u64) {
+        private def writeHelper(addr: u64, size: u8, val: u64) {
                 if (!cache.has(addr)) {
                         addrs.put(addr);
                 }
@@ -438,86 +450,6 @@ class WALCache {
         private def hash(addr: u64) => i32.view(addr ^ (addr >> 32));
 }
 
-// Shared checksum for WAL log entries. Used by both WALWriter (on commit)
-// and PWRegion (on recovery) to ensure they stay in sync.
-def calculateLogChecksum(base: u64, count: u32) -> u64 {
-        var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
-        var ptr = base;
-        for (i < count) {
-                var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(ptr), LogEntry.size));
-                h = (h << 13) | (h >> 51);
-                h = h ^ entry.offset;
-                h = h ^ entry.value;
-                h = h ^ u64.view(entry.width);
-                ptr = ptr + u64.!(LogEntry.size);
-        }
-        return h;
-}
-
-class WALWriter {
-        def logChunk: ChunkHandle;
-        def regionStart: u64; // Needed to calculate relative offsets
-
-        // Pointers to the header and the start of the entry array
-        var header: Ref<LogHeader>;
-        var entryBase: u64;
-        def maxEntries: u32;  // capacity of the log chunk in entries
-
-        // Local counter for the current transaction
-        def var currentEntryIndex: u32 = 0;
-
-        new(logChunk, regionStart, maxEntries) {
-                header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(pointerFromU64(logChunk.addr), LogHeader.size));
-                entryBase = logChunk.addr + u64.!(LogHeader.size);
-        }
-
-        // Records a change into the persistent log buffer (but does not fence yet)
-        def append(targetAddr: u64, value: u64, width: u8) {
-                if (currentEntryIndex >= maxEntries) {
-                        // TODO:
-                        // Log chunk is full; cannot record this entry. This indicates a
-                        // transaction that is too large for the log block.
-                        return;
-                }
-                def entryAddr = entryBase + (currentEntryIndex * u32.!(LogEntry.size));
-                var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(entryAddr), LogEntry.size));
-
-                entry.offset = targetAddr - regionStart;
-                entry.value = value;
-                entry.width = width;
-
-                currentEntryIndex++;
-        }
-
-        // Persist the log entries themselves
-        def fenceLogData() {
-                // TODO
-                // CiRuntime.cacheWriteback(entryBase, currentEntryIndex * LogEntry.size);
-                // CiRuntime.fence()
-        }
-
-        // Commit the transaction
-        def commit() {
-                header.numEntries = currentEntryIndex;
-                header.checksum = calculateLogChecksum(entryBase, currentEntryIndex);
-
-                // Ensure data are persistent
-                fenceLogData();
-
-                header.status = 1;
-
-                // TODO: Persist the header
-                // CiRuntime.cacheWriteback(logChunk.addr, logHeader.size)
-        }
-
-        // Reset for next transaction
-        def clear() {
-                header.status = 0;
-                // TODO
-                // CiRuntime.fence();
-                currentEntryIndex = 0;
-        }
-}
 
 
 // =============================================================================
@@ -537,8 +469,9 @@ class PWRegion {
         def blankChunkHandle = NULL_CHUNK;
         def var blockTableHandle: BlockTableHandle;
         def var logChunk: ChunkHandle;
-        def var walCache = WALCache.new();
-        def var walWriter: WALWriter;
+        def var commitBackend: TxnCommitBackend;
+        def var regionStart: u64;
+        def var walCache: WALCache;
 
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
@@ -549,7 +482,9 @@ class PWRegion {
                         return;
                 }
                 rng = backendRegion.range;
+                regionStart = u64.view(Pointer.atElement(rng, 0));
                 init(blockSize, forceFormat);
+                walCache = WALCache.new(commitBackend, regionStart);
         }
 
         private def sanitizeOffset(offset: u64) {
@@ -636,10 +571,9 @@ class PWRegion {
 
                 def logBlockHandle = blockTableHandle[1];
                 logChunk = blockEntryToChunk(logBlockHandle);
-                def maxEntriesInLog = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
-                walWriter = WALWriter.new(logChunk, u64.view(Pointer.atElement(rng, 0)), maxEntriesInLog);
+                commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
 
-                recover();
+                commitBackend.recover();
         }
 
         // Reset all fields of a block entry to their default (empty) state
@@ -747,8 +681,7 @@ class PWRegion {
                 sanitizeOffset(hdr.blockTable + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
-                def maxEntriesInLog = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
-                walWriter = WALWriter.new(logChunk, u64.view(Pointer.atElement(rng, 0)), maxEntriesInLog);
+                commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
 
                 // Block 2: first free block (LARGE_FREE)
                 sanitizeAddress(firstFreeBlockHandle.addr);
@@ -969,55 +902,16 @@ class PWRegion {
         }
 
         def performCommit() {
-                // Transfer changes from DRAM Cache to PMEM Log
-                walCache.transferToLog(walWriter);
-
-                walWriter.commit();
-                walCache.applyToMemory();
-
-                // TODO: fence here
-                // CiRuntime.fence();
-
-                walWriter.clear();
+                walCache.transferToLog(commitBackend);
+                commitBackend.walCommit();
+                walCache.applyTo(commitBackend);
+                commitBackend.applyFence();
+                commitBackend.walClear();
                 walCache.clear();
         }
 
         private def recover() {
-                def logBase = blockEntryToChunk(blockTableHandle[1]).addr;
-                def header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(pointerFromU64(logBase), LogHeader.size));
-
-                if (header.status != 1) return;
-
-                def expected = header.checksum;
-                def actual = calculateLogChecksum(logBase + u64.!(LogHeader.size), header.numEntries);
-
-                if (expected != actual) {
-                        // Log checksum mismatch. Ignore corrupt log
-                        header.status = 0;
-                        return;
-                }
-
-                var entryAddr = logBase + u64.view(LogHeader.size);
-
-                for (i < header.numEntries) {
-                        def entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(pointerFromU64(entryAddr), LogEntry.size));
-
-                        def targetAddr = Pointer.atElement(rng, int.!(entry.offset));
-
-                        match (entry.width) {
-                                1 => targetAddr.store<u8>(u8.view(entry.value));
-                                2 => targetAddr.store<u16>(u16.view(entry.value));
-                                4 => targetAddr.store<u32>(u32.view(entry.value));
-                                8 => targetAddr.store<u64>(u64.view(entry.value));
-                                _ => ;
-                        }
-                        entryAddr = entryAddr + u64.!(LogEntry.size);
-                }
-
-                header.status = 0;
-                // TODO
-                // CiRuntime.cacheWriteback(header, LogHeader.size);
-                // CiRuntime.fence();
+                commitBackend.recover();
         }
 }
 

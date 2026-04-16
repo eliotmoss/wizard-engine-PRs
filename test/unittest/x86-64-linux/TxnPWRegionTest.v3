@@ -201,11 +201,10 @@ def test_coalesce_right(tc: PWRegionTester) {
 // WAL cache lifecycle test
 // =============================================================================
 
-// The WAL cache must report dirty after an alloc and clean after a commit.
+// The WAL cache must report clean after an alloc, since allocChunk
+// performs its own commit at the end of the transaction boundary.
 def test_commit_clears_wal_cache(tc: PWRegionTester) {
 	tc.t.assertz(false, tc.region.walCache.isDirty());
 	tc.region.allocChunk(1u32);
-	tc.t.assertz(true, tc.region.walCache.isDirty());
-	tc.region.performCommit();
 	tc.t.assertz(false, tc.region.walCache.isDirty());
 }

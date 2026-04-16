@@ -16,14 +16,17 @@ def X = [
 
 class WALCacheTester(t: Tester) {
 	var cache: WALCache;
+	var commitBackend: PmemCommitBackend;
 	// Backing memory for the pointers to test read-through and write-back
-	var dummyData: Array<byte>; 
+	var dummyData: Array<byte>;
 
 	new() {
-		cache = WALCache.new();
 		dummyData = Array<byte>.new(1024);
 		// Initialize memory with a known pattern (0xAA) to detect changes/fallthroughs
 		for (i < 1024) dummyData[i] = 0xAAu8;
+		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
+		commitBackend = PmemCommitBackend.new(regionStart, regionStart, 1024, null);
+		cache = WALCache.new(commitBackend, regionStart);
 	}
 	
 	def getAddr(offset: int) -> u64 {
@@ -80,7 +83,7 @@ def test_read_fallthrough(tc: WALCacheTester) {
 }
 
 // Test 4: Apply to Memory (Flushing)
-// Verifies that applyToMemory() commits cached changes to the underlying pointers.
+// Verifies that applyTo() commits cached changes to the underlying pointers.
 def test_apply_to_memory(tc: WALCacheTester) {
 	var addr = tc.getAddr(20);
 	var val = 0xFFu8;
@@ -92,7 +95,7 @@ def test_apply_to_memory(tc: WALCacheTester) {
 	tc.t.assert_eq(0xAAu8, tc.readRamU8(20));
 
 	// Flush
-	tc.cache.applyToMemory();
+	tc.cache.applyTo(tc.commitBackend);
 
 	// RAM should now be updated
 	tc.t.assert_eq(val, tc.readRamU8(20));
