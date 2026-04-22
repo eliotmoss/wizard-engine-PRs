@@ -46,7 +46,7 @@ class PmemCommitBackend extends TxnCommitBackend {
                 // Flush log entries to persistent storage
                 if (backendRegion != null) {
                         def entryBytes = u64.view(currentEntryIndex) * u64.!(LogEntry.size);
-                        backendRegion.flush(entryBase - regionStart + u64.!(LogHeader.size), entryBytes);
+                        backendRegion.flush(entryBase - regionStart, entryBytes);
                         backendRegion.fence();
                 }
 
