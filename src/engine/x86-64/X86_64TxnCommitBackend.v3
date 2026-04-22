@@ -79,6 +79,9 @@ class PmemCommitBackend extends TxnCommitBackend {
                         8 => addr.store<u64>(value);
                         _ => ;
                 }
+                if (backendRegion != null) {
+                        backendRegion.flush(offset, u64.view(width));
+                }
         }
 
         def applyFence() {
@@ -125,6 +128,8 @@ class PmemCommitBackend extends TxnCommitBackend {
                         applyUpdate(entry.offset, entry.value, entry.width);
                         entryAddr = entryAddr + u64.!(LogEntry.size);
                 }
+
+                applyFence();
 
                 header.status = 0;
                 if (backendRegion != null) {
