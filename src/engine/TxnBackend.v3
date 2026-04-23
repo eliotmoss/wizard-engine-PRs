@@ -1,18 +1,18 @@
 // Abstract interface for transaction storage backends
-// Supports multiple implementations: volatile memory (mmap), SSD, PMEM, etc.
+// Supports multiple implementations: volatile memory, file-backed mmap, PMEM, etc.
 //
 // This abstraction allows PWRegion (block-based memory manager) to work with
 // different storage backends without platform-specific code:
 //
-// 1. MmapVolatileBackend: Anonymous memory (DRAM) using mmap
-// 2. MmapPersistentBackend: PMEM/DAX using mmap with MAP_SYNC
-// 3. DiskBackend: Block device storage (future)
+// 1. VolatileBackend:          Generic in-memory storage (Array-backed)
+// 2. MmapPersistentBackend:    PMEM-style mapped storage with cache-line flush
+// 3. MappedFileRegionBackend:  Shared file mapping with msync durability
 //
 // The backend is responsible for:
 // - Allocating/deallocating regions
 // - Memory protection (mprotect)
-// - Cache flushing for persistence (CLWB/CLFLUSH)
-// - Memory fencing for ordering (SFENCE)
+// - Persistence flush scheduling (which may batch dirty ranges)
+// - Durability fences that complete those flushes
 
 // A memory region allocated by a backend
 class BackendRegion {
@@ -45,10 +45,11 @@ class TxnRegionBackend {
 	// Change protection on a region
 	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool;
 	
-	// Flush cache lines to storage (persistence operation)
+	// Schedule data for persistence. Implementations may batch dirty ranges here
+	// and delay the final durability operation until fence().
 	def flush(range: Range<byte>, offset: u64, size: u64);
 	
-	// Memory fence to ensure all flushes complete
+	// Complete persistence for any prior flush() calls.
 	def fence();
 	
 	// Check if this backend provides persistence
@@ -178,4 +179,3 @@ component Backends {
 	}
 */
 }
-

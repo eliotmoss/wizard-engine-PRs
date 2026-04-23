@@ -474,7 +474,7 @@ class PWRegion {
         def var regionStart: u64;
         def var walCache: WALCache;
 
-        new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool, extCommitBackend: TxnCommitBackend) {
+        new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
                 var prot = BackendProt.READ | BackendProt.WRITE;
                 backendRegion = backend.allocate(size, prot);
@@ -484,10 +484,6 @@ class PWRegion {
                 }
                 rng = backendRegion.range;
                 regionStart = u64.view(Pointer.atElement(rng, 0));
-                if (extCommitBackend != null) {
-                        commitBackend = extCommitBackend;
-                        commitBackend.initRegion(rng);
-                }
                 init(blockSize, forceFormat);
                 walCache = WALCache.new(commitBackend, regionStart);
         }
@@ -549,6 +545,12 @@ class PWRegion {
                 }
         }
 
+        private def ensureCommitBackend(logChunkAddr: u64, blockSize: u64) {
+                if (commitBackend == null) {
+                        commitBackend = RegionWalCommitBackend.new(regionStart, logChunkAddr, blockSize, backendRegion);
+                }
+        }
+
         // Mounts an existing, fully formatted region
         private def mount(blockSize: u64) {
                 def hdr = getHeader();
@@ -576,9 +578,7 @@ class PWRegion {
 
                 def logBlockHandle = blockTableHandle[1];
                 logChunk = blockEntryToChunk(logBlockHandle);
-                if (commitBackend == null) {
-                        commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
-                }
+                ensureCommitBackend(logChunk.addr, blockSize);
 
                 commitBackend.recover();
         }
@@ -688,9 +688,7 @@ class PWRegion {
                 sanitizeOffset(hdr.blockTable + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
-                if (commitBackend == null) {
-                        commitBackend = PmemCommitBackend.new(regionStart, logChunk.addr, blockSize, backendRegion);
-                }
+                ensureCommitBackend(logChunk.addr, blockSize);
 
                 // Block 2: first free block (LARGE_FREE)
                 sanitizeAddress(firstFreeBlockHandle.addr);
@@ -730,14 +728,11 @@ class PWRegion {
                 lastHandle.setPrev(metaHandle);
                 sanitizeOffset(hdr.blockTable + (userDataBlocks + 1) * u64.!(BlockEntry.size));
 
-                // TODO: CiRuntime.fence() here to ensure all structures are physically in PMEM
-
                 hdr.magic = PWRegions.MAGIC;
 
-                // Sync formatted region to persistent storage for file-backed backends
-                commitBackend.syncRegion(rng);
-
-                // TODO: CiRuntime.cacheWriteback & fence for the header
+                // Persist the freshly formatted region image before exposing it.
+                backendRegion.flush(0, u64.!(rng.length));
+                backendRegion.fence();
         }
 
         def getHeader() -> Ref<PWRegionHeader> {
@@ -907,6 +902,10 @@ class PWRegion {
 
         // Deallocate this region
         def deallocate() {
+                if (commitBackend != null) {
+                        commitBackend.close();
+                        commitBackend = null;
+                }
                 if (backendRegion != null) {
                         backendRegion.backend.deallocate(backendRegion);
                         backendRegion = null;
@@ -934,7 +933,7 @@ class PWRegion {
 
 class ImmixPWRegion extends PWRegion {
         new(backend: TxnRegionBackend, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, blockSize: u64, forceFormat: bool)
-                super(backend, numBlocks, metaDataDescs, blockSize, forceFormat, null) {
+                super(backend, numBlocks, metaDataDescs, blockSize, forceFormat) {
                 lineMarks = getLineMarks();
         }
 

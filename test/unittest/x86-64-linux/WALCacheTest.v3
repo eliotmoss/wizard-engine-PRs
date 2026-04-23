@@ -16,7 +16,7 @@ def X = [
 
 class WALCacheTester(t: Tester) {
 	var cache: WALCache;
-	var commitBackend: PmemCommitBackend;
+	var commitBackend: RegionWalCommitBackend;
 	// Backing memory for the pointers to test read-through and write-back
 	var dummyData: Array<byte>;
 
@@ -25,7 +25,7 @@ class WALCacheTester(t: Tester) {
 		// Initialize memory with a known pattern (0xAA) to detect changes/fallthroughs
 		for (i < 1024) dummyData[i] = 0xAAu8;
 		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
-		commitBackend = PmemCommitBackend.new(regionStart, regionStart, 1024, null);
+		commitBackend = RegionWalCommitBackend.new(regionStart, regionStart, 1024, null);
 		cache = WALCache.new(commitBackend, regionStart);
 	}
 	

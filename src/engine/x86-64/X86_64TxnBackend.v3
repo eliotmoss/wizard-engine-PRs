@@ -1,38 +1,52 @@
 // x86-64 specific transaction backend implementations
 
-// Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
-class MmapPersistentBackend extends TxnRegionBackend {
+class MappedRegionBackend extends TxnRegionBackend {
 	var mapping: Mapping;
 
+	def makeRegion(newMapping: Mapping, size: u64) -> BackendRegion {
+		if (newMapping == null) return null;
+		mapping = newMapping;
+		var range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
+		return BackendRegion.new(range, this);
+	}
+
+	def deallocate(region: BackendRegion) {
+		if (mapping != null) {
+			mapping.range.unmap();
+			mapping = null;
+		}
+		cleanup();
+	}
+
+	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
+		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
+		var mmapProt = convertProt(prot);
+		return Mmap.protect(start, size, mmapProt);
+	}
+
+	def cleanup() { }
+
+	def convertProt(prot: int) -> int {
+		var mmapProt = Mmap.PROT_NONE;
+		if ((prot & BackendProt.READ) != 0) mmapProt |= Mmap.PROT_READ;
+		if ((prot & BackendProt.WRITE) != 0) mmapProt |= Mmap.PROT_WRITE;
+		if ((prot & BackendProt.EXEC) != 0) mmapProt |= Mmap.PROT_EXEC;
+		return mmapProt;
+	}
+}
+
+// Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
+class MmapPersistentBackend extends MappedRegionBackend {
 	def path: string;  // Path to PMEM device or DAX file
-	
+
 	new(path) { }
-	
+
 	def allocate(size: u64, prot: int) -> BackendRegion {
 		// For now, just use anonymous mmap
 		// TODO: Implement true PMEM mapping when file descriptor can be obtained
 		// This requires the file to already exist with the correct size
 		var mmapProt = convertProt(prot);
-		var mapping = Mmap.reserve(size, mmapProt);
-		if (mapping == null) return null;
-		var range = CiRuntime.forgeRange<byte>(mapping.range.start, int.!(size));
-		var region = BackendRegion.new(range, this);
-		this.mapping = mapping;  // Keep mapping alive to prevent premature GC/unmapping
-		return region;
-	}
-	
-	def deallocate(region: BackendRegion) {
-		// Explicitly unmap and clear reference
-		if (mapping != null) {
-			mapping.range.unmap();
-			mapping = null;
-		}
-	}
-	
-	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
-		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
-		var mmapProt = convertProt(prot);
-		return Mmap.protect(start, size, mmapProt);
+		return makeRegion(Mmap.reserve(size, mmapProt), size);
 	}
 	
 	def flush(range: Range<byte>, offset: u64, size: u64) {
@@ -64,14 +78,6 @@ class MmapPersistentBackend extends TxnRegionBackend {
 		return "mmap-pmem";
 	}
 	
-	private def convertProt(prot: int) -> int {
-		var mmapProt = Mmap.PROT_NONE;
-		if ((prot & BackendProt.READ) != 0) mmapProt |= Mmap.PROT_READ;
-		if ((prot & BackendProt.WRITE) != 0) mmapProt |= Mmap.PROT_WRITE;
-		if ((prot & BackendProt.EXEC) != 0) mmapProt |= Mmap.PROT_EXEC;
-		return mmapProt;
-	}
-	
 	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
 	private def flushCacheLine(addr: Pointer) {
 		// TODO: This needs compiler support for inline assembly
@@ -85,6 +91,110 @@ class MmapPersistentBackend extends TxnRegionBackend {
 		// TODO: This needs compiler support for inline assembly
 		// Ideally: __builtin_ia32_sfence() or asm volatile("sfence")
 		// For now, this is a placeholder
+	}
+}
+
+class MappedFileRegionBackend extends MappedRegionBackend {
+	def path: string;
+
+	def var fd: int = -1;
+	def var hasDirtyRange = false;
+	def var dirtyStart: u64 = 0;
+	def var dirtyEnd: u64 = 0;
+
+	new(path) { }
+
+	def allocate(size: u64, prot: int) -> BackendRegion {
+		fd = RegionFileIO.openOrCreate(path);
+		if (fd < 0) return null;
+		if (!RegionFileIO.ensureSize(fd, size)) {
+			cleanup();
+			return null;
+		}
+
+		var mmapProt = convertProt(prot);
+		var region = makeRegion(Mmap.map(size, mmapProt, Mmap.MAP_SHARED, fd, 0), size);
+		if (region == null) {
+			cleanup();
+			return null;
+		}
+		hasDirtyRange = false;
+		dirtyStart = dirtyEnd = 0;
+		return region;
+	}
+
+	def flush(range: Range<byte>, offset: u64, size: u64) {
+		if (size == 0) return;
+		def end = offset + size;
+		if (!hasDirtyRange) {
+			dirtyStart = offset;
+			dirtyEnd = end;
+			hasDirtyRange = true;
+			return;
+		}
+		if (offset < dirtyStart) dirtyStart = offset;
+		if (end > dirtyEnd) dirtyEnd = end;
+	}
+
+	def fence() {
+		if (!hasDirtyRange || mapping == null) return;
+
+		// TODO: define this somewhere else as a constant
+		def pageSize = 4096u64;
+		def syncStart = dirtyStart - (dirtyStart % pageSize);
+		def syncEnd = ((dirtyEnd + pageSize - 1u64) / pageSize) * pageSize;
+		Mmap.sync(mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
+
+		hasDirtyRange = false;
+		dirtyStart = dirtyEnd = 0;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "mmap-file";
+	}
+
+	def cleanup() {
+		hasDirtyRange = false;
+		dirtyStart = dirtyEnd = 0;
+		if (fd >= 0) {
+			RegionFileIO.close(fd);
+			fd = -1;
+		}
+	}
+}
+
+component RegionFileIO {
+	def FILE_MODE = 420;	// 0644 octal
+
+	def openOrCreate(path: string) -> int {
+		var pathBuf = Array<byte>.new(path.length + 1);
+		for (i < path.length) pathBuf[i] = path[i];
+		pathBuf[path.length] = 0;
+		var r = Linux.syscall(LinuxConst.SYS_open,
+			(Pointer.atElement(pathBuf, 0), LinuxConst.O_RDWR | LinuxConst.O_CREAT, FILE_MODE));
+		return int.!(r.0);
+	}
+
+	def ensureSize(fd: int, size: u64) -> bool {
+		def fileSize = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
+		if (fileSize == i64.view(size)) return true;
+		if (Linux.syscall(LinuxConst.SYS_ftruncate, (fd, size)).0 != 0) return false;
+		return Linux.syscall(LinuxConst.SYS_fsync, fd).0 == 0;
+	}
+
+	def close(fd: int) {
+		Linux.syscall(LinuxConst.SYS_close, fd);
+	}
+
+	def unlink(path: string) {
+		var pathBuf = Array<byte>.new(path.length + 1);
+		for (i < path.length) pathBuf[i] = path[i];
+		pathBuf[path.length] = 0;
+		Linux.syscall(LinuxConst.SYS_unlink, Pointer.atElement(pathBuf, 0));
 	}
 }
 
@@ -104,5 +214,8 @@ component X86_64Backends {
 	def getPersistent(path: string) -> TxnRegionBackend {
 		return MmapPersistentBackend.new(path);
 	}
-}
 
+	def getFileMapped(path: string) -> TxnRegionBackend {
+		return MappedFileRegionBackend.new(path);
+	}
+}

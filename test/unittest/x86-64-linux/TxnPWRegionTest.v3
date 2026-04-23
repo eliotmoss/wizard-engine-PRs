@@ -37,8 +37,7 @@ class PWRegionTester(t: Tester) {
 			8u64,
 			Array<Ref<MetaDataDesc>>.new(0),
 			4096u64,
-			true,
-			null
+			true
 		);
 	}
 
@@ -228,6 +227,7 @@ def BX = [
 	BT("persist_and_remount",   test_bd_persist_and_remount),
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
+	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
 ];
 
@@ -235,7 +235,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 	var region: PWRegion;
 
 	new() {
-		BlockDeviceIO.unlink(BD_PATH);
+		RegionFileIO.unlink(BD_PATH);
 		region = openRegion(true);
 	}
 
@@ -244,14 +244,20 @@ class BlockDevicePWRegionTester(t: Tester) {
 	}
 
 	def cleanup() {
-		region.commitBackend.close();
-		BlockDeviceIO.unlink(BD_PATH);
+		if (region != null) {
+			region.deallocate();
+			region = null;
+		}
+		RegionFileIO.unlink(BD_PATH);
 	}
 
 	// Open a fresh region over existing files (mount, not format)
 	def remount() -> PWRegion {
-		region.commitBackend.close();
-		return openRegion(false);
+		if (region != null) {
+			region.deallocate();
+		}
+		region = openRegion(false);
+		return region;
 	}
 
 	def logHeader(region: PWRegion) -> Ref<LogHeader> {
@@ -261,14 +267,12 @@ class BlockDevicePWRegionTester(t: Tester) {
 	}
 
 	private def openRegion(forceFormat: bool) -> PWRegion {
-		def backend = BlockDeviceCommitBackend.new(BlockDeviceIO.openOrCreate(BD_PATH), 4096u64);
 		return PWRegion.new(
-			Backends.getVolatile(),
+			X86_64Backends.getFileMapped(BD_PATH),
 			8u64,
 			Array<Ref<MetaDataDesc>>.new(0),
 			4096u64,
-			forceFormat,
-			backend
+			forceFormat
 		);
 	}
 }
@@ -282,9 +286,9 @@ def test_bd_format_magic(tc: BlockDevicePWRegionTester) {
 
 // First-time initialization should size the backing file to the region.
 def test_bd_initializes_file_size(tc: BlockDevicePWRegionTester) {
-	def fd = BlockDeviceIO.openOrCreate(BD_PATH);
+	def fd = RegionFileIO.openOrCreate(BD_PATH);
 	def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
-	Linux.syscall(LinuxConst.SYS_close, fd);
+	RegionFileIO.close(fd);
 	tc.t.assert_eq(8u64 * 4096u64, u64.view(size));
 	tc.cleanup();
 }
@@ -339,8 +343,7 @@ def test_bd_persist_and_remount(tc: BlockDevicePWRegionTester) {
 	// Region was formatted in constructor. Remount it.
 	var region2 = tc.remount();
 	tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
-	region2.commitBackend.close();
-	BlockDeviceIO.unlink(BD_PATH);
+	tc.cleanup();
 }
 
 // After alloc + close + remount, allocation state must be preserved.
@@ -361,8 +364,7 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 	var chunk3 = region2.allocChunk(1u32);
 	tc.t.assertz(false, tc.allocSucceeded(chunk3));
 
-	region2.commitBackend.close();
-	BlockDeviceIO.unlink(BD_PATH);
+	tc.cleanup();
 }
 
 // A committed WAL should replay on remount and then be cleared.
@@ -378,6 +380,26 @@ def test_bd_recover_committed_wal(tc: BlockDevicePWRegionTester) {
 	tc.t.assertz(true, region2.blockTableHandle[2u64].getUsed());
 	tc.t.assert_eq(0u8, tc.logHeader(region2).status);
 
-	region2.commitBackend.close();
-	BlockDeviceIO.unlink(BD_PATH);
+	tc.cleanup();
+}
+
+// A corrupt committed WAL must not replay, and recovery must durably clear it.
+def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
+	var entry = tc.region.blockTableHandle[2u64];
+	tc.t.assertz(false, entry.getUsed());
+
+	entry.setUsedCached(tc.region.walCache, true);
+	tc.region.walCache.transferToLog(tc.region.commitBackend);
+	tc.region.commitBackend.walCommit();
+
+	var header = tc.logHeader(tc.region);
+	header.checksum = header.checksum + 1u64;
+	tc.region.backendRegion.flush(tc.region.logChunk.addr - tc.region.regionStart, u64.!(LogHeader.size));
+	tc.region.backendRegion.fence();
+
+	var region2 = tc.remount();
+	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsed());
+	tc.t.assert_eq(0u8, tc.logHeader(region2).status);
+
+	tc.cleanup();
 }

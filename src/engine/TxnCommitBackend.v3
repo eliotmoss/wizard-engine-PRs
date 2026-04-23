@@ -1,12 +1,12 @@
 // Abstract interface for WAL commit backends.
 // Decouples the commit protocol (WAL append, commit, apply, recover)
-// from the storage medium, enabling both PMEM and block-device backends.
+// from the storage medium. Region allocation and durable mapping live in
+// TxnRegionBackend implementations; commit backends only manage WAL ordering.
 //
 // All offsets passed to this interface are region-relative.
 //
 // Implementations:
-// 1. PmemCommitBackend:        In-region log via Pointer operations + CLWB/SFENCE
-// 2. BlockDeviceCommitBackend: File-based WAL + data I/O via pwrite64/fsync (future)
+// 1. RegionWalCommitBackend: In-region log with backend-provided flush/fence
 
 class TxnCommitBackend {
 	// --- WAL operations ---
@@ -37,18 +37,6 @@ class TxnCommitBackend {
 	// Replay any committed-but-unapplied WAL entries.
 	// Returns true if recovery was performed, false if no recovery needed.
 	def recover() -> bool;
-
-	// --- Lifecycle ---
-
-	// Initialize backend with region information after allocation.
-	// Called before format/mount for externally-provided backends.
-	// File-backed backends use this to set regionStart and load data from disk.
-	def initRegion(rng: Range<byte>) { }
-
-	// Sync in-memory region to persistent storage.
-	// Called after format to persist initial layout for file-backed backends.
-	// No-op for in-memory backends (PMEM, volatile).
-	def syncRegion(rng: Range<byte>) { }
 
 	// Release resources held by this backend.
 	def close();

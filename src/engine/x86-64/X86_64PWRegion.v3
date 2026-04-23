@@ -4,22 +4,19 @@
 // Volatile memory region using mmap with anonymous memory
 class X86_64PWMemRegion extends PWRegion {
 	new(numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
-		super(X86_64Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat, null) { }
+		super(X86_64Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
 
 // Non-volatile (persistent) region using PMEM/DAX
 class X86_64PWNVRegion extends PWRegion {
 	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
-		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat, null) { }
+		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
 
-// Block-device region: volatile DRAM working copy + single file-backed image
+// Block-device region: shared file-backed mapping
 class X86_64PWBlockDeviceRegion extends PWRegion {
 	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
-		super(Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat,
-			BlockDeviceCommitBackend.new(
-				BlockDeviceIO.openOrCreate(path),
-				MemRegions.BlockSize)) { }
+		super(X86_64Backends.getFileMapped(path), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat) { }
 }
 
 // Immix-specific volatile region

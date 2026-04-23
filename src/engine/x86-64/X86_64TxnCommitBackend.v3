@@ -1,8 +1,8 @@
-// PMEM commit backend: WAL lives in block 1 of the mmap'd region.
-// All I/O is via Pointer.store/Pointer.load + cache-line flush/fence.
+// In-region commit backend: WAL lives in block 1 of the mapped region.
+// All I/O is via Pointer.store/Pointer.load + backend-provided flush/fence.
 // This absorbs the logic previously in WALWriter and PWRegion.recover().
 
-class PmemCommitBackend extends TxnCommitBackend {
+class RegionWalCommitBackend extends TxnCommitBackend {
         def regionStart: u64;              // absolute address of region byte 0
         def logChunkAddr: u64;             // absolute address of the log chunk (block 1)
         def backendRegion: BackendRegion;
@@ -117,8 +117,13 @@ class PmemCommitBackend extends TxnCommitBackend {
                 def actual = PWRegionUtils.calculateLogChecksum(entryBase, header.numEntries);
 
                 if (expected != actual) {
-                        // Checksum mismatch -- corrupt log, ignore
+                        // Checksum mismatch -- clear the committed bit so future mounts
+                        // do not retry a corrupt log.
                         header.status = 0;
+                        if (backendRegion != null) {
+                                backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                                backendRegion.fence();
+                        }
                         return false;
                 }
 

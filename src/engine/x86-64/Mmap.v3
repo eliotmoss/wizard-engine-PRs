@@ -8,9 +8,14 @@ component Mmap {
 	def PROT_WRITE = LinuxConst.PROT_WRITE;
 	def PROT_EXEC = LinuxConst.PROT_EXEC;
 
-	def reserve(size: u64, prot: int) -> Mapping {
-		var flags = LinuxConst.MAP_PRIVATE | LinuxConst.MAP_ANONYMOUS;
-		var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, size, prot, flags, 0, 0));
+	def MAP_PRIVATE = LinuxConst.MAP_PRIVATE;
+	def MAP_ANONYMOUS = LinuxConst.MAP_ANONYMOUS;
+	def MAP_SHARED = LinuxConst.MAP_SHARED;
+
+	def MS_SYNC = 4;
+
+	def map(size: u64, prot: int, flags: int, fd: int, offset: u64) -> Mapping {
+		var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, size, prot, flags, fd, offset));
 		if (r.0 == -1) return null;
 		var start = Pointer.NULL + r.0, end = start + i64.view(size);
 		var range = MemoryRange.new(start, end);
@@ -18,8 +23,15 @@ component Mmap {
 		RiGc.registerFinalizer(mapping, range.unmap);
 		return mapping;
 	}
+	def reserve(size: u64, prot: int) -> Mapping {
+		return map(size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	}
 	def protect(start: Pointer, size: u64, prot: int) -> bool {
 		var r = Linux.syscall(LinuxConst.SYS_mprotect, (start, size, prot));
+		return r.0 == 0;
+	}
+	def sync(start: Pointer, size: u64, flags: int) -> bool {
+		var r = Linux.syscall(LinuxConst.SYS_msync, (start, size, flags));
 		return r.0 == 0;
 	}
 }
