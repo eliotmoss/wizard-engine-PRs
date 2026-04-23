@@ -1,51 +1,51 @@
-// Block device commit backend: WAL and data live in files on disk.
-// I/O is via pwrite64/pread64 + fdatasync/fsync (Linux syscalls).
-// Maintains an in-memory copy (the PWRegion's rng) for fast reads and
-// compatibility with direct Ref<> access in PWRegion handle types.
+// Block device commit backend: region image and WAL share one backing file.
+// I/O is via pread64/pwrite64 + fdatasync/fsync (Linux syscalls).
+// The live working region remains in-memory (PWRegion.rng), while block 1 of
+// that region is also the in-memory WAL buffer, matching the PMEM layout.
 //
-// fdatasync is used for most durability operations (avoids writing
-// non-essential metadata like atime/mtime). fsync is only used when
-// the file size changes (e.g., after ftruncate in syncRegion).
+// fdatasync is used for steady-state durability operations. fsync is only used
+// when the backing file grows via ftruncate during one-time initialization.
 
 class BlockDeviceCommitBackend extends TxnCommitBackend {
-	def dataFd: int;
-	def walFd: int;
-	def var walBuffer: Array<byte>;
+	def fd: int;
+	def blockSize: u64;
+
 	def var maxEntries: u32;
+
 	def var regionStart: u64;
+	def var header: Ref<LogHeader>;
+	def var entryBase: u64;
+
 	def var currentEntryIndex: u32 = 0;
 
-	new(dataFd, walFd, blockSize: u64) {
-		walBuffer = Array<byte>.new(int.!(blockSize));
+	new(fd, blockSize) {
 		maxEntries = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
 	}
 
 	// --- Lifecycle ---
 
-	def initRegion(rs: u64, rng: Range<byte>) {
-		this.regionStart = rs;
-		// Load data file into in-memory region
-		def ptr = Pointer.atElement(rng, 0);
+	def initRegion(rng: Range<byte>) {
+		def regionStartPtr = Pointer.atElement(rng, 0);
+		regionStart = u64.view(regionStartPtr);
+		def logChunkAddr = regionStart + blockSize;
+		header = Ref<LogHeader>.of(
+			CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(logChunkAddr), LogHeader.size));
+		entryBase = logChunkAddr + u64.!(LogHeader.size);
+
 		def size = u64.!(rng.length);
-		Linux.syscall(LinuxConst.SYS_pread64, (dataFd, ptr, size, 0));
-		// Load WAL file into buffer
-		def walPtr = Pointer.atElement(walBuffer, 0);
-		def walSize = u64.!(walBuffer.length);
-		Linux.syscall(LinuxConst.SYS_pread64, (walFd, walPtr, walSize, 0));
+		def fileSize = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
+		if (fileSize < i64.view(size)) {
+			Linux.syscall(LinuxConst.SYS_ftruncate, (fd, size));
+			Linux.syscall(LinuxConst.SYS_fsync, fd);
+		}
+		Linux.syscall(LinuxConst.SYS_pread64, (fd, regionStartPtr, size, 0));
 	}
 
 	def syncRegion(rng: Range<byte>) {
 		def ptr = Pointer.atElement(rng, 0);
 		def size = u64.!(rng.length);
-		// ftruncate changes file size -- use fsync to persist size metadata
-		Linux.syscall(LinuxConst.SYS_ftruncate, (dataFd, size));
-		Linux.syscall(LinuxConst.SYS_pwrite64, (dataFd, ptr, size, 0));
-		Linux.syscall(LinuxConst.SYS_fsync, dataFd);
-		// Pre-allocate WAL file to full block size so subsequent
-		// writes stay within the allocated size (fdatasync-safe)
-		Linux.syscall(LinuxConst.SYS_ftruncate, (walFd, u64.!(walBuffer.length)));
-		Linux.syscall(LinuxConst.SYS_fsync, walFd);
-		// Initialize WAL file with clean header
+		Linux.syscall(LinuxConst.SYS_pwrite64, (fd, ptr, size, 0));
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
 		walClear();
 	}
 
@@ -53,8 +53,9 @@ class BlockDeviceCommitBackend extends TxnCommitBackend {
 
 	def walAppend(offset: u64, value: u64, width: u8) {
 		if (currentEntryIndex >= maxEntries) return;
-		def entryOffset = int.!(LogHeader.size) + int.!(currentEntryIndex) * int.!(LogEntry.size);
-		var entry = Ref<LogEntry>.of(walBuffer[entryOffset ..+ LogEntry.size]);
+		def entryAddr = entryBase + u64.view(currentEntryIndex) * u64.!(LogEntry.size);
+		var entry = Ref<LogEntry>.of(
+			CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(entryAddr), LogEntry.size));
 		entry.offset = offset;
 		entry.value = value;
 		entry.width = width;
@@ -62,39 +63,35 @@ class BlockDeviceCommitBackend extends TxnCommitBackend {
 	}
 
 	def walCommit() {
-		var header = Ref<LogHeader>.of(walBuffer[0 ..+ LogHeader.size]);
 		header.numEntries = currentEntryIndex;
-
-		def entryBase = u64.view(Pointer.atElement(walBuffer, int.!(LogHeader.size)));
 		header.checksum = PWRegionUtils.calculateLogChecksum(entryBase, currentEntryIndex);
 
-		// Phase 1: Write entries to WAL file, fdatasync
+		// Phase 1: write entries, then make them durable.
 		def entryBytes = u64.view(currentEntryIndex) * u64.!(LogEntry.size);
 		if (entryBytes > 0) {
-			Linux.syscall(LinuxConst.SYS_pwrite64, (walFd,
-				Pointer.atElement(walBuffer, int.!(LogHeader.size)),
+			Linux.syscall(LinuxConst.SYS_pwrite64, (fd,
+				PWRegionUtils.pointerFromU64(entryBase),
 				entryBytes,
-				u64.!(LogHeader.size)));
+				blockSize + u64.!(LogHeader.size)));
 		}
-		Linux.syscall(LinuxConst.SYS_fdatasync, walFd);
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
 
-		// Phase 2: Write header with status=1, fdatasync
+		// Phase 2: mark the header committed, then make it durable.
 		header.status = 1;
-		Linux.syscall(LinuxConst.SYS_pwrite64, (walFd,
-			Pointer.atElement(walBuffer, 0),
+		Linux.syscall(LinuxConst.SYS_pwrite64, (fd,
+			Pointer.atRef(header),
 			u64.!(LogHeader.size),
-			0));
-		Linux.syscall(LinuxConst.SYS_fdatasync, walFd);
+			blockSize));
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
 	}
 
 	def walClear() {
-		var header = Ref<LogHeader>.of(walBuffer[0 ..+ LogHeader.size]);
 		header.status = 0;
-		Linux.syscall(LinuxConst.SYS_pwrite64, (walFd,
-			Pointer.atElement(walBuffer, 0),
+		Linux.syscall(LinuxConst.SYS_pwrite64, (fd,
+			Pointer.atRef(header),
 			u64.!(LogHeader.size),
-			0));
-		Linux.syscall(LinuxConst.SYS_fdatasync, walFd);
+			blockSize));
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
 		currentEntryIndex = 0;
 	}
 
@@ -110,12 +107,11 @@ class BlockDeviceCommitBackend extends TxnCommitBackend {
 			8 => addr.store<u64>(value);
 			_ => ;
 		}
-		// Persist to data file (source is the in-memory region)
-		Linux.syscall(LinuxConst.SYS_pwrite64, (dataFd, addr, u64.view(width), offset));
+		Linux.syscall(LinuxConst.SYS_pwrite64, (fd, addr, u64.view(width), offset));
 	}
 
 	def applyFence() {
-		Linux.syscall(LinuxConst.SYS_fdatasync, dataFd);
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
 	}
 
 	// --- Read (from in-memory copy, kept in sync by applyUpdate) ---
@@ -139,25 +135,25 @@ class BlockDeviceCommitBackend extends TxnCommitBackend {
 	// --- Recovery ---
 
 	def recover() -> bool {
-		var header = Ref<LogHeader>.of(walBuffer[0 ..+ LogHeader.size]);
-		if (header.status != 1) return false;
+		if (header.status != 1) {
+			currentEntryIndex = 0;
+			return false;
+		}
 
-		def entryBase = u64.view(Pointer.atElement(walBuffer, int.!(LogHeader.size)));
 		def expected = header.checksum;
 		def actual = PWRegionUtils.calculateLogChecksum(entryBase, header.numEntries);
 
 		if (expected != actual) {
-			// Checksum mismatch -- corrupt log, ignore
 			header.status = 0;
-			Linux.syscall(LinuxConst.SYS_pwrite64, (walFd,
-				Pointer.atElement(walBuffer, 0),
+			Linux.syscall(LinuxConst.SYS_pwrite64, (fd,
+				Pointer.atRef(header),
 				u64.!(LogHeader.size),
-				0));
-			Linux.syscall(LinuxConst.SYS_fdatasync, walFd);
+				blockSize));
+			Linux.syscall(LinuxConst.SYS_fdatasync, fd);
+			currentEntryIndex = 0;
 			return false;
 		}
 
-		// Replay entries
 		var entryAddr = entryBase;
 		for (i < header.numEntries) {
 			def entry = Ref<LogEntry>.of(
@@ -166,16 +162,15 @@ class BlockDeviceCommitBackend extends TxnCommitBackend {
 			entryAddr = entryAddr + u64.!(LogEntry.size);
 		}
 
-		// Ensure data is durable
-		Linux.syscall(LinuxConst.SYS_fdatasync, dataFd);
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
 
-		// Clear WAL
 		header.status = 0;
-		Linux.syscall(LinuxConst.SYS_pwrite64, (walFd,
-			Pointer.atElement(walBuffer, 0),
+		Linux.syscall(LinuxConst.SYS_pwrite64, (fd,
+			Pointer.atRef(header),
 			u64.!(LogHeader.size),
-			0));
-		Linux.syscall(LinuxConst.SYS_fdatasync, walFd);
+			blockSize));
+		Linux.syscall(LinuxConst.SYS_fdatasync, fd);
+		currentEntryIndex = 0;
 
 		return true;
 	}
@@ -183,8 +178,7 @@ class BlockDeviceCommitBackend extends TxnCommitBackend {
 	// --- Lifecycle ---
 
 	def close() {
-		Linux.syscall(LinuxConst.SYS_close, dataFd);
-		Linux.syscall(LinuxConst.SYS_close, walFd);
+		Linux.syscall(LinuxConst.SYS_close, fd);
 	}
 }
 

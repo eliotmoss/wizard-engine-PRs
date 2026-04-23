@@ -13,13 +13,12 @@ class X86_64PWNVRegion extends PWRegion {
 		super(X86_64Backends.getPersistent(path), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat, null) { }
 }
 
-// Block-device region: volatile DRAM working copy + file-backed WAL and data
+// Block-device region: volatile DRAM working copy + single file-backed image
 class X86_64PWBlockDeviceRegion extends PWRegion {
-	new(dataPath: string, walPath: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
+	new(path: string, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, forceFormat: bool)
 		super(Backends.getVolatile(), numBlocks, metaDataDescs, MemRegions.BlockSize, forceFormat,
 			BlockDeviceCommitBackend.new(
-				BlockDeviceIO.openOrCreate(dataPath),
-				BlockDeviceIO.openOrCreate(walPath),
+				BlockDeviceIO.openOrCreate(path),
 				MemRegions.BlockSize)) { }
 }
 

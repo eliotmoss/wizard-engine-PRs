@@ -23,7 +23,7 @@ class TxnCommitBackend {
 	// Apply a single update to the persistent data store at a region-relative offset.
 	def applyUpdate(offset: u64, value: u64, width: u8);
 
-	// Ensure all applied updates are durable (fence/fsync).
+	// Ensure all applied updates are durable (fence/fdatasync).
 	def applyFence();
 
 	// --- Read (cache-miss fallthrough) ---
@@ -43,7 +43,7 @@ class TxnCommitBackend {
 	// Initialize backend with region information after allocation.
 	// Called before format/mount for externally-provided backends.
 	// File-backed backends use this to set regionStart and load data from disk.
-	def initRegion(regionStart: u64, rng: Range<byte>) { }
+	def initRegion(rng: Range<byte>) { }
 
 	// Sync in-memory region to persistent storage.
 	// Called after format to persist initial layout for file-backed backends.

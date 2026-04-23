@@ -486,7 +486,7 @@ class PWRegion {
                 regionStart = u64.view(Pointer.atElement(rng, 0));
                 if (extCommitBackend != null) {
                         commitBackend = extCommitBackend;
-                        commitBackend.initRegion(regionStart, rng);
+                        commitBackend.initRegion(rng);
                 }
                 init(blockSize, forceFormat);
                 walCache = WALCache.new(commitBackend, regionStart);
