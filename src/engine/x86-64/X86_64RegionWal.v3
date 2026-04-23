@@ -1,8 +1,7 @@
-// In-region commit backend: WAL lives in block 1 of the mapped region.
-// All I/O is via Pointer.store/Pointer.load + backend-provided flush/fence.
-// This absorbs the logic previously in WALWriter and PWRegion.recover().
+// Concrete in-region WAL helper: the log lives in block 1 of the mapped region.
+// All I/O is via Pointer.store/Pointer.load + BackendRegion-provided flush/fence.
 
-class RegionWalCommitBackend extends TxnCommitBackend {
+class RegionWal {
         def regionStart: u64;              // absolute address of region byte 0
         def logChunkAddr: u64;             // absolute address of the log chunk (block 1)
         def backendRegion: BackendRegion;
@@ -23,7 +22,7 @@ class RegionWalCommitBackend extends TxnCommitBackend {
 
         // --- WAL operations ---
 
-        def walAppend(offset: u64, value: u64, width: u8) {
+        def append(offset: u64, value: u64, width: u8) {
                 if (currentEntryIndex >= maxEntries) {
                         // Log chunk is full; cannot record this entry.
                         // TODO: return error instead of silently dropping
@@ -39,7 +38,7 @@ class RegionWalCommitBackend extends TxnCommitBackend {
                 currentEntryIndex++;
         }
 
-        def walCommit() {
+        def commit() {
                 header.numEntries = currentEntryIndex;
                 header.checksum = PWRegionUtils.calculateLogChecksum(entryBase, currentEntryIndex);
 
@@ -59,7 +58,7 @@ class RegionWalCommitBackend extends TxnCommitBackend {
                 }
         }
 
-        def walClear() {
+        def clear() {
                 header.status = 0;
                 if (backendRegion != null) {
                         backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
@@ -84,7 +83,7 @@ class RegionWalCommitBackend extends TxnCommitBackend {
                 }
         }
 
-        def applyFence() {
+        def fenceAppliedUpdates() {
                 if (backendRegion != null) {
                         backendRegion.fence();
                 }
@@ -134,7 +133,7 @@ class RegionWalCommitBackend extends TxnCommitBackend {
                         entryAddr = entryAddr + u64.!(LogEntry.size);
                 }
 
-                applyFence();
+                fenceAppliedUpdates();
 
                 header.status = 0;
                 if (backendRegion != null) {

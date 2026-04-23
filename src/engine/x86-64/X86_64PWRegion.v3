@@ -1,5 +1,4 @@
-// x86-64 specific implementations of PWRegion using various backends
-// All generic block management logic has been moved to src/engine/TxnPWRegion.v3
+// x86-64 specific wrappers for the shared PWRegion and ImmixPWRegion logic.
 
 // Volatile memory region using mmap with anonymous memory
 class X86_64PWMemRegion extends PWRegion {

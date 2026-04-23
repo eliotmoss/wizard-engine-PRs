@@ -107,8 +107,8 @@ component PWRegionUtils {
                 return Pointer.NULL + n;
         }
 
-        // Shared checksum for WAL log entries. Used by commit backends
-        // (on commit) and on recovery to ensure integrity.
+        // Shared checksum for WAL log entries. Used during WAL commit
+        // and recovery to ensure integrity.
         def calculateLogChecksum(base: u64, count: u32) -> u64 {
                 var h: u64 = 0xCAFE_BABE_DEAD_BEEF_u64;
                 var ptr = base;
@@ -364,10 +364,10 @@ type CachedUpdate(value: u64, size: u8) #unboxed { }
 class WALCache {
         private var cache: HashMap<u64, CachedUpdate>;
         private def addrs = Vector<u64>.new();
-        def commitBackend: TxnCommitBackend;
+        def wal: RegionWal;
         def regionStart: u64;
 
-        new(commitBackend, regionStart) {
+        new(wal, regionStart) {
                 cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
         }
 
@@ -381,43 +381,43 @@ class WALCache {
                 addrs.clear();
         }
 
-        // Flushes cached updates via the commit backend
-        def applyTo(backend: TxnCommitBackend) {
+        // Flushes cached updates to the region via the WAL helper.
+        def applyToRegion() {
                 addrs.apply(
                         fun (addr: u64) {
                                 def c: CachedUpdate = cache[addr];
-                                backend.applyUpdate(addr - regionStart, c.value, c.size);
+                                wal.applyUpdate(addr - regionStart, c.value, c.size);
                         }
                 );
         }
 
-        def transferToLog(backend: TxnCommitBackend) {
+        def appendToWal() {
                 addrs.apply(
                         fun (addr: u64) {
                                 def c: CachedUpdate = cache[addr];
-                                backend.walAppend(addr - regionStart, c.value, c.size);
+                                wal.append(addr - regionStart, c.value, c.size);
                         }
                 );
         }
 
         def readU8(addr: u64) -> u8 {
                 if (cache.has(addr)) return u8.view(cache[addr].value);
-                return commitBackend.readU8(addr - regionStart);
+                return wal.readU8(addr - regionStart);
         }
 
         def readI16(addr: u64) -> i16 {
                 if (cache.has(addr)) return i16.view(cache[addr].value);
-                return commitBackend.readI16(addr - regionStart);
+                return wal.readI16(addr - regionStart);
         }
 
         def readU64(addr: u64) -> u64 {
                 if (cache.has(addr)) return u64.view(cache[addr].value);
-                return commitBackend.readU64(addr - regionStart);
+                return wal.readU64(addr - regionStart);
         }
 
         def readI64(addr: u64) -> i64 {
                 if (cache.has(addr)) return i64.view(cache[addr].value);
-                return commitBackend.readI64(addr - regionStart);
+                return wal.readI64(addr - regionStart);
         }
 
         // Write BlockEntry.used (u1/bool stored as u8)
@@ -457,7 +457,7 @@ class WALCache {
 // Section 7: Core Region Implementation
 // =============================================================================
 
-// Generic block-based region manager (platform-independent)
+// Generic block-based region manager with an in-region WAL.
 class PWRegion {
         def var backendRegion: BackendRegion;
         def var rng: Range<byte>;  // the actual bytes of the region
@@ -470,7 +470,7 @@ class PWRegion {
         def blankChunkHandle = NULL_CHUNK;
         def var blockTableHandle: BlockTableHandle;
         def var logChunk: ChunkHandle;
-        def var commitBackend: TxnCommitBackend;
+        def var wal: RegionWal;
         def var regionStart: u64;
         def var walCache: WALCache;
 
@@ -485,7 +485,7 @@ class PWRegion {
                 rng = backendRegion.range;
                 regionStart = u64.view(Pointer.atElement(rng, 0));
                 init(blockSize, forceFormat);
-                walCache = WALCache.new(commitBackend, regionStart);
+                walCache = WALCache.new(wal, regionStart);
         }
 
         private def sanitizeOffset(offset: u64) {
@@ -545,9 +545,9 @@ class PWRegion {
                 }
         }
 
-        private def ensureCommitBackend(logChunkAddr: u64, blockSize: u64) {
-                if (commitBackend == null) {
-                        commitBackend = RegionWalCommitBackend.new(regionStart, logChunkAddr, blockSize, backendRegion);
+        private def ensureWal(logChunkAddr: u64, blockSize: u64) {
+                if (wal == null) {
+                        wal = RegionWal.new(regionStart, logChunkAddr, blockSize, backendRegion);
                 }
         }
 
@@ -578,9 +578,9 @@ class PWRegion {
 
                 def logBlockHandle = blockTableHandle[1];
                 logChunk = blockEntryToChunk(logBlockHandle);
-                ensureCommitBackend(logChunk.addr, blockSize);
+                ensureWal(logChunk.addr, blockSize);
 
-                commitBackend.recover();
+                wal.recover();
         }
 
         // Reset all fields of a block entry to their default (empty) state
@@ -688,7 +688,7 @@ class PWRegion {
                 sanitizeOffset(hdr.blockTable + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
-                ensureCommitBackend(logChunk.addr, blockSize);
+                ensureWal(logChunk.addr, blockSize);
 
                 // Block 2: first free block (LARGE_FREE)
                 sanitizeAddress(firstFreeBlockHandle.addr);
@@ -902,9 +902,9 @@ class PWRegion {
 
         // Deallocate this region
         def deallocate() {
-                if (commitBackend != null) {
-                        commitBackend.close();
-                        commitBackend = null;
+                if (wal != null) {
+                        wal.close();
+                        wal = null;
                 }
                 if (backendRegion != null) {
                         backendRegion.backend.deallocate(backendRegion);
@@ -913,16 +913,16 @@ class PWRegion {
         }
 
         def performCommit() {
-                walCache.transferToLog(commitBackend);
-                commitBackend.walCommit();
-                walCache.applyTo(commitBackend);
-                commitBackend.applyFence();
-                commitBackend.walClear();
+                walCache.appendToWal();
+                wal.commit();
+                walCache.applyToRegion();
+                wal.fenceAppliedUpdates();
+                wal.clear();
                 walCache.clear();
         }
 
         private def recover() {
-                commitBackend.recover();
+                wal.recover();
         }
 }
 
