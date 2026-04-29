@@ -912,7 +912,8 @@ class PWRegion {
                 }
         }
 
-        def performCommit() {
+        private def performCommit() {
+                if (!walCache.isDirty()) return;
                 walCache.appendToWal();
                 wal.commit();
                 walCache.applyToRegion();

@@ -97,20 +97,18 @@ def test_alloc_multi_valid(tc: PWRegionTester) {
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 }
 
-// After allocChunk(1) + performCommit(), the block entry's used flag must be
-// true when read directly from memory (cache is cleared after commit).
+// After allocChunk(1), the block entry's used flag must be true when read
+// directly from memory (allocChunk commits before returning).
 def test_alloc_sets_used(tc: PWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	var entry = tc.region.chunkToBlockEntry(chunk);
 	tc.t.assertz(true, entry.getUsed());
 }
 
-// After allocChunk(1) + performCommit(), the chunk header fields must reflect
-// the initial allocation state written by createChunk().
+// After allocChunk(1), the chunk header fields must reflect the initial
+// allocation state written by createChunk().
 def test_alloc_chunk_header(tc: PWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	// offset = ChunkHeader.size (start of usable space past the header)
 	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
 	// limit = 1 block * 4096 bytes/block
@@ -122,23 +120,19 @@ def test_alloc_chunk_header(tc: PWRegionTester) {
 // Free tests
 // =============================================================================
 
-// After alloc+commit+free+commit, the block entry must show used == false.
+// After alloc+free, the block entry must show used == false.
 def test_free_clears_used(tc: PWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	tc.region.freeChunk(chunk);
-	tc.region.performCommit();
 	var entry = tc.region.chunkToBlockEntry(chunk);
 	tc.t.assertz(false, entry.getUsed());
 }
 
-// After alloc+commit+free+commit, a subsequent alloc must succeed (the block
-// was returned to the free list).
+// After alloc+free, a subsequent alloc must succeed (the block was returned to
+// the free list).
 def test_free_then_realloc(tc: PWRegionTester) {
 	var chunk1 = tc.region.allocChunk(5u32);
-	tc.region.performCommit();
 	tc.region.freeChunk(chunk1);
-	tc.region.performCommit();
 	var chunk2 = tc.region.allocChunk(5u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk2));
 }
@@ -149,8 +143,8 @@ def test_free_then_realloc(tc: PWRegionTester) {
 // =============================================================================
 
 // With numBlocks=8 and no metadata descriptors, exactly 5 user blocks are
-// available (indices 2-6). The first 5 alloc(1)+commit calls must succeed;
-// the 6th must return blankChunkHandle.
+// available (indices 2-6). The first 5 alloc(1) calls must succeed; the 6th
+// must return blankChunkHandle.
 def test_exhaust_free_blocks(tc: PWRegionTester) {
 	for (i < 5) {
 		var c = tc.region.allocChunk(1u32);
@@ -158,7 +152,6 @@ def test_exhaust_free_blocks(tc: PWRegionTester) {
 			tc.t.fail1("alloc %d of 5 failed unexpectedly", i);
 			return;
 		}
-		tc.region.performCommit();
 	}
 	var overflow = tc.region.allocChunk(1u32);
 	tc.t.assertz(false, tc.allocSucceeded(overflow));
@@ -176,20 +169,16 @@ def test_exhaust_free_blocks(tc: PWRegionTester) {
 // yielding one 5-block free entry spanning blocks 2-6.
 // A subsequent alloc(2) must succeed, proving coalescing occurred.
 def test_coalesce_right(tc: PWRegionTester) {
-	// Alloc block 2 and block 3, committing after each so memory is up to date.
+	// Alloc block 2 and block 3. Each allocation commits before returning.
 	var chunk2 = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	var chunk3 = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 
 	// Free block 2: no free neighbors yet, goes to the small free list.
 	tc.region.freeChunk(chunk2);
-	tc.region.performCommit();
 
 	// Free block 3: triggers left-coalesce (block 2 is free) and
 	// right-coalesce (blocks 4-6 are large-free). Result: one large entry.
 	tc.region.freeChunk(chunk3);
-	tc.region.performCommit();
 
 	// alloc(2) must succeed by splitting the coalesced 5-block entry.
 	var chunk = tc.region.allocChunk(2u32);
@@ -303,7 +292,6 @@ def test_bd_alloc_valid(tc: BlockDevicePWRegionTester) {
 // After allocChunk(1), the block entry's used flag must be true.
 def test_bd_alloc_sets_used(tc: BlockDevicePWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	var entry = tc.region.chunkToBlockEntry(chunk);
 	tc.t.assertz(true, entry.getUsed());
 	tc.cleanup();
@@ -312,9 +300,7 @@ def test_bd_alloc_sets_used(tc: BlockDevicePWRegionTester) {
 // After alloc+free, the block entry must show used == false.
 def test_bd_free_clears_used(tc: BlockDevicePWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	tc.region.freeChunk(chunk);
-	tc.region.performCommit();
 	var entry = tc.region.chunkToBlockEntry(chunk);
 	tc.t.assertz(false, entry.getUsed());
 	tc.cleanup();
@@ -323,14 +309,10 @@ def test_bd_free_clears_used(tc: BlockDevicePWRegionTester) {
 // Coalescing must work with block device backend.
 def test_bd_coalesce(tc: BlockDevicePWRegionTester) {
 	var chunk2 = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 	var chunk3 = tc.region.allocChunk(1u32);
-	tc.region.performCommit();
 
 	tc.region.freeChunk(chunk2);
-	tc.region.performCommit();
 	tc.region.freeChunk(chunk3);
-	tc.region.performCommit();
 
 	// After coalescing, alloc(2) must succeed.
 	var chunk = tc.region.allocChunk(2u32);
