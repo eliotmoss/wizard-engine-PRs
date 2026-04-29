@@ -25,12 +25,12 @@ class BackendRegion {
 	
 	// Flush data to persistent storage (no-op for volatile)
 	def flush(offset: u64, size: u64) {
-		backend.flush(range, offset, size);
+		backend.flush(this, offset, size);
 	}
-	
+
 	// Ensure durability fence (no-op for volatile)
 	def fence() {
-		backend.fence();
+		backend.fence(this);
 	}
 }
 
@@ -47,10 +47,10 @@ class TxnRegionBackend {
 	
 	// Schedule data for persistence. Implementations may batch dirty ranges here
 	// and delay the final durability operation until fence().
-	def flush(range: Range<byte>, offset: u64, size: u64);
+	def flush(region: BackendRegion, offset: u64, size: u64);
 	
 	// Complete persistence for any prior flush() calls.
-	def fence();
+	def fence(region: BackendRegion);
 	
 	// Check if this backend provides persistence
 	def isPersistent() -> bool;
@@ -87,11 +87,11 @@ class VolatileBackend extends TxnRegionBackend {
 		return true;
 	}
 	
-	def flush(range: Range<byte>, offset: u64, size: u64) {
+	def flush(region: BackendRegion, offset: u64, size: u64) {
 		// No-op for volatile memory
 	}
 	
-	def fence() {
+	def fence(region: BackendRegion) {
 		// No-op for volatile memory
 	}
 	
@@ -106,22 +106,29 @@ class VolatileBackend extends TxnRegionBackend {
 
 // Mmap-based memory backend (platform-independent, uses POSIX mmap)
 /* must be restricted to specific platforms, e.g., x86-64-linux
+class MmapBackendRegion extends BackendRegion {
+	def var mapping: Mapping;
+
+	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping) super(range, backend) { }
+}
+
 class MmapBackend extends TxnRegionBackend {
 	def allocate(size: u64, prot: int) -> BackendRegion {
 		var mmapProt = convertProt(prot);
 		var mapping = Mmap.reserve(size, mmapProt);
 		if (mapping == null) return null;
 		var range = CiRuntime.forgeRange<byte>(mapping.range.start, int.!(size));
-		var region = BackendRegion.new(range, this);
-		region.mapping = mapping;  // Keep mapping alive to prevent premature GC/unmapping
-		return region;
+		return MmapBackendRegion.new(range, this, mapping);
 	}
 	
 	def deallocate(region: BackendRegion) {
 		// Explicitly unmap and clear reference
-		if (region.mapping != null) {
-			region.mapping.range.unmap();
-			region.mapping = null;
+		if (MmapBackendRegion.?(region)) {
+			var mapped = MmapBackendRegion.!(region);
+			if (mapped.mapping != null) {
+				mapped.mapping.range.unmap();
+				mapped.mapping = null;
+			}
 		}
 	}
 	
@@ -131,11 +138,11 @@ class MmapBackend extends TxnRegionBackend {
 		return Mmap.protect(start, size, mmapProt);
 	}
 	
-	def flush(range: Range<byte>, offset: u64, size: u64) {
+	def flush(region: BackendRegion, offset: u64, size: u64) {
 		// No-op for volatile memory
 	}
 	
-	def fence() {
+	def fence(region: BackendRegion) {
 		// No-op for volatile memory
 	}
 	

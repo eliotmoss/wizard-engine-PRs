@@ -200,6 +200,90 @@ def test_commit_clears_wal_cache(tc: PWRegionTester) {
 
 
 // =============================================================================
+// Backend ownership tests
+// =============================================================================
+
+def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
+
+def MT = UnitTests.registerT("txn_backend:", _, MappedBackendTester.new, _);
+def MX = [
+	MT("mapped_file_region_owns_state", test_mapped_file_region_owns_state),
+	()
+];
+
+class MappedBackendTester(t: Tester) {
+	var backend: MappedFileRegionBackend;
+	var region1: BackendRegion;
+	var region2: BackendRegion;
+
+	new() {
+		RegionFileIO.unlink(BACKEND_PATH);
+		backend = MappedFileRegionBackend.new(BACKEND_PATH);
+	}
+
+	def cleanup() {
+		if (region1 != null) {
+			backend.deallocate(region1);
+			region1 = null;
+		}
+		if (region2 != null) {
+			backend.deallocate(region2);
+			region2 = null;
+		}
+		RegionFileIO.unlink(BACKEND_PATH);
+	}
+}
+
+def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
+	def prot = BackendProt.READ | BackendProt.WRITE;
+	tc.region1 = tc.backend.allocate(4096u64, prot);
+	tc.region2 = tc.backend.allocate(4096u64, prot);
+
+	if (tc.region1 == null || tc.region2 == null) {
+		tc.t.fail("mapped file backend allocation failed");
+		tc.cleanup();
+		return;
+	}
+
+	var r1 = MappedFileBackendRegion.!(tc.region1);
+	var r2 = MappedFileBackendRegion.!(tc.region2);
+
+	tc.t.assertz(false, r1.mapping == r2.mapping);
+	tc.t.assertz(false, r1.mapping.range.start == r2.mapping.range.start);
+
+	tc.region1.flush(128u64, 16u64);
+	tc.region2.flush(256u64, 32u64);
+
+	tc.t.assertz(true, r1.hasDirtyRange);
+	tc.t.assert_eq(128u64, r1.dirtyStart);
+	tc.t.assert_eq(144u64, r1.dirtyEnd);
+	tc.t.assertz(true, r2.hasDirtyRange);
+	tc.t.assert_eq(256u64, r2.dirtyStart);
+	tc.t.assert_eq(288u64, r2.dirtyEnd);
+
+	tc.region1.fence();
+	tc.t.assertz(false, r1.hasDirtyRange);
+	tc.t.assertz(true, r2.hasDirtyRange);
+
+	tc.backend.deallocate(tc.region1);
+	tc.region1 = null;
+
+	tc.t.assertz(true, r1.mapping == null);
+	tc.t.assert_eq(-1, r1.fd);
+	tc.t.assertz(false, r2.mapping == null);
+	tc.t.assertz(true, r2.hasDirtyRange);
+
+	Pointer.atElement(tc.region2.range, 0).store<u8>(0x42u8);
+	tc.t.assert_eq(0x42u8, Pointer.atElement(tc.region2.range, 0).load<u8>());
+
+	tc.region2.fence();
+	tc.t.assertz(false, r2.hasDirtyRange);
+
+	tc.cleanup();
+}
+
+
+// =============================================================================
 // Block device backend tests
 // =============================================================================
 

@@ -1,21 +1,35 @@
 // x86-64 specific transaction backend implementations
 
-class MappedRegionBackend extends TxnRegionBackend {
-	var mapping: Mapping;
+class MappedBackendRegion extends BackendRegion {
+	def var mapping: Mapping;
 
-	def makeRegion(newMapping: Mapping, size: u64) -> BackendRegion {
+	new(range: Range<byte>, backend: TxnRegionBackend, mapping) super(range, backend) { }
+}
+
+class MappedFileBackendRegion extends MappedBackendRegion {
+	def var fd: int;
+
+	def var hasDirtyRange = false;
+	def var dirtyStart: u64 = 0;
+	def var dirtyEnd: u64 = 0;
+
+	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd) super(range, backend, mapping) { }
+}
+
+class MappedRegionBackend extends TxnRegionBackend {
+	def makeRegion(newMapping: Mapping, size: u64) -> MappedBackendRegion {
 		if (newMapping == null) return null;
-		mapping = newMapping;
 		var range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
-		return BackendRegion.new(range, this);
+		return MappedBackendRegion.new(range, this, newMapping);
 	}
 
 	def deallocate(region: BackendRegion) {
-		if (mapping != null) {
-			mapping.range.unmap();
-			mapping = null;
+		var mapped = asMappedRegion(region);
+		if (mapped != null && mapped.mapping != null) {
+			mapped.mapping.range.unmap();
+			mapped.mapping = null;
 		}
-		cleanup();
+		cleanup(region);
 	}
 
 	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
@@ -24,7 +38,12 @@ class MappedRegionBackend extends TxnRegionBackend {
 		return Mmap.protect(start, size, mmapProt);
 	}
 
-	def cleanup() { }
+	def cleanup(region: BackendRegion) { }
+
+	def asMappedRegion(region: BackendRegion) -> MappedBackendRegion {
+		if (!MappedBackendRegion.?(region)) return null;
+		return MappedBackendRegion.!(region);
+	}
 
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
@@ -49,11 +68,11 @@ class MmapPersistentBackend extends MappedRegionBackend {
 		return makeRegion(Mmap.reserve(size, mmapProt), size);
 	}
 	
-	def flush(range: Range<byte>, offset: u64, size: u64) {
+	def flush(region: BackendRegion, offset: u64, size: u64) {
 		// Flush cache lines to PMEM
 		// CLWB (Cache Line Write Back) is the preferred instruction
 		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
-		var start = Pointer.atElement(range, 0) + i64.view(offset);
+		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
 		var end = start + i64.view(size);
 		var cacheLineSize = 64; // x86-64 cache line size
 		
@@ -65,7 +84,7 @@ class MmapPersistentBackend extends MappedRegionBackend {
 		}
 	}
 	
-	def fence() {
+	def fence(region: BackendRegion) {
 		// SFENCE ensures all cache line flushes complete before continuing
 		storeFence();
 	}
@@ -97,56 +116,59 @@ class MmapPersistentBackend extends MappedRegionBackend {
 class MappedFileRegionBackend extends MappedRegionBackend {
 	def path: string;
 
-	def var fd: int = -1;
-	def var hasDirtyRange = false;
-	def var dirtyStart: u64 = 0;
-	def var dirtyEnd: u64 = 0;
-
 	new(path) { }
 
 	def allocate(size: u64, prot: int) -> BackendRegion {
-		fd = RegionFileIO.openOrCreate(path);
+		def fd = RegionFileIO.openOrCreate(path);
 		if (fd < 0) return null;
 		if (!RegionFileIO.ensureSize(fd, size)) {
-			cleanup();
+			RegionFileIO.close(fd);
 			return null;
 		}
 
-		var mmapProt = convertProt(prot);
-		var region = makeRegion(Mmap.map(size, mmapProt, Mmap.MAP_SHARED, fd, 0), size);
+		def mmapProt = convertProt(prot);
+		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED, fd, 0);
+		def region = makeFileRegion(mapping, size, fd);
 		if (region == null) {
-			cleanup();
+			RegionFileIO.close(fd);
 			return null;
 		}
-		hasDirtyRange = false;
-		dirtyStart = dirtyEnd = 0;
 		return region;
 	}
 
-	def flush(range: Range<byte>, offset: u64, size: u64) {
-		if (size == 0) return;
-		def end = offset + size;
-		if (!hasDirtyRange) {
-			dirtyStart = offset;
-			dirtyEnd = end;
-			hasDirtyRange = true;
-			return;
-		}
-		if (offset < dirtyStart) dirtyStart = offset;
-		if (end > dirtyEnd) dirtyEnd = end;
+	def makeFileRegion(newMapping: Mapping, size: u64, fd: int) -> MappedFileBackendRegion {
+		if (newMapping == null) return null;
+		def range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
+		return MappedFileBackendRegion.new(range, this, newMapping, fd);
 	}
 
-	def fence() {
-		if (!hasDirtyRange || mapping == null) return;
+	def flush(region: BackendRegion, offset: u64, size: u64) {
+		if (size == 0) return;
+		def fileRegion = asFileRegion(region);
+		if (fileRegion == null) return;
+		def end = offset + size;
+		if (!fileRegion.hasDirtyRange) {
+			fileRegion.dirtyStart = offset;
+			fileRegion.dirtyEnd = end;
+			fileRegion.hasDirtyRange = true;
+			return;
+		}
+		if (offset < fileRegion.dirtyStart) fileRegion.dirtyStart = offset;
+		if (end > fileRegion.dirtyEnd) fileRegion.dirtyEnd = end;
+	}
+
+	def fence(region: BackendRegion) {
+		def fileRegion = asFileRegion(region);
+		if (fileRegion == null || !fileRegion.hasDirtyRange || fileRegion.mapping == null) return;
 
 		// TODO: define this somewhere else as a constant
 		def pageSize = 4096u64;
-		def syncStart = dirtyStart - (dirtyStart % pageSize);
-		def syncEnd = ((dirtyEnd + pageSize - 1u64) / pageSize) * pageSize;
-		Mmap.sync(mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
+		def syncStart = fileRegion.dirtyStart - (fileRegion.dirtyStart % pageSize);
+		def syncEnd = ((fileRegion.dirtyEnd + pageSize - 1u64) / pageSize) * pageSize;
+		Mmap.sync(fileRegion.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
 
-		hasDirtyRange = false;
-		dirtyStart = dirtyEnd = 0;
+		fileRegion.hasDirtyRange = false;
+		fileRegion.dirtyStart = fileRegion.dirtyEnd = 0;
 	}
 
 	def isPersistent() -> bool {
@@ -157,13 +179,20 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 		return "mmap-file";
 	}
 
-	def cleanup() {
-		hasDirtyRange = false;
-		dirtyStart = dirtyEnd = 0;
-		if (fd >= 0) {
-			RegionFileIO.close(fd);
-			fd = -1;
+	def cleanup(region: BackendRegion) {
+		def fileRegion = asFileRegion(region);
+		if (fileRegion == null) return;
+		fileRegion.hasDirtyRange = false;
+		fileRegion.dirtyStart = fileRegion.dirtyEnd = 0;
+		if (fileRegion.fd >= 0) {
+			RegionFileIO.close(fileRegion.fd);
+			fileRegion.fd = -1;
 		}
+	}
+
+	def asFileRegion(region: BackendRegion) -> MappedFileBackendRegion {
+		if (!MappedFileBackendRegion.?(region)) return null;
+		return MappedFileBackendRegion.!(region);
 	}
 }
 
