@@ -59,7 +59,9 @@ class RegionWal {
         }
 
         def clear() {
+                header.numEntries = 0u32;
                 header.status = 0;
+                header.checksum = 0u64;
                 if (backendRegion != null) {
                         backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
                         backendRegion.fence();

@@ -1,22 +1,21 @@
-// WALCache Tests
-// Tests the in-memory write-behind cache for the Write Ahead Log
+// RegionTransaction Tests
+// Tests cached transactional writes and the encapsulated redo-log commit flow.
 
-def T = UnitTests.registerT("wal_cache:", _, WALCacheTester.new, _);
+def T = UnitTests.registerT("wal_cache:", _, RegionTransactionTester.new, _);
 def X = [
 	T("basic_u8_flow", test_basic_u8_flow),
 	T("basic_u64_flow", test_basic_u64_flow),
 	T("read_fallthrough", test_read_fallthrough),
-	T("append_to_wal", test_append_to_wal),
-	T("apply_to_memory", test_apply_to_memory),
+	T("commit_applies_and_clears", test_commit_applies_and_clears),
+	T("commit_clean_noop", test_commit_clean_noop),
 	T("overwrite_update", test_overwrite_update),
 	T("is_dirty_check", test_is_dirty_check),
-	T("clear_cache", test_clear_cache),
 	T("misaligned_access", test_misaligned_access),
 	()
 ];
 
-class WALCacheTester(t: Tester) {
-	var cache: WALCache;
+class RegionTransactionTester(t: Tester) {
+	var txn: RegionTransaction;
 	var wal: RegionWal;
 	// Backing memory for the pointers to test read-through and write-back
 	var dummyData: Array<byte>;
@@ -27,7 +26,7 @@ class WALCacheTester(t: Tester) {
 		for (i < 1024) dummyData[i] = 0xAAu8;
 		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
 		wal = RegionWal.new(regionStart, regionStart, 1024, null);
-		cache = WALCache.new(wal, regionStart);
+		txn = RegionTransaction.new(wal, regionStart);
 	}
 	
 	def getAddr(offset: int) -> u64 {
@@ -37,6 +36,10 @@ class WALCacheTester(t: Tester) {
 	// Helper to read actual RAM (bypassing cache) to verify write-behind behavior
 	def readRamU8(offset: int) -> u8 {
 		return dummyData[offset];
+	}
+
+	def readRamU64(offset: int) -> u64 {
+		return Pointer.atElement(dummyData, offset).load<u64>();
 	}
 
 	def logHeader() -> Ref<LogHeader> {
@@ -51,15 +54,15 @@ class WALCacheTester(t: Tester) {
 
 // Test 1: Basic Write and Read flow for U8
 // Verifies that writing to cache allows reading from cache, but does not immediately touch RAM.
-def test_basic_u8_flow(tc: WALCacheTester) {
+def test_basic_u8_flow(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(0);
 	var val = 0x11u8;
 
 	// 1. Write to cache
-	tc.cache.writeU8(addr, val);
+	tc.txn.writeU8(addr, val);
 
 	// 2. Read back (should come from cache)
-	var readVal = tc.cache.readU8(addr);
+	var readVal = tc.txn.readU8(addr);
 	tc.t.assert_eq(val, readVal);
 
 	// 3. Verify RAM is NOT updated yet (Write-Behind)
@@ -67,122 +70,103 @@ def test_basic_u8_flow(tc: WALCacheTester) {
 }
 
 // Test 2: Basic Write and Read flow for U64
-def test_basic_u64_flow(tc: WALCacheTester) {
+def test_basic_u64_flow(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(8);
 	var val = 0xDEAD_BEEF_CAFE_BABE_u64;
 
-	tc.cache.writeU64(addr, val);
+	tc.txn.writeU64(addr, val);
 	
-	var readVal = tc.cache.readU64(addr);
+	var readVal = tc.txn.readU64(addr);
 	tc.t.assert_eq(val, readVal);
 }
 
 // Test 3: Cache Miss (Fallthrough to Memory)
 // If the address is not in the cache, it should load the value currently in RAM.
-def test_read_fallthrough(tc: WALCacheTester) {
+def test_read_fallthrough(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(16);
 	
 	// We haven't written to the cache for 'addr'.
 	// RAM was initialized to 0xAA in setup.
 	
-	var val = tc.cache.readU8(addr);
+	var val = tc.txn.readU8(addr);
 	
 	// Should return value from memory, not 0 or null
 	tc.t.assert_eq(0xAAu8, val);
-	tc.t.assertz(false, tc.cache.isDirty());
+	tc.t.assertz(false, tc.txn.isDirty());
 }
 
-// Test 4: Append to the WAL without applying to region data.
-def test_append_to_wal(tc: WALCacheTester) {
-	var addr = tc.getAddr(20);
+// Test 4: Commit writes the WAL, applies cached data, then clears log and cache.
+def test_commit_applies_and_clears(tc: RegionTransactionTester) {
+	var addr = tc.getAddr(200);
 	var val = 0x0102_0304_0506_0708u64;
 
-	tc.cache.writeU64(addr, val);
-	tc.cache.appendToWal();
+	tc.txn.writeU64(addr, val);
+	tc.t.assertz(true, tc.txn.isDirty());
+	tc.t.assert_eq(0xAAu8, tc.readRamU8(200));
+	tc.txn.commit();
 
 	var entry = tc.logEntry(0u32);
 	tc.t.assert_eq(addr - tc.wal.regionStart, entry.offset);
 	tc.t.assert_eq(val, entry.value);
 	tc.t.assert_eq(8u8, entry.width);
 	tc.t.assert_eq(0u32, tc.logHeader().numEntries);
-	tc.t.assert_eq(0xAAu8, tc.readRamU8(20));
+	tc.t.assert_eq(0u8, tc.logHeader().status);
+	tc.t.assert_eq(0u64, tc.logHeader().checksum);
+	tc.t.assert_eq(0u32, tc.wal.currentEntryIndex);
+	tc.t.assert_eq(val, tc.readRamU64(200));
+	tc.t.assertz(false, tc.txn.isDirty());
 }
 
-// Test 5: Apply to Memory (Flushing)
-// Verifies that applyToRegion() commits cached changes to the underlying pointers.
-def test_apply_to_memory(tc: WALCacheTester) {
+// Test 5: Committing a clean transaction is a no-op.
+def test_commit_clean_noop(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(20);
-	var val = 0xFFu8;
-
-	// Write to cache
-	tc.cache.writeU8(addr, val);
-	
-	// RAM should still be old value
+	tc.t.assertz(false, tc.txn.isDirty());
+	tc.txn.commit();
+	tc.t.assertz(false, tc.txn.isDirty());
 	tc.t.assert_eq(0xAAu8, tc.readRamU8(20));
-
-	// Flush
-	tc.cache.applyToRegion();
-
-	// RAM should now be updated
-	tc.t.assert_eq(val, tc.readRamU8(20));
+	tc.t.assert_eq(0xAAu8, tc.txn.readU8(addr));
 }
 
 // Test 6: Overwriting updates the cache entry
-def test_overwrite_update(tc: WALCacheTester) {
+def test_overwrite_update(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(16);
 
-	tc.cache.writeU64(addr, 100u64);
-	tc.t.assert_eq(100u64, tc.cache.readU64(addr));
+	tc.txn.writeU64(addr, 100u64);
+	tc.t.assert_eq(100u64, tc.txn.readU64(addr));
 
-	tc.cache.writeU64(addr, 200u64);
-	tc.t.assert_eq(200u64, tc.cache.readU64(addr));
+	tc.txn.writeU64(addr, 200u64);
+	tc.t.assert_eq(200u64, tc.txn.readU64(addr));
 }
 
 // Test 7: Verifying the isDirty check
-def test_is_dirty_check(tc: WALCacheTester) {
+def test_is_dirty_check(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(32);
 
-	tc.t.assertz(false, tc.cache.isDirty());
+	tc.t.assertz(false, tc.txn.isDirty());
 
-	tc.cache.writeI16(addr, 123i16);
-	tc.t.assertz(true, tc.cache.isDirty());
+	tc.txn.writeI16(addr, 123i16);
+	tc.t.assertz(true, tc.txn.isDirty());
 }
 
-// Test 8: Clearing the cache discards updates
-def test_clear_cache(tc: WALCacheTester) {
-	var addr = tc.getAddr(50);
-	var newVal = 0x55u8;
-
-	tc.cache.writeU8(addr, newVal);
-	tc.t.assertz(true, tc.cache.isDirty());
-
-	tc.cache.clear();
-
-	tc.t.assertz(false, tc.cache.isDirty());
-	
-	// Reading now should fall through to original memory (0xAA), not the cached 0x55
-	tc.t.assert_eq(0xAAu8, tc.cache.readU8(addr));
-}
-
-// Test 9: Aligned/Spatial Access Constraints
-def test_misaligned_access(tc: WALCacheTester) {
+// Test 8: Aligned/Spatial Access Constraints
+def test_misaligned_access(tc: RegionTransactionTester) {
 	var baseAddr = tc.getAddr(60);
 	var offsetAddr = tc.getAddr(61);
 
 	var val = 0x0102030405060708u64;
 
 	// Write 8 bytes to baseAddr
-	tc.cache.writeU64(baseAddr, val);
+	tc.txn.writeU64(baseAddr, val);
 
 	// Verify we can read the u64 back
-	tc.t.assert_eq(val, tc.cache.readU64(baseAddr));
+	tc.t.assert_eq(val, tc.txn.readU64(baseAddr));
 
 	// Try to read u8 at baseAddr + 1. 
 	// Since the cache maps (u64 addr) -> Entry, and (baseAddr) != (offsetAddr),
 	// this should be a cache miss and fall through to memory (0xAA).
 	// It should NOT return 0x07 (the 2nd byte of the u64).
 	
-	var byteVal = tc.cache.readU8(offsetAddr);
+	var byteVal = tc.txn.readU8(offsetAddr);
 	
 	tc.t.assert_eq(0xAAu8, byteVal);
 }

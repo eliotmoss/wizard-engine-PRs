@@ -185,28 +185,28 @@ type BlockEntryHandle(addr: u64) #unboxed {
                 return toHandle(getRef().listNext);
         }
 
-        def getListNumCached(cache: WALCache) -> i16 {
+        def getListNumCached(cache: RegionTransaction) -> i16 {
                 return cache.readI16(addr + u64.view(BlockEntry.listNum.offset));
         }
 
-        def getUsedCached(cache:WALCache) -> bool {
+        def getUsedCached(cache: RegionTransaction) -> bool {
                 def used = cache.readU8(addr + u64.view(BlockEntry.used.offset));
                 return used == 1;
         }
 
-        def getPrevCached(cache: WALCache) -> BlockEntryHandle {
+        def getPrevCached(cache: RegionTransaction) -> BlockEntryHandle {
                 return toHandle(cache.readI64(addr + u64.view(BlockEntry.prev.offset)));
         }
 
-        def getNextCached(cache: WALCache) -> BlockEntryHandle {
+        def getNextCached(cache: RegionTransaction) -> BlockEntryHandle {
                 return toHandle(cache.readI64(addr + u64.view(BlockEntry.next.offset)));
         }
 
-        def getListPrevCached(cache: WALCache) -> BlockEntryHandle {
+        def getListPrevCached(cache: RegionTransaction) -> BlockEntryHandle {
                 return toHandle(cache.readI64(addr + u64.view(BlockEntry.listPrev.offset)));
         }
 
-        def getListNextCached(cache: WALCache) -> BlockEntryHandle {
+        def getListNextCached(cache: RegionTransaction) -> BlockEntryHandle {
                 return toHandle(cache.readI64(addr + u64.view(BlockEntry.listNext.offset)));
         }
 
@@ -234,28 +234,28 @@ type BlockEntryHandle(addr: u64) #unboxed {
                 getRef().listNext = toOffset(v);
         }
 
-        def setListNumCached(cache: WALCache, v: i16) {
+        def setListNumCached(cache: RegionTransaction, v: i16) {
                 cache.writeI16(addr + u64.view(BlockEntry.listNum.offset), v);
         }
 
-        def setUsedCached(cache: WALCache, v: bool) {
+        def setUsedCached(cache: RegionTransaction, v: bool) {
                 def num: u8 = if(v, 1, 0);
                 cache.writeU8(addr + u64.view(BlockEntry.used.offset), num);
         }
 
-        def setPrevCached(cache: WALCache, v: BlockEntryHandle) {
+        def setPrevCached(cache: RegionTransaction, v: BlockEntryHandle) {
                 cache.writeI64(addr + u64.view(BlockEntry.prev.offset), toOffset(v));
         }
 
-        def setNextCached(cache: WALCache, v: BlockEntryHandle) {
+        def setNextCached(cache: RegionTransaction, v: BlockEntryHandle) {
                 cache.writeI64(addr + u64.view(BlockEntry.next.offset), toOffset(v));
         }
 
-        def setListPrevCached(cache: WALCache, v: BlockEntryHandle) {
+        def setListPrevCached(cache: RegionTransaction, v: BlockEntryHandle) {
                 cache.writeI64(addr + u64.view(BlockEntry.listPrev.offset), toOffset(v));
         }
 
-        def setListNextCached(cache: WALCache, v: BlockEntryHandle) {
+        def setListNextCached(cache: RegionTransaction, v: BlockEntryHandle) {
                 cache.writeI64(addr + u64.view(BlockEntry.listNext.offset), toOffset(v));
         }
 }
@@ -301,19 +301,19 @@ type ChunkHandle(addr: u64) #unboxed {
                 getRef().linemarks = v;
         }
 
-        def setOffsetCached(cache: WALCache, v: u64) {
+        def setOffsetCached(cache: RegionTransaction, v: u64) {
                 cache.writeU64(addr + u64.view(ChunkHeader.offset.offset), v);
         }
 
-        def setLimitCached(cache: WALCache, v: u64) {
+        def setLimitCached(cache: RegionTransaction, v: u64) {
                 cache.writeU64(addr + u64.view(ChunkHeader.limit.offset), v);
         }
 
-        def setChunkLimitCached(cache: WALCache, v: u64) {
+        def setChunkLimitCached(cache: RegionTransaction, v: u64) {
                 cache.writeU64(addr + u64.view(ChunkHeader.chunk_limit.offset), v);
         }
 
-        def setLinemarksCached(cache: WALCache, v: u64) {
+        def setLinemarksCached(cache: RegionTransaction, v: u64) {
                 cache.writeU64(addr + u64.view(ChunkHeader.linemarks.offset), v);
         }
 }
@@ -352,8 +352,8 @@ type LogEntryHandle(addr: u64) { }
 // Wrapper ADT to store the cached value and its width (size)
 type CachedUpdate(value: u64, size: u8) #unboxed { }
 
-// A write-behind cache for the Write Ahead Log (WAL).
-// This component buffers writes in DRAM.
+// A transaction facade over the write-behind cache and redo log.
+// This component buffers writes in DRAM, then commits them through RegionWal.
 //
 // CONSTRAINT: ALIGNED ACCESS ONLY
 // This implementation uses a HashMap to store updates. It does not support spatial
@@ -361,10 +361,10 @@ type CachedUpdate(value: u64, size: u8) #unboxed { }
 // 1. Reads must match the exact address of previous writes.
 // 2. Mixed-width accesses (e.g., writing 8 bytes at 0x10, then reading 1 byte at 0x11)
 //    will result in a cache miss, returning stale data.
-class WALCache {
+class RegionTransaction {
         private var cache: HashMap<u64, CachedUpdate>;
         private def addrs = Vector<u64>.new();
-        def wal: RegionWal;
+        private def wal: RegionWal;
         def regionStart: u64;
 
         new(wal, regionStart) {
@@ -375,29 +375,23 @@ class WALCache {
                 return addrs.length != 0;
         }
 
-        // Clear the cache (re-initializes the map)
-        def clear() {
+        def commit() {
+                if (!isDirty()) return;
+                appendToWal();
+                wal.commit();
+                applyToRegion();
+                wal.fenceAppliedUpdates();
+                wal.clear();
+                clear();
+        }
+
+        def recover() -> bool {
+                return wal.recover();
+        }
+
+        private def clear() {
                 cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
                 addrs.clear();
-        }
-
-        // Flushes cached updates to the region via the WAL helper.
-        def applyToRegion() {
-                addrs.apply(
-                        fun (addr: u64) {
-                                def c: CachedUpdate = cache[addr];
-                                wal.applyUpdate(addr - regionStart, c.value, c.size);
-                        }
-                );
-        }
-
-        def appendToWal() {
-                addrs.apply(
-                        fun (addr: u64) {
-                                def c: CachedUpdate = cache[addr];
-                                wal.append(addr - regionStart, c.value, c.size);
-                        }
-                );
         }
 
         def readU8(addr: u64) -> u8 {
@@ -447,6 +441,24 @@ class WALCache {
                 cache[addr] = CachedUpdate(val, size);
         }
 
+        private def appendToWal() {
+                addrs.apply(
+                        fun (addr: u64) {
+                                def c: CachedUpdate = cache[addr];
+                                wal.append(addr - regionStart, c.value, c.size);
+                        }
+                );
+        }
+
+        private def applyToRegion() {
+                addrs.apply(
+                        fun (addr: u64) {
+                                def c: CachedUpdate = cache[addr];
+                                wal.applyUpdate(addr - regionStart, c.value, c.size);
+                        }
+                );
+        }
+
         // Hash function: Convert u64 -> i32
         private def hash(addr: u64) => i32.view(addr ^ (addr >> 32));
 }
@@ -470,9 +482,9 @@ class PWRegion {
         def blankChunkHandle = NULL_CHUNK;
         def var blockTableHandle: BlockTableHandle;
         def var logChunk: ChunkHandle;
-        def var wal: RegionWal;
+        private var wal: RegionWal;
         def var regionStart: u64;
-        def var walCache: WALCache;
+        def var txn: RegionTransaction;
 
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
@@ -485,7 +497,6 @@ class PWRegion {
                 rng = backendRegion.range;
                 regionStart = u64.view(Pointer.atElement(rng, 0));
                 init(blockSize, forceFormat);
-                walCache = WALCache.new(wal, regionStart);
         }
 
         private def sanitizeOffset(offset: u64) {
@@ -549,6 +560,9 @@ class PWRegion {
                 if (wal == null) {
                         wal = RegionWal.new(regionStart, logChunkAddr, blockSize, backendRegion);
                 }
+                if (txn == null) {
+                        txn = RegionTransaction.new(wal, regionStart);
+                }
         }
 
         // Mounts an existing, fully formatted region
@@ -580,7 +594,7 @@ class PWRegion {
                 logChunk = blockEntryToChunk(logBlockHandle);
                 ensureWal(logChunk.addr, blockSize);
 
-                wal.recover();
+                txn.recover();
         }
 
         // Reset all fields of a block entry to their default (empty) state
@@ -751,9 +765,9 @@ class PWRegion {
         def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
                 var chunk = ChunkHandle(u64.view(Pointer.atElement(rng, 0)) + blockIndexOf(startEntry) * blockSize);
 
-                chunk.setOffsetCached(walCache, u64.!(ChunkHeader.size));
-                chunk.setLimitCached(walCache, u64.!(numBlocks) * blockSize);
-                chunk.setChunkLimitCached(walCache, u64.!(numBlocks) * blockSize);
+                chunk.setOffsetCached(txn, u64.!(ChunkHeader.size));
+                chunk.setLimitCached(txn, u64.!(numBlocks) * blockSize);
+                chunk.setChunkLimitCached(txn, u64.!(numBlocks) * blockSize);
 
                 // TODO link mark field
                 return chunk;
@@ -762,29 +776,29 @@ class PWRegion {
         def allocChunk(numBlocks: u32) -> ChunkHandle {
                 if (numBlocks == 1) {
                         // Try the small free block list
-                        var firstHandle = smallSentinel.getListNextCached(walCache);
+                        var firstHandle = smallSentinel.getListNextCached(txn);
                         if (!firstHandle.isNull()) {
                                 removeFromList(firstHandle);
-                                firstHandle.setUsedCached(walCache, true);
+                                firstHandle.setUsedCached(txn, true);
                                 var chunk = createChunk(firstHandle, 1);
                                 performCommit();
                                 return chunk;
                         }
                 }
-                var thisHandle = largeSentinel.getListNextCached(walCache);
+                var thisHandle = largeSentinel.getListNextCached(txn);
                 while (!thisHandle.isNull()) {
                         var thisIndex = blockIndexOf(thisHandle);
-                        var nextHandle = thisHandle.getNextCached(walCache);
+                        var nextHandle = thisHandle.getNextCached(txn);
                         if (nextHandle.isNull()) return blankChunkHandle;
                         var nextIndex = blockIndexOf(nextHandle);
                         var chunkBlocks = nextIndex - thisIndex;
                         if (numBlocks > chunkBlocks) {
-                                thisHandle = thisHandle.getListNextCached(walCache);
+                                thisHandle = thisHandle.getListNextCached(txn);
                                 continue;
                         }
                         if (numBlocks == chunkBlocks) {
                                 removeFromList(thisHandle);
-                                thisHandle.setUsedCached(walCache, true);
+                                thisHandle.setUsedCached(txn, true);
                                 var chunk = createChunk(thisHandle, numBlocks);
                                 performCommit();
                                 return chunk;
@@ -796,13 +810,13 @@ class PWRegion {
                         var remBlocks = nextIndex - remIndex;
 
                         // Set remainder's memory-order links
-                        remHandle.setUsedCached(walCache, false);
-                        remHandle.setPrevCached(walCache, thisHandle);
-                        remHandle.setNextCached(walCache, nextHandle);
+                        remHandle.setUsedCached(txn, false);
+                        remHandle.setPrevCached(txn, thisHandle);
+                        remHandle.setNextCached(txn, nextHandle);
 
                         // Update neighbors' memory-order links
-                        thisHandle.setNextCached(walCache, remHandle);
-                        nextHandle.setPrevCached(walCache, remHandle);
+                        thisHandle.setNextCached(txn, remHandle);
+                        nextHandle.setPrevCached(txn, remHandle);
 
                         // Remove thisHandle from free list
                         removeFromList(thisHandle);
@@ -815,7 +829,7 @@ class PWRegion {
                         }
 
                         // Mark allocated block as used
-                        thisHandle.setUsedCached(walCache, true);
+                        thisHandle.setUsedCached(txn, true);
                         var chunk = createChunk(thisHandle, numBlocks);
                         performCommit();
                         return chunk;
@@ -828,36 +842,36 @@ class PWRegion {
 
                 var entry = chunkToBlockEntry(chunk);
                 if (entry.isNull()) return;
-                if (!entry.getUsedCached(walCache)) return;
+                if (!entry.getUsedCached(txn)) return;
 
-                entry.setUsedCached(walCache, false);
+                entry.setUsedCached(txn, false);
 
                 // Coalesce Left
-                def prev = entry.getPrevCached(walCache);
-                if (!prev.isNull() && !prev.getUsedCached(walCache)) {
+                def prev = entry.getPrevCached(txn);
+                if (!prev.isNull() && !prev.getUsedCached(txn)) {
                         removeFromList(prev);
-                        def next = entry.getNextCached(walCache);
-                        prev.setNextCached(walCache, next);
+                        def next = entry.getNextCached(txn);
+                        prev.setNextCached(txn, next);
                         if (!next.isNull()) {
-                                next.setPrevCached(walCache, prev);
+                                next.setPrevCached(txn, prev);
                         }
                         entry = prev;
                 }
 
                 // Coalesce Right
-                def next = entry.getNextCached(walCache);
-                if (!next.isNull() && !next.getUsedCached(walCache)) {
+                def next = entry.getNextCached(txn);
+                if (!next.isNull() && !next.getUsedCached(txn)) {
                         removeFromList(next);
-                        def nextNext = next.getNextCached(walCache);
-                        entry.setNextCached(walCache, nextNext);
+                        def nextNext = next.getNextCached(txn);
+                        entry.setNextCached(txn, nextNext);
                         if (!nextNext.isNull()) {
-                                nextNext.setPrevCached(walCache, entry);
+                                nextNext.setPrevCached(txn, entry);
                         }
                 }
 
                 // Insert into the appropriate free list based on coalesced size
                 def startIndex = blockIndexOf(entry);
-                def nextNeighbor = entry.getNextCached(walCache);
+                def nextNeighbor = entry.getNextCached(txn);
                 def endIndex = if (nextNeighbor.isNull(), numBlocks, blockIndexOf(nextNeighbor));
                 def newSize = endIndex - startIndex;
 
@@ -871,33 +885,33 @@ class PWRegion {
 
         // Insert entry into list immediately after sentinel (head insertion)
         def insertAfter(sentinel: BlockEntryHandle, entry: BlockEntryHandle, kind: ListKind) {
-                entry.setListNumCached(walCache, kind.code);
-                var listNext = sentinel.getListNextCached(walCache);
+                entry.setListNumCached(txn, kind.code);
+                var listNext = sentinel.getListNextCached(txn);
 
                 // Link: sentinel -> entry -> listNext
-                sentinel.setListNextCached(walCache, entry);
-                entry.setListPrevCached(walCache, sentinel);
-                entry.setListNextCached(walCache, listNext);
+                sentinel.setListNextCached(txn, entry);
+                entry.setListPrevCached(txn, sentinel);
+                entry.setListNextCached(txn, listNext);
 
                 if (!listNext.isNull()) {
-                        listNext.setListPrevCached(walCache, entry);
+                        listNext.setListPrevCached(txn, entry);
                 }
         }
 
         def removeFromList(blk: BlockEntryHandle) {
-                var listPrev = blk.getListPrevCached(walCache);
-                var listNext = blk.getListNextCached(walCache);
+                var listPrev = blk.getListPrevCached(txn);
+                var listNext = blk.getListNextCached(txn);
 
                 if (!listPrev.isNull()) {
-                        listPrev.setListNextCached(walCache, listNext);
+                        listPrev.setListNextCached(txn, listNext);
                 }
                 if (!listNext.isNull()) {
-                        listNext.setListPrevCached(walCache, listPrev);
+                        listNext.setListPrevCached(txn, listPrev);
                 }
 
-                blk.setListPrevCached(walCache, NULL_BLOCK_ENTRY);
-                blk.setListNextCached(walCache, NULL_BLOCK_ENTRY);
-                blk.setListNumCached(walCache, ListKind.NONE.code);
+                blk.setListPrevCached(txn, NULL_BLOCK_ENTRY);
+                blk.setListNextCached(txn, NULL_BLOCK_ENTRY);
+                blk.setListNumCached(txn, ListKind.NONE.code);
         }
 
         // Deallocate this region
@@ -913,17 +927,11 @@ class PWRegion {
         }
 
         private def performCommit() {
-                if (!walCache.isDirty()) return;
-                walCache.appendToWal();
-                wal.commit();
-                walCache.applyToRegion();
-                wal.fenceAppliedUpdates();
-                wal.clear();
-                walCache.clear();
+                txn.commit();
         }
 
         private def recover() {
-                wal.recover();
+                txn.recover();
         }
 }
 
