@@ -6,14 +6,22 @@ class MappedBackendRegion extends BackendRegion {
 	new(range: Range<byte>, backend: TxnRegionBackend, mapping) super(range, backend) { }
 }
 
-class MappedFileBackendRegion extends MappedBackendRegion {
+class FdMappedBackendRegion extends MappedBackendRegion {
 	def var fd: int;
 
+	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping) { }
+}
+
+class MmapPersistentBackendRegion extends FdMappedBackendRegion {
+	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping, fd) { }
+}
+
+class MappedFileBackendRegion extends FdMappedBackendRegion {
 	def var hasDirtyRange = false;
 	def var dirtyStart: u64 = 0;
 	def var dirtyEnd: u64 = 0;
 
-	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd) super(range, backend, mapping) { }
+	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping, fd) { }
 }
 
 class MappedRegionBackend extends TxnRegionBackend {
@@ -45,6 +53,20 @@ class MappedRegionBackend extends TxnRegionBackend {
 		return MappedBackendRegion.!(region);
 	}
 
+	def asFdRegion(region: BackendRegion) -> FdMappedBackendRegion {
+		if (!FdMappedBackendRegion.?(region)) return null;
+		return FdMappedBackendRegion.!(region);
+	}
+
+	def closeFdRegion(region: BackendRegion) {
+		def fdRegion = asFdRegion(region);
+		if (fdRegion == null) return;
+		if (fdRegion.fd >= 0) {
+			RegionFileIO.close(fdRegion.fd);
+			fdRegion.fd = -1;
+		}
+	}
+
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
 		if ((prot & BackendProt.READ) != 0) mmapProt |= Mmap.PROT_READ;
@@ -61,25 +83,44 @@ class MmapPersistentBackend extends MappedRegionBackend {
 	new(path) { }
 
 	def allocate(size: u64, prot: int) -> BackendRegion {
-		// For now, just use anonymous mmap
-		// TODO: Implement true PMEM mapping when file descriptor can be obtained
-		// This requires the file to already exist with the correct size
+		def fd = RegionFileIO.openOrCreate(path);
+		if (fd < 0) return null;
+		if (!RegionFileIO.ensureSize(fd, size)) {
+			RegionFileIO.close(fd);
+			return null;
+		}
+
 		var mmapProt = convertProt(prot);
-		return makeRegion(Mmap.reserve(size, mmapProt), size);
+		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED_VALIDATE | Mmap.MAP_SYNC, fd, 0);
+		def region = makePersistentRegion(mapping, size, fd);
+		if (region == null) {
+			RegionFileIO.close(fd);
+			return null;
+		}
+		return region;
+	}
+
+	def makePersistentRegion(newMapping: Mapping, size: u64, fd: int) -> MmapPersistentBackendRegion {
+		if (newMapping == null) return null;
+		def range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
+		return MmapPersistentBackendRegion.new(range, this, newMapping, fd);
 	}
 	
 	def flush(region: BackendRegion, offset: u64, size: u64) {
+		if (size == 0) return;
 		// Flush cache lines to PMEM
 		// CLWB (Cache Line Write Back) is the preferred instruction
 		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
 		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
 		var end = start + i64.view(size);
-		var cacheLineSize = 64; // x86-64 cache line size
+		def cacheLineSize = 64u64; // x86-64 cache line size
 		
 		// Flush each cache line
-		var addr = start;
-		while (addr < end) {
-			flushCacheLine(addr);
+		var addr = u64.view(start);
+		def endAddr = u64.view(end);
+		addr = addr - (addr % cacheLineSize);
+		while (addr < endAddr) {
+			flushCacheLine(PWRegionUtils.pointerFromU64(addr));
 			addr = addr + cacheLineSize;
 		}
 	}
@@ -95,6 +136,10 @@ class MmapPersistentBackend extends MappedRegionBackend {
 	
 	def name() -> string {
 		return "mmap-pmem";
+	}
+
+	def cleanup(region: BackendRegion) {
+		closeFdRegion(region);
 	}
 	
 	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
@@ -184,10 +229,7 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 		if (fileRegion == null) return;
 		fileRegion.hasDirtyRange = false;
 		fileRegion.dirtyStart = fileRegion.dirtyEnd = 0;
-		if (fileRegion.fd >= 0) {
-			RegionFileIO.close(fileRegion.fd);
-			fileRegion.fd = -1;
-		}
+		closeFdRegion(region);
 	}
 
 	def asFileRegion(region: BackendRegion) -> MappedFileBackendRegion {

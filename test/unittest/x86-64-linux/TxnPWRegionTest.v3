@@ -208,6 +208,7 @@ def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
 def MT = UnitTests.registerT("txn_backend:", _, MappedBackendTester.new, _);
 def MX = [
 	MT("mapped_file_region_owns_state", test_mapped_file_region_owns_state),
+	MT("pmem_region_type_separation", test_pmem_region_type_separation),
 	()
 ];
 
@@ -280,6 +281,27 @@ def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
 	tc.t.assertz(false, r2.hasDirtyRange);
 
 	tc.cleanup();
+}
+
+def test_pmem_region_type_separation(tc: MappedBackendTester) {
+	def backend = MmapPersistentBackend.new(BACKEND_PATH);
+	def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
+	var region: BackendRegion = backend.makePersistentRegion(mapping, 4096u64, -1);
+
+	if (region == null) {
+		tc.t.fail("pmem test mapping allocation failed");
+		return;
+	}
+
+	tc.t.assertz(true, FdMappedBackendRegion.?(region));
+	tc.t.assertz(true, MmapPersistentBackendRegion.?(region));
+	tc.t.assertz(false, MappedFileBackendRegion.?(region));
+
+	def mapped = MappedBackendRegion.!(region);
+	def fdRegion = FdMappedBackendRegion.!(region);
+	backend.deallocate(region);
+	tc.t.assertz(true, mapped.mapping == null);
+	tc.t.assert_eq(-1, fdRegion.fd);
 }
 
 

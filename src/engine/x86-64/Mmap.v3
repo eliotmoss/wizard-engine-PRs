@@ -11,12 +11,14 @@ component Mmap {
 	def MAP_PRIVATE = LinuxConst.MAP_PRIVATE;
 	def MAP_ANONYMOUS = LinuxConst.MAP_ANONYMOUS;
 	def MAP_SHARED = LinuxConst.MAP_SHARED;
+	def MAP_SHARED_VALIDATE = 0x03;
+	def MAP_SYNC = 0x80000;
 
 	def MS_SYNC = 4;
 
 	def map(size: u64, prot: int, flags: int, fd: int, offset: u64) -> Mapping {
 		var r = Linux.syscall(LinuxConst.SYS_mmap, (Pointer.NULL, size, prot, flags, fd, offset));
-		if (r.0 == -1) return null;
+		if (r.0 < 0) return null;
 		var start = Pointer.NULL + r.0, end = start + i64.view(size);
 		var range = MemoryRange.new(start, end);
 		var mapping = Mapping.new(range);
