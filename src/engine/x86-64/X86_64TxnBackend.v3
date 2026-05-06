@@ -9,14 +9,8 @@ class MappedBackendRegion extends BackendRegion {
 
 class FdMappedBackendRegion extends MappedBackendRegion {
 	def var fd: int;
-	// TODO: user tells you the fd, and mapping, and then I should map that
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping) { }
-}
 
-// TODO: remove this class, the class above is good enough
-// Maybe call it BytePersistentBackendRegion?
-class MmapPersistentBackendRegion extends FdMappedBackendRegion {
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping) { }
 }
 
 // Maybe call it FilePersistentBackendRegion?
@@ -103,9 +97,9 @@ class MmapPersistentBackend extends MappedRegionBackend {
 		return region;
 	}
 
-	def makePersistentRegion(newMapping: Mapping, fd: int) -> MmapPersistentBackendRegion {
+	def makePersistentRegion(newMapping: Mapping, fd: int) -> FdMappedBackendRegion {
 		if (newMapping == null) return null;
-		return MmapPersistentBackendRegion.new(this, newMapping, fd);
+		return FdMappedBackendRegion.new(this, newMapping, fd);
 	}
 	
 	def flush(region: BackendRegion, offset: u64, size: u64) {
