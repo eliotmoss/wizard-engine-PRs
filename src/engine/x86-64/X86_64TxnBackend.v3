@@ -1,22 +1,22 @@
 // x86-64 specific transaction backend implementations
 
-// TODO: odd to have both 'range' and 'mapping' passed into constructor, since mapping contains the range. Allowing two params may mean an unrelated range can be provided
 class MappedBackendRegion extends BackendRegion {
 	def var mapping: Mapping;
 
-	new(range: Range<byte>, backend: TxnRegionBackend, mapping) super(range, backend) { }
+	new(backend: TxnRegionBackend, mapping: Mapping)
+		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size())), backend) { }
 }
 
 class FdMappedBackendRegion extends MappedBackendRegion {
 	def var fd: int;
 	// TODO: user tells you the fd, and mapping, and then I should map that
-	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping) { }
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping) { }
 }
 
 // TODO: remove this class, the class above is good enough
 // Maybe call it BytePersistentBackendRegion?
 class MmapPersistentBackendRegion extends FdMappedBackendRegion {
-	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping, fd) { }
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
 }
 
 // Maybe call it FilePersistentBackendRegion?
@@ -25,14 +25,13 @@ class MappedFileBackendRegion extends FdMappedBackendRegion {
 	def var dirtyStart: u64 = 0;
 	def var dirtyEnd: u64 = 0;
 
-	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping, fd) { }
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
 }
 
 class MappedRegionBackend extends TxnRegionBackend {
-	def makeRegion(newMapping: Mapping, size: u64) -> MappedBackendRegion {
+	def makeRegion(newMapping: Mapping) -> MappedBackendRegion {
 		if (newMapping == null) return null;
-		var range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
-		return MappedBackendRegion.new(range, this, newMapping);
+		return MappedBackendRegion.new(this, newMapping);
 	}
 
 	def destroy(region: BackendRegion) {
@@ -96,7 +95,7 @@ class MmapPersistentBackend extends MappedRegionBackend {
 
 		var mmapProt = convertProt(prot);
 		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED_VALIDATE | Mmap.MAP_SYNC, fd, 0);
-		def region = makePersistentRegion(mapping, size, fd);
+		def region = makePersistentRegion(mapping, fd);
 		if (region == null) {
 			RegionFileIO.close(fd);
 			return null;
@@ -104,10 +103,9 @@ class MmapPersistentBackend extends MappedRegionBackend {
 		return region;
 	}
 
-	def makePersistentRegion(newMapping: Mapping, size: u64, fd: int) -> MmapPersistentBackendRegion {
+	def makePersistentRegion(newMapping: Mapping, fd: int) -> MmapPersistentBackendRegion {
 		if (newMapping == null) return null;
-		def range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
-		return MmapPersistentBackendRegion.new(range, this, newMapping, fd);
+		return MmapPersistentBackendRegion.new(this, newMapping, fd);
 	}
 	
 	def flush(region: BackendRegion, offset: u64, size: u64) {
@@ -177,7 +175,7 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 
 		def mmapProt = convertProt(prot);
 		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED, fd, 0);
-		def region = makeFileRegion(mapping, size, fd);
+		def region = makeFileRegion(mapping, fd);
 		if (region == null) {
 			RegionFileIO.close(fd);
 			return null;
@@ -185,10 +183,9 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 		return region;
 	}
 
-	def makeFileRegion(newMapping: Mapping, size: u64, fd: int) -> MappedFileBackendRegion {
+	def makeFileRegion(newMapping: Mapping, fd: int) -> MappedFileBackendRegion {
 		if (newMapping == null) return null;
-		def range = CiRuntime.forgeRange<byte>(newMapping.range.start, int.!(size));
-		return MappedFileBackendRegion.new(range, this, newMapping, fd);
+		return MappedFileBackendRegion.new(this, newMapping, fd);
 	}
 
 	def flush(region: BackendRegion, offset: u64, size: u64) {

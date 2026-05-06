@@ -251,6 +251,10 @@ def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
 
 	tc.t.assertz(false, r1.mapping == r2.mapping);
 	tc.t.assertz(false, r1.mapping.range.start == r2.mapping.range.start);
+	tc.t.assertz(true, Pointer.atElement(r1.range, 0) == r1.mapping.range.start);
+	tc.t.assert_eq(int.!(r1.mapping.range.size()), r1.range.length);
+	tc.t.assertz(true, Pointer.atElement(r2.range, 0) == r2.mapping.range.start);
+	tc.t.assert_eq(int.!(r2.mapping.range.size()), r2.range.length);
 
 	tc.region1.flush(128u64, 16u64);
 	tc.region2.flush(256u64, 32u64);
@@ -286,7 +290,7 @@ def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
 def test_pmem_region_type_separation(tc: MappedBackendTester) {
 	def backend = MmapPersistentBackend.new(BACKEND_PATH);
 	def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
-	var region: BackendRegion = backend.makePersistentRegion(mapping, 4096u64, -1);
+	var region: BackendRegion = backend.makePersistentRegion(mapping, -1);
 
 	if (region == null) {
 		tc.t.fail("pmem test mapping allocation failed");
@@ -299,6 +303,8 @@ def test_pmem_region_type_separation(tc: MappedBackendTester) {
 
 	def mapped = MappedBackendRegion.!(region);
 	def fdRegion = FdMappedBackendRegion.!(region);
+	tc.t.assertz(true, Pointer.atElement(mapped.range, 0) == mapped.mapping.range.start);
+	tc.t.assert_eq(int.!(mapped.mapping.range.size()), mapped.range.length);
 	backend.destroy(region);
 	tc.t.assertz(true, mapped.mapping == null);
 	tc.t.assert_eq(-1, fdRegion.fd);
