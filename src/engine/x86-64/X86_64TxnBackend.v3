@@ -1,5 +1,6 @@
 // x86-64 specific transaction backend implementations
 
+// TODO: odd to have both 'range' and 'mapping' passed into constructor, since mapping contains the range. Allowing two params may mean an unrelated range can be provided
 class MappedBackendRegion extends BackendRegion {
 	def var mapping: Mapping;
 
@@ -8,14 +9,17 @@ class MappedBackendRegion extends BackendRegion {
 
 class FdMappedBackendRegion extends MappedBackendRegion {
 	def var fd: int;
-
+	// TODO: user tells you the fd, and mapping, and then I should map that
 	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping) { }
 }
 
+// TODO: remove this class, the class above is good enough
+// Maybe call it BytePersistentBackendRegion?
 class MmapPersistentBackendRegion extends FdMappedBackendRegion {
 	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping, fd: int) super(range, backend, mapping, fd) { }
 }
 
+// Maybe call it FilePersistentBackendRegion?
 class MappedFileBackendRegion extends FdMappedBackendRegion {
 	def var hasDirtyRange = false;
 	def var dirtyStart: u64 = 0;
@@ -31,7 +35,7 @@ class MappedRegionBackend extends TxnRegionBackend {
 		return MappedBackendRegion.new(range, this, newMapping);
 	}
 
-	def deallocate(region: BackendRegion) {
+	def destroy(region: BackendRegion) {
 		var mapped = asMappedRegion(region);
 		if (mapped != null && mapped.mapping != null) {
 			mapped.mapping.range.unmap();
@@ -69,9 +73,9 @@ class MappedRegionBackend extends TxnRegionBackend {
 
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
-		if ((prot & BackendProt.READ) != 0) mmapProt |= Mmap.PROT_READ;
-		if ((prot & BackendProt.WRITE) != 0) mmapProt |= Mmap.PROT_WRITE;
-		if ((prot & BackendProt.EXEC) != 0) mmapProt |= Mmap.PROT_EXEC;
+		if ((prot & BackendProt.READ.mask) != 0) mmapProt |= Mmap.PROT_READ;
+		if ((prot & BackendProt.WRITE.mask) != 0) mmapProt |= Mmap.PROT_WRITE;
+		if ((prot & BackendProt.EXEC.mask) != 0) mmapProt |= Mmap.PROT_EXEC;
 		return mmapProt;
 	}
 }
@@ -82,7 +86,7 @@ class MmapPersistentBackend extends MappedRegionBackend {
 
 	new(path) { }
 
-	def allocate(size: u64, prot: int) -> BackendRegion {
+	def create(size: u64, prot: int) -> BackendRegion {
 		def fd = RegionFileIO.openOrCreate(path);
 		if (fd < 0) return null;
 		if (!RegionFileIO.ensureSize(fd, size)) {
@@ -163,7 +167,7 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 
 	new(path) { }
 
-	def allocate(size: u64, prot: int) -> BackendRegion {
+	def create(size: u64, prot: int) -> BackendRegion {
 		def fd = RegionFileIO.openOrCreate(path);
 		if (fd < 0) return null;
 		if (!RegionFileIO.ensureSize(fd, size)) {

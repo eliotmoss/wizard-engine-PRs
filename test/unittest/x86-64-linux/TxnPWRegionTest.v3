@@ -224,11 +224,11 @@ class MappedBackendTester(t: Tester) {
 
 	def cleanup() {
 		if (region1 != null) {
-			backend.deallocate(region1);
+			backend.destroy(region1);
 			region1 = null;
 		}
 		if (region2 != null) {
-			backend.deallocate(region2);
+			backend.destroy(region2);
 			region2 = null;
 		}
 		RegionFileIO.unlink(BACKEND_PATH);
@@ -236,12 +236,12 @@ class MappedBackendTester(t: Tester) {
 }
 
 def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
-	def prot = BackendProt.READ | BackendProt.WRITE;
-	tc.region1 = tc.backend.allocate(4096u64, prot);
-	tc.region2 = tc.backend.allocate(4096u64, prot);
+	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
+	tc.region1 = tc.backend.create(4096u64, prot);
+	tc.region2 = tc.backend.create(4096u64, prot);
 
 	if (tc.region1 == null || tc.region2 == null) {
-		tc.t.fail("mapped file backend allocation failed");
+		tc.t.fail("mapped file backend creation failed");
 		tc.cleanup();
 		return;
 	}
@@ -266,7 +266,7 @@ def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
 	tc.t.assertz(false, r1.hasDirtyRange);
 	tc.t.assertz(true, r2.hasDirtyRange);
 
-	tc.backend.deallocate(tc.region1);
+	tc.backend.destroy(tc.region1);
 	tc.region1 = null;
 
 	tc.t.assertz(true, r1.mapping == null);
@@ -299,7 +299,7 @@ def test_pmem_region_type_separation(tc: MappedBackendTester) {
 
 	def mapped = MappedBackendRegion.!(region);
 	def fdRegion = FdMappedBackendRegion.!(region);
-	backend.deallocate(region);
+	backend.destroy(region);
 	tc.t.assertz(true, mapped.mapping == null);
 	tc.t.assert_eq(-1, fdRegion.fd);
 }

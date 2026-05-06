@@ -488,10 +488,10 @@ class PWRegion {
 
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
-                var prot = BackendProt.READ | BackendProt.WRITE;
-                backendRegion = backend.allocate(size, prot);
+                var prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
+                backendRegion = backend.create(size, prot);
                 if (backendRegion == null) {
-                        // Allocation failed
+                        // Creation failed
                         return;
                 }
                 rng = backendRegion.range;
@@ -921,7 +921,7 @@ class PWRegion {
                         wal = null;
                 }
                 if (backendRegion != null) {
-                        backendRegion.backend.deallocate(backendRegion);
+                        backendRegion.backend.destroy(backendRegion);
                         backendRegion = null;
                 }
         }
