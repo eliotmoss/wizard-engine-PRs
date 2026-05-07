@@ -5,8 +5,8 @@
 // different storage backends without platform-specific code:
 //
 // 1. VolatileBackend:          Generic in-memory storage (Array-backed)
-// 2. MmapPersistentBackend:    PMEM-style mapped storage with cache-line flush
-// 3. MappedFileRegionBackend:  Shared file mapping with msync durability
+// 2. PmemMmapBackend:          PMEM-style mapped storage with cache-line flush
+// 3. FileMmapBackend:          Shared file mapping with msync durability
 //
 // The backend is responsible for:
 // - Creating/destroying regions

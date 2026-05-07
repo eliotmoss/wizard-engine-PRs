@@ -205,7 +205,7 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 
 def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
 
-def MT = UnitTests.registerT("txn_backend:", _, MappedBackendTester.new, _);
+def MT = UnitTests.registerT("txn_backend:", _, FileMmapBackendTester.new, _);
 def MX = [
 	MT("mapped_file_region_owns_state", test_mapped_file_region_owns_state),
 	MT("mapped_file_persist_all_clears_dirty_range", test_mapped_file_persist_all_clears_dirty_range),
@@ -217,14 +217,14 @@ def MX = [
 	()
 ];
 
-class MappedBackendTester(t: Tester) {
-	var backend: MappedFileRegionBackend;
+class FileMmapBackendTester(t: Tester) {
+	var backend: FileMmapBackend;
 	var region1: BackendRegion;
 	var region2: BackendRegion;
 
 	new() {
 		RegionFileIO.unlink(BACKEND_PATH);
-		backend = MappedFileRegionBackend.new(BACKEND_PATH);
+		backend = FileMmapBackend.new(BACKEND_PATH);
 	}
 
 	def cleanup() {
@@ -240,7 +240,7 @@ class MappedBackendTester(t: Tester) {
 	}
 }
 
-def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
+def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 	tc.region2 = tc.backend.create(4096u64, prot);
@@ -251,8 +251,8 @@ def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
 		return;
 	}
 
-	var r1 = MappedFileBackendRegion.!(tc.region1);
-	var r2 = MappedFileBackendRegion.!(tc.region2);
+	var r1 = FileMmapRegion.!(tc.region1);
+	var r2 = FileMmapRegion.!(tc.region2);
 
 	tc.t.assertz(false, r1.mapping == r2.mapping);
 	tc.t.assertz(false, r1.mapping.range.start == r2.mapping.range.start);
@@ -292,7 +292,7 @@ def test_mapped_file_region_owns_state(tc: MappedBackendTester) {
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_all_clears_dirty_range(tc: MappedBackendTester) {
+def test_mapped_file_persist_all_clears_dirty_range(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 
@@ -302,7 +302,7 @@ def test_mapped_file_persist_all_clears_dirty_range(tc: MappedBackendTester) {
 		return;
 	}
 
-	var r1 = MappedFileBackendRegion.!(tc.region1);
+	var r1 = FileMmapRegion.!(tc.region1);
 	Pointer.atElement(tc.region1.range, 64).store<u8>(0x7au8);
 	tc.t.assertz(true, tc.region1.flush(64u64, 1u64));
 
@@ -315,7 +315,7 @@ def test_mapped_file_persist_all_clears_dirty_range(tc: MappedBackendTester) {
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_all_keeps_other_region_dirty(tc: MappedBackendTester) {
+def test_mapped_file_persist_all_keeps_other_region_dirty(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 	tc.region2 = tc.backend.create(4096u64, prot);
@@ -326,8 +326,8 @@ def test_mapped_file_persist_all_keeps_other_region_dirty(tc: MappedBackendTeste
 		return;
 	}
 
-	var r1 = MappedFileBackendRegion.!(tc.region1);
-	var r2 = MappedFileBackendRegion.!(tc.region2);
+	var r1 = FileMmapRegion.!(tc.region1);
+	var r2 = FileMmapRegion.!(tc.region2);
 
 	Pointer.atElement(tc.region1.range, 128).store<u8>(0x11u8);
 	Pointer.atElement(tc.region2.range, 256).store<u8>(0x22u8);
@@ -343,7 +343,7 @@ def test_mapped_file_persist_all_keeps_other_region_dirty(tc: MappedBackendTeste
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_all_failure_keeps_dirty_range(tc: MappedBackendTester) {
+def test_mapped_file_persist_all_failure_keeps_dirty_range(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 
@@ -353,7 +353,7 @@ def test_mapped_file_persist_all_failure_keeps_dirty_range(tc: MappedBackendTest
 		return;
 	}
 
-	var r1 = MappedFileBackendRegion.!(tc.region1);
+	var r1 = FileMmapRegion.!(tc.region1);
 	tc.t.assertz(true, tc.region1.flush(96u64, 8u64));
 	RegionFileIO.close(r1.fd);
 
@@ -365,7 +365,7 @@ def test_mapped_file_persist_all_failure_keeps_dirty_range(tc: MappedBackendTest
 	tc.cleanup();
 }
 
-def test_mapped_file_invalid_ops_fail(tc: MappedBackendTester) {
+def test_mapped_file_invalid_ops_fail(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 
@@ -387,13 +387,13 @@ def test_mapped_file_invalid_ops_fail(tc: MappedBackendTester) {
 	tc.cleanup();
 }
 
-def test_fdatasync_invalid_fd_fails(tc: MappedBackendTester) {
+def test_fdatasync_invalid_fd_fails(tc: FileMmapBackendTester) {
 	tc.t.assertz(false, RegionFileIO.fdatasync(-1));
 	tc.cleanup();
 }
 
-def test_pmem_region_uses_fd_region(tc: MappedBackendTester) {
-	def backend = MmapPersistentBackend.new(BACKEND_PATH);
+def test_pmem_region_uses_fd_region(tc: FileMmapBackendTester) {
+	def backend = PmemMmapBackend.new(BACKEND_PATH);
 	def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
 	var region: BackendRegion = backend.makePersistentRegion(mapping, -1);
 
@@ -402,12 +402,12 @@ def test_pmem_region_uses_fd_region(tc: MappedBackendTester) {
 		return;
 	}
 
-	tc.t.assertz(true, FdMappedBackendRegion.?(region));
-	tc.t.assertz(false, MappedFileBackendRegion.?(region));
-	tc.t.assertz(true, MmapPersistentBackend.?(region.backend));
+	tc.t.assertz(true, FdMmapRegion.?(region));
+	tc.t.assertz(false, FileMmapRegion.?(region));
+	tc.t.assertz(true, PmemMmapBackend.?(region.backend));
 
-	def mapped = MappedBackendRegion.!(region);
-	def fdRegion = FdMappedBackendRegion.!(region);
+	def mapped = MmapRegion.!(region);
+	def fdRegion = FdMmapRegion.!(region);
 	tc.t.assertz(true, Pointer.atElement(mapped.range, 0) == mapped.mapping.range.start);
 	tc.t.assert_eq(int.!(mapped.mapping.range.size()), mapped.range.length);
 	backend.destroy(region);

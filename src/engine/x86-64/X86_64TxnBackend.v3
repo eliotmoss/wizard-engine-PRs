@@ -1,20 +1,19 @@
 // x86-64 specific transaction backend implementations
 
-class MappedBackendRegion extends BackendRegion {
+class MmapRegion extends BackendRegion {
 	def var mapping: Mapping;
 
 	new(backend: TxnRegionBackend, mapping: Mapping)
 		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size())), backend) { }
 }
 
-class FdMappedBackendRegion extends MappedBackendRegion {
+class FdMmapRegion extends MmapRegion {
 	def var fd: int;
 
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping) { }
 }
 
-// Maybe call it FilePersistentBackendRegion?
-class MappedFileBackendRegion extends FdMappedBackendRegion {
+class FileMmapRegion extends FdMmapRegion {
 	def var hasDirtyRange = false;
 	def var dirtyStart: u64 = 0;
 	def var dirtyEnd: u64 = 0;
@@ -22,10 +21,10 @@ class MappedFileBackendRegion extends FdMappedBackendRegion {
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
 }
 
-class MappedRegionBackend extends TxnRegionBackend {
-	def makeRegion(newMapping: Mapping) -> MappedBackendRegion {
+class MmapRegionBackend extends TxnRegionBackend {
+	def makeRegion(newMapping: Mapping) -> MmapRegion {
 		if (newMapping == null) return null;
-		return MappedBackendRegion.new(this, newMapping);
+		return MmapRegion.new(this, newMapping);
 	}
 
 	def destroy(region: BackendRegion) {
@@ -39,14 +38,14 @@ class MappedRegionBackend extends TxnRegionBackend {
 
 	def cleanup(region: BackendRegion) { }
 
-	def asMappedRegion(region: BackendRegion) -> MappedBackendRegion {
-		if (!MappedBackendRegion.?(region)) return null;
-		return MappedBackendRegion.!(region);
+	def asMappedRegion(region: BackendRegion) -> MmapRegion {
+		if (!MmapRegion.?(region)) return null;
+		return MmapRegion.!(region);
 	}
 
-	def asFdRegion(region: BackendRegion) -> FdMappedBackendRegion {
-		if (!FdMappedBackendRegion.?(region)) return null;
-		return FdMappedBackendRegion.!(region);
+	def asFdRegion(region: BackendRegion) -> FdMmapRegion {
+		if (!FdMmapRegion.?(region)) return null;
+		return FdMmapRegion.!(region);
 	}
 
 	def closeFdRegion(region: BackendRegion) {
@@ -68,7 +67,7 @@ class MappedRegionBackend extends TxnRegionBackend {
 }
 
 // Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
-class MmapPersistentBackend extends MappedRegionBackend {
+class PmemMmapBackend extends MmapRegionBackend {
 	def path: string;  // Path to PMEM device or DAX file
 
 	new(path) { }
@@ -91,9 +90,9 @@ class MmapPersistentBackend extends MappedRegionBackend {
 		return region;
 	}
 
-	def makePersistentRegion(newMapping: Mapping, fd: int) -> FdMappedBackendRegion {
+	def makePersistentRegion(newMapping: Mapping, fd: int) -> FdMmapRegion {
 		if (newMapping == null) return null;
-		return FdMappedBackendRegion.new(this, newMapping, fd);
+		return FdMmapRegion.new(this, newMapping, fd);
 	}
 	
 	def flush(region: BackendRegion, offset: u64, size: u64) -> bool {
@@ -159,7 +158,7 @@ class MmapPersistentBackend extends MappedRegionBackend {
 	}
 }
 
-class MappedFileRegionBackend extends MappedRegionBackend {
+class FileMmapBackend extends MmapRegionBackend {
 	def path: string;
 
 	new(path) { }
@@ -182,9 +181,9 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 		return region;
 	}
 
-	def makeFileRegion(newMapping: Mapping, fd: int) -> MappedFileBackendRegion {
+	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
 		if (newMapping == null) return null;
-		return MappedFileBackendRegion.new(this, newMapping, fd);
+		return FileMmapRegion.new(this, newMapping, fd);
 	}
 
 	def flush(region: BackendRegion, offset: u64, size: u64) -> bool {
@@ -246,9 +245,9 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 		closeFdRegion(region);
 	}
 
-	def asFileRegion(region: BackendRegion) -> MappedFileBackendRegion {
-		if (!MappedFileBackendRegion.?(region)) return null;
-		return MappedFileBackendRegion.!(region);
+	def asFileRegion(region: BackendRegion) -> FileMmapRegion {
+		if (!FileMmapRegion.?(region)) return null;
+		return FileMmapRegion.!(region);
 	}
 }
 
@@ -301,10 +300,10 @@ component X86_64Backends {
 	
 	// Get PMEM backend (x86-64 specific with cache flush instructions)
 	def getPersistent(path: string) -> TxnRegionBackend {
-		return MmapPersistentBackend.new(path);
+		return PmemMmapBackend.new(path);
 	}
 
 	def getFileMapped(path: string) -> TxnRegionBackend {
-		return MappedFileRegionBackend.new(path);
+		return FileMmapBackend.new(path);
 	}
 }
