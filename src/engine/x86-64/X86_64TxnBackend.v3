@@ -37,12 +37,6 @@ class MappedRegionBackend extends TxnRegionBackend {
 		cleanup(region);
 	}
 
-	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
-		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
-		var mmapProt = convertProt(prot);
-		return Mmap.protect(start, size, mmapProt);
-	}
-
 	def cleanup(region: BackendRegion) { }
 
 	def asMappedRegion(region: BackendRegion) -> MappedBackendRegion {

@@ -10,7 +10,6 @@
 //
 // The backend is responsible for:
 // - Creating/destroying regions
-// - Memory protection (mprotect)
 // - Persistence flush scheduling (which may batch dirty ranges)
 // - Durability fences that complete those flushes
 
@@ -41,10 +40,6 @@ class TxnRegionBackend {
 	
 	// Destroy a previously created region
 	def destroy(region: BackendRegion);
-	
-	// TODO: reconsider whether we want protect
-	// Change protection on a region
-	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool;
 	
 	// Schedule data for persistence. Implementations may batch dirty ranges here
 	// and delay the final durability operation until fence().
@@ -84,11 +79,6 @@ class VolatileBackend extends TxnRegionBackend {
 	def destroy(region: BackendRegion) {
 		// Array will be garbage collected automatically
 		// No explicit cleanup needed
-	}
-	
-	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
-		// No-op for array-based memory (no memory protection)
-		return true;
 	}
 	
 	def flush(region: BackendRegion, offset: u64, size: u64) {
@@ -134,12 +124,6 @@ class MmapBackend extends TxnRegionBackend {
 				mapped.mapping = null;
 			}
 		}
-	}
-	
-	def protect(region: BackendRegion, offset: u64, size: u64, prot: int) -> bool {
-		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
-		var mmapProt = convertProt(prot);
-		return Mmap.protect(start, size, mmapProt);
 	}
 	
 	def flush(region: BackendRegion, offset: u64, size: u64) {
