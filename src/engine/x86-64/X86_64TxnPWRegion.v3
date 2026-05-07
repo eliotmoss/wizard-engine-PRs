@@ -745,8 +745,7 @@ class PWRegion {
                 hdr.magic = PWRegions.MAGIC;
 
                 // Persist the freshly formatted region image before exposing it.
-                backendRegion.flush(0, u64.!(rng.length));
-                backendRegion.fence();
+                backendRegion.persistRange(0, u64.!(rng.length));
         }
 
         def getHeader() -> Ref<PWRegionHeader> {

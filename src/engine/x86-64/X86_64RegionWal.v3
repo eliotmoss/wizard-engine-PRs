@@ -45,16 +45,14 @@ class RegionWal {
                 // Flush log entries to persistent storage
                 if (backendRegion != null) {
                         def entryBytes = u64.view(currentEntryIndex) * u64.!(LogEntry.size);
-                        backendRegion.flush(entryBase - regionStart, entryBytes);
-                        backendRegion.fence();
+                        backendRegion.persistRange(entryBase - regionStart, entryBytes);
                 }
 
                 header.status = 1;
 
                 // Flush the header
                 if (backendRegion != null) {
-                        backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
-                        backendRegion.fence();
+                        backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
                 }
         }
 
@@ -63,8 +61,7 @@ class RegionWal {
                 header.status = 0;
                 header.checksum = 0u64;
                 if (backendRegion != null) {
-                        backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
-                        backendRegion.fence();
+                        backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
                 }
                 currentEntryIndex = 0;
         }
@@ -81,13 +78,13 @@ class RegionWal {
                         _ => ;
                 }
                 if (backendRegion != null) {
-                        backendRegion.flush(offset, u64.view(width));
+                        backendRegion.markDirty(offset, u64.view(width));
                 }
         }
 
         def fenceAppliedUpdates() {
                 if (backendRegion != null) {
-                        backendRegion.fence();
+                        backendRegion.persistChanges();
                 }
         }
 
@@ -122,8 +119,7 @@ class RegionWal {
                         // do not retry a corrupt log.
                         header.status = 0;
                         if (backendRegion != null) {
-                                backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
-                                backendRegion.fence();
+                                backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
                         }
                         return false;
                 }
@@ -139,8 +135,7 @@ class RegionWal {
 
                 header.status = 0;
                 if (backendRegion != null) {
-                        backendRegion.flush(logChunkAddr - regionStart, u64.!(LogHeader.size));
-                        backendRegion.fence();
+                        backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
                 }
                 return true;
         }

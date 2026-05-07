@@ -10,8 +10,8 @@
 //
 // The backend is responsible for:
 // - Creating/destroying regions
-// - Persistence flush scheduling (which may batch dirty ranges)
-// - Durability fences that complete those flushes
+// - Tracking dirty data ranges that can be persisted as a batch
+// - Persisting specific ranges when callers need explicit ordering
 
 // A memory region created by a backend
 class BackendRegion {
@@ -22,19 +22,21 @@ class BackendRegion {
 	
 	new(range, backend) { }
 	
-	// Flush data to persistent storage (no-op for volatile)
-	def flush(offset: u64, size: u64) -> bool {
-		return backend.flush(this, offset, size);
+	// Mark ordinary data bytes as changed. The backend may batch these changes
+	// until persistChanges().
+	def markDirty(offset: u64, size: u64) -> bool {
+		return backend.markDirty(this, offset, size);
 	}
 
-	// Ensure durability fence (no-op for volatile)
-	def fence() -> bool {
-		return backend.fence(this);
+	// Synchronously persist a specific range. This is intended for ordered WAL
+	// log/header writes.
+	def persistRange(offset: u64, size: u64) -> bool {
+		return backend.persistRange(this, offset, size);
 	}
 
-	// Persist all durable storage associated with this region.
-	def persistAll() -> bool {
-		return backend.persistAll(this);
+	// Synchronously persist all dirty ranges previously marked on this region.
+	def persistChanges() -> bool {
+		return backend.persistChanges(this);
 	}
 }
 
@@ -46,20 +48,16 @@ class TxnRegionBackend {
 	// Destroy a previously created region
 	def destroy(region: BackendRegion);
 	
-	// Schedule data for persistence. Implementations may batch dirty ranges here
-	// and delay the final durability operation until fence().
-	def flush(region: BackendRegion, offset: u64, size: u64) -> bool;
-	// TODO: consider having two kinds of flush:
-	// 1. flush a specific range
-	// 2. flush all pending changes
-	
-	// Complete persistence for any prior flush() calls.
-	def fence(region: BackendRegion) -> bool;
+	// Mark ordinary data bytes as changed. Implementations may batch dirty
+	// ranges here and delay the durability operation until persistChanges().
+	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool;
 
-	// Synchronously persist all durable storage associated with this region.
-	// This is coarser than flush()/fence(); callers that need range ordering
-	// should keep using the staged range operations.
-	def persistAll(region: BackendRegion) -> bool;
+	// Synchronously persist a specific range. This is intended for WAL bytes
+	// where the caller needs an explicit durability boundary.
+	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool;
+
+	// Complete persistence for all prior markDirty() calls on this region.
+	def persistChanges(region: BackendRegion) -> bool;
 	
 	// Check if this backend provides persistence
 	def isPersistent() -> bool;
@@ -91,17 +89,17 @@ class VolatileBackend extends TxnRegionBackend {
 		// No explicit cleanup needed
 	}
 	
-	def flush(region: BackendRegion, offset: u64, size: u64) -> bool {
-		// No-op for volatile memory
-		return true;
-	}
-	
-	def fence(region: BackendRegion) -> bool {
+	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
 		// No-op for volatile memory
 		return true;
 	}
 
-	def persistAll(region: BackendRegion) -> bool {
+	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
+		// No-op for volatile memory
+		return true;
+	}
+
+	def persistChanges(region: BackendRegion) -> bool {
 		return true;
 	}
 	
@@ -142,11 +140,15 @@ class MmapBackend extends TxnRegionBackend {
 		}
 	}
 	
-	def flush(region: BackendRegion, offset: u64, size: u64) {
+	def markDirty(region: BackendRegion, offset: u64, size: u64) {
 		// No-op for volatile memory
 	}
 	
-	def fence(region: BackendRegion) {
+	def persistRange(region: BackendRegion, offset: u64, size: u64) {
+		// No-op for volatile memory
+	}
+
+	def persistChanges(region: BackendRegion) {
 		// No-op for volatile memory
 	}
 	

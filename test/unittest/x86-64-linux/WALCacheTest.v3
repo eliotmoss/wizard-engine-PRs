@@ -7,6 +7,7 @@ def X = [
 	T("basic_u64_flow", test_basic_u64_flow),
 	T("read_fallthrough", test_read_fallthrough),
 	T("commit_applies_and_clears", test_commit_applies_and_clears),
+	T("commit_uses_persistence_api", test_commit_uses_persistence_api),
 	T("commit_clean_noop", test_commit_clean_noop),
 	T("overwrite_update", test_overwrite_update),
 	T("is_dirty_check", test_is_dirty_check),
@@ -14,9 +15,53 @@ def X = [
 	()
 ];
 
+class CountingBackend extends TxnRegionBackend {
+	def range: Range<byte>;
+	def var markDirtyCount = 0;
+	def var persistRangeCount = 0;
+	def var persistChangesCount = 0;
+	def var lastDirtyOffset: u64 = 0;
+	def var lastDirtySize: u64 = 0;
+
+	new(range) { }
+
+	def create(size: u64, prot: int) -> BackendRegion {
+		return BackendRegion.new(range, this);
+	}
+
+	def destroy(region: BackendRegion) { }
+
+	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
+		markDirtyCount++;
+		lastDirtyOffset = offset;
+		lastDirtySize = size;
+		return true;
+	}
+
+	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
+		persistRangeCount++;
+		return true;
+	}
+
+	def persistChanges(region: BackendRegion) -> bool {
+		persistChangesCount++;
+		return true;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "counting";
+	}
+}
+
 class RegionTransactionTester(t: Tester) {
 	var txn: RegionTransaction;
 	var wal: RegionWal;
+	var backend: CountingBackend;
+	var backendRegion: BackendRegion;
 	// Backing memory for the pointers to test read-through and write-back
 	var dummyData: Array<byte>;
 
@@ -25,7 +70,9 @@ class RegionTransactionTester(t: Tester) {
 		// Initialize memory with a known pattern (0xAA) to detect changes/fallthroughs
 		for (i < 1024) dummyData[i] = 0xAAu8;
 		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
-		wal = RegionWal.new(regionStart, regionStart, 1024, null);
+		backend = CountingBackend.new(dummyData[0 ..+ dummyData.length]);
+		backendRegion = backend.create(1024u64, BackendProt.READ.mask | BackendProt.WRITE.mask);
+		wal = RegionWal.new(regionStart, regionStart, 1024, backendRegion);
 		txn = RegionTransaction.new(wal, regionStart);
 	}
 	
@@ -117,7 +164,22 @@ def test_commit_applies_and_clears(tc: RegionTransactionTester) {
 	tc.t.assertz(false, tc.txn.isDirty());
 }
 
-// Test 5: Committing a clean transaction is a no-op.
+// Test 5: WAL commit uses range persistence for log bytes and dirty batching for data bytes.
+def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
+	var addr = tc.getAddr(200);
+	var val = 0x0102_0304_0506_0708u64;
+
+	tc.txn.writeU64(addr, val);
+	tc.txn.commit();
+
+	tc.t.assert_eq(3, tc.backend.persistRangeCount);
+	tc.t.assert_eq(1, tc.backend.markDirtyCount);
+	tc.t.assert_eq(1, tc.backend.persistChangesCount);
+	tc.t.assert_eq(addr - tc.wal.regionStart, tc.backend.lastDirtyOffset);
+	tc.t.assert_eq(8u64, tc.backend.lastDirtySize);
+}
+
+// Test 6: Committing a clean transaction is a no-op.
 def test_commit_clean_noop(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(20);
 	tc.t.assertz(false, tc.txn.isDirty());
@@ -127,7 +189,7 @@ def test_commit_clean_noop(tc: RegionTransactionTester) {
 	tc.t.assert_eq(0xAAu8, tc.txn.readU8(addr));
 }
 
-// Test 6: Overwriting updates the cache entry
+// Test 7: Overwriting updates the cache entry
 def test_overwrite_update(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(16);
 
@@ -138,7 +200,7 @@ def test_overwrite_update(tc: RegionTransactionTester) {
 	tc.t.assert_eq(200u64, tc.txn.readU64(addr));
 }
 
-// Test 7: Verifying the isDirty check
+// Test 8: Verifying the isDirty check
 def test_is_dirty_check(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(32);
 
@@ -148,7 +210,7 @@ def test_is_dirty_check(tc: RegionTransactionTester) {
 	tc.t.assertz(true, tc.txn.isDirty());
 }
 
-// Test 8: Aligned/Spatial Access Constraints
+// Test 9: Aligned/Spatial Access Constraints
 def test_misaligned_access(tc: RegionTransactionTester) {
 	var baseAddr = tc.getAddr(60);
 	var offsetAddr = tc.getAddr(61);
