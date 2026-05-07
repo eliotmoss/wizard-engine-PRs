@@ -96,8 +96,11 @@ class MmapPersistentBackend extends MappedRegionBackend {
 		return FdMappedBackendRegion.new(this, newMapping, fd);
 	}
 	
-	def flush(region: BackendRegion, offset: u64, size: u64) {
-		if (size == 0) return;
+	def flush(region: BackendRegion, offset: u64, size: u64) -> bool {
+		if (region == null) return false;
+		def regionSize = u64.!(region.range.length);
+		if (offset > regionSize || size > regionSize - offset) return false;
+		if (size == 0) return true;
 		// Flush cache lines to PMEM
 		// CLWB (Cache Line Write Back) is the preferred instruction
 		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
@@ -113,11 +116,19 @@ class MmapPersistentBackend extends MappedRegionBackend {
 			flushCacheLine(PWRegionUtils.pointerFromU64(addr));
 			addr = addr + cacheLineSize;
 		}
+		return true;
 	}
 	
-	def fence(region: BackendRegion) {
+	def fence(region: BackendRegion) -> bool {
+		if (region == null) return false;
 		// SFENCE ensures all cache line flushes complete before continuing
 		storeFence();
+		return true;
+	}
+
+	def persistAll(region: BackendRegion) -> bool {
+		if (region == null) return false;
+		return flush(region, 0, u64.!(region.range.length)) && fence(region);
 	}
 	
 	def isPersistent() -> bool {
@@ -176,33 +187,47 @@ class MappedFileRegionBackend extends MappedRegionBackend {
 		return MappedFileBackendRegion.new(this, newMapping, fd);
 	}
 
-	def flush(region: BackendRegion, offset: u64, size: u64) {
-		if (size == 0) return;
+	def flush(region: BackendRegion, offset: u64, size: u64) -> bool {
 		def fileRegion = asFileRegion(region);
-		if (fileRegion == null) return;
+		if (fileRegion == null || fileRegion.mapping == null) return false;
+		def regionSize = u64.!(fileRegion.range.length);
+		if (offset > regionSize || size > regionSize - offset) return false;
+		if (size == 0) return true;
 		def end = offset + size;
 		if (!fileRegion.hasDirtyRange) {
 			fileRegion.dirtyStart = offset;
 			fileRegion.dirtyEnd = end;
 			fileRegion.hasDirtyRange = true;
-			return;
+			return true;
 		}
 		if (offset < fileRegion.dirtyStart) fileRegion.dirtyStart = offset;
 		if (end > fileRegion.dirtyEnd) fileRegion.dirtyEnd = end;
+		return true;
 	}
 
-	def fence(region: BackendRegion) {
+	def fence(region: BackendRegion) -> bool {
 		def fileRegion = asFileRegion(region);
-		if (fileRegion == null || !fileRegion.hasDirtyRange || fileRegion.mapping == null) return;
+		if (fileRegion == null || fileRegion.mapping == null) return false;
+		if (!fileRegion.hasDirtyRange) return true;
 
 		// TODO: define this somewhere else as a constant
 		def pageSize = 4096u64;
 		def syncStart = fileRegion.dirtyStart - (fileRegion.dirtyStart % pageSize);
 		def syncEnd = ((fileRegion.dirtyEnd + pageSize - 1u64) / pageSize) * pageSize;
-		Mmap.sync(fileRegion.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
+		if (!Mmap.sync(fileRegion.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC)) return false;
 
 		fileRegion.hasDirtyRange = false;
 		fileRegion.dirtyStart = fileRegion.dirtyEnd = 0;
+		return true;
+	}
+
+	def persistAll(region: BackendRegion) -> bool {
+		def fileRegion = asFileRegion(region);
+		if (fileRegion == null || fileRegion.mapping == null || fileRegion.fd < 0) return false;
+		if (!RegionFileIO.fdatasync(fileRegion.fd)) return false;
+		fileRegion.hasDirtyRange = false;
+		fileRegion.dirtyStart = fileRegion.dirtyEnd = 0;
+		return true;
 	}
 
 	def isPersistent() -> bool {
@@ -244,6 +269,10 @@ component RegionFileIO {
 		if (fileSize == i64.view(size)) return true;
 		if (Linux.syscall(LinuxConst.SYS_ftruncate, (fd, size)).0 != 0) return false;
 		return Linux.syscall(LinuxConst.SYS_fsync, fd).0 == 0;
+	}
+
+	def fdatasync(fd: int) -> bool {
+		return Linux.syscall(LinuxConst.SYS_fdatasync, fd).0 == 0;
 	}
 
 	def close(fd: int) {

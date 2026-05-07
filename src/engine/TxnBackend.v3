@@ -23,13 +23,18 @@ class BackendRegion {
 	new(range, backend) { }
 	
 	// Flush data to persistent storage (no-op for volatile)
-	def flush(offset: u64, size: u64) {
-		backend.flush(this, offset, size);
+	def flush(offset: u64, size: u64) -> bool {
+		return backend.flush(this, offset, size);
 	}
 
 	// Ensure durability fence (no-op for volatile)
-	def fence() {
-		backend.fence(this);
+	def fence() -> bool {
+		return backend.fence(this);
+	}
+
+	// Persist all durable storage associated with this region.
+	def persistAll() -> bool {
+		return backend.persistAll(this);
 	}
 }
 
@@ -43,13 +48,18 @@ class TxnRegionBackend {
 	
 	// Schedule data for persistence. Implementations may batch dirty ranges here
 	// and delay the final durability operation until fence().
-	def flush(region: BackendRegion, offset: u64, size: u64);
+	def flush(region: BackendRegion, offset: u64, size: u64) -> bool;
 	// TODO: consider having two kinds of flush:
 	// 1. flush a specific range
 	// 2. flush all pending changes
 	
 	// Complete persistence for any prior flush() calls.
-	def fence(region: BackendRegion);
+	def fence(region: BackendRegion) -> bool;
+
+	// Synchronously persist all durable storage associated with this region.
+	// This is coarser than flush()/fence(); callers that need range ordering
+	// should keep using the staged range operations.
+	def persistAll(region: BackendRegion) -> bool;
 	
 	// Check if this backend provides persistence
 	def isPersistent() -> bool;
@@ -81,12 +91,18 @@ class VolatileBackend extends TxnRegionBackend {
 		// No explicit cleanup needed
 	}
 	
-	def flush(region: BackendRegion, offset: u64, size: u64) {
+	def flush(region: BackendRegion, offset: u64, size: u64) -> bool {
 		// No-op for volatile memory
+		return true;
 	}
 	
-	def fence(region: BackendRegion) {
+	def fence(region: BackendRegion) -> bool {
 		// No-op for volatile memory
+		return true;
+	}
+
+	def persistAll(region: BackendRegion) -> bool {
+		return true;
 	}
 	
 	def isPersistent() -> bool {
