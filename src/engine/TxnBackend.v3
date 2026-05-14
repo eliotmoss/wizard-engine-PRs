@@ -10,8 +10,8 @@
 //
 // The backend is responsible for:
 // - Creating/destroying regions
-// - Tracking dirty data ranges that can be persisted as a batch
-// - Persisting specific ranges when callers need explicit ordering
+// - Preparing changed data for a later durability barrier
+// - Persisting specific ranges synchronously when callers need explicit ordering
 
 // A memory region created by a backend
 class BackendRegion {
@@ -22,8 +22,8 @@ class BackendRegion {
 	
 	new(range, backend) { }
 	
-	// Mark ordinary data bytes as changed. The backend may batch these changes
-	// until persistChanges().
+	// Mark ordinary data bytes as already changed. The backend must prepare
+	// these bytes for durability at the next persistChanges().
 	def markDirty(offset: u64, size: u64) -> bool {
 		return backend.markDirty(this, offset, size);
 	}
@@ -34,7 +34,7 @@ class BackendRegion {
 		return backend.persistRange(this, offset, size);
 	}
 
-	// Synchronously persist all dirty ranges previously marked on this region.
+	// Complete persistence for all prior markDirty() calls on this region.
 	def persistChanges() -> bool {
 		return backend.persistChanges(this);
 	}
@@ -48,8 +48,8 @@ class TxnRegionBackend {
 	// Destroy a previously created region
 	def destroy(region: BackendRegion);
 	
-	// Mark ordinary data bytes as changed. Implementations may batch dirty
-	// ranges here and delay the durability operation until persistChanges().
+	// Mark ordinary data bytes as already changed. Implementations may use any
+	// backend-specific preparation needed before persistChanges().
 	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool;
 
 	// Synchronously persist a specific range. This is intended for WAL bytes

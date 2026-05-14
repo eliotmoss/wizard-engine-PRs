@@ -9,14 +9,19 @@ class MmapRegion extends BackendRegion {
 
 class FdMmapRegion extends MmapRegion {
 	def var fd: int;
-	def var hasDirtyRange = false;
-	def var dirtyStart: u64 = 0;
-	def var dirtyEnd: u64 = 0;
 
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping) { }
 }
 
 class FileMmapRegion extends FdMmapRegion {
+	def var hasDirtyChanges = false;
+
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
+}
+
+class PmemMmapRegion extends FdMmapRegion {
+	def var hasPendingWriteback = false;
+
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
 }
 
@@ -70,26 +75,6 @@ class MmapRegionBackend extends TxnRegionBackend {
 		return offset <= regionSize && size <= regionSize - offset;
 	}
 
-	def markDirtyRange(region: FdMmapRegion, offset: u64, size: u64) -> bool {
-		if (region == null || region.mapping == null) return false;
-		if (!validRange(region, offset, size)) return false;
-		if (size == 0) return true;
-		def end = offset + size;
-		if (!region.hasDirtyRange) {
-			region.dirtyStart = offset;
-			region.dirtyEnd = end;
-			region.hasDirtyRange = true;
-			return true;
-		}
-		if (offset < region.dirtyStart) region.dirtyStart = offset;
-		if (end > region.dirtyEnd) region.dirtyEnd = end;
-		return true;
-	}
-
-	def clearDirtyRange(region: FdMmapRegion) {
-		region.hasDirtyRange = false;
-		region.dirtyStart = region.dirtyEnd = 0;
-	}
 }
 
 // Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
@@ -116,30 +101,33 @@ class PmemMmapBackend extends MmapRegionBackend {
 		return region;
 	}
 
-	def makePersistentRegion(newMapping: Mapping, fd: int) -> FdMmapRegion {
+	def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
 		if (newMapping == null) return null;
-		return FdMmapRegion.new(this, newMapping, fd);
+		return PmemMmapRegion.new(this, newMapping, fd);
 	}
 	
 	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
-		return markDirtyRange(asFdRegion(region), offset, size);
+		def pmemRegion = asPmemRegion(region);
+		if (pmemRegion == null || pmemRegion.mapping == null) return false;
+		if (!flushRange(pmemRegion, offset, size)) return false;
+		if (size != 0) pmemRegion.hasPendingWriteback = true;
+		return true;
 	}
 
 	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
-		def mapped = asMappedRegion(region);
-		if (mapped == null || mapped.mapping == null) return false;
-		if (!flushRange(mapped, offset, size)) return false;
+		def pmemRegion = asPmemRegion(region);
+		if (pmemRegion == null || pmemRegion.mapping == null) return false;
+		if (!flushRange(pmemRegion, offset, size)) return false;
 		storeFence();
 		return true;
 	}
 
 	def persistChanges(region: BackendRegion) -> bool {
-		def fdRegion = asFdRegion(region);
-		if (fdRegion == null || fdRegion.mapping == null) return false;
-		if (!fdRegion.hasDirtyRange) return true;
-		if (!flushRange(fdRegion, fdRegion.dirtyStart, fdRegion.dirtyEnd - fdRegion.dirtyStart)) return false;
+		def pmemRegion = asPmemRegion(region);
+		if (pmemRegion == null || pmemRegion.mapping == null) return false;
+		if (!pmemRegion.hasPendingWriteback) return true;
 		storeFence();
-		clearDirtyRange(fdRegion);
+		pmemRegion.hasPendingWriteback = false;
 		return true;
 	}
 
@@ -173,9 +161,14 @@ class PmemMmapBackend extends MmapRegionBackend {
 	}
 
 	def cleanup(region: BackendRegion) {
-		def fdRegion = asFdRegion(region);
-		if (fdRegion != null) clearDirtyRange(fdRegion);
+		def pmemRegion = asPmemRegion(region);
+		if (pmemRegion != null) pmemRegion.hasPendingWriteback = false;
 		closeFdRegion(region);
+	}
+
+	def asPmemRegion(region: BackendRegion) -> PmemMmapRegion {
+		if (!PmemMmapRegion.?(region)) return null;
+		return PmemMmapRegion.!(region);
 	}
 	
 	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
@@ -224,7 +217,10 @@ class FileMmapBackend extends MmapRegionBackend {
 
 	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
 		def fileRegion = asFileRegion(region);
-		return markDirtyRange(fileRegion, offset, size);
+		if (fileRegion == null || fileRegion.mapping == null) return false;
+		if (!validRange(fileRegion, offset, size)) return false;
+		if (size != 0) fileRegion.hasDirtyChanges = true;
+		return true;
 	}
 
 	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
@@ -236,10 +232,10 @@ class FileMmapBackend extends MmapRegionBackend {
 	def persistChanges(region: BackendRegion) -> bool {
 		def fileRegion = asFileRegion(region);
 		if (fileRegion == null || fileRegion.mapping == null || fileRegion.fd < 0) return false;
-		if (!fileRegion.hasDirtyRange) return true;
+		if (!fileRegion.hasDirtyChanges) return true;
 		if (!RegionFileIO.fdatasync(fileRegion.fd)) return false;
 
-		clearDirtyRange(fileRegion);
+		fileRegion.hasDirtyChanges = false;
 		return true;
 	}
 
@@ -249,8 +245,8 @@ class FileMmapBackend extends MmapRegionBackend {
 		// TODO: define this somewhere else as a constant
 		def pageSize = 4096u64;
 		def syncStart = offset - (offset % pageSize);
-		def dirtyEnd = offset + size;
-		def syncEnd = ((dirtyEnd + pageSize - 1u64) / pageSize) * pageSize;
+		def rangeEnd = offset + size;
+		def syncEnd = ((rangeEnd + pageSize - 1u64) / pageSize) * pageSize;
 		return Mmap.sync(region.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
 	}
 
@@ -265,7 +261,7 @@ class FileMmapBackend extends MmapRegionBackend {
 	def cleanup(region: BackendRegion) {
 		def fileRegion = asFileRegion(region);
 		if (fileRegion == null) return;
-		clearDirtyRange(fileRegion);
+		fileRegion.hasDirtyChanges = false;
 		closeFdRegion(region);
 	}
 

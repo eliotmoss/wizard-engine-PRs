@@ -208,13 +208,13 @@ def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
 def MT = UnitTests.registerT("txn_backend:", _, FileMmapBackendTester.new, _);
 def MX = [
 	MT("mapped_file_region_owns_state", test_mapped_file_region_owns_state),
-	MT("mapped_file_persist_changes_clears_dirty_range", test_mapped_file_persist_changes_clears_dirty_range),
+	MT("mapped_file_persist_changes_clears_dirty_flag", test_mapped_file_persist_changes_clears_dirty_flag),
 	MT("mapped_file_persist_changes_keeps_other_region_dirty", test_mapped_file_persist_changes_keeps_other_region_dirty),
-	MT("mapped_file_persist_changes_failure_keeps_dirty_range", test_mapped_file_persist_changes_failure_keeps_dirty_range),
-	MT("mapped_file_persist_range_keeps_dirty_range", test_mapped_file_persist_range_keeps_dirty_range),
+	MT("mapped_file_persist_changes_failure_keeps_dirty_flag", test_mapped_file_persist_changes_failure_keeps_dirty_flag),
+	MT("mapped_file_persist_range_keeps_dirty_flag", test_mapped_file_persist_range_keeps_dirty_flag),
 	MT("mapped_file_invalid_ops_fail", test_mapped_file_invalid_ops_fail),
 	MT("fdatasync_invalid_fd_fails", test_fdatasync_invalid_fd_fails),
-	MT("pmem_region_uses_fd_region", test_pmem_region_uses_fd_region),
+	MT("pmem_region_tracks_pending_writeback", test_pmem_region_tracks_pending_writeback),
 	()
 ];
 
@@ -265,16 +265,12 @@ def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 	tc.t.assertz(true, tc.region1.markDirty(128u64, 16u64));
 	tc.t.assertz(true, tc.region2.markDirty(256u64, 32u64));
 
-	tc.t.assertz(true, r1.hasDirtyRange);
-	tc.t.assert_eq(128u64, r1.dirtyStart);
-	tc.t.assert_eq(144u64, r1.dirtyEnd);
-	tc.t.assertz(true, r2.hasDirtyRange);
-	tc.t.assert_eq(256u64, r2.dirtyStart);
-	tc.t.assert_eq(288u64, r2.dirtyEnd);
+	tc.t.assertz(true, r1.hasDirtyChanges);
+	tc.t.assertz(true, r2.hasDirtyChanges);
 
 	tc.t.assertz(true, tc.region1.persistChanges());
-	tc.t.assertz(false, r1.hasDirtyRange);
-	tc.t.assertz(true, r2.hasDirtyRange);
+	tc.t.assertz(false, r1.hasDirtyChanges);
+	tc.t.assertz(true, r2.hasDirtyChanges);
 
 	tc.backend.destroy(tc.region1);
 	tc.region1 = null;
@@ -282,18 +278,18 @@ def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 	tc.t.assertz(true, r1.mapping == null);
 	tc.t.assert_eq(-1, r1.fd);
 	tc.t.assertz(false, r2.mapping == null);
-	tc.t.assertz(true, r2.hasDirtyRange);
+	tc.t.assertz(true, r2.hasDirtyChanges);
 
 	Pointer.atElement(tc.region2.range, 0).store<u8>(0x42u8);
 	tc.t.assert_eq(0x42u8, Pointer.atElement(tc.region2.range, 0).load<u8>());
 
 	tc.t.assertz(true, tc.region2.persistChanges());
-	tc.t.assertz(false, r2.hasDirtyRange);
+	tc.t.assertz(false, r2.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_changes_clears_dirty_range(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_changes_clears_dirty_flag(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 
@@ -307,11 +303,9 @@ def test_mapped_file_persist_changes_clears_dirty_range(tc: FileMmapBackendTeste
 	Pointer.atElement(tc.region1.range, 64).store<u8>(0x7au8);
 	tc.t.assertz(true, tc.region1.markDirty(64u64, 1u64));
 
-	tc.t.assertz(true, r1.hasDirtyRange);
+	tc.t.assertz(true, r1.hasDirtyChanges);
 	tc.t.assertz(true, tc.region1.persistChanges());
-	tc.t.assertz(false, r1.hasDirtyRange);
-	tc.t.assert_eq(0u64, r1.dirtyStart);
-	tc.t.assert_eq(0u64, r1.dirtyEnd);
+	tc.t.assertz(false, r1.hasDirtyChanges);
 
 	tc.cleanup();
 }
@@ -336,15 +330,13 @@ def test_mapped_file_persist_changes_keeps_other_region_dirty(tc: FileMmapBacken
 	tc.t.assertz(true, tc.region2.markDirty(256u64, 1u64));
 
 	tc.t.assertz(true, tc.region1.persistChanges());
-	tc.t.assertz(false, r1.hasDirtyRange);
-	tc.t.assertz(true, r2.hasDirtyRange);
-	tc.t.assert_eq(256u64, r2.dirtyStart);
-	tc.t.assert_eq(257u64, r2.dirtyEnd);
+	tc.t.assertz(false, r1.hasDirtyChanges);
+	tc.t.assertz(true, r2.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_changes_failure_keeps_dirty_range(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_changes_failure_keeps_dirty_flag(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 
@@ -359,14 +351,12 @@ def test_mapped_file_persist_changes_failure_keeps_dirty_range(tc: FileMmapBacke
 	RegionFileIO.close(r1.fd);
 
 	tc.t.assertz(false, tc.region1.persistChanges());
-	tc.t.assertz(true, r1.hasDirtyRange);
-	tc.t.assert_eq(96u64, r1.dirtyStart);
-	tc.t.assert_eq(104u64, r1.dirtyEnd);
+	tc.t.assertz(true, r1.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_range_keeps_dirty_range(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_range_keeps_dirty_flag(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	tc.region1 = tc.backend.create(4096u64, prot);
 
@@ -382,9 +372,7 @@ def test_mapped_file_persist_range_keeps_dirty_range(tc: FileMmapBackendTester) 
 	tc.t.assertz(true, tc.region1.markDirty(64u64, 1u64));
 	tc.t.assertz(true, tc.region1.persistRange(512u64, 1u64));
 
-	tc.t.assertz(true, r1.hasDirtyRange);
-	tc.t.assert_eq(64u64, r1.dirtyStart);
-	tc.t.assert_eq(65u64, r1.dirtyEnd);
+	tc.t.assertz(true, r1.hasDirtyChanges);
 
 	tc.cleanup();
 }
@@ -419,7 +407,7 @@ def test_fdatasync_invalid_fd_fails(tc: FileMmapBackendTester) {
 	tc.cleanup();
 }
 
-def test_pmem_region_uses_fd_region(tc: FileMmapBackendTester) {
+def test_pmem_region_tracks_pending_writeback(tc: FileMmapBackendTester) {
 	def backend = PmemMmapBackend.new(BACKEND_PATH);
 	def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
 	var region: BackendRegion = backend.makePersistentRegion(mapping, -1);
@@ -430,19 +418,24 @@ def test_pmem_region_uses_fd_region(tc: FileMmapBackendTester) {
 	}
 
 	tc.t.assertz(true, FdMmapRegion.?(region));
+	tc.t.assertz(true, PmemMmapRegion.?(region));
 	tc.t.assertz(false, FileMmapRegion.?(region));
 	tc.t.assertz(true, PmemMmapBackend.?(region.backend));
 
 	def mapped = MmapRegion.!(region);
 	def fdRegion = FdMmapRegion.!(region);
+	def pmemRegion = PmemMmapRegion.!(region);
 	tc.t.assertz(true, Pointer.atElement(mapped.range, 0) == mapped.mapping.range.start);
 	tc.t.assert_eq(int.!(mapped.mapping.range.size()), mapped.range.length);
 	tc.t.assertz(true, region.markDirty(32u64, 8u64));
-	tc.t.assertz(true, fdRegion.hasDirtyRange);
-	tc.t.assert_eq(32u64, fdRegion.dirtyStart);
-	tc.t.assert_eq(40u64, fdRegion.dirtyEnd);
+	tc.t.assertz(true, pmemRegion.hasPendingWriteback);
+	tc.t.assertz(true, region.markDirty(4096u64, 0u64));
+	tc.t.assertz(false, region.markDirty(4096u64, 1u64));
+	tc.t.assertz(false, region.markDirty(4095u64, 2u64));
+	tc.t.assertz(true, region.persistRange(512u64, 1u64));
+	tc.t.assertz(true, pmemRegion.hasPendingWriteback);
 	tc.t.assertz(true, region.persistChanges());
-	tc.t.assertz(false, fdRegion.hasDirtyRange);
+	tc.t.assertz(false, pmemRegion.hasPendingWriteback);
 	backend.destroy(region);
 	tc.t.assertz(true, mapped.mapping == null);
 	tc.t.assert_eq(-1, fdRegion.fd);
