@@ -28,19 +28,20 @@ class BackendRegion {
 		return backend.markDirty(this, offset, size);
 	}
 
+	// Complete persistence for all prior markDirty() calls on this region.
+	def persistChanges() -> bool {
+		return backend.persistChanges(this);
+	}
+
 	// Synchronously persist a specific range. This is intended for ordered WAL
 	// log/header writes.
 	def persistRange(offset: u64, size: u64) -> bool {
 		return backend.persistRange(this, offset, size);
 	}
-
-	// Complete persistence for all prior markDirty() calls on this region.
-	def persistChanges() -> bool {
-		return backend.persistChanges(this);
-	}
 }
 
 // Backend interface that all storage implementations must provide
+// TODO: maybe call it a RegionManager
 class TxnRegionBackend {
 	// Create a region of the given size with specified protection
 	def create(size: u64, prot: int) -> BackendRegion;
@@ -52,12 +53,12 @@ class TxnRegionBackend {
 	// backend-specific preparation needed before persistChanges().
 	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool;
 
+	// Complete persistence for all prior markDirty() calls on this region.
+	def persistChanges(region: BackendRegion) -> bool;
+
 	// Synchronously persist a specific range. This is intended for WAL bytes
 	// where the caller needs an explicit durability boundary.
 	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool;
-
-	// Complete persistence for all prior markDirty() calls on this region.
-	def persistChanges(region: BackendRegion) -> bool;
 	
 	// Check if this backend provides persistence
 	def isPersistent() -> bool;
