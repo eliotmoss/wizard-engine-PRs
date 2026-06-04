@@ -25,6 +25,7 @@ class PmemMmapRegion extends FdMmapRegion {
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
 }
 
+// TODO: consider removing this class or making it abstract, if it's not used directly
 class MmapRegionBackend extends TxnRegionBackend {
 	def makeRegion(newMapping: Mapping) -> MmapRegion {
 		if (newMapping == null) return null;
@@ -81,9 +82,12 @@ class MmapRegionBackend extends TxnRegionBackend {
 class PmemMmapBackend extends MmapRegionBackend {
 	def path: string;  // Path to PMEM device or DAX file
 
+	// TODO: think about whether we want a single path to be able to used to create multiple regions
 	new(path) { }
 
 	def create(size: u64, prot: int) -> BackendRegion {
+		// TODO: opening an old file and creating a new file should be done with separate methods,
+		// because creating a new file would need to populate the file with initial values
 		def fd = RegionFileIO.openOrCreate(path);
 		if (fd < 0) return null;
 		if (!RegionFileIO.ensureSize(fd, size)) {
@@ -121,6 +125,8 @@ class PmemMmapBackend extends MmapRegionBackend {
 		storeFence();
 		return true;
 	}
+
+	// TODO: think about if I can have a better class hierarchy to avoid doing downcastings all over the place
 
 	def persistChanges(region: BackendRegion) -> bool {
 		def pmemRegion = asPmemRegion(region);
