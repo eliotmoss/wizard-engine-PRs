@@ -1,16 +1,11 @@
 // x86-64 specific transaction backend implementations
 
-class MmapRegion extends BackendRegion {
+class FdMmapRegion extends BackendRegion {
 	def var mapping: Mapping;
-
-	new(backend: TxnRegionBackend, mapping: Mapping)
-		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size())), backend) { }
-}
-
-class FdMmapRegion extends MmapRegion {
 	def var fd: int;
 
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping) { }
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int)
+		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size())), backend) { }
 }
 
 class FileMmapRegion extends FdMmapRegion {
@@ -25,28 +20,19 @@ class PmemMmapRegion extends FdMmapRegion {
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
 }
 
-// TODO: consider removing this class or making it abstract, if it's not used directly
-class MmapRegionBackend extends TxnRegionBackend {
-	def makeRegion(newMapping: Mapping) -> MmapRegion {
-		if (newMapping == null) return null;
-		return MmapRegion.new(this, newMapping);
-	}
-
+class MmapTxnRegionBackend extends TxnRegionBackend {
 	def destroy(region: BackendRegion) {
-		var mapped = asMappedRegion(region);
-		if (mapped != null && mapped.mapping != null) {
-			mapped.mapping.range.unmap();
-			mapped.mapping = null;
+		if (region == null || region.backend != this) return;
+		def fdRegion = asFdRegion(region);
+		if (fdRegion == null) return;
+		cleanupRegionState(region);
+		if (fdRegion.mapping != null) {
+			fdRegion.mapping.range.unmap();
+			fdRegion.mapping = null;
 		}
-		cleanup(region);
 	}
 
-	def cleanup(region: BackendRegion) { }
-
-	def asMappedRegion(region: BackendRegion) -> MmapRegion {
-		if (!MmapRegion.?(region)) return null;
-		return MmapRegion.!(region);
-	}
+	def cleanupRegionState(region: BackendRegion) { }
 
 	def asFdRegion(region: BackendRegion) -> FdMmapRegion {
 		if (!FdMmapRegion.?(region)) return null;
@@ -79,7 +65,7 @@ class MmapRegionBackend extends TxnRegionBackend {
 }
 
 // Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
-class PmemMmapBackend extends MmapRegionBackend {
+class PmemMmapBackend extends MmapTxnRegionBackend {
 	def path: string;  // Path to PMEM device or DAX file
 
 	// TODO: think about whether we want a single path to be able to used to create multiple regions
@@ -137,7 +123,7 @@ class PmemMmapBackend extends MmapRegionBackend {
 		return true;
 	}
 
-	private def flushRange(region: MmapRegion, offset: u64, size: u64) -> bool {
+	private def flushRange(region: PmemMmapRegion, offset: u64, size: u64) -> bool {
 		if (!validRange(region, offset, size)) return false;
 		if (size == 0) return true;
 		// Flush cache lines to PMEM
@@ -166,7 +152,7 @@ class PmemMmapBackend extends MmapRegionBackend {
 		return "mmap-pmem";
 	}
 
-	def cleanup(region: BackendRegion) {
+	def cleanupRegionState(region: BackendRegion) {
 		def pmemRegion = asPmemRegion(region);
 		if (pmemRegion != null) pmemRegion.hasPendingWriteback = false;
 		closeFdRegion(region);
@@ -193,7 +179,7 @@ class PmemMmapBackend extends MmapRegionBackend {
 	}
 }
 
-class FileMmapBackend extends MmapRegionBackend {
+class FileMmapBackend extends MmapTxnRegionBackend {
 	def path: string;
 
 	new(path) { }
@@ -264,7 +250,7 @@ class FileMmapBackend extends MmapRegionBackend {
 		return "mmap-file";
 	}
 
-	def cleanup(region: BackendRegion) {
+	def cleanupRegionState(region: BackendRegion) {
 		def fileRegion = asFileRegion(region);
 		if (fileRegion == null) return;
 		fileRegion.hasDirtyChanges = false;
