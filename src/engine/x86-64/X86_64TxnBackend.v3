@@ -4,8 +4,8 @@ class FdMmapRegion extends BackendRegion {
 	def var mapping: Mapping;
 	def var fd: int;
 
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int)
-		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size())), backend) { }
+	new(mapping: Mapping, fd: int)
+		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size()))) { }
 
 	def validRange(offset: u64, size: u64) -> bool {
 		def regionSize = u64.!(range.length);
@@ -103,7 +103,7 @@ component MmapRegionUtils {
 class FileMmapRegion extends FdMmapRegion {
 	def var hasDirtyChanges = false;
 
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
+	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
 	def prepareChangedRange(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
@@ -134,7 +134,7 @@ class FileMmapRegion extends FdMmapRegion {
 class PmemMmapRegion extends FdMmapRegion {
 	def var hasPendingWriteback = false;
 
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
+	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
 	def prepareChangedRange(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
@@ -194,7 +194,7 @@ class PmemMmapBackend extends TxnRegionBackend {
 
 	def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
 		if (newMapping == null) return null;
-		return PmemMmapRegion.new(this, newMapping, fd);
+		return PmemMmapRegion.new(newMapping, fd);
 	}
 
 	def isPersistent() -> bool {
@@ -231,7 +231,7 @@ class FileMmapBackend extends TxnRegionBackend {
 
 	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
 		if (newMapping == null) return null;
-		return FileMmapRegion.new(this, newMapping, fd);
+		return FileMmapRegion.new(newMapping, fd);
 	}
 
 	def isPersistent() -> bool {

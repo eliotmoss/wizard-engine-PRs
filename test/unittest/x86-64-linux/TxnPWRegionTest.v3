@@ -443,7 +443,6 @@ def test_pmem_region_tracks_pending_writeback(tc: FileMmapBackendTester) {
 	tc.t.assertz(true, FdMmapRegion.?(region));
 	tc.t.assertz(true, PmemMmapRegion.?(region));
 	tc.t.assertz(false, FileMmapRegion.?(region));
-	tc.t.assertz(true, PmemMmapBackend.?(region.backend));
 
 	def fdRegion = FdMmapRegion.!(region);
 	def pmemRegion = PmemMmapRegion.!(region);

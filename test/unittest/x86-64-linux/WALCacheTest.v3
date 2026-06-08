@@ -41,7 +41,7 @@ class CountingBackend extends TxnRegionBackend {
 class CountingRegion extends BackendRegion {
 	def counter: CountingBackend;
 
-	new(range: Range<byte>, counter: CountingBackend) super(range, counter) { }
+	new(range: Range<byte>, counter: CountingBackend) super(range) { }
 
 	def destroy() { }
 

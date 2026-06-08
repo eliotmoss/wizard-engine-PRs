@@ -14,9 +14,8 @@
 // A memory region created by a backend
 class BackendRegion {
 	def range: Range<byte>;  // The actual bytes of the region
-	def backend: TxnRegionBackend;  // Reference to the backend that created this
 	
-	new(range, backend) { }
+	new(range) { }
 	
 	// Destroy this region and release any resources it owns.
 	def destroy();
@@ -55,7 +54,7 @@ enum BackendProt(mask: int) {
 }
 
 class VolatileRegion extends BackendRegion {
-	new(range: Range<byte>, backend: TxnRegionBackend) super(range, backend) { }
+	new(range: Range<byte>) super(range) { }
 
 	def destroy() {
 		// Array storage is garbage collected automatically.
@@ -81,7 +80,7 @@ class VolatileBackend extends TxnRegionBackend {
 		// Create a byte array-backed region
 		var data = Array<byte>.new(int.!(size));
 		var range = data[0 ..+ data.length];
-		return VolatileRegion.new(range, this);
+		return VolatileRegion.new(range);
 	}
 	
 	def isPersistent() -> bool {
