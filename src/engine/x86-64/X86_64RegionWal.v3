@@ -78,7 +78,7 @@ class RegionWal {
                         _ => ;
                 }
                 if (backendRegion != null) {
-                        backendRegion.markDirty(offset, u64.view(width));
+                        backendRegion.prepareChangedRange(offset, u64.view(width));
                 }
         }
 
@@ -143,6 +143,6 @@ class RegionWal {
         // --- Lifecycle ---
 
         def close() {
-                // No-op: memory is managed by TxnRegionBackend
+                // No-op: memory is managed by BackendRegion
         }
 }

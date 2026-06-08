@@ -17,7 +17,7 @@ def X = [
 
 class CountingBackend extends TxnRegionBackend {
 	def range: Range<byte>;
-	def var markDirtyCount = 0;
+	def var prepareChangedRangeCount = 0;
 	def var persistRangeCount = 0;
 	def var persistChangesCount = 0;
 	def var lastDirtyOffset: u64 = 0;
@@ -26,26 +26,7 @@ class CountingBackend extends TxnRegionBackend {
 	new(range) { }
 
 	def create(size: u64, prot: int) -> BackendRegion {
-		return BackendRegion.new(range, this);
-	}
-
-	def destroy(region: BackendRegion) { }
-
-	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
-		markDirtyCount++;
-		lastDirtyOffset = offset;
-		lastDirtySize = size;
-		return true;
-	}
-
-	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
-		persistRangeCount++;
-		return true;
-	}
-
-	def persistChanges(region: BackendRegion) -> bool {
-		persistChangesCount++;
-		return true;
+		return CountingRegion.new(range, this);
 	}
 
 	def isPersistent() -> bool {
@@ -54,6 +35,31 @@ class CountingBackend extends TxnRegionBackend {
 
 	def name() -> string {
 		return "counting";
+	}
+}
+
+class CountingRegion extends BackendRegion {
+	def counter: CountingBackend;
+
+	new(range: Range<byte>, counter: CountingBackend) super(range, counter) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		counter.prepareChangedRangeCount++;
+		counter.lastDirtyOffset = offset;
+		counter.lastDirtySize = size;
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		counter.persistRangeCount++;
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		counter.persistChangesCount++;
+		return true;
 	}
 }
 
@@ -173,7 +179,7 @@ def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	tc.txn.commit();
 
 	tc.t.assert_eq(3, tc.backend.persistRangeCount);
-	tc.t.assert_eq(1, tc.backend.markDirtyCount);
+	tc.t.assert_eq(1, tc.backend.prepareChangedRangeCount);
 	tc.t.assert_eq(1, tc.backend.persistChangesCount);
 	tc.t.assert_eq(addr - tc.wal.regionStart, tc.backend.lastDirtyOffset);
 	tc.t.assert_eq(8u64, tc.backend.lastDirtySize);

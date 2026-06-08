@@ -8,36 +8,29 @@
 // 2. PmemMmapBackend:          PMEM-style mapped storage with cache-line flush
 // 3. FileMmapBackend:          Shared file mapping with msync durability
 //
-// The backend is responsible for:
-// - Creating/destroying regions
-// - Preparing changed data for a later durability barrier
-// - Persisting specific ranges synchronously when callers need explicit ordering
+// The backend is responsible for creating regions and reporting capabilities.
+// Region objects own their own lifecycle and persistence behavior.
 
 // A memory region created by a backend
 class BackendRegion {
 	def range: Range<byte>;  // The actual bytes of the region
 	def backend: TxnRegionBackend;  // Reference to the backend that created this
-// Mapping exists only on certain targets
-//	var mapping: Mapping;  // Keeps the Mapping alive so GC finalizer doesn't unmap prematurely
 	
 	new(range, backend) { }
 	
-	// Mark ordinary data bytes as already changed. The backend must prepare
-	// these bytes for durability at the next persistChanges().
-	def markDirty(offset: u64, size: u64) -> bool {
-		return backend.markDirty(this, offset, size);
-	}
+	// Destroy this region and release any resources it owns.
+	def destroy();
 
-	// Complete persistence for all prior markDirty() calls on this region.
-	def persistChanges() -> bool {
-		return backend.persistChanges(this);
-	}
+	// Ordinary data bytes have already changed; prepare them for durability at
+	// the next persistChanges().
+	def prepareChangedRange(offset: u64, size: u64) -> bool;
+
+	// Complete persistence for all prior prepareChangedRange() calls.
+	def persistChanges() -> bool;
 
 	// Synchronously persist a specific range. This is intended for ordered WAL
 	// log/header writes.
-	def persistRange(offset: u64, size: u64) -> bool {
-		return backend.persistRange(this, offset, size);
-	}
+	def persistRange(offset: u64, size: u64) -> bool;
 }
 
 // Backend interface that all storage implementations must provide
@@ -45,20 +38,6 @@ class BackendRegion {
 class TxnRegionBackend {
 	// Create a region of the given size with specified protection
 	def create(size: u64, prot: int) -> BackendRegion;
-	
-	// Destroy a previously created region
-	def destroy(region: BackendRegion);
-	
-	// Mark ordinary data bytes as already changed. Implementations may use any
-	// backend-specific preparation needed before persistChanges().
-	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool;
-
-	// Complete persistence for all prior markDirty() calls on this region.
-	def persistChanges(region: BackendRegion) -> bool;
-
-	// Synchronously persist a specific range. This is intended for WAL bytes
-	// where the caller needs an explicit durability boundary.
-	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool;
 	
 	// Check if this backend provides persistence
 	def isPersistent() -> bool;
@@ -75,6 +54,26 @@ enum BackendProt(mask: int) {
 	EXEC(4)
 }
 
+class VolatileRegion extends BackendRegion {
+	new(range: Range<byte>, backend: TxnRegionBackend) super(range, backend) { }
+
+	def destroy() {
+		// Array storage is garbage collected automatically.
+	}
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+}
+
 // Platform-independent volatile memory backend using simple Array allocation
 class VolatileBackend extends TxnRegionBackend {
 	
@@ -82,26 +81,7 @@ class VolatileBackend extends TxnRegionBackend {
 		// Create a byte array-backed region
 		var data = Array<byte>.new(int.!(size));
 		var range = data[0 ..+ data.length];
-		return BackendRegion.new(range, this);
-	}
-	
-	def destroy(region: BackendRegion) {
-		// Array will be garbage collected automatically
-		// No explicit cleanup needed
-	}
-	
-	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
-		// No-op for volatile memory
-		return true;
-	}
-
-	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
-		// No-op for volatile memory
-		return true;
-	}
-
-	def persistChanges(region: BackendRegion) -> bool {
-		return true;
+		return VolatileRegion.new(range, this);
 	}
 	
 	def isPersistent() -> bool {
@@ -113,68 +93,9 @@ class VolatileBackend extends TxnRegionBackend {
 	}
 }
 
-// Mmap-based memory backend (platform-independent, uses POSIX mmap)
-/* must be restricted to specific platforms, e.g., x86-64-linux
-class MmapBackendRegion extends BackendRegion {
-	def var mapping: Mapping;
-
-	new(range: Range<byte>, backend: TxnRegionBackend, mapping: Mapping) super(range, backend) { }
-}
-
-class MmapBackend extends TxnRegionBackend {
-	def create(size: u64, prot: int) -> BackendRegion {
-		var mmapProt = convertProt(prot);
-		var mapping = Mmap.reserve(size, mmapProt);
-		if (mapping == null) return null;
-		var range = CiRuntime.forgeRange<byte>(mapping.range.start, int.!(size));
-		return MmapBackendRegion.new(range, this, mapping);
-	}
-	
-	def destroy(region: BackendRegion) {
-		// Explicitly unmap and clear reference
-		if (MmapBackendRegion.?(region)) {
-			var mapped = MmapBackendRegion.!(region);
-			if (mapped.mapping != null) {
-				mapped.mapping.range.unmap();
-				mapped.mapping = null;
-			}
-		}
-	}
-	
-	def markDirty(region: BackendRegion, offset: u64, size: u64) {
-		// No-op for volatile memory
-	}
-	
-	def persistRange(region: BackendRegion, offset: u64, size: u64) {
-		// No-op for volatile memory
-	}
-
-	def persistChanges(region: BackendRegion) {
-		// No-op for volatile memory
-	}
-	
-	def isPersistent() -> bool {
-		return false;
-	}
-	
-	def name() -> string {
-		return "mmap";
-	}
-	
-	private def convertProt(prot: int) -> int {
-		var mmapProt = Mmap.PROT_NONE;
-		if ((prot & BackendProt.READ.mask) != 0) mmapProt |= Mmap.PROT_READ;
-		if ((prot & BackendProt.WRITE.mask) != 0) mmapProt |= Mmap.PROT_WRITE;
-		if ((prot & BackendProt.EXEC.mask) != 0) mmapProt |= Mmap.PROT_EXEC;
-		return mmapProt;
-	}
-}
-*/
-
 // Global instances of platform-independent backends
 component Backends {
 	private var volatileBackend: VolatileBackend;
-//	private var mmapBackend: MmapBackend;
 	
 	def getVolatile() -> TxnRegionBackend {
 		if (volatileBackend == null) {
@@ -184,12 +105,4 @@ component Backends {
 	}
 	
 	def getMmap() -> TxnRegionBackend;
-/* must be restricted to specific back ends, e.g., x86-64-linux
-	def getMmap() -> TxnRegionBackend {
-		if (mmapBackend == null) {
-			mmapBackend = MmapBackend.new();
-		}
-		return mmapBackend;
-	}
-*/
 }

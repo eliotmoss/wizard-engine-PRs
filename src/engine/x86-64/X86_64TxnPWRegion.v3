@@ -920,7 +920,7 @@ class PWRegion {
                         wal = null;
                 }
                 if (backendRegion != null) {
-                        backendRegion.backend.destroy(backendRegion);
+                        backendRegion.destroy();
                         backendRegion = null;
                 }
         }

@@ -6,48 +6,44 @@ class FdMmapRegion extends BackendRegion {
 
 	new(backend: TxnRegionBackend, mapping: Mapping, fd: int)
 		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size())), backend) { }
-}
 
-class FileMmapRegion extends FdMmapRegion {
-	def var hasDirtyChanges = false;
+	def validRange(offset: u64, size: u64) -> bool {
+		def regionSize = u64.!(range.length);
+		return offset <= regionSize && size <= regionSize - offset;
+	}
 
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
-}
+	def cleanupBeforeDestroy() { }
 
-class PmemMmapRegion extends FdMmapRegion {
-	def var hasPendingWriteback = false;
+	def destroy() {
+		cleanupBeforeDestroy();
+		if (mapping != null) {
+			mapping.range.unmap();
+			mapping = null;
+		}
+		closeFd();
+	}
 
-	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
-}
-
-class MmapTxnRegionBackend extends TxnRegionBackend {
-	def destroy(region: BackendRegion) {
-		if (region == null || region.backend != this) return;
-		def fdRegion = asFdRegion(region);
-		if (fdRegion == null) return;
-		cleanupRegionState(region);
-		if (fdRegion.mapping != null) {
-			fdRegion.mapping.range.unmap();
-			fdRegion.mapping = null;
+	def closeFd() {
+		if (fd >= 0) {
+			RegionFileIO.close(fd);
+			fd = -1;
 		}
 	}
 
-	def cleanupRegionState(region: BackendRegion) { }
-
-	def asFdRegion(region: BackendRegion) -> FdMmapRegion {
-		if (!FdMmapRegion.?(region)) return null;
-		return FdMmapRegion.!(region);
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		return false;
 	}
 
-	def closeFdRegion(region: BackendRegion) {
-		def fdRegion = asFdRegion(region);
-		if (fdRegion == null) return;
-		if (fdRegion.fd >= 0) {
-			RegionFileIO.close(fdRegion.fd);
-			fdRegion.fd = -1;
-		}
+	def persistChanges() -> bool {
+		return false;
 	}
 
+	def persistRange(offset: u64, size: u64) -> bool {
+		return false;
+	}
+}
+
+component MmapRegionUtils {
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
 		if ((prot & BackendProt.READ.mask) != 0) mmapProt |= Mmap.PROT_READ;
@@ -56,16 +52,121 @@ class MmapTxnRegionBackend extends TxnRegionBackend {
 		return mmapProt;
 	}
 
-	def validRange(region: BackendRegion, offset: u64, size: u64) -> bool {
-		if (region == null) return false;
-		def regionSize = u64.!(region.range.length);
-		return offset <= regionSize && size <= regionSize - offset;
+	def pageAlignedSyncRange(region: FdMmapRegion, offset: u64, size: u64) -> bool {
+		if (!region.validRange(offset, size)) return false;
+		if (size == 0) return true;
+		// TODO: define this somewhere else as a constant
+		def pageSize = 4096u64;
+		def syncStart = offset - (offset % pageSize);
+		def rangeEnd = offset + size;
+		def syncEnd = ((rangeEnd + pageSize - 1u64) / pageSize) * pageSize;
+		return Mmap.sync(region.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
 	}
 
+	def flushRange(region: FdMmapRegion, offset: u64, size: u64) -> bool {
+		if (!region.validRange(offset, size)) return false;
+		if (size == 0) return true;
+		// Flush cache lines to PMEM
+		// CLWB (Cache Line Write Back) is the preferred instruction
+		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
+		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
+		var end = start + i64.view(size);
+		def cacheLineSize = 64u64; // x86-64 cache line size
+
+		// Flush each cache line
+		var addr = u64.view(start);
+		def endAddr = u64.view(end);
+		addr = addr - (addr % cacheLineSize);
+		while (addr < endAddr) {
+			flushCacheLine(PWRegionUtils.pointerFromU64(addr));
+			addr = addr + cacheLineSize;
+		}
+		return true;
+	}
+
+	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
+	private def flushCacheLine(addr: Pointer) {
+		// TODO: This needs compiler support for inline assembly
+		// Ideally: __builtin_ia32_clwb(addr) or asm volatile("clwb (%0)" :: "r"(addr))
+		// For now, this is a placeholder that would need to be implemented
+		// with proper x86-64 CLWB/CLFLUSHOPT/CLFLUSH instruction
+	}
+
+	// Platform-specific store fence
+	def storeFence() {
+		// TODO: This needs compiler support for inline assembly
+		// Ideally: __builtin_ia32_sfence() or asm volatile("sfence")
+		// For now, this is a placeholder
+	}
+}
+
+class FileMmapRegion extends FdMmapRegion {
+	def var hasDirtyChanges = false;
+
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		if (mapping == null) return false;
+		if (!validRange(offset, size)) return false;
+		if (size != 0) hasDirtyChanges = true;
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		if (mapping == null) return false;
+		return MmapRegionUtils.pageAlignedSyncRange(this, offset, size);
+	}
+
+	def persistChanges() -> bool {
+		if (mapping == null || fd < 0) return false;
+		if (!hasDirtyChanges) return true;
+		if (!RegionFileIO.fdatasync(fd)) return false;
+
+		hasDirtyChanges = false;
+		return true;
+	}
+
+	def cleanupBeforeDestroy() {
+		hasDirtyChanges = false;
+	}
+}
+
+class PmemMmapRegion extends FdMmapRegion {
+	def var hasPendingWriteback = false;
+
+	new(backend: TxnRegionBackend, mapping: Mapping, fd: int) super(backend, mapping, fd) { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		if (mapping == null) return false;
+		if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
+		if (size != 0) hasPendingWriteback = true;
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		if (mapping == null) return false;
+		if (!hasPendingWriteback) return true;
+		MmapRegionUtils.storeFence();
+		hasPendingWriteback = false;
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		if (mapping == null) return false;
+		if (!validRange(offset, size)) return false;
+		if (size == 0) return true;
+		if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
+		MmapRegionUtils.storeFence();
+		return true;
+	}
+
+	def cleanupBeforeDestroy() {
+		hasPendingWriteback = false;
+	}
 }
 
 // Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
-class PmemMmapBackend extends MmapTxnRegionBackend {
+class PmemMmapBackend extends TxnRegionBackend {
 	def path: string;  // Path to PMEM device or DAX file
 
 	// TODO: think about whether we want a single path to be able to used to create multiple regions
@@ -81,7 +182,7 @@ class PmemMmapBackend extends MmapTxnRegionBackend {
 			return null;
 		}
 
-		var mmapProt = convertProt(prot);
+		var mmapProt = MmapRegionUtils.convertProt(prot);
 		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED_VALIDATE | Mmap.MAP_SYNC, fd, 0);
 		def region = makePersistentRegion(mapping, fd);
 		if (region == null) {
@@ -95,91 +196,17 @@ class PmemMmapBackend extends MmapTxnRegionBackend {
 		if (newMapping == null) return null;
 		return PmemMmapRegion.new(this, newMapping, fd);
 	}
-	
-	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
-		def pmemRegion = asPmemRegion(region);
-		if (pmemRegion == null || pmemRegion.mapping == null) return false;
-		if (!flushRange(pmemRegion, offset, size)) return false;
-		if (size != 0) pmemRegion.hasPendingWriteback = true;
-		return true;
-	}
 
-	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
-		def pmemRegion = asPmemRegion(region);
-		if (pmemRegion == null || pmemRegion.mapping == null) return false;
-		if (!flushRange(pmemRegion, offset, size)) return false;
-		storeFence();
-		return true;
-	}
-
-	// TODO: think about if I can have a better class hierarchy to avoid doing downcastings all over the place
-
-	def persistChanges(region: BackendRegion) -> bool {
-		def pmemRegion = asPmemRegion(region);
-		if (pmemRegion == null || pmemRegion.mapping == null) return false;
-		if (!pmemRegion.hasPendingWriteback) return true;
-		storeFence();
-		pmemRegion.hasPendingWriteback = false;
-		return true;
-	}
-
-	private def flushRange(region: PmemMmapRegion, offset: u64, size: u64) -> bool {
-		if (!validRange(region, offset, size)) return false;
-		if (size == 0) return true;
-		// Flush cache lines to PMEM
-		// CLWB (Cache Line Write Back) is the preferred instruction
-		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
-		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
-		var end = start + i64.view(size);
-		def cacheLineSize = 64u64; // x86-64 cache line size
-		
-		// Flush each cache line
-		var addr = u64.view(start);
-		def endAddr = u64.view(end);
-		addr = addr - (addr % cacheLineSize);
-		while (addr < endAddr) {
-			flushCacheLine(PWRegionUtils.pointerFromU64(addr));
-			addr = addr + cacheLineSize;
-		}
-		return true;
-	}
-	
 	def isPersistent() -> bool {
 		return true;
 	}
-	
+
 	def name() -> string {
 		return "mmap-pmem";
 	}
-
-	def cleanupRegionState(region: BackendRegion) {
-		def pmemRegion = asPmemRegion(region);
-		if (pmemRegion != null) pmemRegion.hasPendingWriteback = false;
-		closeFdRegion(region);
-	}
-
-	def asPmemRegion(region: BackendRegion) -> PmemMmapRegion {
-		if (!PmemMmapRegion.?(region)) return null;
-		return PmemMmapRegion.!(region);
-	}
-	
-	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
-	private def flushCacheLine(addr: Pointer) {
-		// TODO: This needs compiler support for inline assembly
-		// Ideally: __builtin_ia32_clwb(addr) or asm volatile("clwb (%0)" :: "r"(addr))
-		// For now, this is a placeholder that would need to be implemented
-		// with proper x86-64 CLWB/CLFLUSHOPT/CLFLUSH instruction
-	}
-	
-	// Platform-specific store fence
-	private def storeFence() {
-		// TODO: This needs compiler support for inline assembly
-		// Ideally: __builtin_ia32_sfence() or asm volatile("sfence")
-		// For now, this is a placeholder
-	}
 }
 
-class FileMmapBackend extends MmapTxnRegionBackend {
+class FileMmapBackend extends TxnRegionBackend {
 	def path: string;
 
 	new(path) { }
@@ -192,7 +219,7 @@ class FileMmapBackend extends MmapTxnRegionBackend {
 			return null;
 		}
 
-		def mmapProt = convertProt(prot);
+		def mmapProt = MmapRegionUtils.convertProt(prot);
 		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED, fd, 0);
 		def region = makeFileRegion(mapping, fd);
 		if (region == null) {
@@ -207,59 +234,12 @@ class FileMmapBackend extends MmapTxnRegionBackend {
 		return FileMmapRegion.new(this, newMapping, fd);
 	}
 
-	def markDirty(region: BackendRegion, offset: u64, size: u64) -> bool {
-		def fileRegion = asFileRegion(region);
-		if (fileRegion == null || fileRegion.mapping == null) return false;
-		if (!validRange(fileRegion, offset, size)) return false;
-		if (size != 0) fileRegion.hasDirtyChanges = true;
-		return true;
-	}
-
-	def persistRange(region: BackendRegion, offset: u64, size: u64) -> bool {
-		def fileRegion = asFileRegion(region);
-		if (fileRegion == null || fileRegion.mapping == null) return false;
-		return syncRange(fileRegion, offset, size);
-	}
-
-	def persistChanges(region: BackendRegion) -> bool {
-		def fileRegion = asFileRegion(region);
-		if (fileRegion == null || fileRegion.mapping == null || fileRegion.fd < 0) return false;
-		if (!fileRegion.hasDirtyChanges) return true;
-		if (!RegionFileIO.fdatasync(fileRegion.fd)) return false;
-
-		fileRegion.hasDirtyChanges = false;
-		return true;
-	}
-
-	private def syncRange(region: FileMmapRegion, offset: u64, size: u64) -> bool {
-		if (!validRange(region, offset, size)) return false;
-		if (size == 0) return true;
-		// TODO: define this somewhere else as a constant
-		def pageSize = 4096u64;
-		def syncStart = offset - (offset % pageSize);
-		def rangeEnd = offset + size;
-		def syncEnd = ((rangeEnd + pageSize - 1u64) / pageSize) * pageSize;
-		return Mmap.sync(region.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
-	}
-
 	def isPersistent() -> bool {
 		return true;
 	}
 
 	def name() -> string {
 		return "mmap-file";
-	}
-
-	def cleanupRegionState(region: BackendRegion) {
-		def fileRegion = asFileRegion(region);
-		if (fileRegion == null) return;
-		fileRegion.hasDirtyChanges = false;
-		closeFdRegion(region);
-	}
-
-	def asFileRegion(region: BackendRegion) -> FileMmapRegion {
-		if (!FileMmapRegion.?(region)) return null;
-		return FileMmapRegion.!(region);
 	}
 }
 
