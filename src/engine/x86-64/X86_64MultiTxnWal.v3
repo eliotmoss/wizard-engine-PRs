@@ -1,0 +1,75 @@
+// Multi-Transaction Redo WAL
+
+layout WalSuperblock {
+        +0      magic:                  u64;    // Constant signature identifying this as a WAL superblock
+        +8      version:                u32;    // Persistent format version. Used to reject or migrate incompatible WAL layouts
+        +16     superblockSize:         u64;    // Size of this superblock layout in bytes
+        +24     generation:             u64;    // Monotonically increasing copy number. Recovery chooses the valid copy with the highest generation
+        +32     logEpoch:               u64;    // Current logical WAL incarnation. Transaction records from other epochs are stale and ignored
+        +40     durableAppliedSeq:      u64;    // Highest transaction sequence whose region updates are known to be durable
+        +48     reserved:               u64;    // Reserved for future metadata. Must be zero in version 1
+        +56     checksum:               u64;    // Checksum over the superblock, excluding this field
+        =64;
+}
+
+layout TxnRecordHeader {
+        +0      magic:          u64;    // Constant signature identifying the start of a transaction record
+        +8      version:        u16;    // Transaction-record format version. Used to reject incompatible record layouts
+        +16     headerSize:     u16;    // Size of this header in bytes
+        +24     entrySize:      u16;    // Size of each redo entry. Expected to match LogEntry.size
+        +32     recordLen:      u32;    // Total aligned record length: header + entries + commit trailer + padding
+        +40     entryCount:     u32;    // Number of redo entries immediately following this trailer
+        +48     logEpoch:       u64;    // WAL epoch this record belongs to. Must match the current superblock epoch
+        +56     txnSeq:         u64;    // Transaction sequence number. Defines commit order and recovery replay order
+        =64;
+}
+
+layout TxnCommitTrailer {
+        +0      magic:          u64;    // Constant signature identifying the commit trailer
+        +8      recordLen:      u32;    // Must match TxnRecordHeader.recordLen
+        +16     entryCount:     u32;    // Must match TxnRecordHeader.entryCount
+        +24     logEpoch:       u64;    // Must match both the record header and current superblock epoch
+        +32     txnSeq:         u64;    // Must match the record header
+        +40     checksum:       u64;    // Checksum for the complete transaction record.
+                                        // Computed over header, entries, trailer fields except this checksum
+        =48;
+}
+
+class MultiTxnWal {
+
+        new() {
+        }
+
+        // --- WAL operations ---
+
+        def append(offset: u64, value: u64, width: u8) {
+        }
+
+        def commit() {
+        }
+
+        def clear() {
+        }
+
+        // --- Data application ---
+
+        def applyUpdate(offset: u64, value: u64, width: u8) {
+        }
+
+        def fenceAppliedUpdates() {
+        }
+
+        // --- Read (cache-miss fallthrough) ---
+
+
+        // --- Recovery ---
+
+        def recover() -> bool {
+                return false;
+        }
+
+        // --- Lifecycle ---
+
+        def close() {
+        }
+}
