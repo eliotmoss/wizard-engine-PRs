@@ -70,7 +70,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ### 1. Multi-transaction WAL — finish off
 The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining work:
-- [ ] `maybeCheckpoint()` is a no-op stub (`return true`) — checkpointing currently happens only lazily when the ring fills in `reserveRecord`. Decide on a per-commit / threshold checkpoint policy so `durableAppliedSeq` advances without log pressure.
+- [ ] `maybeCheckpoint()` is a no-op stub (`return true`) — checkpointing currently happens only lazily when the ring fills in `reserveRecord`. Decide on a per-commit / threshold checkpoint policy so `durableAppliedSeq` advances without log pressure. Policy options brainstormed in `docs/checkpoint-policy.md` (recommendation: hybrid count-OR-occupancy with lazy ring-full backstop).
 - [x] Test the untested core paths: **epoch-stale rejection** (bump epoch, confirm prior-epoch records are ignored) and **wrap-around / log-full → checkpoint → reserve** (fill a small ring and verify reclaim + wrap). Done in `MultiTxnWalTest.v3` (`epoch_stale_rejected`, `wraparound_checkpoint_reserve`).
 - [x] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case). Done in `MultiTxnWalTest.v3` (`recovers_multiple_records`, `crash_mid_log_recovery`).
 - [ ] Remove or repurpose the now-orphaned `RegionWal` (`X86_64RegionWal.v3`).
