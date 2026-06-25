@@ -513,28 +513,19 @@ class BlockDevicePWRegionTester(t: Tester) {
 		return region;
 	}
 
-	def logHeader(region: PWRegion) -> Ref<LogHeader> {
-		return Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(
-			PWRegionUtils.pointerFromU64(region.logChunk.addr),
-			LogHeader.size));
+	def writeCommittedWalUpdate(region: PWRegion, addr: u64, value: u64, width: u8) {
+		var wal = MultiTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+		wal.append(addr - region.regionStart, value, width);
+		wal.commit();
 	}
 
-	def writeCommittedWalUpdate(region: PWRegion, addr: u64, value: u64, width: u8) {
-		def entryAddr = region.logChunk.addr + u64.!(LogHeader.size);
-		var logEntry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(
-			PWRegionUtils.pointerFromU64(entryAddr),
-			LogEntry.size));
-		logEntry.offset = addr - region.regionStart;
-		logEntry.value = value;
-		logEntry.width = width;
-
-		var header = logHeader(region);
-		header.numEntries = 1u32;
-		header.checksum = PWRegionUtils.calculateLogChecksum(entryAddr, 1u32);
-		region.backendRegion.persistRange(entryAddr - region.regionStart, u64.!(LogEntry.size));
-
-		header.status = 1;
-		region.backendRegion.persistRange(region.logChunk.addr - region.regionStart, u64.!(LogHeader.size));
+	def corruptFirstRecordChecksum(region: PWRegion) {
+		var wal = MultiTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+		def entryCount = PWRegionUtils.pointerFromU64(wal.ringBase + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
+		def checksumAddr = wal.ringBase + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+		def checksum = PWRegionUtils.pointerFromU64(checksumAddr).load<u64>();
+		PWRegionUtils.pointerFromU64(checksumAddr).store<u64>(checksum + 1u64);
+		region.backendRegion.persistRange(checksumAddr - region.regionStart, 8u64);
 	}
 
 	private def openRegion(forceFormat: bool) -> PWRegion {
@@ -644,7 +635,6 @@ def test_bd_recover_committed_wal(tc: BlockDevicePWRegionTester) {
 
 	var region2 = tc.remount();
 	tc.t.assertz(true, region2.blockTableHandle[2u64].getUsed());
-	tc.t.assert_eq(0u8, tc.logHeader(region2).status);
 
 	tc.cleanup();
 }
@@ -660,13 +650,10 @@ def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
 		1u64,
 		1u8);
 
-	var header = tc.logHeader(tc.region);
-	header.checksum = header.checksum + 1u64;
-	tc.region.backendRegion.persistRange(tc.region.logChunk.addr - tc.region.regionStart, u64.!(LogHeader.size));
+	tc.corruptFirstRecordChecksum(tc.region);
 
 	var region2 = tc.remount();
 	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsed());
-	tc.t.assert_eq(0u8, tc.logHeader(region2).status);
 
 	tc.cleanup();
 }

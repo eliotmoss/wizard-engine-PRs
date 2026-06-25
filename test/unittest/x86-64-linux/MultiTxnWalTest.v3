@@ -1,0 +1,150 @@
+// MultiTxnWal Tests
+// Tests the persistent multi-transaction redo log and recovery flow.
+
+def MTW = UnitTests.registerT("multi_wal:", _, MultiTxnWalTester.new, _);
+def MTWX = [
+	MTW("fresh_superblocks", test_multi_fresh_superblocks),
+	MTW("selects_newest_superblock", test_multi_selects_newest_superblock),
+	MTW("ignores_corrupt_newer_superblock", test_multi_ignores_corrupt_newer_superblock),
+	MTW("recovers_persisted_record", test_multi_recovers_persisted_record),
+	MTW("invalid_checksum_ignored", test_multi_invalid_checksum_ignored),
+	MTW("invalid_width_rejected", test_multi_invalid_width_rejected),
+	MTW("contiguous_prefix_only", test_multi_contiguous_prefix_only),
+	()
+];
+
+class MultiTxnWalTestBackend extends TxnRegionBackend {
+	def range: Range<byte>;
+
+	new(range) { }
+
+	def create(size: u64, prot: int) -> BackendRegion {
+		return MultiTxnWalTestRegion.new(range);
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "multi_txn_wal_test";
+	}
+}
+
+class MultiTxnWalTestRegion extends BackendRegion {
+	new(range: Range<byte>) super(range) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		return true;
+	}
+}
+
+class MultiTxnWalTester(t: Tester) {
+	var data: Array<byte>;
+	var backend: MultiTxnWalTestBackend;
+	var backendRegion: BackendRegion;
+	var wal: MultiTxnWal;
+	var regionStart: u64;
+	var logAddr: u64;
+
+	new() {
+		data = Array<byte>.new(4096);
+		for (i < data.length) data[i] = 0u8;
+		regionStart = u64.view(Pointer.atElement(data, 0));
+		logAddr = regionStart + 1024u64;
+		backend = MultiTxnWalTestBackend.new(data[0 ..+ data.length]);
+		backendRegion = backend.create(u64.!(data.length), BackendProt.READ.mask | BackendProt.WRITE.mask);
+		wal = MultiTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, true);
+	}
+
+	def reopen() -> MultiTxnWal {
+		return MultiTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, false);
+	}
+
+	def writeTxn(offset: u64, value: u64, width: u8) -> u64 {
+		wal.append(offset, value, width);
+		return wal.commit();
+	}
+
+	def checksumAddrFor(seqOffset: u64) -> u64 {
+		def start = wal.ringBase + seqOffset;
+		def entryCount = PWRegionUtils.pointerFromU64(start + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
+		return start + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+	}
+
+	def corruptChecksumAt(recordOffset: u64) {
+		def addr = checksumAddrFor(recordOffset);
+		def old = PWRegionUtils.pointerFromU64(addr).load<u64>();
+		PWRegionUtils.pointerFromU64(addr).store<u64>(old + 1u64);
+	}
+}
+
+def test_multi_fresh_superblocks(tc: MultiTxnWalTester) {
+	tc.t.assertz(true, tc.wal.validateSuperblock(0));
+	tc.t.assertz(true, tc.wal.validateSuperblock(1));
+	tc.t.assert_eq(1u64, tc.wal.logEpoch);
+	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
+}
+
+def test_multi_selects_newest_superblock(tc: MultiTxnWalTester) {
+	tc.writeTxn(200u64, 0x55u64, 1u8);
+	tc.wal.noteApplied(1u64);
+	tc.t.assertz(true, tc.wal.checkpoint(1u64));
+	var reopened = tc.reopen();
+	tc.t.assert_eq(3u64, reopened.currentGeneration);
+	tc.t.assert_eq(1u64, reopened.logEpoch);
+}
+
+def test_multi_ignores_corrupt_newer_superblock(tc: MultiTxnWalTester) {
+	tc.writeTxn(200u64, 0x55u64, 1u8);
+	tc.wal.noteApplied(1u64);
+	tc.t.assertz(true, tc.wal.checkpoint(1u64));
+	var newer = tc.wal.superblockAt(tc.wal.currentSuperblockIndex);
+	newer.checksum = newer.checksum + 1u64;
+	var reopened = tc.reopen();
+	tc.t.assert_eq(2u64, reopened.currentGeneration);
+}
+
+def test_multi_recovers_persisted_record(tc: MultiTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
+	var reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover());
+	tc.t.assert_eq(0x55u8, tc.data[200]);
+	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
+}
+
+def test_multi_invalid_checksum_ignored(tc: MultiTxnWalTester) {
+	tc.writeTxn(200u64, 0x55u64, 1u8);
+	tc.corruptChecksumAt(0u64);
+	var reopened = tc.reopen();
+	tc.t.assertz(false, reopened.recover());
+	tc.t.assert_eq(0u8, tc.data[200]);
+}
+
+def test_multi_invalid_width_rejected(tc: MultiTxnWalTester) {
+	tc.wal.append(200u64, 0x55u64, 3u8);
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+}
+
+def test_multi_contiguous_prefix_only(tc: MultiTxnWalTester) {
+	tc.writeTxn(200u64, 0x11u64, 1u8);
+	def secondOffset = tc.wal.headOffset;
+	tc.writeTxn(201u64, 0x22u64, 1u8);
+	tc.corruptChecksumAt(0u64);
+	var reopened = tc.reopen();
+	tc.t.assertz(false, reopened.recover());
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assert_eq(0u8, tc.data[201]);
+	tc.t.assertz(true, secondOffset > 0u64);
+}

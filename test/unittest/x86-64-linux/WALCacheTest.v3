@@ -65,21 +65,24 @@ class CountingRegion extends BackendRegion {
 
 class RegionTransactionTester(t: Tester) {
 	var txn: RegionTransaction;
-	var wal: RegionWal;
+	var wal: MultiTxnWal;
 	var backend: CountingBackend;
 	var backendRegion: BackendRegion;
 	// Backing memory for the pointers to test read-through and write-back
 	var dummyData: Array<byte>;
 
 	new() {
-		dummyData = Array<byte>.new(1024);
+		dummyData = Array<byte>.new(4096);
 		// Initialize memory with a known pattern (0xAA) to detect changes/fallthroughs
-		for (i < 1024) dummyData[i] = 0xAAu8;
+		for (i < dummyData.length) dummyData[i] = 0xAAu8;
 		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
 		backend = CountingBackend.new(dummyData[0 ..+ dummyData.length]);
-		backendRegion = backend.create(1024u64, BackendProt.READ.mask | BackendProt.WRITE.mask);
-		wal = RegionWal.new(regionStart, regionStart, 1024, backendRegion);
+		backendRegion = backend.create(u64.!(dummyData.length), BackendProt.READ.mask | BackendProt.WRITE.mask);
+		wal = MultiTxnWal.new(regionStart, regionStart + 1024u64, 1024u64, backendRegion, true);
 		txn = RegionTransaction.new(wal, regionStart);
+		backend.prepareChangedRangeCount = 0;
+		backend.persistRangeCount = 0;
+		backend.persistChangesCount = 0;
 	}
 	
 	def getAddr(offset: int) -> u64 {
@@ -95,13 +98,13 @@ class RegionTransactionTester(t: Tester) {
 		return Pointer.atElement(dummyData, offset).load<u64>();
 	}
 
-	def logHeader() -> Ref<LogHeader> {
-		return wal.header;
+	def recordHeader() -> Ref<TxnRecordHeader> {
+		return wal.recordHeaderAt(wal.ringBase);
 	}
 
 	def logEntry(index: u32) -> Ref<LogEntry> {
-		def addr = wal.entryBase + u64.view(index) * u64.!(LogEntry.size);
-		return Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LogEntry.size));
+		def addr = wal.ringBase + u64.!(TxnRecordHeader.size) + u64.view(index) * u64.!(LogEntry.size);
+		return wal.logEntryAt(addr);
 	}
 }
 
@@ -148,7 +151,7 @@ def test_read_fallthrough(tc: RegionTransactionTester) {
 	tc.t.assertz(false, tc.txn.isDirty());
 }
 
-// Test 4: Commit writes the WAL, applies cached data, then clears log and cache.
+// Test 4: Commit writes a durable WAL record, then applies cached data and clears only the cache.
 def test_commit_applies_and_clears(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(200);
 	var val = 0x0102_0304_0506_0708u64;
@@ -162,10 +165,10 @@ def test_commit_applies_and_clears(tc: RegionTransactionTester) {
 	tc.t.assert_eq(addr - tc.wal.regionStart, entry.offset);
 	tc.t.assert_eq(val, entry.value);
 	tc.t.assert_eq(8u8, entry.width);
-	tc.t.assert_eq(0u32, tc.logHeader().numEntries);
-	tc.t.assert_eq(0u8, tc.logHeader().status);
-	tc.t.assert_eq(0u64, tc.logHeader().checksum);
-	tc.t.assert_eq(0u32, tc.wal.currentEntryIndex);
+	tc.t.assert_eq(1u32, tc.recordHeader().entryCount);
+	tc.t.assert_eq(1, tc.wal.activeRecords.length);
+	tc.t.assert_eq(1u64, tc.wal.appliedSeqVolatile);
+	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
 	tc.t.assert_eq(val, tc.readRamU64(200));
 	tc.t.assertz(false, tc.txn.isDirty());
 }
@@ -178,9 +181,9 @@ def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	tc.txn.writeU64(addr, val);
 	tc.txn.commit();
 
-	tc.t.assert_eq(3, tc.backend.persistRangeCount);
+	tc.t.assert_eq(1, tc.backend.persistRangeCount);
 	tc.t.assert_eq(1, tc.backend.prepareChangedRangeCount);
-	tc.t.assert_eq(1, tc.backend.persistChangesCount);
+	tc.t.assert_eq(0, tc.backend.persistChangesCount);
 	tc.t.assert_eq(addr - tc.wal.regionStart, tc.backend.lastDirtyOffset);
 	tc.t.assert_eq(8u64, tc.backend.lastDirtySize);
 }
