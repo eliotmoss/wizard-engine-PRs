@@ -10,6 +10,8 @@ def MTWX = [
 	MTW("invalid_checksum_ignored", test_multi_invalid_checksum_ignored),
 	MTW("invalid_width_rejected", test_multi_invalid_width_rejected),
 	MTW("contiguous_prefix_only", test_multi_contiguous_prefix_only),
+	MTW("epoch_stale_rejected", test_multi_epoch_stale_rejected),
+	MTW("wraparound_checkpoint_reserve", test_multi_wraparound_checkpoint_reserve),
 	()
 ];
 
@@ -74,6 +76,16 @@ class MultiTxnWalTester(t: Tester) {
 	def writeTxn(offset: u64, value: u64, width: u8) -> u64 {
 		wal.append(offset, value, width);
 		return wal.commit();
+	}
+
+	// Commit one transaction and mark it applied, exactly as RegionTransaction
+	// does (commit -> noteApplied). Without noteApplied, appliedSeqVolatile never
+	// advances and a lazy checkpoint could not reclaim anything.
+	def writeAndApply(offset: u64, value: u64, width: u8) -> u64 {
+		wal.append(offset, value, width);
+		def seq = wal.commit();
+		if (seq != 0u64) wal.noteApplied(seq);
+		return seq;
 	}
 
 	def checksumAddrFor(seqOffset: u64) -> u64 {
@@ -147,4 +159,65 @@ def test_multi_contiguous_prefix_only(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(0u8, tc.data[201]);
 	tc.t.assertz(true, secondOffset > 0u64);
+}
+
+// Epoch-stale rejection: a record whose checksum is valid and whose txnSeq is
+// past durableAppliedSeq must still be ignored once its epoch no longer matches
+// the current WAL incarnation. This isolates the `recordEpoch != logEpoch` guard
+// from the `txnSeq <= durableAppliedSeq` guard.
+def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
+	// Two epoch-1 records. Corrupt the first so seq 2 becomes a stray valid
+	// record sitting after a sequence gap.
+	tc.writeTxn(200u64, 0x11u64, 1u8);              // seq 1 at ring offset 0
+	def strayOffset = tc.wal.headOffset;            // where seq 2 will land
+	tc.writeTxn(201u64, 0x22u64, 1u8);              // seq 2
+	tc.corruptChecksumAt(0u64);
+
+	// First recovery finds no contiguous prefix (seq 1 invalid) but sees the
+	// stray seq 2, so it abandons it by bumping the epoch and republishing.
+	var r1 = tc.reopen();
+	tc.t.assertz(false, r1.recover());
+
+	// Reopen reads the persisted, freshly bumped epoch. The stray seq 2 record
+	// is still physically present, still checksum-valid, and its txnSeq (2) is
+	// still greater than durableAppliedSeq (0) -- so the ONLY thing that can
+	// reject it now is the epoch mismatch.
+	var r2 = tc.reopen();
+	tc.t.assert_eq(2u64, r2.logEpoch);              // bumped from the original 1
+	tc.t.assert_eq(0u64, r2.durableAppliedSeq);     // nothing was ever committed durably
+	tc.t.assertz(false, r2.recover());              // stray epoch-1 record rejected
+	tc.t.assert_eq(0u8, tc.data[201]);              // and never applied
+	tc.t.assertz(true, strayOffset > 0u64);
+}
+
+// Wrap-around / log-full -> checkpoint -> reserve: fill the small ring until a
+// commit cannot fit, forcing reserveRecord to lazily checkpoint the applied
+// tail, reclaim now-durable records, and retry the reservation at the wrapped
+// (offset 0) slot. Every commit must still succeed and the ring must wrap.
+def test_multi_wraparound_checkpoint_reserve(tc: MultiTxnWalTester) {
+	// ringBytes = 1024 - 2*64 = 896; a 1-entry record is align64(64+48+32) = 192,
+	// so 4 records fit and the 5th must wrap. Bound the loop well above that.
+	def maxRecords = 64;
+	var prevHead = 0u64;
+	var wrapped = false;
+	var committed = 0;
+	for (i < maxRecords) {
+		prevHead = tc.wal.headOffset;
+		def seq = tc.writeAndApply(200u64, u64.view(i), 1u8);
+		// The overflowing commit must still succeed: reserveRecord checkpoints
+		// the applied tail and retries rather than dropping the transaction.
+		tc.t.assertz(true, seq != 0u64);
+		committed++;
+		if (tc.wal.headOffset <= prevHead) {        // head moved backwards => wrapped
+			wrapped = true;
+			break;
+		}
+	}
+	tc.t.assertz(true, wrapped);                        // the ring wrapped at least once
+	tc.t.assertz(true, committed > 1);                  // wrap happened after several records
+	tc.t.assertz(true, tc.wal.durableAppliedSeq > 0u64);// the lazy checkpoint advanced durability
+	tc.t.assertz(true, tc.wal.appliedSeqVolatile >= tc.wal.durableAppliedSeq);
+	// After reclaim the ring no longer tracks every record ever written -- only
+	// the post-checkpoint tail remains active.
+	tc.t.assertz(true, tc.wal.activeRecords.length < committed);
 }
