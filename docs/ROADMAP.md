@@ -15,12 +15,23 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `RegionFileIO` — `openOrCreate`, `ensureSize`, `fdatasync`, `close`, `unlink`
 - `X86_64Backends` factory component
 
-### Write-ahead log
+### Write-ahead log (single-transaction, superseded)
 - `RegionWal` — in-region single-transaction redo log living in block 1 (`X86_64RegionWal.v3`)
 - `LogHeader` layout: `numEntries`, `status` (0=invalid/1=committed), `checksum`
 - `LogEntry` layout: `offset` (region-relative), `value`, `width` (1/2/4/8)
 - Commit protocol: persist entries → set status=1 → apply to region → fence → clear status
 - Recovery: checksum verify → redo entries → fence → clear status durably
+- **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `MultiTxnWal` instead. `RegionWal` is currently orphaned (kept for reference; see Next Steps cleanup).
+
+### Multi-transaction WAL (`X86_64MultiTxnWal.v3`)
+- Circular redo log living in block 1, with a dual-copy superblock at the head of the chunk and the ring immediately after (`ringBase = logChunkAddr + 2 * WalSuperblock.size`, `ringBytes = blockSize - 2 * WalSuperblock.size`)
+- Layouts: `WalSuperblock` (64 B, dual copy), `TxnRecordHeader` (64 B), `TxnCommitTrailer` (48 B); records are `ALIGNMENT`(64 B)-aligned, magic/version/size guarded, with an FNV-style checksum over the whole record
+- Generation-based superblock selection: `loadSuperblock` picks the valid copy with the higher `generation`; `writeSuperblock` writes the inactive copy, persists, then swaps
+- `logEpoch` fences stale records: `validateRecord` rejects records whose epoch ≠ current epoch; recovery bumps the epoch (and writes a fresh superblock) so replayed records cannot be re-applied on a later mount
+- `durableAppliedSeq` is the replay floor: recovery scans the ring, selects the contiguous `txnSeq` prefix starting at `durableAppliedSeq + 1` (`selectContiguousPrefix`), redoes it, persists, then publishes the new `durableAppliedSeq`
+- Append path: `append()` buffers `WalPendingEntry`s; `commit()` writes one contiguous record (`appendCommittedRecord`) and returns its `txnSeq` (0 on failure). `reserveRecord` handles wrap-around and triggers a lazy `checkpoint` when the ring is full before retrying
+- `checkpoint(targetSeq)` persists pending region changes, publishes `durableAppliedSeq` via the superblock, and reclaims now-durable records from `activeRecords`
+- `RegionTransaction` rewired onto `MultiTxnWal`: `commit()` is `appendToWal → wal.commit → applyToRegion → noteApplied → maybeCheckpoint → clear`
 
 ### Transaction cache
 - `RegionTransaction` — write-behind `HashMap<u64, CachedUpdate>` buffering writes in DRAM
@@ -43,35 +54,29 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `X86_64ImmixPWMemRegion`, `X86_64ImmixPWNVRegion`
 
 ### Tests
-- `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow, clean-txn no-op, aligned-access constraint
-- `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection; `FileMmapRegion`/`PmemMmapRegion` state and lifecycle
+- `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow (now over `MultiTxnWal`: durable record written, only cache cleared on commit), clean-txn no-op, aligned-access constraint
+- `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection (now via `MultiTxnWal` record checksum); `FileMmapRegion`/`PmemMmapRegion` state and lifecycle
+- `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay
 
 ---
 
 ## In Progress
 
-- Multi-transaction WAL (`X86_64MultiTxnWal.v3`): `WalSuperblock` and `TxnRecordHeader` layouts defined; class body is stubs
+- Multi-transaction WAL test breadth: epoch-stale rejection and wrap-around / log-full→checkpoint paths are implemented but not yet covered by tests (see Next Steps #1)
 
 ---
 
 ## Next Steps
 
-### 1. Multi-transaction WAL (`X86_64MultiTxnWal.v3`) — priority
-Replace the single-active-transaction `RegionWal` with a circular redo log supporting multiple outstanding transactions and generation-based crash recovery.
+### 1. Multi-transaction WAL — finish off
+The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining work:
+- [ ] `maybeCheckpoint()` is a no-op stub (`return true`) — checkpointing currently happens only lazily when the ring fills in `reserveRecord`. Decide on a per-commit / threshold checkpoint policy so `durableAppliedSeq` advances without log pressure.
+- [ ] Test the untested core paths: **epoch-stale rejection** (bump epoch, confirm prior-epoch records are ignored) and **wrap-around / log-full → checkpoint → reserve** (fill a small ring and verify reclaim + wrap).
+- [ ] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case).
+- [ ] Remove or repurpose the now-orphaned `RegionWal` (`X86_64RegionWal.v3`).
 
-Key design points already captured in the layouts:
-- Dual-copy superblock (`generation` field) — recovery picks the copy with the higher valid generation
-- `logEpoch` — stale records from prior epochs are ignored
-- `durableAppliedSeq` — highest txn whose region updates are known durable; recovery replays from here forward
-
-Work items:
-- [ ] Circular log append with wrap-around
-- [ ] Superblock dual-copy write (write to inactive copy, fence, increment generation)
-- [ ] Recovery: read both superblock copies, select winner, scan log from `durableAppliedSeq`, redo uncommitted-but-flushed entries
-- [ ] Tests: multi-transaction commit, recovery after crash mid-log, epoch-stale rejection, superblock corruption
-
-### 2. WAL overflow handling
-`RegionWal.append` silently drops entries when block 1 is full. Needs to return an error so callers can split the transaction (or trigger a log-full flush).
+### 2. WAL overflow / commit-failure propagation
+`appendCommittedRecord` returns `0` when a record will not fit even after a checkpoint, and `RegionTransaction.commit` returns early leaving the cache dirty (data is retained, not lost, but the failure is not surfaced to the allocator). Propagate an error so callers can split the transaction or trigger a log-full flush. (The legacy `RegionWal.append` silently dropped entries; the multi-txn path no longer loses data but is still silent.)
 
 ### 3. CLWB/SFENCE intrinsics
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
@@ -90,9 +95,11 @@ Work items:
 | # | File | Description |
 |---|------|-------------|
 | 1 | `X86_64TxnBackend.v3:88-100` | `flushCacheLine`/`storeFence` are stubs — PMEM not truly durable |
-| 2 | `X86_64RegionWal.v3:26-29` | WAL silently drops entries on overflow |
+| 2 | `X86_64MultiTxnWal.v3` | Commit failure (record won't fit even after checkpoint) returns `0` and is not surfaced to the allocator; `maybeCheckpoint()` is a no-op stub |
 | 3 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
-| 4 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` missing log-chunk offset field |
+| 4 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` missing log-chunk offset field — `mount` still assumes block 1 is the log |
 | 5 | `X86_64TxnPWRegion.v3:771` | Line-mark field not linked in `createChunk()` |
 | 6 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 7 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
+| 8 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
+| 9 | `X86_64RegionWal.v3` | `RegionWal` is orphaned — no longer wired in after the `MultiTxnWal` switch |

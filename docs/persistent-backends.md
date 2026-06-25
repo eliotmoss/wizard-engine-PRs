@@ -14,7 +14,7 @@ The system is organised into four layers that sit between raw storage media and 
 ├─────────────────────────────────────────────┤
 │  Transaction cache  (RegionTransaction)      │  write-behind DRAM buffer
 ├─────────────────────────────────────────────┤
-│  Write-ahead log    (RegionWal)              │  redo log + recovery
+│  Write-ahead log    (MultiTxnWal)            │  circular redo log + recovery
 ├─────────────────────────────────────────────┤
 │  Backend region     (BackendRegion)          │  storage abstraction: memory / file / PMEM
 └─────────────────────────────────────────────┘
@@ -89,63 +89,92 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
 
 ## Layer 2 — Write-Ahead Log
 
-**File:** `src/engine/x86-64/X86_64RegionWal.v3`
+**File:** `src/engine/x86-64/X86_64MultiTxnWal.v3`
 
-`RegionWal` manages a fixed-size redo log that occupies block 1 of a `PWRegion`. Each call to `append()` records one memory write; `commit()` makes the entire batch durable; `clear()` resets the log; `recover()` replays a committed log on remount.
+`MultiTxnWal` is the active WAL: a **circular redo log** supporting multiple outstanding transactions with generation-based crash recovery. It occupies block 1 of a `PWRegion`. `append()` buffers one memory write; `commit()` writes a single contiguous, checksummed transaction record and returns its sequence number; `checkpoint()` publishes how far the region data is durable and reclaims log space; `recover()` replays the committed tail on remount.
+
+> The earlier single-transaction `RegionWal` (`src/engine/x86-64/X86_64RegionWal.v3`, `LogHeader` + `LogEntry[]`, `status` commit flag) is **superseded and no longer wired in**. It is retained for reference only.
 
 ### On-disk layout
+
+Block 1 begins with two fixed superblock copies, followed by the record ring:
 
 ```
 Block 1  (256 KB)
   ┌─────────────────────────────┐  offset 0
-  │  LogHeader  (32 bytes)      │
-  │    numEntries : u32         │  +0
-  │    status     : u8          │  +4   (0 = invalid, 1 = committed)
-  │    checksum   : u64         │  +8
-  └─────────────────────────────┘
-  ┌─────────────────────────────┐  offset 32
-  │  LogEntry[]                 │  one per buffered write
-  │    offset : u64             │  +0   (relative to region start)
-  │    value  : u64             │  +8
-  │    width  : u8              │  +16  (1, 2, 4, or 8)
+  │  WalSuperblock  copy 0 (64B) │
+  ├─────────────────────────────┤  offset 64
+  │  WalSuperblock  copy 1 (64B) │
+  ├─────────────────────────────┤  ringBase = logChunkAddr + 2 * 64
+  │  record ring  (ringBytes =  │
+  │   blockSize - 2 * 64)       │
+  │   TxnRecord[]  (variable,    │
+  │   64-byte aligned, may wrap) │
   └─────────────────────────────┘
 ```
+
+**`WalSuperblock` (64 bytes, two copies)**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `magic` | u64 | `"WALSUPER"` signature |
+| `version` | u32 | format version (1) |
+| `superblockSize` | u64 | size of this layout |
+| `generation` | u64 | monotonic copy number; recovery picks the higher valid copy |
+| `logEpoch` | u64 | current WAL incarnation; records from other epochs are stale |
+| `durableAppliedSeq` | u64 | highest txn whose region updates are known durable |
+| `reserved` | u64 | must be zero in v1 |
+| `checksum` | u64 | checksum over the superblock, excluding this field |
+
+**`TxnRecord`** = `TxnRecordHeader` (64 B) + `LogEntry[]` + `TxnCommitTrailer` (48 B), padded up to a 64-byte (`ALIGNMENT`) boundary. The header (`"WALTXNHD"`) and trailer (`"WALTXNCM"`) carry redundant `recordLen` / `entryCount` / `logEpoch` / `txnSeq`, and the trailer holds an FNV-style `checksum` over the whole record (excluding the checksum field). `LogEntry` is unchanged: `offset` (region-relative), `value`, `width` (1/2/4/8).
 
 ### Commit protocol
 
 ```
-append(offset, value, width)   -- called per write while txn is open
-  store entry at currentEntryIndex; increment index
+append(offset, value, width)   -- validated, buffered into pendingEntries
 
-commit()
-  1. header.numEntries = currentEntryIndex
-  2. header.checksum  = computed checksum over entries
-  3. backendRegion.persistRange(entries_range)   -- entries durable
-  4. header.status = 1
-  5. backendRegion.persistRange(header_range)    -- header durable (commit point)
-
-clear()
-  1. zero header fields
-  2. backendRegion.persistRange(header_range)    -- invalidate log durably
-  3. currentEntryIndex = 0
+commit() -> txnSeq             -- appendCommittedRecord(pendingEntries); clears pending
+  1. reserveRecord(len)        -- find a free, contiguous, aligned slot in the ring;
+                                  wrap to offset 0 if needed; if full, lazily checkpoint
+                                  the applied tail and retry
+  2. zero slot; write header, entries, trailer; compute + store record checksum
+  3. backendRegion.persistRange(record_range)   -- COMMIT POINT: record durable
+  4. push WalActiveRecord; nextTxnSeq++; return txnSeq   (0 on failure)
 ```
+
+After the WAL record is durable, `RegionTransaction` applies the cached writes to region memory and calls `noteApplied(txnSeq)` (advances `appliedSeqVolatile` in order).
+
+```
+checkpoint(targetSeq) -> bool  -- targetSeq must be ≤ appliedSeqVolatile
+  1. backendRegion.persistChanges()             -- applied region data durable
+  2. writeSuperblock(targetSeq, logEpoch)        -- inactive copy, persist, bump generation, swap
+  3. durableAppliedSeq = targetSeq; reclaim now-durable records from activeRecords
+```
+
+`fenceAppliedUpdates()` is `checkpoint(appliedSeqVolatile)`.
 
 ### Recovery protocol
 
 ```
 recover() -> bool
-  if header.status != 1  → return false  (no committed txn)
-  if checksum mismatch:
-    clear status durably
-    return false
-  for each entry:
-    applyUpdate(offset, value, width)    -- write into region bytes
-  fenceAppliedUpdates()                  -- backendRegion.persistChanges()
-  clear status durably
+  load winning superblock (higher generation among the two valid copies)
+  scanCommittedRecords()                 -- stride the ring at 64B, validateRecord each
+       validateRecord rejects on: bad magic/version/size, recordLen misalignment,
+       trailer mismatch, epoch ≠ current logEpoch, txnSeq ≤ durableAppliedSeq,
+       checksum mismatch, or any invalid entry field
+  selectContiguousPrefix()               -- contiguous txnSeq run from durableAppliedSeq+1
+  if no contiguous prefix:
+       if stray valid records exist, bump epoch + rewrite superblock to abandon them
+       return false
+  for each selected record: redoRecord() ; appliedSeqVolatile = txnSeq
+  backendRegion.persistChanges()         -- replayed data durable
+  writeSuperblock(maxSeq, logEpoch + 1)  -- publish + bump epoch so replay can't recur
   return true
 ```
 
-> **TODO:** If `maxEntries` is exceeded during `append()`, entries are silently dropped. This should return an error so callers can split the transaction.
+The epoch bump is the key anti-double-replay guard: once recovery republishes at `logEpoch + 1`, every record written under the old epoch fails `validateRecord` on any future mount.
+
+> **TODO:** When a record will not fit even after a checkpoint, `appendCommittedRecord` returns `0` and `RegionTransaction.commit` returns early with the cache still dirty — data is retained but the failure is not surfaced to the caller. `maybeCheckpoint()` is also still a no-op stub, so checkpoints currently happen only lazily under ring pressure.
 
 ---
 
@@ -173,12 +202,15 @@ writeU8 / writeI16 / writeU64 / writeI64(addr, val)
 commit()
   if !isDirty() → return
   appendToWal()             // iterate addrs → wal.append(offset, value, width)
-  wal.commit()              // make log durable
+  txnSeq = wal.commit()     // write one durable WAL record; 0 == failure
+  if txnSeq == 0 → return   // leave cache dirty for retry (see Layer 2 TODO)
   applyToRegion()           // write cache values into region bytes
-  wal.fenceAppliedUpdates() // fence applied writes
-  wal.clear()               // invalidate log
+  wal.noteApplied(txnSeq)   // advance appliedSeqVolatile in order
+  wal.maybeCheckpoint()     // policy hook (currently a no-op stub)
   clear()                   // reset cache
 ```
+
+Unlike the old single-transaction flow, `commit()` no longer fences and clears the log per call. The WAL record stays live until a `checkpoint()` (lazy, on ring-full) proves the region data durable and reclaims its space; only the DRAM cache is cleared here.
 
 ### Read path (cache miss)
 
@@ -318,10 +350,10 @@ PWRegion.allocChunk(n)
       cache[addr] = CachedUpdate(val, 1)
   → performCommit() → txn.commit()
       appendToWal()           -- wal.append per cache entry
-      wal.commit()            -- make entries + header durable
+      txnSeq = wal.commit()   -- write one durable, checksummed WAL record
       applyToRegion()         -- write values into region bytes
-      wal.fenceAppliedUpdates()
-      wal.clear()
+      wal.noteApplied(txnSeq)
+      wal.maybeCheckpoint()   -- no-op stub; checkpoint happens lazily on ring-full
       cache.clear()
 ```
 
@@ -339,13 +371,15 @@ BlockEntryHandle.getUsedCached(txn)
 ```
 PWRegion.mount()
   → txn.recover() → wal.recover()
-      if status == 1 and checksum OK:
-        apply all log entries to region bytes
-        fence
-        clear log header durably
+      load winning superblock (higher generation of the two valid copies)
+      scan ring; select contiguous txnSeq prefix from durableAppliedSeq+1
+      if a committed prefix exists:
+        redo each record into region bytes
+        persistChanges()                       -- replayed data durable
+        writeSuperblock(maxSeq, logEpoch + 1)   -- publish + bump epoch
         return true
       else:
-        clear log header durably if status was set
+        if stray valid records exist, bump epoch to abandon them
         return false
 ```
 
@@ -355,8 +389,11 @@ PWRegion.mount()
 
 | Test file | Location | What it covers |
 |---|---|---|
-| `TxnPWRegionTest.v3` | `test/unittest/x86-64-linux/` | format/mount, alloc/free, coalescing, WAL recovery, corrupt-WAL detection, file-backed persistence |
-| `WALCacheTest.v3` | `test/unittest/x86-64-linux/` | cache read/write, cache-miss fallthrough, commit flow, clean-txn no-op |
+| `TxnPWRegionTest.v3` | `test/unittest/x86-64-linux/` | format/mount, alloc/free, coalescing, WAL recovery, corrupt-WAL detection (via `MultiTxnWal` record checksum), file-backed persistence |
+| `WALCacheTest.v3` | `test/unittest/x86-64-linux/` | cache read/write, cache-miss fallthrough, commit flow over `MultiTxnWal`, clean-txn no-op |
+| `MultiTxnWalTest.v3` | `test/unittest/x86-64-linux/` | fresh superblock init, newest-generation selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay |
+
+**Coverage gaps:** epoch-stale rejection and the wrap-around / log-full→checkpoint paths are implemented but not yet tested; recovery is exercised only for a single committed record.
 
 Run with:
 
@@ -371,10 +408,12 @@ test/unit.sh
 | # | Location | Description |
 |---|---|---|
 | 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
-| 2 | `X86_64RegionWal.v3:26-29` | WAL silently drops entries when the log chunk is full. Should return an error so the caller can split the transaction. |
+| 2 | `X86_64MultiTxnWal.v3` | When a record won't fit even after a checkpoint, `commit` returns `0` and `RegionTransaction.commit` returns early with the cache still dirty — failure is not surfaced to the caller. `maybeCheckpoint()` is a no-op stub (checkpoints only fire lazily on ring-full). |
 | 3 | `TxnBackend.v3:36` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:177` | `RegionFileIO.openOrCreate` should be split into `open` and `create`; `create` must initialise bytes to zero. |
 | 5 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 6 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` should store a pointer/offset to the log chunk to simplify recovery without requiring block 1 to always be the log. |
 | 7 | `X86_64TxnPWRegion.v3:771` | Line-mark field is not yet linked during `createChunk()`. |
 | 8 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
+| 9 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
+| 10 | `X86_64RegionWal.v3` | The single-transaction `RegionWal` is orphaned after the `MultiTxnWal` switch — remove or repurpose. |
