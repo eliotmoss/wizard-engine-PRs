@@ -56,13 +56,13 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 ### Tests
 - `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow (now over `MultiTxnWal`: durable record written, only cache cleared on commit), clean-txn no-op, aligned-access constraint
 - `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection (now via `MultiTxnWal` record checksum); `FileMmapRegion`/`PmemMmapRegion` state and lifecycle
-- `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve
+- `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, crash-mid-log recovery
 
 ---
 
 ## In Progress
 
-- Multi-transaction WAL test breadth: epoch-stale rejection and wrap-around / log-full→checkpoint→reserve are now covered (`MultiTxnWalTest.v3`). Remaining test gap: multi-record / crash-mid-log recovery (see Next Steps #1).
+- Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. Remaining `MultiTxnWal` work is the `maybeCheckpoint()` policy and commit-failure propagation (Next Steps #1–2).
 
 ---
 
@@ -72,7 +72,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining work:
 - [ ] `maybeCheckpoint()` is a no-op stub (`return true`) — checkpointing currently happens only lazily when the ring fills in `reserveRecord`. Decide on a per-commit / threshold checkpoint policy so `durableAppliedSeq` advances without log pressure.
 - [x] Test the untested core paths: **epoch-stale rejection** (bump epoch, confirm prior-epoch records are ignored) and **wrap-around / log-full → checkpoint → reserve** (fill a small ring and verify reclaim + wrap). Done in `MultiTxnWalTest.v3` (`epoch_stale_rejected`, `wraparound_checkpoint_reserve`).
-- [ ] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case).
+- [x] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case). Done in `MultiTxnWalTest.v3` (`recovers_multiple_records`, `crash_mid_log_recovery`).
 - [ ] Remove or repurpose the now-orphaned `RegionWal` (`X86_64RegionWal.v3`).
 
 ### 2. WAL overflow / commit-failure propagation

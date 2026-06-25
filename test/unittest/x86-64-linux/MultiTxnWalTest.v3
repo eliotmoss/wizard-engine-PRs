@@ -12,6 +12,8 @@ def MTWX = [
 	MTW("contiguous_prefix_only", test_multi_contiguous_prefix_only),
 	MTW("epoch_stale_rejected", test_multi_epoch_stale_rejected),
 	MTW("wraparound_checkpoint_reserve", test_multi_wraparound_checkpoint_reserve),
+	MTW("recovers_multiple_records", test_multi_recovers_multiple_records),
+	MTW("crash_mid_log_recovery", test_multi_crash_mid_log_recovery),
 	()
 ];
 
@@ -220,4 +222,43 @@ def test_multi_wraparound_checkpoint_reserve(tc: MultiTxnWalTester) {
 	// After reclaim the ring no longer tracks every record ever written -- only
 	// the post-checkpoint tail remains active.
 	tc.t.assertz(true, tc.wal.activeRecords.length < committed);
+}
+
+// Multi-record recovery: a run of committed transactions must all be replayed
+// in order on remount, with durableAppliedSeq advanced to the last one.
+def test_multi_recovers_multiple_records(tc: MultiTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x11u64, 1u8));
+	tc.t.assert_eq(2u64, tc.writeTxn(201u64, 0x22u64, 1u8));
+	tc.t.assert_eq(3u64, tc.writeTxn(202u64, 0x33u64, 1u8));
+
+	var reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover());
+	tc.t.assert_eq(0x11u8, tc.data[200]);
+	tc.t.assert_eq(0x22u8, tc.data[201]);
+	tc.t.assert_eq(0x33u8, tc.data[202]);
+	tc.t.assert_eq(3u64, reopened.durableAppliedSeq);
+	tc.t.assert_eq(3u64, reopened.appliedSeqVolatile);
+}
+
+// Crash mid-log: a crash during the final commit leaves its record only
+// partially durable (its checksum never settled). Recovery must replay the
+// contiguous committed prefix and stop at the torn tail -- the partial record
+// and anything after it are not applied.
+def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
+	tc.writeTxn(200u64, 0x11u64, 1u8);              // seq 1 at ring offset 0
+	tc.writeTxn(201u64, 0x22u64, 1u8);              // seq 2
+	def tornOffset = tc.wal.headOffset;             // where seq 3 lands
+	tc.writeTxn(202u64, 0x33u64, 1u8);              // seq 3 -- the torn tail
+
+	// Model the interrupted commit: the final record is unreadable because its
+	// checksum never reached durability.
+	tc.corruptChecksumAt(tornOffset);
+
+	var reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover());         // committed prefix still replays
+	tc.t.assert_eq(0x11u8, tc.data[200]);           // seq 1 applied
+	tc.t.assert_eq(0x22u8, tc.data[201]);           // seq 2 applied
+	tc.t.assert_eq(0u8, tc.data[202]);              // torn seq 3 NOT applied
+	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
+	tc.t.assertz(true, tornOffset > 0u64);
 }

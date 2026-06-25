@@ -391,9 +391,9 @@ PWRegion.mount()
 |---|---|---|
 | `TxnPWRegionTest.v3` | `test/unittest/x86-64-linux/` | format/mount, alloc/free, coalescing, WAL recovery, corrupt-WAL detection (via `MultiTxnWal` record checksum), file-backed persistence |
 | `WALCacheTest.v3` | `test/unittest/x86-64-linux/` | cache read/write, cache-miss fallthrough, commit flow over `MultiTxnWal`, clean-txn no-op |
-| `MultiTxnWalTest.v3` | `test/unittest/x86-64-linux/` | fresh superblock init, newest-generation selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve |
+| `MultiTxnWalTest.v3` | `test/unittest/x86-64-linux/` | fresh superblock init, newest-generation selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, crash-mid-log recovery |
 
-**Coverage gaps:** epoch-stale rejection and the wrap-around / log-full→checkpoint paths are implemented but not yet tested; recovery is exercised only for a single committed record.
+**Coverage gaps:** the `MultiTxnWal` core paths — epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery — are now tested. The remaining untested behaviour is checkpoint-failure / commit-failure propagation, which is still a known stub (see Open items #2).
 
 Run with:
 
