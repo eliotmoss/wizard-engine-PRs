@@ -162,27 +162,27 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def getListNum() -> i16 {
-                return getRef().listNum;
+                return PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNum.offset)).load<i16>();
         }
 
         def getUsed() -> bool {
-                return getRef().used == 1u1;
+                return PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.used.offset)).load<u8>() == 1u8;
         }
 
         def getPrev() -> BlockEntryHandle {
-                return toHandle(getRef().prev);
+                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.prev.offset)).load<i64>());
         }
 
         def getNext() -> BlockEntryHandle {
-                return toHandle(getRef().next);
+                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.next.offset)).load<i64>());
         }
 
         def getListPrev() -> BlockEntryHandle {
-                return toHandle(getRef().listPrev);
+                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listPrev.offset)).load<i64>());
         }
 
         def getListNext() -> BlockEntryHandle {
-                return toHandle(getRef().listNext);
+                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNext.offset)).load<i64>());
         }
 
         def getListNumCached(cache: RegionTransaction) -> i16 {
@@ -211,27 +211,27 @@ type BlockEntryHandle(addr: u64) #unboxed {
         }
 
         def setListNum(v: i16) {
-                getRef().listNum = v;
+                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNum.offset)).store<i16>(v);
         }
 
         def setUsed(v: bool) {
-                getRef().used = if(v, 1u1, 0u1);
+                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.used.offset)).store<u8>(if(v, 1u8, 0u8));
         }
 
         def setPrev(v: BlockEntryHandle) {
-                getRef().prev = toOffset(v);
+                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.prev.offset)).store<i64>(toOffset(v));
         }
 
         def setNext(v: BlockEntryHandle) {
-                getRef().next = toOffset(v);
+                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.next.offset)).store<i64>(toOffset(v));
         }
 
         def setListPrev(v: BlockEntryHandle) {
-                getRef().listPrev = toOffset(v);
+                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listPrev.offset)).store<i64>(toOffset(v));
         }
 
         def setListNext(v: BlockEntryHandle) {
-                getRef().listNext = toOffset(v);
+                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNext.offset)).store<i64>(toOffset(v));
         }
 
         def setListNumCached(cache: RegionTransaction, v: i16) {
@@ -353,7 +353,7 @@ type LogEntryHandle(addr: u64) { }
 type CachedUpdate(value: u64, size: u8) #unboxed { }
 
 // A transaction facade over the write-behind cache and redo log.
-// This component buffers writes in DRAM, then commits them through RegionWal.
+// This component buffers writes in DRAM, then commits them through MultiTxnWal.
 //
 // CONSTRAINT: ALIGNED ACCESS ONLY
 // This implementation uses a HashMap to store updates. It does not support spatial
@@ -364,7 +364,7 @@ type CachedUpdate(value: u64, size: u8) #unboxed { }
 class RegionTransaction {
         private var cache: HashMap<u64, CachedUpdate>;
         private def addrs = Vector<u64>.new();
-        private def wal: RegionWal;
+        private def wal: MultiTxnWal;
         def regionStart: u64;
 
         new(wal, regionStart) {
@@ -378,10 +378,11 @@ class RegionTransaction {
         def commit() {
                 if (!isDirty()) return;
                 appendToWal();
-                wal.commit();
+                def txnSeq = wal.commit();
+                if (txnSeq == 0u64) return;
                 applyToRegion();
-                wal.fenceAppliedUpdates();
-                wal.clear();
+                wal.noteApplied(txnSeq);
+                wal.maybeCheckpoint();
                 clear();
         }
 
@@ -482,7 +483,7 @@ class PWRegion {
         def blankChunkHandle = NULL_CHUNK;
         def var blockTableHandle: BlockTableHandle;
         def var logChunk: ChunkHandle;
-        private var wal: RegionWal;
+        private var wal: MultiTxnWal;
         def var regionStart: u64;
         def var txn: RegionTransaction;
 
@@ -527,7 +528,7 @@ class PWRegion {
         }
 
         def offsetInRegion(addr: u64) -> u64 {
-                return addr - u64.view((Pointer.atElement(rng, 0) - Pointer.NULL));
+                return addr - regionStart;
         }
 
         def blockOfOffset(offset: u64) -> u64 {
@@ -539,7 +540,7 @@ class PWRegion {
         }
 
         def blockEntryToChunk(blk: BlockEntryHandle) -> ChunkHandle {
-                return ChunkHandle(u64.view(Pointer.atElement(rng, 0)) + (blockSize * blockIndexOf(blk)));
+                return ChunkHandle(regionStart + (blockSize * blockIndexOf(blk)));
         }
 
         def chunkToBlockEntry(chunk: ChunkHandle) -> BlockEntryHandle {
@@ -548,17 +549,21 @@ class PWRegion {
         }
 
         private def init(blockSize: u64, forceFormat: bool) {
+                if (forceFormat) {
+                        format(blockSize);
+                        return;
+                }
                 var hdr = getHeader();
-                if (!forceFormat && hdr.magic == PWRegions.MAGIC) {
+                if (hdr.magic == PWRegions.MAGIC) {
                         mount(blockSize);
                 } else {
                         format(blockSize);
                 }
         }
 
-        private def ensureWal(logChunkAddr: u64, blockSize: u64) {
+        private def ensureWal(logChunkAddr: u64, blockSize: u64, initializeFresh: bool) {
                 if (wal == null) {
-                        wal = RegionWal.new(regionStart, logChunkAddr, blockSize, backendRegion);
+                        wal = MultiTxnWal.new(regionStart, logChunkAddr, blockSize, backendRegion, initializeFresh);
                 }
                 if (txn == null) {
                         txn = RegionTransaction.new(wal, regionStart);
@@ -592,7 +597,7 @@ class PWRegion {
 
                 def logBlockHandle = blockTableHandle[1];
                 logChunk = blockEntryToChunk(logBlockHandle);
-                ensureWal(logChunk.addr, blockSize);
+                ensureWal(logChunk.addr, blockSize, false);
 
                 txn.recover();
         }
@@ -608,24 +613,29 @@ class PWRegion {
         }
 
         // Initialize list sentinels just after the region header
-        private def formatSentinels(hdr: Ref<PWRegionHeader>) {
-                hdr.sentinels = u64.!(PWRegionHeader.size);
-                sentinels = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.sentinels))), u64.!(BlockLists.MAX_LISTS));
-                sanitizeOffset(hdr.sentinels);
-                sanitizeOffset(hdr.sentinels + u64.!(sentinels.size));
+        private def headerSetU64(offset: int, value: u64) {
+                (PWRegionUtils.pointerFromU64(regionStart) + offset).store<u64>(value);
+        }
+
+        private def formatSentinels() {
+                def sentinelOffset = u64.!(PWRegionHeader.size);
+                headerSetU64(PWRegionHeader.sentinels.offset, sentinelOffset);
+                sentinels = BlockTableHandle(regionStart + sentinelOffset, u64.!(BlockLists.MAX_LISTS));
+                sanitizeOffset(sentinelOffset);
+                sanitizeOffset(sentinelOffset + u64.!(sentinels.size));
                 for (i < u64.!(BlockLists.MAX_LISTS)) {
                         clearBlockEntry(sentinels[i]);
                 }
         }
 
         // Allocate block table space from the end of the region
-        private def formatBlockTable(hdr: Ref<PWRegionHeader>, currentRegionEnd: u64) -> u64 {
+        private def formatBlockTable(currentRegionEnd: u64) -> u64 {
                 def numBlockTableEntries = numBlocks + 1;
                 def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
                 var end = currentRegionEnd - blockTableSize;
-                hdr.blockTable = end;
+                headerSetU64(PWRegionHeader.blockTable.offset, end);
                 sanitizeOffset(end);
-                blockTableHandle = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(end))), numBlockTableEntries);
+                blockTableHandle = BlockTableHandle(regionStart + end, numBlockTableEntries);
 
                 for (i < numBlockTableEntries) {
                         clearBlockEntry(blockTableHandle[i]);
@@ -634,12 +644,12 @@ class PWRegion {
         }
 
         // Allocate metadata descriptor and metadata space from the end of the region
-        private def formatMetaData(hdr: Ref<PWRegionHeader>, size: u64, currentRegionEnd: u64) -> u64 {
+        private def formatMetaData(size: u64, currentRegionEnd: u64) -> u64 {
                 def metaDataDescsSize = u64.!(metaDataDescs.length * MetaDataDesc.size);
                 var end = currentRegionEnd - metaDataDescsSize;
                 sanitizeOffset(end);
-                hdr.metaDataDescs = end;
-                hdr.numDescs = u64.!(metaDataDescs.length);
+                headerSetU64(PWRegionHeader.metaDataDescs.offset, end);
+                headerSetU64(PWRegionHeader.numDescs.offset, u64.!(metaDataDescs.length));
 
                 for (i < metaDataDescs.length) {
                         var desc = metaDataDescs[i];
@@ -662,16 +672,16 @@ class PWRegion {
         // Formats a completely uninitialized region of memory
         private def format(blockSize: u64) {
                 def size = numBlocks * blockSize;
-                def hdr = getHeader();
-                sanitizeAddress(u64.view(Pointer.atRef(hdr)));
 
-                hdr.numBlocks = this.numBlocks;
-                hdr.numBytes = size;
-                hdr.blockSize = blockSize;
+                headerSetU64(PWRegionHeader.numBlocks.offset, this.numBlocks);
+                headerSetU64(PWRegionHeader.numBytes.offset, size);
+                headerSetU64(PWRegionHeader.blockSize.offset, blockSize);
 
-                formatSentinels(hdr);
-                var currentRegionEnd = formatBlockTable(hdr, size);
-                currentRegionEnd = formatMetaData(hdr, size, currentRegionEnd);
+                formatSentinels();
+                var currentRegionEnd = formatBlockTable(size);
+                currentRegionEnd = formatMetaData(size, currentRegionEnd);
+                def blockTableOffset = blockTableHandle.addr - regionStart;
+                def sentinelOffset = u64.!(PWRegionHeader.size);
 
                 var metaDataBytes = u64.!(rng.length) - currentRegionEnd;
                 var metaDataBlocks = (metaDataBytes + (blockSize - 1)) / blockSize;
@@ -691,7 +701,7 @@ class PWRegion {
                 headerBlockHandle.setListNum(ListKind.METADATA.code);
                 headerBlockHandle.setUsed(true);
                 headerBlockHandle.setNext(logBlockHandle);
-                sanitizeOffset(hdr.blockTable + u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset + u64.!(BlockEntry.size));
 
                 // Block 1: WAL log chunk (METADATA, used)
                 sanitizeAddress(logBlockHandle.addr);
@@ -699,10 +709,10 @@ class PWRegion {
                 logBlockHandle.setUsed(true);
                 logBlockHandle.setPrev(headerBlockHandle);
                 logBlockHandle.setNext(firstFreeBlockHandle);
-                sanitizeOffset(hdr.blockTable + 2u64 * u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
-                ensureWal(logChunk.addr, blockSize);
+                ensureWal(logChunk.addr, blockSize, true);
 
                 // Block 2: first free block (LARGE_FREE)
                 sanitizeAddress(firstFreeBlockHandle.addr);
@@ -711,18 +721,18 @@ class PWRegion {
                 firstFreeBlockHandle.setPrev(logBlockHandle);
                 firstFreeBlockHandle.setListPrev(largeSentinel);
                 firstFreeBlockHandle.setListNext(NULL_BLOCK_ENTRY);
-                sanitizeOffset(hdr.blockTable + (userDataBlocks + 1) * u64.!(BlockEntry.size));
-                sanitizeOffset(hdr.blockTable);
-                sanitizeOffset(hdr.sentinels + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
+                sanitizeOffset(blockTableOffset + (userDataBlocks + 1) * u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset);
+                sanitizeOffset(sentinelOffset + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
 
                 // Sentinels: small starts empty, large points to firstFreeBlock
                 sanitizeAddress(smallSentinel.addr);
                 smallSentinel.setListNext(NULL_BLOCK_ENTRY);
-                sanitizeOffset(hdr.blockTable);
+                sanitizeOffset(blockTableOffset);
 
                 sanitizeAddress(largeSentinel.addr);
                 largeSentinel.setListNext(firstFreeBlockHandle);
-                sanitizeOffset(hdr.blockTable + u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset + u64.!(BlockEntry.size));
 
                 // Metadata block (METADATA, used)
                 sanitizeAddress(metaHandle.addr);
@@ -732,37 +742,46 @@ class PWRegion {
                 metaHandle.setPrev(firstFreeBlockHandle);
                 metaHandle.setListPrev(NULL_BLOCK_ENTRY);
                 metaHandle.setListNext(NULL_BLOCK_ENTRY);
-                sanitizeOffset(hdr.blockTable + numBlocks * u64.!(BlockEntry.size));
-                sanitizeOffset(hdr.blockTable + u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset + numBlocks * u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset + u64.!(BlockEntry.size));
 
                 // End-of-region marker (NONE, used)
                 sanitizeAddress(lastHandle.addr);
                 lastHandle.setListNum(ListKind.NONE.code);
                 lastHandle.setUsed(true);
                 lastHandle.setPrev(metaHandle);
-                sanitizeOffset(hdr.blockTable + (userDataBlocks + 1) * u64.!(BlockEntry.size));
+                sanitizeOffset(blockTableOffset + (userDataBlocks + 1) * u64.!(BlockEntry.size));
 
-                hdr.magic = PWRegions.MAGIC;
+                headerSetU64(PWRegionHeader.magic.offset, PWRegions.MAGIC);
 
                 // Persist the freshly formatted region image before exposing it.
                 backendRegion.persistRange(0, u64.!(rng.length));
         }
 
         def getHeader() -> Ref<PWRegionHeader> {
-                return Ref<PWRegionHeader>.of(rng[0 ..+ PWRegionHeader.size]);
+                var copy = Array<byte>.new(PWRegionHeader.size);
+                def base = PWRegionUtils.pointerFromU64(regionStart);
+                for (i < PWRegionHeader.size) {
+                        copy[i] = (base + i).load<byte>();
+                }
+                return Ref<PWRegionHeader>.of(copy[0 ..+ copy.length]);
         }
 
         def getMetaDataDesc(i: u64) -> Ref<MetaDataDesc> {
                 var hdr = getHeader();
-                return Ref<MetaDataDesc>.of(rng[hdr.metaDataDescs + i * u64.!(MetaDataDesc.size) ..+ MetaDataDesc.size]);
+                return Ref<MetaDataDesc>.of(CiRuntime.forgeRange<byte>(
+                        PWRegionUtils.pointerFromU64(regionStart + hdr.metaDataDescs + i * u64.!(MetaDataDesc.size)),
+                        MetaDataDesc.size));
         }
 
         def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
-                return Ref<BlockEntry>.of(rng[offset ..+ BlockEntry.size]);
+                return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(
+                        PWRegionUtils.pointerFromU64(regionStart + offset),
+                        BlockEntry.size));
         }
 
         def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
-                var chunk = ChunkHandle(u64.view(Pointer.atElement(rng, 0)) + blockIndexOf(startEntry) * blockSize);
+                var chunk = ChunkHandle(regionStart + blockIndexOf(startEntry) * blockSize);
 
                 chunk.setOffsetCached(txn, u64.!(ChunkHeader.size));
                 chunk.setLimitCached(txn, u64.!(numBlocks) * blockSize);
