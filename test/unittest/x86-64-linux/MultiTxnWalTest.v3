@@ -14,6 +14,9 @@ def MTWX = [
 	MTW("wraparound_checkpoint_reserve", test_multi_wraparound_checkpoint_reserve),
 	MTW("recovers_multiple_records", test_multi_recovers_multiple_records),
 	MTW("crash_mid_log_recovery", test_multi_crash_mid_log_recovery),
+	MTW("checkpoint_policy_thresholds", test_multi_checkpoint_policy_thresholds),
+	MTW("maybe_checkpoint_count", test_multi_maybe_checkpoint_count),
+	MTW("maybe_checkpoint_occupancy", test_multi_maybe_checkpoint_occupancy),
 	()
 ];
 
@@ -50,6 +53,32 @@ class MultiTxnWalTestRegion extends BackendRegion {
 
 	def persistChanges() -> bool {
 		return true;
+	}
+}
+
+// A region whose checkpoint cost class is configurable, so the per-backend
+// threshold wiring in configureCheckpointPolicy() can be exercised directly.
+class CostRegion extends BackendRegion {
+	def cost: CheckpointCost;
+
+	new(range: Range<byte>, cost) super(range) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		return true;
+	}
+
+	def checkpointCost() -> CheckpointCost {
+		return cost;
 	}
 }
 
@@ -261,4 +290,64 @@ def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(0u8, tc.data[202]);              // torn seq 3 NOT applied
 	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
 	tc.t.assertz(true, tornOffset > 0u64);
+}
+
+// Per-backend threshold wiring: configureCheckpointPolicy() must map each
+// CheckpointCost class to its constants (free->aggressive, expensive->lazy).
+def test_multi_checkpoint_policy_thresholds(tc: MultiTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def log = base + 1024u64;
+
+	def freeWal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.FREE), true);
+	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_TXN_FREE, freeWal.checkpointTxnThreshold);
+	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_FILL_FREE, freeWal.checkpointFillPercent);
+
+	def cheapWal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.CHEAP), false);
+	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_TXN_CHEAP, cheapWal.checkpointTxnThreshold);
+	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_FILL_CHEAP, cheapWal.checkpointFillPercent);
+
+	def expWal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.EXPENSIVE), false);
+	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE, expWal.checkpointTxnThreshold);
+	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE, expWal.checkpointFillPercent);
+}
+
+// Count-cap path: on a FREE backend (txn threshold 1) a single applied commit
+// is enough for maybeCheckpoint() to publish durability and reclaim the record,
+// well below the occupancy watermark.
+def test_multi_maybe_checkpoint_count(tc: MultiTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def log = base + 1024u64;
+	def wal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.FREE), true);
+
+	wal.append(200u64, 0x55u64, 1u8);
+	def seq = wal.commit();
+	tc.t.assert_eq(1u64, seq);
+	wal.noteApplied(seq);
+	tc.t.assertz(true, wal.maybeCheckpoint());
+	tc.t.assert_eq(1u64, wal.durableAppliedSeq);    // count cap (threshold 1) fired
+	tc.t.assert_eq(0, wal.activeRecords.length);     // record reclaimed
+	tc.t.assert_eq(0u64, wal.activeBytes);
+}
+
+// Occupancy-watermark path: on an EXPENSIVE backend the count cap is 64 (never
+// reached here) but the 50% fill watermark fires. ringBytes = 896, each 1-entry
+// record is 192 B, so the watermark (448 B) is crossed at the third record.
+def test_multi_maybe_checkpoint_occupancy(tc: MultiTxnWalTester) {
+	tc.writeAndApply(200u64, 0x11u64, 1u8);
+	tc.t.assertz(true, tc.wal.maybeCheckpoint());
+	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);  // 192 B < 448 B watermark
+
+	tc.writeAndApply(201u64, 0x22u64, 1u8);
+	tc.t.assertz(true, tc.wal.maybeCheckpoint());
+	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);  // 384 B < 448 B watermark
+
+	tc.writeAndApply(202u64, 0x33u64, 1u8);
+	tc.t.assertz(true, tc.wal.maybeCheckpoint());
+	tc.t.assert_eq(3u64, tc.wal.durableAppliedSeq);  // 576 B >= 448 B -> checkpoint
+	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+	tc.t.assert_eq(0u64, tc.wal.activeBytes);
 }

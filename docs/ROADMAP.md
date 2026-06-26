@@ -31,6 +31,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `durableAppliedSeq` is the replay floor: recovery scans the ring, selects the contiguous `txnSeq` prefix starting at `durableAppliedSeq + 1` (`selectContiguousPrefix`), redoes it, persists, then publishes the new `durableAppliedSeq`
 - Append path: `append()` buffers `WalPendingEntry`s; `commit()` writes one contiguous record (`appendCommittedRecord`) and returns its `txnSeq` (0 on failure). `reserveRecord` handles wrap-around and triggers a lazy `checkpoint` when the ring is full before retrying
 - `checkpoint(targetSeq)` persists pending region changes, publishes `durableAppliedSeq` via the superblock, and reclaims now-durable records from `activeRecords`
+- `maybeCheckpoint()` implements a hybrid count-OR-occupancy policy (`lag ≥ checkpointTxnThreshold` **OR** `activeBytes ≥ checkpointFillPercent% of ringBytes`) with the lazy ring-full `reserveRecord` checkpoint kept as a backstop. Thresholds are chosen per backend via `BackendRegion.checkpointCost()` (`CheckpointCost.FREE`/`CHEAP`/`EXPENSIVE` → volatile/PMEM/file); an `activeBytes` running counter (maintained in `appendCommittedRecord`/`reclaimAppliedRecords`) drives the occupancy watermark. Best-effort: a failed checkpoint leaves data recoverable from the WAL.
 - `RegionTransaction` rewired onto `MultiTxnWal`: `commit()` is `appendToWal → wal.commit → applyToRegion → noteApplied → maybeCheckpoint → clear`
 
 ### Transaction cache
@@ -56,13 +57,13 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 ### Tests
 - `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow (now over `MultiTxnWal`: durable record written, only cache cleared on commit), clean-txn no-op, aligned-access constraint
 - `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection (now via `MultiTxnWal` record checksum); `FileMmapRegion`/`PmemMmapRegion` state and lifecycle
-- `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, crash-mid-log recovery
+- `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, crash-mid-log recovery, per-backend checkpoint-policy thresholds, `maybeCheckpoint` count-cap and occupancy-watermark paths
 
 ---
 
 ## In Progress
 
-- Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. Remaining `MultiTxnWal` work is the `maybeCheckpoint()` policy and commit-failure propagation (Next Steps #1–2).
+- Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is now implemented (hybrid count-OR-occupancy, per-backend thresholds — Next Steps #1). Remaining `MultiTxnWal` work is commit-failure propagation (Next Steps #2).
 
 ---
 
@@ -70,7 +71,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ### 1. Multi-transaction WAL — finish off
 The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining work:
-- [ ] `maybeCheckpoint()` is a no-op stub (`return true`) — checkpointing currently happens only lazily when the ring fills in `reserveRecord`. Decide on a per-commit / threshold checkpoint policy so `durableAppliedSeq` advances without log pressure. Policy options brainstormed in `docs/checkpoint-policy.md` (recommendation: hybrid count-OR-occupancy with lazy ring-full backstop).
+- [x] `maybeCheckpoint()` implemented as hybrid count-OR-occupancy with the lazy ring-full `reserveRecord` checkpoint kept as a backstop, thresholds chosen per backend via `BackendRegion.checkpointCost()` (`CheckpointCost.FREE`/`CHEAP`/`EXPENSIVE`). Policy brainstormed in `docs/checkpoint-policy.md` (Option E + light F). Covered by `MultiTxnWalTest.v3` (`checkpoint_policy_thresholds`, `maybe_checkpoint_count`, `maybe_checkpoint_occupancy`).
 - [x] Test the untested core paths: **epoch-stale rejection** (bump epoch, confirm prior-epoch records are ignored) and **wrap-around / log-full → checkpoint → reserve** (fill a small ring and verify reclaim + wrap). Done in `MultiTxnWalTest.v3` (`epoch_stale_rejected`, `wraparound_checkpoint_reserve`).
 - [x] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case). Done in `MultiTxnWalTest.v3` (`recovers_multiple_records`, `crash_mid_log_recovery`).
 - [ ] Remove or repurpose the now-orphaned `RegionWal` (`X86_64RegionWal.v3`).
@@ -95,7 +96,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 | # | File | Description |
 |---|------|-------------|
 | 1 | `X86_64TxnBackend.v3:88-100` | `flushCacheLine`/`storeFence` are stubs — PMEM not truly durable |
-| 2 | `X86_64MultiTxnWal.v3` | Commit failure (record won't fit even after checkpoint) returns `0` and is not surfaced to the allocator; `maybeCheckpoint()` is a no-op stub |
+| 2 | `X86_64MultiTxnWal.v3` | Commit failure (record won't fit even after checkpoint) returns `0` and is not surfaced to the allocator (`maybeCheckpoint()` now implemented) |
 | 3 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
 | 4 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` missing log-chunk offset field — `mount` still assumes block 1 is the log |
 | 5 | `X86_64TxnPWRegion.v3:771` | Line-mark field not linked in `createChunk()` |

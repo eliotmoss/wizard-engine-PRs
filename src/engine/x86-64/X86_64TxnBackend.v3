@@ -129,6 +129,11 @@ class FileMmapRegion extends FdMmapRegion {
 	def cleanupBeforeDestroy() {
 		hasDirtyChanges = false;
 	}
+
+	// fdatasync of region data plus a superblock msync per checkpoint.
+	def checkpointCost() -> CheckpointCost {
+		return CheckpointCost.EXPENSIVE;
+	}
 }
 
 class PmemMmapRegion extends FdMmapRegion {
@@ -162,6 +167,11 @@ class PmemMmapRegion extends FdMmapRegion {
 
 	def cleanupBeforeDestroy() {
 		hasPendingWriteback = false;
+	}
+
+	// Only store fences on the persist path, so checkpoints are cheap here.
+	def checkpointCost() -> CheckpointCost {
+		return CheckpointCost.CHEAP;
 	}
 }
 

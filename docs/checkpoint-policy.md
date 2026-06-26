@@ -120,3 +120,40 @@ def maybeCheckpoint() -> bool {
 
 Proposed default: fixed constants + best-effort, with a count cap of ~64 and a
 50% fill watermark — easy to unit-test.
+
+---
+
+## Implemented (Option E + light F)
+
+`maybeCheckpoint()` now applies the hybrid policy with per-backend thresholds:
+
+```
+def maybeCheckpoint() -> bool {
+        def lag = appliedSeqVolatile - durableAppliedSeq;
+        if (lag == 0u64) return true;
+        if (lag >= checkpointTxnThreshold) return checkpoint(appliedSeqVolatile);
+        if (activeBytes * 100u64 >= ringBytes * checkpointFillPercent) return checkpoint(appliedSeqVolatile);
+        return true;
+}
+```
+
+Resolutions to the open decisions:
+
+1. **How configurable** — backend-aware. `BackendRegion.checkpointCost()` returns
+   a `CheckpointCost` class (`FREE` volatile / `CHEAP` PMEM / `EXPENSIVE` file;
+   `EXPENSIVE` is the conservative default for unknown backends).
+   `configureCheckpointPolicy()` maps each class to a `(txnThreshold, fillPercent)`
+   pair held in `MultiTxnWalConstants`:
+   - `FREE` → (1, 1%) — reclaim on essentially every commit; checkpoint is free.
+   - `CHEAP` → (8, 25%) — low cap; store fences are cheap.
+   - `EXPENSIVE` → (64, 50%) — lazy; amortize `fdatasync` + superblock `msync`.
+2. **Failure handling** — best-effort. The boolean result is returned but a failed
+   checkpoint is non-fatal (data remains recoverable from the WAL). Surfacing it
+   up is folded into Roadmap Next Steps #2 (commit-failure propagation).
+
+`activeBytes` is a running counter maintained in `appendCommittedRecord`
+(increment) and `reclaimAppliedRecords` (recompute over kept records), and reset
+wherever `activeRecords` is reset (mount/recovery). The lazy ring-full checkpoint
+in `reserveRecord` is retained as a backstop. Tests: `MultiTxnWalTest.v3`
+(`checkpoint_policy_thresholds`, `maybe_checkpoint_count`,
+`maybe_checkpoint_occupancy`).

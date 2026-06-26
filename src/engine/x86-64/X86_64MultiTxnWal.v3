@@ -43,6 +43,18 @@ component MultiTxnWalConstants {
         def RECORD_VERSION = 1u16;
         def ALIGNMENT = 64u64;
         def NO_OFFSET = 0xffff_ffff_ffff_ffff_u64;
+
+        // Checkpoint thresholds by backend cost class (see CheckpointCost). A
+        // checkpoint reclaims ring space and bounds recovery replay length,
+        // traded against a region-data sync plus superblock churn. The count cap
+        // bounds mount/recovery time; the fill watermark pre-empts the ring-full
+        // stall handled lazily in reserveRecord.
+        def CHECKPOINT_TXN_FREE = 1u64;         // volatile: reclaim on every commit
+        def CHECKPOINT_FILL_FREE = 1u64;
+        def CHECKPOINT_TXN_CHEAP = 8u64;        // PMEM: low cap, fences are cheap
+        def CHECKPOINT_FILL_CHEAP = 25u64;
+        def CHECKPOINT_TXN_EXPENSIVE = 64u64;   // file: lazy, amortize fdatasync/msync
+        def CHECKPOINT_FILL_EXPENSIVE = 50u64;
 }
 
 type WalPendingEntry(offset: u64, value: u64, width: u8) #unboxed { }
@@ -67,6 +79,9 @@ class MultiTxnWal {
         def var durableAppliedSeq: u64 = 0;     // Loaded from the newest valid superblock
         def var appliedSeqVolatile: u64 = 0;    // Highest sequence applied to region memory
         def var activeRecords = Vector<WalActiveRecord>.new();
+        def var activeBytes: u64 = 0;           // Running sum of recordLen over activeRecords; drives the occupancy watermark
+        def var checkpointTxnThreshold: u64 = MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE;
+        def var checkpointFillPercent: u64 = MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE;
         private def pendingEntries = Vector<WalPendingEntry>.new();
         def var openOk = false;
 
@@ -76,6 +91,7 @@ class MultiTxnWal {
                 ringBase = logChunkAddr + 2u64 * u64.!(WalSuperblock.size);
                 ringBytes = blockSize - 2u64 * u64.!(WalSuperblock.size);
                 activeRecords = Vector<WalActiveRecord>.new();
+                configureCheckpointPolicy();
                 if (initializeFresh) {
                         initializeSuperblocks();
                 } else {
@@ -119,8 +135,35 @@ class MultiTxnWal {
                 }
         }
 
+        // Hybrid count-OR-occupancy checkpoint policy. The count cap bounds
+        // recovery replay length; the occupancy watermark pre-empts the lazy
+        // ring-full checkpoint in reserveRecord (kept as a backstop). Thresholds
+        // are chosen per backend in configureCheckpointPolicy(). Best-effort: a
+        // failed checkpoint leaves data recoverable from the WAL.
         def maybeCheckpoint() -> bool {
+                def lag = appliedSeqVolatile - durableAppliedSeq;
+                if (lag == 0u64) return true;                                                   // nothing applied to publish
+                if (lag >= checkpointTxnThreshold) return checkpoint(appliedSeqVolatile);       // bound recovery replay length
+                if (activeBytes * 100u64 >= ringBytes * checkpointFillPercent) return checkpoint(appliedSeqVolatile); // pre-empt ring-full stall
                 return true;
+        }
+
+        private def configureCheckpointPolicy() {
+                def cost = if(backendRegion != null, backendRegion.checkpointCost(), CheckpointCost.EXPENSIVE);
+                match (cost) {
+                        FREE => {
+                                checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_FREE;
+                                checkpointFillPercent = MultiTxnWalConstants.CHECKPOINT_FILL_FREE;
+                        }
+                        CHEAP => {
+                                checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_CHEAP;
+                                checkpointFillPercent = MultiTxnWalConstants.CHECKPOINT_FILL_CHEAP;
+                        }
+                        EXPENSIVE => {
+                                checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE;
+                                checkpointFillPercent = MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE;
+                        }
+                }
         }
 
         def checkpoint(targetSeq: u64) -> bool {
@@ -195,6 +238,7 @@ class MultiTxnWal {
                 }
 
                 activeRecords.put(WalActiveRecord(txnSeq, start, u32.!(recordLen64), entryCount));
+                activeBytes += recordLen64;
                 nextTxnSeq++;
                 return txnSeq;
         }
@@ -229,11 +273,16 @@ class MultiTxnWal {
 
         private def reclaimAppliedRecords() {
                 var kept = Vector<WalActiveRecord>.new();
+                var keptBytes = 0u64;
                 for (i < activeRecords.length) {
                         def rec = activeRecords[i];
-                        if (rec.txnSeq > durableAppliedSeq) kept.put(rec);
+                        if (rec.txnSeq > durableAppliedSeq) {
+                                kept.put(rec);
+                                keptBytes += u64.view(rec.recordLen);
+                        }
                 }
                 activeRecords = kept;
+                activeBytes = keptBytes;
         }
 
         // --- Read (cache-miss fallthrough) ---
@@ -272,6 +321,7 @@ class MultiTxnWal {
                         appliedSeqVolatile = durableAppliedSeq;
                         headOffset = 0u64;
                         activeRecords.resize(0);
+                        activeBytes = 0u64;
                         return false;
                 }
 
@@ -292,6 +342,7 @@ class MultiTxnWal {
                 nextTxnSeq = durableAppliedSeq + 1u64;
                 headOffset = 0u64;
                 activeRecords.resize(0);
+                activeBytes = 0u64;
                 return true;
         }
 
@@ -375,6 +426,7 @@ class MultiTxnWal {
                 nextSuperblockIndex = 1 - index;
                 headOffset = 0u64;
                 activeRecords.resize(0);
+                activeBytes = 0u64;
                 return true;
         }
 

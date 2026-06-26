@@ -11,14 +11,33 @@
 // The backend is responsible for creating regions and reporting capabilities.
 // Region objects own their own lifecycle and persistence behavior.
 
+// Relative cost class of a checkpoint() on a backend, used to tune the WAL's
+// checkpoint thresholds. Checkpoint cost is strongly backend-asymmetric:
+//   FREE      volatile  -- reclaim only, no syncs
+//   CHEAP     PMEM      -- a couple of store fences
+//   EXPENSIVE file      -- fdatasync of region data + superblock msync
+enum CheckpointCost {
+	FREE,
+	CHEAP,
+	EXPENSIVE
+}
+
 // A memory region created by a backend
 class BackendRegion {
 	def range: Range<byte>;  // The actual bytes of the region
-	
+
 	new(range) { }
-	
+
 	// Destroy this region and release any resources it owns.
 	def destroy();
+
+	// Relative cost of a checkpoint() on this backend. The WAL uses it to choose
+	// how aggressively to checkpoint: a free backend can checkpoint on nearly
+	// every commit, while an expensive backend checkpoints lazily. Conservative
+	// default for unknown backends is EXPENSIVE.
+	def checkpointCost() -> CheckpointCost {
+		return CheckpointCost.EXPENSIVE;
+	}
 
 	// Ordinary data bytes have already changed; prepare them for durability at
 	// the next persistChanges().
@@ -58,6 +77,10 @@ class VolatileRegion extends BackendRegion {
 
 	def destroy() {
 		// Array storage is garbage collected automatically.
+	}
+
+	def checkpointCost() -> CheckpointCost {
+		return CheckpointCost.FREE;
 	}
 
 	def prepareChangedRange(offset: u64, size: u64) -> bool {
