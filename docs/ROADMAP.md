@@ -32,6 +32,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Append path: `append()` buffers `WalPendingEntry`s; `commit()` writes one contiguous record (`appendCommittedRecord`) and returns its `txnSeq` (0 on failure). `reserveRecord` handles wrap-around and triggers a lazy `checkpoint` when the ring is full before retrying
 - `checkpoint(targetSeq)` persists pending region changes, publishes `durableAppliedSeq` via the superblock, and reclaims now-durable records from `activeRecords`
 - `maybeCheckpoint()` implements a hybrid count-OR-occupancy policy (`lag ≥ checkpointTxnThreshold` **OR** `activeBytes ≥ checkpointFillPercent% of ringBytes`) with the lazy ring-full `reserveRecord` checkpoint kept as a backstop. Thresholds are chosen per backend via `BackendRegion.checkpointCost()` (`CheckpointCost.FREE`/`CHEAP`/`EXPENSIVE` → volatile/PMEM/file); an `activeBytes` running counter (maintained in `appendCommittedRecord`/`reclaimAppliedRecords`) drives the occupancy watermark. Best-effort: a failed checkpoint leaves data recoverable from the WAL.
+- `RegionTransaction.commit()` / `PWRegion.performCommit()` now return `bool` instead of silently swallowing a WAL commit failure. `allocChunk()` returns `blankChunkHandle` (the existing exhaustion sentinel) and `freeChunk()` returns `false` when the underlying WAL commit fails (record cannot fit even after a checkpoint-and-retry). This is propagation only — no auto-split/retry — and buffered writes are never discarded on failure (the cache stays dirty; data is retained, not lost, consistent with the pre-existing invariant). A failed opportunistic `maybeCheckpoint()` after a successful WAL commit does **not** fail the transaction (see `docs/checkpoint-policy.md`); it only emits a `Trace.OUT` diagnostic.
 - `RegionTransaction` rewired onto `MultiTxnWal`: `commit()` is `appendToWal → wal.commit → applyToRegion → noteApplied → maybeCheckpoint → clear`
 
 ### Transaction cache
@@ -55,15 +56,15 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `X86_64ImmixPWMemRegion`, `X86_64ImmixPWNVRegion`
 
 ### Tests
-- `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow (now over `MultiTxnWal`: durable record written, only cache cleared on commit), clean-txn no-op, aligned-access constraint
-- `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection (now via `MultiTxnWal` record checksum); `FileMmapRegion`/`PmemMmapRegion` state and lifecycle
+- `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow (now over `MultiTxnWal`: durable record written, only cache cleared on commit), clean-txn no-op, aligned-access constraint, commit-failure propagation (oversized transaction overflows the ring, `commit()` returns `false`, cache stays dirty, WAL remains usable for subsequent transactions)
+- `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection (now via `MultiTxnWal` record checksum); `FileMmapRegion`/`PmemMmapRegion` state and lifecycle; small-ring WAL-overflow commit-failure propagation through `allocChunk`
 - `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, crash-mid-log recovery, per-backend checkpoint-policy thresholds, `maybeCheckpoint` count-cap and occupancy-watermark paths
 
 ---
 
 ## In Progress
 
-- Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is now implemented (hybrid count-OR-occupancy, per-backend thresholds — Next Steps #1). Remaining `MultiTxnWal` work is commit-failure propagation (Next Steps #2).
+- Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is now implemented (hybrid count-OR-occupancy, per-backend thresholds — Next Steps #1). Commit-failure propagation is now implemented (see Completed).
 
 ---
 
@@ -74,15 +75,13 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 - [x] `maybeCheckpoint()` implemented as hybrid count-OR-occupancy with the lazy ring-full `reserveRecord` checkpoint kept as a backstop, thresholds chosen per backend via `BackendRegion.checkpointCost()` (`CheckpointCost.FREE`/`CHEAP`/`EXPENSIVE`). Policy brainstormed in `docs/checkpoint-policy.md` (Option E + light F). Covered by `MultiTxnWalTest.v3` (`checkpoint_policy_thresholds`, `maybe_checkpoint_count`, `maybe_checkpoint_occupancy`).
 - [x] Test the untested core paths: **epoch-stale rejection** (bump epoch, confirm prior-epoch records are ignored) and **wrap-around / log-full → checkpoint → reserve** (fill a small ring and verify reclaim + wrap). Done in `MultiTxnWalTest.v3` (`epoch_stale_rejected`, `wraparound_checkpoint_reserve`).
 - [x] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case). Done in `MultiTxnWalTest.v3` (`recovers_multiple_records`, `crash_mid_log_recovery`).
+- [x] Commit-failure propagation: `RegionTransaction.commit()`/`PWRegion.performCommit()` return `bool`; `allocChunk()`/`freeChunk()` surface failure via `blankChunkHandle`/`false`. Done — see Completed.
 - [ ] Remove or repurpose the now-orphaned `RegionWal` (`X86_64RegionWal.v3`).
 
-### 2. WAL overflow / commit-failure propagation
-`appendCommittedRecord` returns `0` when a record will not fit even after a checkpoint, and `RegionTransaction.commit` returns early leaving the cache dirty (data is retained, not lost, but the failure is not surfaced to the allocator). Propagate an error so callers can split the transaction or trigger a log-full flush. (The legacy `RegionWal.append` silently dropped entries; the multi-txn path no longer loses data but is still silent.)
-
-### 3. CLWB/SFENCE intrinsics
+### 2. CLWB/SFENCE intrinsics
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
 
-### 4. Minor cleanups
+### 3. Minor cleanups
 - `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` must zero-initialise bytes
 - Add log-chunk offset to `PWRegionHeader` (avoids assuming block 1 is always the log)
 - `RegionTransaction.clear()` — avoid allocating a new `HashMap` on every commit
@@ -96,11 +95,10 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 | # | File | Description |
 |---|------|-------------|
 | 1 | `X86_64TxnBackend.v3:88-100` | `flushCacheLine`/`storeFence` are stubs — PMEM not truly durable |
-| 2 | `X86_64MultiTxnWal.v3` | Commit failure (record won't fit even after checkpoint) returns `0` and is not surfaced to the allocator (`maybeCheckpoint()` now implemented) |
-| 3 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
-| 4 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` missing log-chunk offset field — `mount` still assumes block 1 is the log |
-| 5 | `X86_64TxnPWRegion.v3:771` | Line-mark field not linked in `createChunk()` |
-| 6 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
-| 7 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
-| 8 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
-| 9 | `X86_64RegionWal.v3` | `RegionWal` is orphaned — no longer wired in after the `MultiTxnWal` switch |
+| 2 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
+| 3 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` missing log-chunk offset field — `mount` still assumes block 1 is the log |
+| 4 | `X86_64TxnPWRegion.v3:771` | Line-mark field not linked in `createChunk()` |
+| 5 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
+| 6 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
+| 7 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
+| 8 | `X86_64RegionWal.v3` | `RegionWal` is orphaned — no longer wired in after the `MultiTxnWal` switch |

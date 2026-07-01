@@ -375,15 +375,18 @@ class RegionTransaction {
                 return addrs.length != 0;
         }
 
-        def commit() {
-                if (!isDirty()) return;
+        def commit() -> bool {
+                if (!isDirty()) return true;
                 appendToWal();
                 def txnSeq = wal.commit();
-                if (txnSeq == 0u64) return;
+                if (txnSeq == 0u64) return false;
                 applyToRegion();
                 wal.noteApplied(txnSeq);
-                wal.maybeCheckpoint();
+                if (!wal.maybeCheckpoint()) {
+                        Trace.OUT.put1("checkpoint failed after commit of txnSeq %d (best-effort, data remains WAL-recoverable)", txnSeq).ln();
+                }
                 clear();
+                return true;
         }
 
         def recover() -> bool {
@@ -799,7 +802,7 @@ class PWRegion {
                                 removeFromList(firstHandle);
                                 firstHandle.setUsedCached(txn, true);
                                 var chunk = createChunk(firstHandle, 1);
-                                performCommit();
+                                if (!performCommit()) return blankChunkHandle;
                                 return chunk;
                         }
                 }
@@ -818,7 +821,7 @@ class PWRegion {
                                 removeFromList(thisHandle);
                                 thisHandle.setUsedCached(txn, true);
                                 var chunk = createChunk(thisHandle, numBlocks);
-                                performCommit();
+                                if (!performCommit()) return blankChunkHandle;
                                 return chunk;
                         }
 
@@ -849,18 +852,18 @@ class PWRegion {
                         // Mark allocated block as used
                         thisHandle.setUsedCached(txn, true);
                         var chunk = createChunk(thisHandle, numBlocks);
-                        performCommit();
+                        if (!performCommit()) return blankChunkHandle;
                         return chunk;
                 }
                 return blankChunkHandle;
         }
 
-        def freeChunk(chunk: ChunkHandle) {
-                if (chunk.isNull()) return;
+        def freeChunk(chunk: ChunkHandle) -> bool {
+                if (chunk.isNull()) return false;
 
                 var entry = chunkToBlockEntry(chunk);
-                if (entry.isNull()) return;
-                if (!entry.getUsedCached(txn)) return;
+                if (entry.isNull()) return false;
+                if (!entry.getUsedCached(txn)) return false;
 
                 entry.setUsedCached(txn, false);
 
@@ -898,7 +901,7 @@ class PWRegion {
                 } else {
                         insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
                 }
-                performCommit();
+                return performCommit();
         }
 
         // Insert entry into list immediately after sentinel (head insertion)
@@ -944,8 +947,8 @@ class PWRegion {
                 }
         }
 
-        private def performCommit() {
-                txn.commit();
+        private def performCommit() -> bool {
+                return txn.commit();
         }
 
         private def recover() {

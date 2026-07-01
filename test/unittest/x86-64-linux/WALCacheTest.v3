@@ -9,6 +9,8 @@ def X = [
 	T("commit_applies_and_clears", test_commit_applies_and_clears),
 	T("commit_uses_persistence_api", test_commit_uses_persistence_api),
 	T("commit_clean_noop", test_commit_clean_noop),
+	T("commit_overflow_returns_false", test_commit_overflow_returns_false),
+	T("commit_overflow_then_success", test_commit_overflow_then_success),
 	T("overwrite_update", test_overwrite_update),
 	T("is_dirty_check", test_is_dirty_check),
 	T("misaligned_access", test_misaligned_access),
@@ -238,6 +240,39 @@ def test_misaligned_access(tc: RegionTransactionTester) {
 	// It should NOT return 0x07 (the 2nd byte of the u64).
 	
 	var byteVal = tc.txn.readU8(offsetAddr);
-	
+
 	tc.t.assert_eq(0xAAu8, byteVal);
+}
+
+// Test 10: A transaction whose buffered writes cannot fit in the ring even after a
+// checkpoint (nothing durable to reclaim on a fresh WAL) must fail commit(),
+// leaving the cache dirty and the buffered values still readable.
+def test_commit_overflow_returns_false(tc: RegionTransactionTester) {
+	for (i < 25) {
+		tc.txn.writeU64(tc.getAddr(2048 + i * 8), u64.view(i));
+	}
+	tc.t.assertz(true, tc.txn.isDirty());
+	tc.t.assertz(false, tc.txn.commit());
+	tc.t.assertz(true, tc.txn.isDirty());
+	tc.t.assert_eq(7u64, tc.txn.readU64(tc.getAddr(2048 + 7 * 8)));
+	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
+	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+}
+
+// Test 11: A failed commit must not wedge the shared WAL: the oversized-record
+// check short-circuits before reserveRecord ever runs, so no ring space was
+// reserved. A second, independent transaction on the same WAL must still
+// commit normally afterward.
+def test_commit_overflow_then_success(tc: RegionTransactionTester) {
+	for (i < 25) {
+		tc.txn.writeU64(tc.getAddr(2048 + i * 8), u64.view(i));
+	}
+	tc.t.assertz(false, tc.txn.commit());
+	tc.t.assertz(true, tc.txn.isDirty());
+
+	var txn2 = RegionTransaction.new(tc.wal, tc.wal.regionStart);
+	txn2.writeU64(tc.getAddr(3000), 0x99u64);
+	tc.t.assertz(true, txn2.commit());
+	tc.t.assert_eq(1u64, tc.wal.appliedSeqVolatile);
+	tc.t.assertz(false, txn2.isDirty());
 }

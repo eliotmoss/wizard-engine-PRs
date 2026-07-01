@@ -200,6 +200,50 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 
 
 // =============================================================================
+// Commit-failure propagation test (small ring forces WAL overflow)
+// =============================================================================
+
+// numBlocks=8, blockSize=512 -> ringBytes = 512 - 2*64 = 384. A single
+// allocChunk(2) split-path call buffers 16 distinct cache writes in one WAL
+// transaction; alignedRecordLen(9) = 448 > 384, so the record can never fit
+// even after a checkpoint (nothing durable yet to reclaim on a fresh region).
+def SRT = UnitTests.registerT("pwregion_overflow:", _, SmallRingPWRegionTester.new, _);
+def SX = [
+	SRT("alloc_overflow_returns_blank", test_alloc_overflow_returns_blank),
+	()
+];
+
+class SmallRingPWRegionTester(t: Tester) {
+	var region: PWRegion;
+
+	new() {
+		region = PWRegion.new(
+			Backends.getVolatile(),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			512u64,
+			true
+		);
+	}
+
+	def allocSucceeded(chunk: ChunkHandle) -> bool {
+		return !chunk.isNull();
+	}
+}
+
+// allocChunk(2) on a fresh small-ring region takes the split path (16
+// buffered writes), which overflows ringBytes=384. The commit must fail,
+// allocChunk must return blankChunkHandle (not a chunk claiming success), and
+// the transaction must remain dirty (data retained, not lost).
+def test_alloc_overflow_returns_blank(tc: SmallRingPWRegionTester) {
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	var chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, tc.allocSucceeded(chunk));
+	tc.t.assertz(true, tc.region.txn.isDirty());
+}
+
+
+// =============================================================================
 // Backend region ownership tests
 // =============================================================================
 
