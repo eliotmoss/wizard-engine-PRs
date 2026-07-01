@@ -14,7 +14,7 @@ The current design commits one WAL transaction per `allocChunk`/`freeChunk` call
 
 ## 2. Single-transaction WAL does not match the multi-transaction goal
 
-The `MultiTxnWal` skeleton exists, but the entire stack routes through `RegionWal`, which allows exactly one active transaction at a time. If WASM needs concurrent transactions (e.g. multiple WASM threads each with an in-flight allocation), the current design serialises them at the allocator level with no visibility into ordering or isolation. The `WalSuperblock` layout anticipates this with `logEpoch` and `durableAppliedSeq`, but nothing connects it to the allocator yet.
+The stack now routes through `MultiTxnWal` (the log itself supports many outstanding committed transactions), but `RegionTransaction` still exposes exactly one active transaction at a time, so the allocator serialises operations regardless. If WASM needs *concurrent* transactions (e.g. multiple WASM threads each with an in-flight allocation), the current design serialises them at the allocator level with no visibility into ordering or isolation. `MultiTxnWal` uses `logEpoch` and `durableAppliedSeq` for crash recovery, but nothing connects the multi-transaction machinery to concurrent allocator clients yet. (The original single-transaction WAL now lives on as `SingleTxnWal`, a reference implementation — see `docs/wal-comparison.md`.)
 
 ---
 
@@ -37,7 +37,7 @@ Format hardwires block 1 as the log chunk; mount rediscovers it by index. If the
 
 ## 5. Unbounded cache accumulation can produce incomplete WAL records
 
-`RegionTransaction` accumulates an unlimited number of `(addr, value)` pairs before committing. Each becomes a 32-byte `LogEntry`. A large transaction can silently overflow the log chunk; the current overflow path in `RegionWal.append` drops the entry without signalling an error. The committed WAL record is then incomplete — recovery replays a partial state that differs from the pre-crash intent. This is a correctness hole, not a performance issue.
+`RegionTransaction` accumulates an unlimited number of `(addr, value)` pairs before committing. Each becomes a 32-byte `LogEntry`. A large transaction can overflow the log chunk. In the superseded single-transaction WAL (`SingleTxnWal.append`, kept only as a reference implementation), the overflow path drops the entry without signalling an error, leaving a committed-but-incomplete log — recovery then replays a partial state that differs from the pre-crash intent. The active `MultiTxnWal` closes that hole by surfacing ring overflow through a failed `commit()` (returns `0`, propagated up by `RegionTransaction.commit()` / `PWRegion.performCommit()`), so no incomplete record is marked committed. This was a correctness hole, not a performance issue.
 
 ---
 

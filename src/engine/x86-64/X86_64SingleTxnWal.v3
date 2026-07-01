@@ -1,7 +1,18 @@
-// Concrete in-region WAL helper: the log lives in block 1 of the mapped region.
+// SingleTxnWal -- the original single-transaction, in-region redo WAL.
+//
+// SUPERSEDED and no longer wired in: PWRegion / RegionTransaction now drive the
+// multi-transaction ring log (MultiTxnWal, X86_64MultiTxnWal.v3). This class is
+// retained as a reference point for comparing the single-transaction design
+// against the multi-transaction ring. See docs/wal-comparison.md.
+//
+// Design: the log lives in block 1 of the mapped region. A single LogHeader
+// (numEntries / status / checksum) precedes a flat LogEntry[] array. commit()
+// persists the entries, then sets status=1; recovery replays the entries when
+// status==1 and the checksum matches, then clears status. Only one in-flight
+// transaction -- there is no ring, epoch, superblock, or checkpoint machinery.
 // All I/O is via Pointer.store/Pointer.load + BackendRegion-provided flush/fence.
 
-class RegionWal {
+class SingleTxnWal {
         def regionStart: u64;              // absolute address of region byte 0
         def logChunkAddr: u64;             // absolute address of the log chunk (block 1)
         def backendRegion: BackendRegion;

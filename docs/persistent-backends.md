@@ -93,7 +93,7 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
 
 `MultiTxnWal` is the active WAL: a **circular redo log** supporting multiple outstanding transactions with generation-based crash recovery. It occupies block 1 of a `PWRegion`. `append()` buffers one memory write; `commit()` writes a single contiguous, checksummed transaction record and returns its sequence number; `checkpoint()` publishes how far the region data is durable and reclaims log space; `recover()` replays the committed tail on remount.
 
-> The earlier single-transaction `RegionWal` (`src/engine/x86-64/X86_64RegionWal.v3`, `LogHeader` + `LogEntry[]`, `status` commit flag) is **superseded and no longer wired in**. It is retained for reference only.
+> The earlier single-transaction `SingleTxnWal` (`src/engine/x86-64/X86_64SingleTxnWal.v3`, `LogHeader` + `LogEntry[]`, `status` commit flag) is **superseded and no longer wired in**. It is retained as a reference implementation for comparison against `MultiTxnWal` — see `docs/wal-comparison.md`.
 
 ### On-disk layout
 
@@ -295,7 +295,7 @@ mount(blockSize)
   verify blockSize and numBlocks match header
   restore block table handle
   locate log block (block 1)
-  init RegionWal + RegionTransaction
+  init MultiTxnWal + RegionTransaction
   txn.recover()                              -- replay committed WAL if present
 ```
 
@@ -416,4 +416,3 @@ test/unit.sh
 | 7 | `X86_64TxnPWRegion.v3:771` | Line-mark field is not yet linked during `createChunk()`. |
 | 8 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
 | 9 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
-| 10 | `X86_64RegionWal.v3` | The single-transaction `RegionWal` is orphaned after the `MultiTxnWal` switch — remove or repurpose. |

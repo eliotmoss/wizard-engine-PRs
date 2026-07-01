@@ -16,12 +16,12 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `X86_64Backends` factory component
 
 ### Write-ahead log (single-transaction, superseded)
-- `RegionWal` — in-region single-transaction redo log living in block 1 (`X86_64RegionWal.v3`)
+- `SingleTxnWal` — in-region single-transaction redo log living in block 1 (`X86_64SingleTxnWal.v3`)
 - `LogHeader` layout: `numEntries`, `status` (0=invalid/1=committed), `checksum`
 - `LogEntry` layout: `offset` (region-relative), `value`, `width` (1/2/4/8)
 - Commit protocol: persist entries → set status=1 → apply to region → fence → clear status
 - Recovery: checksum verify → redo entries → fence → clear status durably
-- **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `MultiTxnWal` instead. `RegionWal` is currently orphaned (kept for reference; see Next Steps cleanup).
+- **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `MultiTxnWal` instead. Renamed `RegionWal` → `SingleTxnWal` and retained as a reference implementation for comparison against `MultiTxnWal` (see `docs/wal-comparison.md`).
 
 ### Multi-transaction WAL (`X86_64MultiTxnWal.v3`)
 - Circular redo log living in block 1, with a dual-copy superblock at the head of the chunk and the ring immediately after (`ringBase = logChunkAddr + 2 * WalSuperblock.size`, `ringBytes = blockSize - 2 * WalSuperblock.size`)
@@ -76,7 +76,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 - [x] Test the untested core paths: **epoch-stale rejection** (bump epoch, confirm prior-epoch records are ignored) and **wrap-around / log-full → checkpoint → reserve** (fill a small ring and verify reclaim + wrap). Done in `MultiTxnWalTest.v3` (`epoch_stale_rejected`, `wraparound_checkpoint_reserve`).
 - [x] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case). Done in `MultiTxnWalTest.v3` (`recovers_multiple_records`, `crash_mid_log_recovery`).
 - [x] Commit-failure propagation: `RegionTransaction.commit()`/`PWRegion.performCommit()` return `bool`; `allocChunk()`/`freeChunk()` surface failure via `blankChunkHandle`/`false`. Done — see Completed.
-- [ ] Remove or repurpose the now-orphaned `RegionWal` (`X86_64RegionWal.v3`).
+- [x] Repurpose the now-orphaned `RegionWal`: renamed to `SingleTxnWal` (`X86_64SingleTxnWal.v3`) and retained as a reference implementation for comparison against `MultiTxnWal`. Comparison written up in `docs/wal-comparison.md`; still not wired in.
 
 ### 2. CLWB/SFENCE intrinsics
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
@@ -101,4 +101,3 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 | 5 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 6 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
-| 8 | `X86_64RegionWal.v3` | `RegionWal` is orphaned — no longer wired in after the `MultiTxnWal` switch |
