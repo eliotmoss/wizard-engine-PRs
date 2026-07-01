@@ -288,8 +288,8 @@ class FileMmapBackendTester(t: Tester) {
 
 def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot);
-	tc.region2 = tc.backend.create(4096u64, prot);
+	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region2 = tc.backend.create(4096u64, prot, false);
 
 	if (tc.region1 == null || tc.region2 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -336,7 +336,7 @@ def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 
 def test_mapped_file_persist_changes_clears_dirty_flag(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot);
+	tc.region1 = tc.backend.create(4096u64, prot, false);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -357,8 +357,8 @@ def test_mapped_file_persist_changes_clears_dirty_flag(tc: FileMmapBackendTester
 
 def test_mapped_file_persist_changes_keeps_other_region_dirty(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot);
-	tc.region2 = tc.backend.create(4096u64, prot);
+	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region2 = tc.backend.create(4096u64, prot, false);
 
 	if (tc.region1 == null || tc.region2 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -383,7 +383,7 @@ def test_mapped_file_persist_changes_keeps_other_region_dirty(tc: FileMmapBacken
 
 def test_mapped_file_persist_changes_failure_keeps_dirty_flag(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot);
+	tc.region1 = tc.backend.create(4096u64, prot, false);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -403,7 +403,7 @@ def test_mapped_file_persist_changes_failure_keeps_dirty_flag(tc: FileMmapBacken
 
 def test_mapped_file_persist_range_keeps_dirty_flag(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot);
+	tc.region1 = tc.backend.create(4096u64, prot, false);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -424,7 +424,7 @@ def test_mapped_file_persist_range_keeps_dirty_flag(tc: FileMmapBackendTester) {
 
 def test_mapped_file_invalid_ops_fail(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot);
+	tc.region1 = tc.backend.create(4096u64, prot, false);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -432,7 +432,7 @@ def test_mapped_file_invalid_ops_fail(tc: FileMmapBackendTester) {
 		return;
 	}
 
-	def volatileRegion = Backends.getVolatile().create(4096u64, prot);
+	def volatileRegion = Backends.getVolatile().create(4096u64, prot, false);
 	tc.t.assertz(true, volatileRegion.prepareChangedRange(0u64, 1u64));
 	tc.t.assertz(true, volatileRegion.persistRange(0u64, 1u64));
 	tc.t.assertz(true, volatileRegion.persistChanges());
@@ -449,7 +449,7 @@ def test_mapped_file_invalid_ops_fail(tc: FileMmapBackendTester) {
 def test_mapped_file_region_destroy_owns_lifecycle(tc: FileMmapBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
 	def otherBackend = FileMmapBackend.new(BACKEND_PATH);
-	tc.region1 = otherBackend.create(4096u64, prot);
+	tc.region1 = otherBackend.create(4096u64, prot, false);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -592,7 +592,7 @@ def test_bd_format_magic(tc: BlockDevicePWRegionTester) {
 
 // First-time initialization should size the backing file to the region.
 def test_bd_initializes_file_size(tc: BlockDevicePWRegionTester) {
-	def fd = RegionFileIO.openOrCreate(BD_PATH);
+	def fd = RegionFileIO.open(BD_PATH);
 	def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
 	RegionFileIO.close(fd);
 	tc.t.assert_eq(8u64 * 4096u64, u64.view(size));

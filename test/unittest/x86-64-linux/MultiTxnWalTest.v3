@@ -25,7 +25,7 @@ class MultiTxnWalTestBackend extends TxnRegionBackend {
 
 	new(range) { }
 
-	def create(size: u64, prot: int) -> BackendRegion {
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
 		return MultiTxnWalTestRegion.new(range);
 	}
 
@@ -96,7 +96,7 @@ class MultiTxnWalTester(t: Tester) {
 		regionStart = u64.view(Pointer.atElement(data, 0));
 		logAddr = regionStart + 1024u64;
 		backend = MultiTxnWalTestBackend.new(data[0 ..+ data.length]);
-		backendRegion = backend.create(u64.!(data.length), BackendProt.READ.mask | BackendProt.WRITE.mask);
+		backendRegion = backend.create(u64.!(data.length), BackendProt.READ.mask | BackendProt.WRITE.mask, true);
 		wal = MultiTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, true);
 	}
 

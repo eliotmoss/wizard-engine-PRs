@@ -493,7 +493,7 @@ class PWRegion {
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
                 var prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-                backendRegion = backend.create(size, prot);
+                backendRegion = backend.create(size, prot, forceFormat);
                 if (backendRegion == null) {
                         // Creation failed
                         return;

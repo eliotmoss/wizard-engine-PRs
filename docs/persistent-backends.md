@@ -78,12 +78,14 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
 
 `RegionFileIO` wraps the raw syscalls needed by the mmap backends:
 
-- `openOrCreate(path)` — opens or creates a file (`O_RDWR | O_CREAT`, mode `0644`)
+- `open(path)` — opens an existing file (`O_RDWR`, mode `0644`); returns `-errno` if it does not exist
+- `create(path)` — creates/re-creates a fresh file (`O_RDWR | O_CREAT | O_TRUNC`, mode `0644`); `O_TRUNC` plus the `ensureSize` `ftruncate` extension leaves the region zero-initialised
+- `openBacking(path, fresh)` — selects `create` for a fresh format, otherwise `open` (falling back to `create` when the file is missing)
 - `ensureSize(fd, size)` — `ftruncate` + `fdatasync` to guarantee file extent
 - `fdatasync(fd)` — data-only sync (no metadata)
 - `close(fd)`, `unlink(path)`
 
-> **TODO:** Opening an existing file vs. creating a new one should be two separate methods. A newly created file needs to be explicitly initialised with zero bytes before the first mount.
+Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, prot, fresh)`: `PWRegion` passes its `forceFormat` flag down, so a fresh format zero-initialises the backing store while a mount attaches to the existing one.
 
 ---
 

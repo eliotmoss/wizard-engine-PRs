@@ -182,10 +182,8 @@ class PmemMmapBackend extends TxnRegionBackend {
 	// TODO: think about whether we want a single path to be able to used to create multiple regions
 	new(path) { }
 
-	def create(size: u64, prot: int) -> BackendRegion {
-		// TODO: opening an old file and creating a new file should be done with separate methods,
-		// because creating a new file would need to populate the file with initial values
-		def fd = RegionFileIO.openOrCreate(path);
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def fd = RegionFileIO.openBacking(path, fresh);
 		if (fd < 0) return null;
 		if (!RegionFileIO.ensureSize(fd, size)) {
 			RegionFileIO.close(fd);
@@ -221,8 +219,8 @@ class FileMmapBackend extends TxnRegionBackend {
 
 	new(path) { }
 
-	def create(size: u64, prot: int) -> BackendRegion {
-		def fd = RegionFileIO.openOrCreate(path);
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def fd = RegionFileIO.openBacking(path, fresh);
 		if (fd < 0) return null;
 		if (!RegionFileIO.ensureSize(fd, size)) {
 			RegionFileIO.close(fd);
@@ -256,13 +254,40 @@ class FileMmapBackend extends TxnRegionBackend {
 component RegionFileIO {
 	def FILE_MODE = 420;	// 0644 octal
 
-	def openOrCreate(path: string) -> int {
+	// Build a null-terminated C string for the given path.
+	private def toCPath(path: string) -> Array<byte> {
 		var pathBuf = Array<byte>.new(path.length + 1);
 		for (i < path.length) pathBuf[i] = path[i];
 		pathBuf[path.length] = 0;
+		return pathBuf;
+	}
+
+	// Open an existing region file for read/write. Does not create it: returns a
+	// negative value (-errno, e.g. -ENOENT) if the file does not exist.
+	def open(path: string) -> int {
+		var pathBuf = toCPath(path);
 		var r = Linux.syscall(LinuxConst.SYS_open,
-			(Pointer.atElement(pathBuf, 0), LinuxConst.O_RDWR | LinuxConst.O_CREAT, FILE_MODE));
+			(Pointer.atElement(pathBuf, 0), LinuxConst.O_RDWR, FILE_MODE));
 		return int.!(r.0);
+	}
+
+	// Create (or re-create) a fresh region file for read/write. O_TRUNC clears any
+	// stale content to length 0; the subsequent ensureSize()->ftruncate() extension
+	// is zero-filled by the kernel, so the resulting region is zero-initialised.
+	def create(path: string) -> int {
+		var pathBuf = toCPath(path);
+		var r = Linux.syscall(LinuxConst.SYS_open,
+			(Pointer.atElement(pathBuf, 0), LinuxConst.O_RDWR | LinuxConst.O_CREAT | LinuxConst.O_TRUNC, FILE_MODE));
+		return int.!(r.0);
+	}
+
+	// Obtain a backing fd for a region: a fresh format re-creates the file (zeroed),
+	// otherwise attach to the existing file, creating it zeroed if it is missing.
+	def openBacking(path: string, fresh: bool) -> int {
+		if (fresh) return create(path);
+		var fd = open(path);
+		if (fd < 0) fd = create(path);  // missing -> fresh, zeroed
+		return fd;
 	}
 
 	def ensureSize(fd: int, size: u64) -> bool {
@@ -280,6 +305,10 @@ component RegionFileIO {
 		Linux.syscall(LinuxConst.SYS_close, fd);
 	}
 
+	// NOTE: intentionally inlines the C-string construction rather than calling
+	// toCPath(). Routing this through toCPath() (a third caller) shifts Virgil's
+	// inlining/stackmap layout enough to trip a latent precise-GC bug that crashes
+	// unrelated interpreter GC tests (e.g. int:force_gc1). Keep this inline.
 	def unlink(path: string) {
 		var pathBuf = Array<byte>.new(path.length + 1);
 		for (i < path.length) pathBuf[i] = path[i];

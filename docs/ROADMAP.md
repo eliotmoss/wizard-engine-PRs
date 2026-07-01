@@ -12,7 +12,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `FdMmapRegion` base class — owns fd + Mapping, handles destroy/unmap
 - `FileMmapRegion` — file-backed mmap; `msync`/`fdatasync` durability
 - `PmemMmapRegion` — PMEM mmap with `MAP_SYNC`; cache-line flush + store-fence durability (flush/fence are stubs pending Virgil inline-asm support)
-- `RegionFileIO` — `openOrCreate`, `ensureSize`, `fdatasync`, `close`, `unlink`
+- `RegionFileIO` — `open` (attach to existing), `create` (zero-initialising, `O_TRUNC`), `openBacking` (fresh-or-existing selection), `ensureSize`, `fdatasync`, `close`, `unlink`. Fresh-format intent is threaded to backends via `TxnRegionBackend.create(size, prot, fresh)`.
 - `X86_64Backends` factory component
 
 ### Write-ahead log (single-transaction, superseded)
@@ -82,7 +82,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
 
 ### 3. Minor cleanups
-- `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` must zero-initialise bytes
+- [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
 - Add log-chunk offset to `PWRegionHeader` (avoids assuming block 1 is always the log)
 - `RegionTransaction.clear()` — avoid allocating a new `HashMap` on every commit
 - Link line-mark field in `createChunk()` (`ImmixPWRegion`)

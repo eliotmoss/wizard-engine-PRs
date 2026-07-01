@@ -54,8 +54,10 @@ class BackendRegion {
 // Backend interface that all storage implementations must provide
 // TODO: maybe call it a RegionManager
 class TxnRegionBackend {
-	// Create a region of the given size with specified protection
-	def create(size: u64, prot: int) -> BackendRegion;
+	// Create a region of the given size with specified protection. `fresh` marks a
+	// fresh format: the backing store must be zero-initialised. When false, attach
+	// to an existing store (backends may fall back to a fresh store if none exists).
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion;
 	
 	// Check if this backend provides persistence
 	def isPersistent() -> bool;
@@ -99,8 +101,9 @@ class VolatileRegion extends BackendRegion {
 // Platform-independent volatile memory backend using simple Array allocation
 class VolatileBackend extends TxnRegionBackend {
 	
-	def create(size: u64, prot: int) -> BackendRegion {
-		// Create a byte array-backed region
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		// Create a byte array-backed region. `fresh` is ignored: a newly-allocated
+		// Array<byte> is zero-initialised by construction, satisfying both intents.
 		var data = Array<byte>.new(int.!(size));
 		var range = data[0 ..+ data.length];
 		return VolatileRegion.new(range);
