@@ -394,7 +394,10 @@ class RegionTransaction {
         }
 
         private def clear() {
-                cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
+                // Empty the map in place rather than reallocating it: {addrs} holds exactly
+                // the set of keys present in {cache}, and HashMap.remove retains the backing
+                // table, so this reuses both structures' storage across commits.
+                for (i < addrs.length) cache.remove(addrs[i]);
                 addrs.clear();
         }
 

@@ -84,7 +84,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 ### 3. Minor cleanups
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
 - [x] Add log-chunk offset to `PWRegionHeader` — new `logChunk` field (region-relative byte offset) written by `format()` and read by `mount()`, so recovery locates the log via the header instead of assuming block 1. Header grew 72 → 80 bytes; `mount()` keeps a defensive fallback to block 1 when the field reads as `0`. Covered by `TxnPWRegionTest.v3` (`format_header_fields` asserts the field; the remount/recovery tests exercise the header-driven read path).
-- `RegionTransaction.clear()` — avoid allocating a new `HashMap` on every commit
+- [x] `RegionTransaction.clear()` — no longer reallocates the `HashMap`; empties it in place via `cache.remove()` over the `addrs` key set (both `HashMap.remove` and `Vector.clear` retain their backing storage), reusing the map and vector across commits. Covered by the existing `wal_cache:` and `pwregion:` unit tests (commit→clear cycle, remount/recovery).
 - Link line-mark field in `createChunk()` (`ImmixPWRegion`)
 - `ImmixLineSize` should come from the metadata descriptor, not be hardcoded
 
