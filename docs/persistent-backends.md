@@ -242,7 +242,7 @@ Block 2..N   User data  (allocated / free)
 Block N..M   Metadata   (block table, sentinels, descriptors)
 ```
 
-### `PWRegionHeader` (72 bytes, stored at offset 0)
+### `PWRegionHeader` (80 bytes, stored at offset 0)
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -255,6 +255,7 @@ Block N..M   Metadata   (block table, sentinels, descriptors)
 | `metaDataDescs` | u64 | offset to descriptor table |
 | `magic` | u64 | `0x50_57_41_53_4D` ("PWASM") |
 | `blockSize` | u64 | bytes per block (default 256 KB) |
+| `logChunk` | u64 | region-relative offset of the WAL log chunk (block 1 in the current layout) |
 
 ### `BlockEntry` (40 bytes)
 
@@ -286,7 +287,7 @@ PWRegion.__new(backend, numBlocks, metaDataDescs, blockSize, forceFormat)
   else                       → mount(blockSize)
 
 format(blockSize)
-  write PWRegionHeader
+  write PWRegionHeader (incl. logChunk offset)
   create SMALL_FREE and LARGE_FREE sentinels
   allocate block table in metadata area
   link all user blocks in memory order
@@ -296,7 +297,7 @@ format(blockSize)
 mount(blockSize)
   verify blockSize and numBlocks match header
   restore block table handle
-  locate log block (block 1)
+  locate log chunk via header.logChunk       -- fall back to block 1 if unset (0)
   init MultiTxnWal + RegionTransaction
   txn.recover()                              -- replay committed WAL if present
 ```
@@ -414,7 +415,6 @@ test/unit.sh
 | 3 | `TxnBackend.v3:36` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:177` | `RegionFileIO.openOrCreate` should be split into `open` and `create`; `create` must initialise bytes to zero. |
 | 5 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
-| 6 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` should store a pointer/offset to the log chunk to simplify recovery without requiring block 1 to always be the log. |
-| 7 | `X86_64TxnPWRegion.v3:771` | Line-mark field is not yet linked during `createChunk()`. |
-| 8 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
-| 9 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
+| 6 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
+| 7 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
+| 8 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |

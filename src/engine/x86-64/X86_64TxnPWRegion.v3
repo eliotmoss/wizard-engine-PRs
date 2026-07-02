@@ -28,8 +28,8 @@ layout PWRegionHeader {
         +48     metaDataDescs:  u64;    // relative offset to the metadata descriptors
         +56     magic:          u64;    // identifier to confirm region is formatted
         +64     blockSize:      u64;    // block size this region was formatted with
-        // TODO: maybe add pointer to log chunk, because this will be needed for recovery
-        =72;
+        +72     logChunk:       u64;    // region-relative offset of the WAL log chunk
+        =80;
 }
 
 layout BlockEntry {
@@ -598,8 +598,9 @@ class PWRegion {
 
                 blockTableHandle = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.blockTable))), numBlockTableEntries);
 
-                def logBlockHandle = blockTableHandle[1];
-                logChunk = blockEntryToChunk(logBlockHandle);
+                var logChunkOffset = hdr.logChunk;
+                if (logChunkOffset == 0) logChunkOffset = blockSize; // defensive: field unset -> block 1
+                logChunk = ChunkHandle(regionStart + logChunkOffset);
                 ensureWal(logChunk.addr, blockSize, false);
 
                 txn.recover();
@@ -715,6 +716,7 @@ class PWRegion {
                 sanitizeOffset(blockTableOffset + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
+                headerSetU64(PWRegionHeader.logChunk.offset, offsetInRegion(logChunk.addr));
                 ensureWal(logChunk.addr, blockSize, true);
 
                 // Block 2: first free block (LARGE_FREE)

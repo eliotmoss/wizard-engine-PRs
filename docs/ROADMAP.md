@@ -83,7 +83,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 
 ### 3. Minor cleanups
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
-- Add log-chunk offset to `PWRegionHeader` (avoids assuming block 1 is always the log)
+- [x] Add log-chunk offset to `PWRegionHeader` — new `logChunk` field (region-relative byte offset) written by `format()` and read by `mount()`, so recovery locates the log via the header instead of assuming block 1. Header grew 72 → 80 bytes; `mount()` keeps a defensive fallback to block 1 when the field reads as `0`. Covered by `TxnPWRegionTest.v3` (`format_header_fields` asserts the field; the remount/recovery tests exercise the header-driven read path).
 - `RegionTransaction.clear()` — avoid allocating a new `HashMap` on every commit
 - Link line-mark field in `createChunk()` (`ImmixPWRegion`)
 - `ImmixLineSize` should come from the metadata descriptor, not be hardcoded
@@ -96,8 +96,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 |---|------|-------------|
 | 1 | `X86_64TxnBackend.v3:88-100` | `flushCacheLine`/`storeFence` are stubs — PMEM not truly durable |
 | 2 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
-| 3 | `X86_64TxnPWRegion.v3:31` | `PWRegionHeader` missing log-chunk offset field — `mount` still assumes block 1 is the log |
-| 4 | `X86_64TxnPWRegion.v3:771` | Line-mark field not linked in `createChunk()` |
-| 5 | `X86_64TxnPWRegion.v3:977` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
-| 6 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
-| 7 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
+| 3 | `X86_64TxnPWRegion.v3` | Line-mark field not linked in `createChunk()` |
+| 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
+| 5 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
+| 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |

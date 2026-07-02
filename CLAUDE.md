@@ -138,7 +138,6 @@ The superseded single-transaction protocol (`SingleTxnWal`: persist entries → 
 
 - `MmapRegionUtils.flushCacheLine` / `storeFence` are no-op placeholders — need Virgil inline-asm or intrinsic support for CLWB/SFENCE (`X86_64TxnBackend.v3:88-100`)
 - WAL overflow in `SingleTxnWal.append` (the superseded reference WAL) silently drops entries when block 1 is full; the active `MultiTxnWal` surfaces ring overflow via a failed `commit()` instead
-- `PWRegionHeader` is missing a pointer to the log chunk (needed for recovery without scanning)
 - `Backends.getMmap()` declared but not implemented
 - `ImmixPWRegion` line marks bypass the WAL and are not durable
 - `RegionTransaction.clear()` allocates a new `HashMap` on every commit (GC pressure)
