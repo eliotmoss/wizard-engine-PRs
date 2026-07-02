@@ -14,6 +14,7 @@ def MTWX = [
 	MTW("wraparound_checkpoint_reserve", test_multi_wraparound_checkpoint_reserve),
 	MTW("recovers_multiple_records", test_multi_recovers_multiple_records),
 	MTW("crash_mid_log_recovery", test_multi_crash_mid_log_recovery),
+	MTW("commit_after_recovery_survives", test_multi_commit_after_recovery_survives),
 	MTW("checkpoint_policy_thresholds", test_multi_checkpoint_policy_thresholds),
 	MTW("maybe_checkpoint_count", test_multi_maybe_checkpoint_count),
 	MTW("maybe_checkpoint_occupancy", test_multi_maybe_checkpoint_occupancy),
@@ -290,6 +291,32 @@ def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(0u8, tc.data[202]);              // torn seq 3 NOT applied
 	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
 	tc.t.assertz(true, tornOffset > 0u64);
+}
+
+// Recover -> commit -> crash -> recover: recovery bumps the epoch exactly once,
+// and the in-memory epoch must match what the superblock published. Records
+// committed after a recovery are stamped with that epoch; if the copies ever
+// disagree, a crash before the next checkpoint silently loses those commits on
+// the following mount.
+def test_multi_commit_after_recovery_survives(tc: MultiTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
+
+	// First crash + recovery: replays seq 1 and publishes epoch 2.
+	var recovered = tc.reopen();
+	tc.t.assertz(true, recovered.recover());
+	tc.t.assert_eq(2u64, recovered.logEpoch);       // in-memory epoch == published epoch
+
+	// Commit seq 2 on the recovered WAL, then crash again before any checkpoint.
+	recovered.append(210u64, 0x66u64, 1u8);
+	tc.t.assert_eq(2u64, recovered.commit());
+
+	// Second recovery must replay the post-recovery commit, not reject it as
+	// stale-epoch.
+	var reopened = tc.reopen();
+	tc.t.assert_eq(2u64, reopened.logEpoch);
+	tc.t.assertz(true, reopened.recover());
+	tc.t.assert_eq(0x66u8, tc.data[210]);
+	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
 }
 
 // Per-backend threshold wiring: configureCheckpointPolicy() must map each

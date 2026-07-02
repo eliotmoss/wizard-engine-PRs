@@ -313,9 +313,9 @@ class MultiTxnWal {
                         if (candidates.length > 0) {
                                 // Valid records after a sequence gap are intentionally
                                 // abandoned by advancing the epoch. They are not applied.
+                                // writeSuperblock publishes the new epoch and adopts it
+                                // (and the new generation) in memory on success.
                                 writeSuperblock(durableAppliedSeq, logEpoch + 1u64);
-                                logEpoch++;
-                                currentGeneration++;
                         }
                         nextTxnSeq = durableAppliedSeq + 1u64;
                         appliedSeqVolatile = durableAppliedSeq;
@@ -336,7 +336,6 @@ class MultiTxnWal {
                 if (backendRegion != null && !backendRegion.persistChanges()) return false;
                 def recoveredMaxSeq = selected[selected.length - 1].txnSeq;
                 if (!writeSuperblock(recoveredMaxSeq, logEpoch + 1u64)) return false;
-                logEpoch++;
                 durableAppliedSeq = recoveredMaxSeq;
                 appliedSeqVolatile = durableAppliedSeq;
                 nextTxnSeq = durableAppliedSeq + 1u64;
