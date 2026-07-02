@@ -65,7 +65,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 ## In Progress
 
 - Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is now implemented (hybrid count-OR-occupancy, per-backend thresholds — Next Steps #1). Commit-failure propagation is now implemented (see Completed).
-- A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus several API-hardening items — see Next Steps #1 follow-ups and Open Issues #7–9. The epoch double-increment is fixed (regression-tested by `multi_wal:commit_after_recovery_survives`).
+- A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus several API-hardening items — see Next Steps #1 follow-ups and Open Issues #7–8. Both durability bugs are fixed (regression-tested by `multi_wal:commit_after_recovery_survives` and `multi_wal:failed_persist_no_duplicate`).
 
 ---
 
@@ -83,7 +83,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 
 Durability bugs (fix first):
 - [x] **Epoch double-increment in `recover()`** — both recovery paths called `writeSuperblock(…, logEpoch + 1)` and then bumped `logEpoch` *again* (`writeSuperblock` already assigns `logEpoch = epoch`), so after recovery the in-memory epoch was one ahead of the durable superblock; records committed after a recovery were stamped with the wrong epoch and a crash before the next checkpoint made the remount reject them as stale — **acknowledged commits lost**. The gap-abandonment path also double-bumped `currentGeneration`. Fixed: both redundant bumps removed — `writeSuperblock` alone adopts the new epoch/generation on success. Note the gap path still ignores `writeSuperblock`'s return (best-effort abandonment; folded into the `recover()` return-value item below).
-- [ ] **Duplicate `txnSeq` after failed `persistRange`** — `appendCommittedRecord` writes a complete, valid-checksum record into the ring (and `reserveRecord` advances `headOffset`) *before* the `persistRange` at the commit point. On failure it returns 0 without incrementing `nextTxnSeq`, but the record bytes may still reach disk via page-cache writeback. The retried commit writes a second record with the same `txnSeq` at a different offset (possibly different content if more writes were buffered); recovery's `selectContiguousPrefix` silently keeps whichever duplicate it scans last and may replay the *failed* attempt. Fix: scrub the record's header magic before returning failure (and/or burn the sequence number).
+- [x] **Duplicate `txnSeq` after failed `persistRange`** — `appendCommittedRecord` wrote a complete, valid-checksum record into the ring (and advanced `headOffset`) *before* the `persistRange` at the commit point; on failure the record bytes could still reach disk via page-cache writeback, and a retried commit wrote a second record with the same `txnSeq` at a different offset — recovery's `selectContiguousPrefix` silently keeps whichever duplicate it scans last and could replay the *failed* attempt. Fixed: on persist failure the record's header magic is scrubbed (scrub persisted best-effort) and `headOffset` is rolled back to the reserved slot, so a retry reuses both the same seq and the same location. The seq is deliberately *not* burned — a skipped seq would gap the committed prefix and make recovery abandon later acknowledged transactions. Regression-tested by `multi_wal:failed_persist_no_duplicate` (verified to fail pre-fix on the head-rollback assertion).
 - [x] Add a **recover → commit → crash → recover** test. Done: `multi_wal:commit_after_recovery_survives` (`MultiTxnWalTest.v3`) — verified to fail on the pre-fix code (`expected 2 == 3` on the epoch).
 
 API hardening:
@@ -121,6 +121,5 @@ Design notes (no action yet, keep in mind):
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 5 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
-| 7 | `X86_64MultiTxnWal.v3` | **Durability bug:** failed `persistRange` in `appendCommittedRecord` leaves a valid-checksum record in the ring without burning its `txnSeq` — a retried commit creates a duplicate sequence number and recovery may replay the failed attempt (see Next Steps #1 follow-ups) |
-| 8 | `X86_64MultiTxnWal.v3` | `append()` silently drops invalid entries — a transaction can commit successfully while missing a write |
-| 9 | `X86_64MultiTxnWal.v3` | `recover()` return value conflates clean/corrupt/persist-failure, and both `PWRegion` call sites ignore it |
+| 7 | `X86_64MultiTxnWal.v3` | `append()` silently drops invalid entries — a transaction can commit successfully while missing a write |
+| 8 | `X86_64MultiTxnWal.v3` | `recover()` return value conflates clean/corrupt/persist-failure, and both `PWRegion` call sites ignore it |

@@ -15,6 +15,7 @@ def MTWX = [
 	MTW("recovers_multiple_records", test_multi_recovers_multiple_records),
 	MTW("crash_mid_log_recovery", test_multi_crash_mid_log_recovery),
 	MTW("commit_after_recovery_survives", test_multi_commit_after_recovery_survives),
+	MTW("failed_persist_no_duplicate", test_multi_failed_persist_no_duplicate),
 	MTW("checkpoint_policy_thresholds", test_multi_checkpoint_policy_thresholds),
 	MTW("maybe_checkpoint_count", test_multi_maybe_checkpoint_count),
 	MTW("maybe_checkpoint_occupancy", test_multi_maybe_checkpoint_occupancy),
@@ -49,6 +50,32 @@ class MultiTxnWalTestRegion extends BackendRegion {
 	}
 
 	def persistRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		return true;
+	}
+}
+
+// A region that can fail the next persistRange on demand, to exercise the
+// failed-commit-point path in appendCommittedRecord.
+class FailingRegion extends BackendRegion {
+	var failNextPersistRange = false;
+
+	new(range: Range<byte>) super(range) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		if (failNextPersistRange) {
+			failNextPersistRange = false;
+			return false;
+		}
 		return true;
 	}
 
@@ -316,6 +343,50 @@ def test_multi_commit_after_recovery_survives(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(2u64, reopened.logEpoch);
 	tc.t.assertz(true, reopened.recover());
 	tc.t.assert_eq(0x66u8, tc.data[210]);
+	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
+}
+
+// Failed commit point: when the record's persistRange fails, the fully-written
+// record must be scrubbed and the head rolled back, so a retried commit reuses
+// both the same txnSeq (a skipped seq would gap the committed prefix and
+// abandon later acked commits) and the same ring slot. Otherwise two valid
+// records with the same sequence can coexist and recovery may replay the
+// failed attempt's contents instead of the acknowledged retry's.
+def test_multi_failed_persist_no_duplicate(tc: MultiTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def log = base + 1024u64;
+	def region = FailingRegion.new(data[0 ..+ data.length]);
+	def wal = MultiTxnWal.new(base, log, 1024u64, region, true);
+
+	wal.append(200u64, 0x55u64, 1u8);
+	tc.t.assert_eq(1u64, wal.commit());             // seq 1 committed normally
+	def headBefore = wal.headOffset;                // where seq 2 will land
+
+	// Commit seq 2 with a failing commit point.
+	region.failNextPersistRange = true;
+	wal.append(210u64, 0x11u64, 1u8);
+	tc.t.assert_eq(0u64, wal.commit());
+	tc.t.assert_eq(2u64, wal.nextTxnSeq);           // seq NOT burned
+	tc.t.assert_eq(headBefore, wal.headOffset);     // head rolled back to the slot
+	// The failed record's header magic is scrubbed -- it can never validate.
+	tc.t.assert_eq(0u64, PWRegionUtils.pointerFromU64(wal.ringBase + headBefore).load<u64>());
+
+	// Retry with different contents, as RegionTransaction does when its dirty
+	// cache accumulated more writes between the failure and the retry.
+	wal.append(210u64, 0x22u64, 1u8);
+	wal.append(211u64, 0x33u64, 1u8);
+	tc.t.assert_eq(2u64, wal.commit());
+	// The retry overwrote the failed attempt's slot -- same seq, one location.
+	tc.t.assertz(true, wal.headOffset > headBefore);
+
+	// Crash + recover: only the acknowledged retry's contents are replayed.
+	def reopened = MultiTxnWal.new(base, log, 1024u64, region, false);
+	tc.t.assertz(true, reopened.recover());
+	tc.t.assert_eq(0x55u8, data[200]);              // seq 1
+	tc.t.assert_eq(0x22u8, data[210]);              // retry's value, not 0x11
+	tc.t.assert_eq(0x33u8, data[211]);              // retry's extra entry
 	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
 }
 

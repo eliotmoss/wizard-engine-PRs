@@ -234,6 +234,18 @@ class MultiTxnWal {
                 // The WAL persistRange is the transaction commit point. Region data
                 // is applied only after this contiguous record is durable.
                 if (backendRegion != null && !backendRegion.persistRange(absStart - regionStart, recordLen64)) {
+                        // The fully-written record must not survive the failure: a
+                        // retry reuses this txnSeq, and two valid records with the
+                        // same sequence let recovery replay the failed attempt's
+                        // contents. Scrub the header magic (persisting the scrub
+                        // best-effort) and roll the head back so a retry overwrites
+                        // this same slot. The sequence number is deliberately NOT
+                        // burned: a skipped seq is a gap that recovery treats as the
+                        // end of the committed prefix, which would abandon later
+                        // acknowledged transactions.
+                        recordStoreU64(absStart, TxnRecordHeader.magic.offset, 0u64);
+                        backendRegion.persistRange(absStart - regionStart, u64.!(TxnRecordHeader.size));
+                        headOffset = start;
                         return 0u64;
                 }
 
