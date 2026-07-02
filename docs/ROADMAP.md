@@ -65,6 +65,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 ## In Progress
 
 - Multi-transaction WAL core paths are now test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is now implemented (hybrid count-OR-occupancy, per-backend thresholds — Next Steps #1). Commit-failure propagation is now implemented (see Completed).
+- A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus several API-hardening items — see Next Steps #1 follow-ups and Open Issues #7–10.
 
 ---
 
@@ -77,6 +78,26 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 - [x] Multi-record recovery test (current recovery test replays a single record; add a multi-transaction commit + crash-mid-log case). Done in `MultiTxnWalTest.v3` (`recovers_multiple_records`, `crash_mid_log_recovery`).
 - [x] Commit-failure propagation: `RegionTransaction.commit()`/`PWRegion.performCommit()` return `bool`; `allocChunk()`/`freeChunk()` surface failure via `blankChunkHandle`/`false`. Done — see Completed.
 - [x] Repurpose the now-orphaned `RegionWal`: renamed to `SingleTxnWal` (`X86_64SingleTxnWal.v3`) and retained as a reference implementation for comparison against `MultiTxnWal`. Comparison written up in `docs/wal-comparison.md`; still not wired in.
+
+**Design-review follow-ups (2026-07-02):**
+
+Durability bugs (fix first):
+- [ ] **Epoch double-increment in `recover()`** — both recovery paths call `writeSuperblock(…, logEpoch + 1)` and then bump `logEpoch` *again* (`writeSuperblock` already assigns `logEpoch = epoch`), so after recovery the in-memory epoch is one ahead of the durable superblock. Records committed after a recovery are stamped with the wrong epoch; a crash before the next checkpoint (up to `checkpointTxnThreshold` transactions later) makes the remount reject them as stale — **acknowledged commits lost**. The gap-abandonment path also double-bumps `currentGeneration` (harmless but desyncs it from the written copy) and ignores `writeSuperblock`'s return.
+- [ ] **Duplicate `txnSeq` after failed `persistRange`** — `appendCommittedRecord` writes a complete, valid-checksum record into the ring (and `reserveRecord` advances `headOffset`) *before* the `persistRange` at the commit point. On failure it returns 0 without incrementing `nextTxnSeq`, but the record bytes may still reach disk via page-cache writeback. The retried commit writes a second record with the same `txnSeq` at a different offset (possibly different content if more writes were buffered); recovery's `selectContiguousPrefix` silently keeps whichever duplicate it scans last and may replay the *failed* attempt. Fix: scrub the record's header magic before returning failure (and/or burn the sequence number).
+- [ ] Add a **recover → commit → crash → recover** test — would have caught the epoch bug; none of the existing recovery tests commit after a recovery.
+
+API hardening:
+- [ ] `append()` silently drops entries failing `validEntryFields` (returns void); the revalidation loop in `appendCommittedRecord` can't see the dropped entry, so a transaction can commit *successfully* while missing a write. `append` should return `bool` or poison the pending transaction so `commit()` fails.
+- [ ] `validEntryFields` dereferences `backendRegion.range` without the null guard every other method uses — either the guards are dead code or this is a crash path; pick one contract.
+- [ ] Empty-commit sentinel collision: `appendCommittedRecord` returns `durableAppliedSeq` for an empty commit, which is 0 on a fresh region — indistinguishable from the failure sentinel. Unreachable today only because `RegionTransaction.commit()` guards with `isDirty()`.
+- [ ] `recover()`'s `bool` conflates clean-nothing-to-replay, corrupt superblocks, and persist-failure-mid-recovery — and both `PWRegion` call sites discard the result, so a mid-recovery persist failure is invisible to `mount()`.
+
+Design notes (no action yet, keep in mind):
+- Layering: `MultiTxnWal` is log manager + region applier + raw read path in one class; the `readU8`…`readI64` helpers have nothing to do with logging and belong in a shared region-memory helper.
+- Recovery scan cost: `scanCommittedRecords` runs a full checksum-validating `validateRecord` at every 64-byte slot and `selectContiguousPrefix` is O(n²) — fine for one 4 KB block, quadratic-ish if `logChunkSize` grows (the new `logChunk` header field makes that likely).
+- `reserveRecord` only tries `headOffset` and offset 0; a surviving record ahead of the head forces a full checkpoint even when a fitting hole exists elsewhere. Fine under the current commit-then-apply-immediately usage — an implicit dependency worth documenting.
+- `close()` is empty, so even a clean unmount replays the tail on the next mount; a `fenceAppliedUpdates()` call there would make clean remounts replay-free.
+- Per-commit constant factors: `zeroBytes` + field stores + `checksumBytes` are three byte-at-a-time passes over each record.
 
 ### 2. CLWB/SFENCE intrinsics
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
@@ -100,3 +121,7 @@ The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining wo
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 5 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
+| 7 | `X86_64MultiTxnWal.v3` | **Durability bug:** `recover()` double-increments `logEpoch` (in-memory epoch ends up one ahead of the superblock) — post-recovery commits are lost on a crash before the next checkpoint (see Next Steps #1 follow-ups) |
+| 8 | `X86_64MultiTxnWal.v3` | **Durability bug:** failed `persistRange` in `appendCommittedRecord` leaves a valid-checksum record in the ring without burning its `txnSeq` — a retried commit creates a duplicate sequence number and recovery may replay the failed attempt (see Next Steps #1 follow-ups) |
+| 9 | `X86_64MultiTxnWal.v3` | `append()` silently drops invalid entries — a transaction can commit successfully while missing a write |
+| 10 | `X86_64MultiTxnWal.v3` | `recover()` return value conflates clean/corrupt/persist-failure, and both `PWRegion` call sites ignore it |
