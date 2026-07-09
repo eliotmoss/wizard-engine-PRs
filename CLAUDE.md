@@ -96,7 +96,7 @@ This branch extends Wizard with transactional, persistent storage for WASM, targ
 ```
 PWRegion (block allocator)
   └── RegionTransaction (write-behind cache + WAL facade)
-        └── MultiTxnWal (in-region multi-transaction redo ring log, lives in block 1)
+        └── DualTxnWal (in-region two-slot redo log, lives in block 1)
               └── BackendRegion (persistence abstraction)
                     ├── VolatileRegion      (Array<byte>, GC-managed)
                     ├── FileMmapRegion      (mmap + msync/fdatasync — block device)
@@ -112,32 +112,37 @@ PWRegion (block allocator)
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, `ImmixPWRegion` |
 | `X86_64SingleTxnWal.v3` | Single-transaction in-region WAL — superseded, **not wired in**; kept as a reference implementation (see `docs/wal-comparison.md`) |
 | `X86_64PWRegion.v3` | Thin x86-64 convenience wrappers (`X86_64PWMemRegion`, `X86_64PWNVRegion`, `X86_64PWBlockDeviceRegion`, Immix variants) |
-| `X86_64MultiTxnWal.v3` | Active multi-transaction WAL — circular redo log with dual superblock, epoch fencing, and checkpoint policy; drives `PWRegion`/`RegionTransaction` |
+| `X86_64DualTxnWal.v3` | Active two-slot WAL (phase A) — two parity-selected record slots, per-record checksum, poisoning `append()`, `DualWalRecovery` result; drives `PWRegion`/`RegionTransaction` |
+| `X86_64MultiTxnWal.v3` | Multi-transaction ring WAL (dual superblock, epoch fencing, checkpoint policy) — superseded, **not wired in**; kept as a comparison implementation |
 | `test/unittest/x86-64-linux/TxnPWRegionTest.v3` | PWRegion + backend region unit tests (incl. remount/recovery) |
 | `test/unittest/x86-64-linux/WALCacheTest.v3` | `RegionTransaction` write-behind cache unit tests |
+| `test/unittest/x86-64-linux/DualTxnWalTest.v3` | `DualTxnWal` unit tests (commit/recovery/guard/failure paths) |
+| `test/unittest/x86-64-linux/MultiTxnWalTest.v3` | `MultiTxnWal` unit tests (comparison implementation) |
 
 ### On-region layout
 
 ```
 Block 0:   Region header (PWRegionHeader) + sentinels
-Block 1:   WAL log chunk (MultiTxnWal: dual WalSuperblock + ring of transaction records)
+Block 1:   WAL log chunk (DualTxnWal: DualWalHeader + two fixed record slots)
 Blocks 2…N-2: User data blocks (SMALL_FREE / LARGE_FREE / USED)
 Block N-1: Metadata overhead (block table, MetaDataDesc[])
 Entry N:   End-of-region marker (no backing data)
 ```
 
-### WAL commit protocol (multi-transaction, current — `MultiTxnWal`)
+### WAL commit protocol (two-slot, current — `DualTxnWal`, phase A)
 
 1. Writes buffered in `RegionTransaction` (HashMap-backed write-behind cache)
-2. `commit()`: `appendToWal → wal.commit` (write one contiguous, checksummed transaction record, get `txnSeq`) `→ applyToRegion → noteApplied → maybeCheckpoint → clear`
-3. On mount: load newest valid `WalSuperblock`, scan the ring, validate records (magic/epoch/checksum), replay the contiguous `txnSeq` prefix from `durableAppliedSeq + 1`, then publish the new `durableAppliedSeq`
+2. `commit()`: `appendToWal → wal.commit` (write one checksummed record into slot `txnSeq % 2`, persist it — boundary 1, the commit point) `→ applyToRegion → persistAppliedData` (boundary 2) `→ clear`
+3. On mount: validate the `DualWalHeader`, validate both slots, replay the valid records in ascending `txnSeq` (idempotent after-images, so re-replay is harmless), persist, set `nextTxnSeq = max + 1`. `recover()` returns `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`)
 
-The superseded single-transaction protocol (`SingleTxnWal`: persist entries → `status=1` → apply → fence → `status=0`) is retained for reference — see `docs/wal-comparison.md`.
+An overwrite guard keeps a slot from being destroyed while it covers not-yet-durable data; a failed commit-point persist retries with the same seq into the same slot (parity), so duplicate-seq records cannot exist. Phase B (planned) piggybacks boundary 2 onto the next commit's boundary 1, reaching one boundary per commit in steady state.
+
+The superseded protocols are retained for comparison, **not wired in** — `SingleTxnWal` (persist entries → `status=1` → apply → fence → `status=0`) and `MultiTxnWal` (ring + superblock + epoch fencing + checkpoint policy) — see `docs/wal-comparison.md`.
 
 ### Known gaps and stubs
 
 - `MmapRegionUtils.flushCacheLine` / `storeFence` are no-op placeholders — need Virgil inline-asm or intrinsic support for CLWB/SFENCE (`X86_64TxnBackend.v3:88-100`)
-- WAL overflow in `SingleTxnWal.append` (the superseded reference WAL) silently drops entries when block 1 is full; the active `MultiTxnWal` surfaces ring overflow via a failed `commit()` instead
+- WAL overflow in `SingleTxnWal.append` (the superseded reference WAL) silently drops entries when block 1 is full; the active `DualTxnWal` surfaces an oversized transaction via a failed `commit()` instead (per-transaction capacity ≈ half the log chunk minus headers)
 - `Backends.getMmap()` declared but not implemented
 - `ImmixPWRegion` line marks bypass the WAL and are not durable
 - `RegionTransaction.clear()` allocates a new `HashMap` on every commit (GC pressure)

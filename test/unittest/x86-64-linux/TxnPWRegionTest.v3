@@ -201,13 +201,13 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 
 
 // =============================================================================
-// Commit-failure propagation test (small ring forces WAL overflow)
+// Commit-failure propagation test (small slots force WAL overflow)
 // =============================================================================
 
-// numBlocks=8, blockSize=512 -> ringBytes = 512 - 2*64 = 384. A single
-// allocChunk(2) split-path call buffers 16 distinct cache writes in one WAL
-// transaction; alignedRecordLen(9) = 448 > 384, so the record can never fit
-// even after a checkpoint (nothing durable yet to reclaim on a fresh region).
+// numBlocks=8, blockSize=512 -> slotBytes = (512 - 64) / 2 aligned down to
+// 64 = 192. A single allocChunk(2) split-path call buffers 16 distinct cache
+// writes in one WAL transaction; the resulting record (>= 448 B) can never
+// fit in a 192 B slot, so the commit must fail.
 def SRT = UnitTests.registerT("pwregion_overflow:", _, SmallRingPWRegionTester.new, _);
 def SX = [
 	SRT("alloc_overflow_returns_blank", test_alloc_overflow_returns_blank),
@@ -232,8 +232,8 @@ class SmallRingPWRegionTester(t: Tester) {
 	}
 }
 
-// allocChunk(2) on a fresh small-ring region takes the split path (16
-// buffered writes), which overflows ringBytes=384. The commit must fail,
+// allocChunk(2) on a fresh small-slot region takes the split path (16
+// buffered writes), which overflows slotBytes=192. The commit must fail,
 // allocChunk must return blankChunkHandle (not a chunk claiming success), and
 // the transaction must remain dirty (data retained, not lost).
 def test_alloc_overflow_returns_blank(tc: SmallRingPWRegionTester) {
@@ -559,15 +559,18 @@ class BlockDevicePWRegionTester(t: Tester) {
 	}
 
 	def writeCommittedWalUpdate(region: PWRegion, addr: u64, value: u64, width: u8) {
-		var wal = MultiTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+		var wal = DualTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
 		wal.append(addr - region.regionStart, value, width);
 		wal.commit();
 	}
 
+	// Corrupt the record written by writeCommittedWalUpdate: its txnSeq 1
+	// parity-maps to slot 1.
 	def corruptFirstRecordChecksum(region: PWRegion) {
-		var wal = MultiTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
-		def entryCount = PWRegionUtils.pointerFromU64(wal.ringBase + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
-		def checksumAddr = wal.ringBase + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+		var wal = DualTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+		def recordAddr = wal.slotAddr(1);
+		def entryCount = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
+		def checksumAddr = recordAddr + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
 		def checksum = PWRegionUtils.pointerFromU64(checksumAddr).load<u64>();
 		PWRegionUtils.pointerFromU64(checksumAddr).store<u64>(checksum + 1u64);
 		region.backendRegion.persistRange(checksumAddr - region.regionStart, 8u64);

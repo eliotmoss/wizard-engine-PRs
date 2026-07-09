@@ -353,7 +353,7 @@ type LogEntryHandle(addr: u64) { }
 type CachedUpdate(value: u64, size: u8) #unboxed { }
 
 // A transaction facade over the write-behind cache and redo log.
-// This component buffers writes in DRAM, then commits them through MultiTxnWal.
+// This component buffers writes in DRAM, then commits them through DualTxnWal.
 //
 // CONSTRAINT: ALIGNED ACCESS ONLY
 // This implementation uses a HashMap to store updates. It does not support spatial
@@ -364,7 +364,7 @@ type CachedUpdate(value: u64, size: u8) #unboxed { }
 class RegionTransaction {
         private var cache: HashMap<u64, CachedUpdate>;
         private def addrs = Vector<u64>.new();
-        private def wal: MultiTxnWal;
+        private def wal: DualTxnWal;
         def regionStart: u64;
 
         new(wal, regionStart) {
@@ -375,21 +375,26 @@ class RegionTransaction {
                 return addrs.length != 0;
         }
 
+        // Phase A commit: two persistence boundaries. wal.commit() persists the
+        // record (boundary 1, the commit point); persistAppliedData() persists
+        // the applied after-images (boundary 2). A boundary-2 failure does not
+        // fail the transaction -- the durable record keeps the data recoverable,
+        // and the WAL's overwrite guard protects the slot until a later persist
+        // succeeds.
         def commit() -> bool {
                 if (!isDirty()) return true;
                 appendToWal();
                 def txnSeq = wal.commit();
                 if (txnSeq == 0u64) return false;
                 applyToRegion();
-                wal.noteApplied(txnSeq);
-                if (!wal.maybeCheckpoint()) {
-                        Trace.OUT.put1("checkpoint failed after commit of txnSeq %d (best-effort, data remains WAL-recoverable)", txnSeq).ln();
+                if (!wal.persistAppliedData()) {
+                        Trace.OUT.put1("data persist failed after commit of txnSeq %d (best-effort, data remains WAL-recoverable)", txnSeq).ln();
                 }
                 clear();
                 return true;
         }
 
-        def recover() -> bool {
+        def recover() -> DualWalRecovery {
                 return wal.recover();
         }
 
@@ -489,7 +494,7 @@ class PWRegion {
         def blankChunkHandle = NULL_CHUNK;
         def var blockTableHandle: BlockTableHandle;
         def var logChunk: ChunkHandle;
-        private var wal: MultiTxnWal;
+        private var wal: DualTxnWal;
         def var regionStart: u64;
         def var txn: RegionTransaction;
 
@@ -569,7 +574,7 @@ class PWRegion {
 
         private def ensureWal(logChunkAddr: u64, blockSize: u64, initializeFresh: bool) {
                 if (wal == null) {
-                        wal = MultiTxnWal.new(regionStart, logChunkAddr, blockSize, backendRegion, initializeFresh);
+                        wal = DualTxnWal.new(regionStart, logChunkAddr, blockSize, backendRegion, initializeFresh);
                 }
                 if (txn == null) {
                         txn = RegionTransaction.new(wal, regionStart);
@@ -606,7 +611,11 @@ class PWRegion {
                 logChunk = ChunkHandle(regionStart + logChunkOffset);
                 ensureWal(logChunk.addr, blockSize, false);
 
-                txn.recover();
+                match (txn.recover()) {
+                        CORRUPT => Trace.OUT.puts("WAL corrupt on mount: log records ignored").ln();
+                        PERSIST_FAILED => Trace.OUT.puts("WAL recovery replay could not be persisted; records retained for the next mount").ln();
+                        _ => ;
+                }
         }
 
         // Reset all fields of a block entry to their default (empty) state
@@ -956,8 +965,8 @@ class PWRegion {
                 return txn.commit();
         }
 
-        private def recover() {
-                txn.recover();
+        private def recover() -> DualWalRecovery {
+                return txn.recover();
         }
 }
 

@@ -67,7 +67,7 @@ class CountingRegion extends BackendRegion {
 
 class RegionTransactionTester(t: Tester) {
 	var txn: RegionTransaction;
-	var wal: MultiTxnWal;
+	var wal: DualTxnWal;
 	var backend: CountingBackend;
 	var backendRegion: BackendRegion;
 	// Backing memory for the pointers to test read-through and write-back
@@ -80,13 +80,13 @@ class RegionTransactionTester(t: Tester) {
 		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
 		backend = CountingBackend.new(dummyData[0 ..+ dummyData.length]);
 		backendRegion = backend.create(u64.!(dummyData.length), BackendProt.READ.mask | BackendProt.WRITE.mask, true);
-		wal = MultiTxnWal.new(regionStart, regionStart + 1024u64, 1024u64, backendRegion, true);
+		wal = DualTxnWal.new(regionStart, regionStart + 1024u64, 1024u64, backendRegion, true);
 		txn = RegionTransaction.new(wal, regionStart);
 		backend.prepareChangedRangeCount = 0;
 		backend.persistRangeCount = 0;
 		backend.persistChangesCount = 0;
 	}
-	
+
 	def getAddr(offset: int) -> u64 {
 		return u64.view(Pointer.atElement(dummyData, offset));
 	}
@@ -100,12 +100,13 @@ class RegionTransactionTester(t: Tester) {
 		return Pointer.atElement(dummyData, offset).load<u64>();
 	}
 
+	// The first transaction gets txnSeq 1, which parity-maps to slot 1.
 	def recordHeader() -> Ref<TxnRecordHeader> {
-		return wal.recordHeaderAt(wal.ringBase);
+		return wal.recordHeaderAt(wal.slotAddr(1));
 	}
 
 	def logEntry(index: u32) -> Ref<LogEntry> {
-		def addr = wal.ringBase + u64.!(TxnRecordHeader.size) + u64.view(index) * u64.!(LogEntry.size);
+		def addr = wal.slotAddr(1) + u64.!(TxnRecordHeader.size) + u64.view(index) * u64.!(LogEntry.size);
 		return wal.logEntryAt(addr);
 	}
 }
@@ -168,14 +169,15 @@ def test_commit_applies_and_clears(tc: RegionTransactionTester) {
 	tc.t.assert_eq(val, entry.value);
 	tc.t.assert_eq(8u8, entry.width);
 	tc.t.assert_eq(1u32, tc.recordHeader().entryCount);
-	tc.t.assert_eq(1, tc.wal.activeRecords.length);
-	tc.t.assert_eq(1u64, tc.wal.appliedSeqVolatile);
-	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
+	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
+	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
+	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);	// phase A: boundary 2 ran in commit()
 	tc.t.assert_eq(val, tc.readRamU64(200));
 	tc.t.assertz(false, tc.txn.isDirty());
 }
 
-// Test 5: WAL commit uses range persistence for log bytes and dirty batching for data bytes.
+// Test 5: WAL commit uses range persistence for the record (boundary 1) and
+// dirty batching + persistChanges for the applied data (boundary 2).
 def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(200);
 	var val = 0x0102_0304_0506_0708u64;
@@ -185,7 +187,7 @@ def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 
 	tc.t.assert_eq(1, tc.backend.persistRangeCount);
 	tc.t.assert_eq(1, tc.backend.prepareChangedRangeCount);
-	tc.t.assert_eq(0, tc.backend.persistChangesCount);
+	tc.t.assert_eq(1, tc.backend.persistChangesCount);
 	tc.t.assert_eq(addr - tc.wal.regionStart, tc.backend.lastDirtyOffset);
 	tc.t.assert_eq(8u64, tc.backend.lastDirtySize);
 }
@@ -244,8 +246,8 @@ def test_misaligned_access(tc: RegionTransactionTester) {
 	tc.t.assert_eq(0xAAu8, byteVal);
 }
 
-// Test 10: A transaction whose buffered writes cannot fit in the ring even after a
-// checkpoint (nothing durable to reclaim on a fresh WAL) must fail commit(),
+// Test 10: A transaction whose buffered writes cannot fit in a record slot
+// (25 u64 entries -> 960 B record > 448 B slotBytes) must fail commit(),
 // leaving the cache dirty and the buffered values still readable.
 def test_commit_overflow_returns_false(tc: RegionTransactionTester) {
 	for (i < 25) {
@@ -255,14 +257,15 @@ def test_commit_overflow_returns_false(tc: RegionTransactionTester) {
 	tc.t.assertz(false, tc.txn.commit());
 	tc.t.assertz(true, tc.txn.isDirty());
 	tc.t.assert_eq(7u64, tc.txn.readU64(tc.getAddr(2048 + 7 * 8)));
-	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
-	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+	tc.t.assert_eq(0u64, tc.wal.lastCommittedSeq);
+	tc.t.assert_eq(0u64, tc.wal.slotSeqs[0]);
+	tc.t.assert_eq(0u64, tc.wal.slotSeqs[1]);
 }
 
 // Test 11: A failed commit must not wedge the shared WAL: the oversized-record
-// check short-circuits before reserveRecord ever runs, so no ring space was
-// reserved. A second, independent transaction on the same WAL must still
-// commit normally afterward.
+// check short-circuits before any slot is touched, so no sequence was burned.
+// A second, independent transaction on the same WAL must still commit
+// normally afterward.
 def test_commit_overflow_then_success(tc: RegionTransactionTester) {
 	for (i < 25) {
 		tc.txn.writeU64(tc.getAddr(2048 + i * 8), u64.view(i));
@@ -273,6 +276,6 @@ def test_commit_overflow_then_success(tc: RegionTransactionTester) {
 	var txn2 = RegionTransaction.new(tc.wal, tc.wal.regionStart);
 	txn2.writeU64(tc.getAddr(3000), 0x99u64);
 	tc.t.assertz(true, txn2.commit());
-	tc.t.assert_eq(1u64, tc.wal.appliedSeqVolatile);
+	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
 	tc.t.assertz(false, txn2.isDirty());
 }

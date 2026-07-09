@@ -23,7 +23,18 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Recovery: checksum verify → redo entries → fence → clear status durably
 - **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `MultiTxnWal` instead. Renamed `RegionWal` → `SingleTxnWal` and retained as a reference implementation for comparison against `MultiTxnWal` (see `docs/wal-comparison.md`).
 
-### Multi-transaction WAL (`X86_64MultiTxnWal.v3`)
+### Two-slot redo WAL, phase A (`X86_64DualTxnWal.v3`) — active
+- `DualTxnWal` — redo log holding at most 2 transactions in two fixed slots after a minimal `DualWalHeader` (64 B: magic/version/headerSize/slotBytes/slotCount/checksum) in the block-1 log chunk; `slotBytes = alignDown((blockSize − 64) / 2, 64)`
+- Slot selected by sequence parity (`txnSeq % 2`); records reuse the `TxnRecordHeader`/`TxnCommitTrailer`/`LogEntry` layouts with the `logEpoch` fields reserved (must be 0) and distinct magics (`DWALHEAD`/`DWALTXHD`/`DWALTXCM`) so stale `MultiTxnWal` ring bytes in a reused chunk can never validate
+- Phase A commit = write record into slot `txnSeq % 2` → `persistRange` (boundary 1, the commit point) → apply after-images → `persistChanges` (boundary 2). Recovery = validate both slots → replay valid records in ascending `txnSeq` → persist → `nextTxnSeq = max + 1`. No superblocks, epochs, replay floor, or checkpoint policy
+- **Open Issue #7 fixed from day one**: `append()` returns `bool` and poisons the pending transaction on an invalid entry, so `commit()` fails instead of committing with a silently missing write. Empty commits write an `entryCount=0` record, so a successful commit always returns a nonzero seq (no failure-sentinel collision)
+- **Open Issue #8 fixed from day one**: `recover()` returns `DualWalRecovery` (`CLEAN` / `REPLAYED` / `CORRUPT` / `PERSIST_FAILED`); `PWRegion.mount()` consumes it and traces the bad outcomes
+- Failed commit-point persist burns nothing: the seq is not advanced and parity maps the retry onto the same slot, so a duplicate-seq record at another location is structurally impossible (no scrub/rollback protocol)
+- Overwrite guard: a slot whose record covers not-yet-durable data (boundary-2 failure, or a mount that skipped `recover()`) cannot be overwritten — commit retries the data persist and otherwise fails cleanly through the existing `bool` propagation
+- Wired into `RegionTransaction`/`PWRegion` in place of `MultiTxnWal`: `commit()` is `appendToWal → wal.commit → applyToRegion → persistAppliedData → clear`; `noteApplied`/`maybeCheckpoint` dropped out. A boundary-2 failure does not fail the transaction (data remains WAL-recoverable); it emits a `Trace.OUT` diagnostic
+- Tests: `DualTxnWalTest.v3` (fresh init, slot alternation, empty-commit seq, commit→crash→recover, clean remount, torn-record rejection, two-slot ascending replay, overwrite + latest-two replay, oversize-commit failure, poisoned-append commit failure, unrecovered-slot overwrite guard, failed-persist same-slot/same-seq retry, corrupt-header recovery result); `WALCacheTest.v3`/`TxnPWRegionTest.v3` re-pointed (slot geometry, boundary-2 persist counts, recovery paths)
+
+### Multi-transaction WAL (`X86_64MultiTxnWal.v3`) — superseded, not wired in
 - Circular redo log living in block 1, with a dual-copy superblock at the head of the chunk and the ring immediately after (`ringBase = logChunkAddr + 2 * WalSuperblock.size`, `ringBytes = blockSize - 2 * WalSuperblock.size`)
 - Layouts: `WalSuperblock` (64 B, dual copy), `TxnRecordHeader` (64 B), `TxnCommitTrailer` (48 B); records are `ALIGNMENT`(64 B)-aligned, magic/version/size guarded, with an FNV-style checksum over the whole record
 - Generation-based superblock selection: `loadSuperblock` picks the valid copy with the higher `generation`; `writeSuperblock` writes the inactive copy, persists, then swaps
@@ -64,7 +75,8 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ## In Progress
 
-- **Design pivot (2026-07-09, decided with supervisor):** a redo log holding **at most 2 transactions** is good enough for our use case — it achieves the persistence-boundary reduction that motivated `MultiTxnWal` at a fraction of the complexity. The two-slot WAL (`DualTxnWal`, Next Steps #1) is now the priority; finishing `MultiTxnWal` hardening is second priority (Next Steps #2). `MultiTxnWal` stays wired in until the new WAL lands.
+- **Design pivot (2026-07-09, decided with supervisor):** a redo log holding **at most 2 transactions** is good enough for our use case — it achieves the persistence-boundary reduction that motivated `MultiTxnWal` at a fraction of the complexity. The two-slot WAL (`DualTxnWal`, Next Steps #1) is now the priority; finishing `MultiTxnWal` hardening is second priority (Next Steps #2).
+- **Phase A of `DualTxnWal` is implemented and wired in** (see Completed): two persistence boundaries per commit, replacing `MultiTxnWal` on the commit path. `MultiTxnWal` is retained alongside `SingleTxnWal` as a comparison implementation. Next: phase B (piggybacked boundary, one per commit steady-state).
 - Multi-transaction WAL core paths are test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is implemented (hybrid count-OR-occupancy, per-backend thresholds). Commit-failure propagation is implemented (see Completed).
 - A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus several API-hardening items — see Next Steps #2 follow-ups and Open Issues #7–8. Both durability bugs are fixed (regression-tested by `multi_wal:commit_after_recovery_survives` and `multi_wal:failed_persist_no_duplicate`).
 
@@ -85,12 +97,12 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 **Accepted trade-offs vs `MultiTxnWal`:** per-transaction capacity is ~half the log chunk minus headers (allocator transactions are a handful of metadata words, so this is ample; an oversize commit fails cleanly through the existing `bool` propagation); no burst absorption of many committed-but-uncheckpointed transactions; on PMEM, data lines are flushed every commit instead of every `CHECKPOINT_TXN_CHEAP` commits (cheap fences — acceptable).
 
-**Phase A — two boundaries per commit** (implement, verify, then phase B):
+**Phase A — two boundaries per commit** — **done (see Completed)**:
 commit = write record into slot `txnSeq % 2` → **persist record** (boundary 1, the commit point) → apply after-images to region → **persist data** (boundary 2) → slot reclaimable. Recovery: validate both slots → replay valid records in seq order → persist data → `nextTxnSeq = max(valid seqs) + 1`.
-- [ ] Implement `X86_64DualTxnWal.v3`: two fixed slots after a minimal chunk header; reuse the `TxnRecordHeader`/`TxnCommitTrailer` layouts minus `logEpoch`; keep the per-record checksum
-- [ ] Fix the `append()` contract from day one: return `bool` or poison the pending transaction so `commit()` fails (don't inherit Open Issue #7); give `recover()` a return type that distinguishes clean / replayed / corrupt / persist-failure (don't inherit Open Issue #8)
-- [ ] Wire into `RegionTransaction`/`PWRegion` in place of `MultiTxnWal` — the commit pipeline shape (`appendToWal → wal.commit → applyToRegion → …`) and commit-failure propagation carry over; `noteApplied`/`maybeCheckpoint` drop out in phase A
-- [ ] Tests (`DualTxnWalTest.v3`, plus re-point `WALCacheTest`/`TxnPWRegionTest` recovery paths): fresh init, commit→crash→recover, torn-record rejection (checksum), two-valid-slots replay order, retry-after-failed-persist reuses the same slot (no duplicate seq), oversize-commit failure propagation (cache stays dirty), clean remount
+- [x] Implement `X86_64DualTxnWal.v3`: two fixed slots after a minimal chunk header (`DualWalHeader`); reuses the `TxnRecordHeader`/`TxnCommitTrailer` layouts with `logEpoch` reserved-zero and distinct magics; per-record checksum kept
+- [x] `append()` contract fixed from day one: returns `bool` **and** poisons the pending transaction so `commit()` fails (Open Issue #7 not inherited); `recover()` returns `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) and `mount()` consumes it (Open Issue #8 not inherited). Bonus: empty commits write an `entryCount=0` record, eliminating the empty-commit sentinel collision; `backendRegion` is required non-null (one contract, no dead guards)
+- [x] Wired into `RegionTransaction`/`PWRegion` in place of `MultiTxnWal` — commit pipeline is `appendToWal → wal.commit → applyToRegion → persistAppliedData → clear`; `noteApplied`/`maybeCheckpoint` dropped out. Added an overwrite guard: a slot covering not-yet-durable data is never destroyed (commit retries the data persist or fails cleanly)
+- [x] Tests: `DualTxnWalTest.v3` (13 cases — fresh init, commit→crash→recover, torn-record rejection, two-valid-slots replay order, retry-after-failed-persist reuses the same slot/seq, oversize-commit failure, poisoned-append failure, unrecovered-slot overwrite guard, clean remount, corrupt-header result); `WALCacheTest`/`TxnPWRegionTest` recovery paths re-pointed
 
 **Phase B — piggybacked boundary (one per commit steady-state):** defer transaction N's data persist; the log-persist boundary at transaction N+1's commit also covers it. Slot N is reclaimable only once a later record is durable.
 - File backend: free — `fdatasync`/`msync` flush the whole mapping, so txn N+1's boundary 1 subsumes txn N's data persist
@@ -101,7 +113,7 @@ commit = write record into slot `txnSeq % 2` → **persist record** (boundary 1,
 - [ ] Extend `docs/wal-comparison.md` with a third column for `DualTxnWal`
 
 ### 2. Multi-transaction WAL — deprioritized (second priority)
-**Deprioritized 2026-07-09** in favor of the two-slot WAL (#1): the superblock/epoch/ring/checkpoint machinery buys burst absorption and bounded replay we don't need for allocator-sized transactions. `MultiTxnWal` stays wired in until `DualTxnWal` lands, then is retained alongside `SingleTxnWal` as a comparison implementation. The unchecked items below are paused unless they block the comparison write-up.
+**Deprioritized 2026-07-09** in favor of the two-slot WAL (#1): the superblock/epoch/ring/checkpoint machinery buys burst absorption and bounded replay we don't need for allocator-sized transactions. `DualTxnWal` phase A has landed and replaced it on the commit path; `MultiTxnWal` is now retained alongside `SingleTxnWal` as a comparison implementation (its own unit tests still run). The unchecked items below are paused unless they block the comparison write-up.
 
 The core `MultiTxnWal` is implemented and wired in (see Completed). Remaining work:
 - [x] `maybeCheckpoint()` implemented as hybrid count-OR-occupancy with the lazy ring-full `reserveRecord` checkpoint kept as a backstop, thresholds chosen per backend via `BackendRegion.checkpointCost()` (`CheckpointCost.FREE`/`CHEAP`/`EXPENSIVE`). Policy brainstormed in `docs/checkpoint-policy.md` (Option E + light F). Covered by `MultiTxnWalTest.v3` (`checkpoint_policy_thresholds`, `maybe_checkpoint_count`, `maybe_checkpoint_occupancy`).
@@ -152,5 +164,5 @@ Design notes (no action yet, keep in mind):
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 5 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
-| 7 | `X86_64MultiTxnWal.v3` | `append()` silently drops invalid entries — a transaction can commit successfully while missing a write. Deprioritized with `MultiTxnWal`; `DualTxnWal` must fix this contract from day one (Next Steps #1) |
-| 8 | `X86_64MultiTxnWal.v3` | `recover()` return value conflates clean/corrupt/persist-failure, and both `PWRegion` call sites ignore it. Deprioritized with `MultiTxnWal`; `DualTxnWal` must define a proper recovery result (Next Steps #1) |
+| 7 | `X86_64MultiTxnWal.v3` | `append()` silently drops invalid entries — a transaction can commit successfully while missing a write. Deprioritized with `MultiTxnWal` (now a comparison implementation, not wired in); `DualTxnWal` fixed this contract from day one (`append() -> bool` + transaction poisoning) |
+| 8 | `X86_64MultiTxnWal.v3` | `recover()` return value conflates clean/corrupt/persist-failure, and both `PWRegion` call sites ignore it. Deprioritized with `MultiTxnWal` (not wired in); `DualTxnWal` defines `DualWalRecovery` and `mount()` consumes it |

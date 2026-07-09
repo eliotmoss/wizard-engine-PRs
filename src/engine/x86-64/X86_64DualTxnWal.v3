@@ -1,0 +1,504 @@
+// Dual-Transaction Redo WAL (two-slot log, phase A: two persistence boundaries per commit)
+//
+// Replaces the ring/superblock machinery of MultiTxnWal with two fixed record
+// slots in the block-1 log chunk, selected by transaction-sequence parity
+// (txnSeq % 2). Redo entries are idempotent absolute after-images, so recovery
+// simply validates both slots and replays the valid records in ascending
+// txnSeq -- no durableAppliedSeq replay floor, superblocks, epoch fencing, or
+// checkpoint policy are needed. Parity slot selection also makes a duplicate
+// txnSeq after a failed commit-point persist structurally impossible: a
+// retried commit overwrites the same slot, so no scrub/rollback protocol is
+// needed either.
+//
+// Commit (phase A) = write record into slot txnSeq % 2 -> persist record
+// (boundary 1, the commit point) -> apply after-images to region -> persist
+// data (boundary 2) -> slot reclaimable. Recovery = validate both slots ->
+// replay valid records in seq order -> persist data -> nextTxnSeq = max + 1.
+//
+// Record slots reuse the TxnRecordHeader/TxnCommitTrailer/LogEntry layouts
+// from MultiTxnWal; the logEpoch fields are reserved here and must be zero.
+// Distinct magic values guarantee stale MultiTxnWal ring bytes in a reused
+// log chunk can never validate as dual-slot records.
+
+layout DualWalHeader {
+        +0      magic:          u64;    // Constant signature identifying this as a dual-slot WAL header
+        +8      version:        u32;    // Persistent format version. Used to reject incompatible layouts
+        +16     headerSize:     u64;    // Size of this header layout in bytes
+        +24     slotBytes:      u64;    // Capacity of each record slot; must match the mount-time geometry
+        +32     slotCount:      u32;    // Number of record slots. Must be 2 in version 1
+        +40     reserved:       u64;    // Reserved for future metadata. Must be zero in version 1
+        +48     checksum:       u64;    // Checksum over the header, excluding this field
+        =64;
+}
+
+component DualTxnWalConstants {
+        def HEADER_MAGIC = 0x4457_414c_4845_4144_u64;   // "DWALHEAD"
+        def RECORD_MAGIC = 0x4457_414c_5458_4844_u64;   // "DWALTXHD"
+        def TRAILER_MAGIC = 0x4457_414c_5458_434d_u64;  // "DWALTXCM"
+        def VERSION = 1u32;
+        def RECORD_VERSION = 1u16;
+        def SLOT_COUNT = 2u32;
+        def ALIGNMENT = 64u64;
+}
+
+// Outcome of DualTxnWal.recover(). Distinguishes the cases that MultiTxnWal's
+// bool return conflated: nothing to replay, a successful replay, an unusable
+// log, and a replay whose data persist failed.
+enum DualWalRecovery {
+        CLEAN,          // no valid records; nothing was replayed
+        REPLAYED,       // valid records were replayed and their data persisted
+        CORRUPT,        // WAL header invalid; log contents were ignored
+        PERSIST_FAILED  // replay was applied in memory, but persisting it failed;
+                        // the records stay valid and replay again on the next mount
+}
+
+class DualTxnWal {
+        def regionStart: u64;
+        def logChunkAddr: u64;
+        def var logChunkSize: u64;
+        def backendRegion: BackendRegion;
+
+        def var logChunkOffset: u64;
+        def var slotBytes: u64;
+        def var nextTxnSeq: u64 = 1;            // Next transaction sequence number
+        def var lastCommittedSeq: u64 = 0;      // Highest seq whose record reached its commit point (boundary 1)
+        def var dataDurableSeq: u64 = 0;        // Highest seq whose applied after-images are known durable (boundary 2)
+        def var slotSeqs = Array<u64>.new(2);   // txnSeq of the valid record in each slot (0 = empty/unknown)
+        def var poisoned = false;               // An invalid append poisoned the pending transaction
+        private def pendingEntries = Vector<WalPendingEntry>.new();
+        def var openOk = false;
+
+        new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
+                logChunkSize = blockSize;
+                logChunkOffset = logChunkAddr - regionStart;
+                slotBytes = alignDown((blockSize - u64.!(DualWalHeader.size)) / 2u64, DualTxnWalConstants.ALIGNMENT);
+                slotSeqs[0] = 0u64;
+                slotSeqs[1] = 0u64;
+                if (backendRegion == null) {
+                        Trace.OUT.puts("dual-transaction WAL requires a backend region").ln();
+                        return;
+                }
+                if (slotBytes < alignedRecordLen(0u32)) {
+                        Trace.OUT.put1("log chunk too small for dual-transaction WAL slots (%d bytes)", blockSize).ln();
+                        return;
+                }
+                if (initializeFresh) {
+                        initializeHeader();
+                } else {
+                        openOk = validateHeader();
+                        if (!openOk) {
+                                Trace.OUT.puts("corrupt dual-transaction WAL header").ln();
+                                return;
+                        }
+                        scanSlots();
+                }
+        }
+
+        // --- WAL operations ---
+
+        // Buffer one redo entry for the pending transaction. An invalid entry
+        // poisons the whole pending transaction so the subsequent commit()
+        // fails: a transaction must never commit successfully while silently
+        // missing one of its writes.
+        def append(offset: u64, value: u64, width: u8) -> bool {
+                if (!validEntryFields(offset, width)) {
+                        poisoned = true;
+                        return false;
+                }
+                pendingEntries.put(WalPendingEntry(offset, value, width));
+                return true;
+        }
+
+        // Commit the pending transaction: write its record into slot
+        // txnSeq % 2 and persist it (boundary 1, the commit point). Returns the
+        // record's txnSeq, or 0 on failure. An empty transaction commits as an
+        // entryCount=0 record, so a successful commit always returns a nonzero
+        // sequence and the failure sentinel is unambiguous.
+        def commit() -> u64 {
+                def txnSeq = appendCommittedRecord(pendingEntries);
+                pendingEntries.resize(0);
+                poisoned = false;
+                return txnSeq;
+        }
+
+        def clear() {
+                pendingEntries.resize(0);
+                poisoned = false;
+        }
+
+        // --- Data application ---
+
+        def applyUpdate(offset: u64, value: u64, width: u8) {
+                if (!validEntryFields(offset, width)) return;
+                writeAfterImage(offset, value, width);
+                backendRegion.prepareChangedRange(offset, u64.view(width));
+        }
+
+        // Boundary 2: complete durability for all after-images applied so far.
+        // A failure is not fatal to any acknowledged transaction -- the data
+        // remains recoverable from the slot records -- but the affected slots
+        // stay unreclaimable until a later persist succeeds (see the overwrite
+        // guard in appendCommittedRecord).
+        def persistAppliedData() -> bool {
+                if (!backendRegion.persistChanges()) return false;
+                dataDurableSeq = lastCommittedSeq;
+                return true;
+        }
+
+        private def appendCommittedRecord(entries: Vector<WalPendingEntry>) -> u64 {
+                if (!openOk || poisoned) return 0u64;
+                def entryCount = u32.!(entries.length);
+                def recordLen64 = alignedRecordLen(entryCount);
+                if (recordLen64 > slotBytes) return 0u64;
+
+                def txnSeq = nextTxnSeq;
+                def slot = slotIndexOf(txnSeq);
+                // Overwrite guard: the slot's current record may be the only
+                // durable copy of data that has not yet reached the region
+                // backing store; destroying it would lose that data on a crash.
+                // Retry the data persist before overwriting. If the record was
+                // committed by an earlier incarnation and never replayed (mount
+                // without recover()), the persist cannot cover it and the commit
+                // must fail until recover() runs.
+                if (slotSeqs[slot] != 0u64 && slotSeqs[slot] > dataDurableSeq) {
+                        if (!persistAppliedData() || slotSeqs[slot] > dataDurableSeq) return 0u64;
+                }
+
+                def absStart = slotAddr(slot);
+                slotSeqs[slot] = 0u64;  // the previous record is destroyed from here on
+                zeroBytes(absStart, recordLen64);
+
+                recordStoreU64(absStart, TxnRecordHeader.magic.offset, DualTxnWalConstants.RECORD_MAGIC);
+                recordStoreU16(absStart, TxnRecordHeader.version.offset, DualTxnWalConstants.RECORD_VERSION);
+                recordStoreU16(absStart, TxnRecordHeader.headerSize.offset, u16.!(TxnRecordHeader.size));
+                recordStoreU16(absStart, TxnRecordHeader.entrySize.offset, u16.!(LogEntry.size));
+                recordStoreU32(absStart, TxnRecordHeader.recordLen.offset, u32.!(recordLen64));
+                recordStoreU32(absStart, TxnRecordHeader.entryCount.offset, entryCount);
+                recordStoreU64(absStart, TxnRecordHeader.logEpoch.offset, 0u64);        // reserved
+                recordStoreU64(absStart, TxnRecordHeader.txnSeq.offset, txnSeq);
+
+                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                for (i < entries.length) {
+                        def e = entries[i];
+                        recordStoreU64(entryAddr, LogEntry.offset.offset, e.offset);
+                        recordStoreU64(entryAddr, LogEntry.value.offset, e.value);
+                        recordStoreU8(entryAddr, LogEntry.width.offset, e.width);
+                        entryAddr += u64.!(LogEntry.size);
+                }
+
+                def trailerAddr = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
+                recordStoreU64(trailerAddr, TxnCommitTrailer.magic.offset, DualTxnWalConstants.TRAILER_MAGIC);
+                recordStoreU32(trailerAddr, TxnCommitTrailer.recordLen.offset, u32.!(recordLen64));
+                recordStoreU32(trailerAddr, TxnCommitTrailer.entryCount.offset, entryCount);
+                recordStoreU64(trailerAddr, TxnCommitTrailer.logEpoch.offset, 0u64);    // reserved
+                recordStoreU64(trailerAddr, TxnCommitTrailer.txnSeq.offset, txnSeq);
+                recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, 0u64);
+                recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, computeRecordChecksum(absStart, recordLen64));
+
+                // The record persistRange is the transaction commit point
+                // (boundary 1). The sequence is deliberately not burned on
+                // failure: parity maps the retry back onto this same slot, so a
+                // duplicate-seq record at another location is structurally
+                // impossible and no scrub or rollback is needed.
+                if (!backendRegion.persistRange(absStart - regionStart, recordLen64)) return 0u64;
+
+                slotSeqs[slot] = txnSeq;
+                lastCommittedSeq = txnSeq;
+                nextTxnSeq++;
+                return txnSeq;
+        }
+
+        // --- Read (cache-miss fallthrough) ---
+
+        def readU8(offset: u64) -> u8 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u8>();
+        }
+
+        def readI16(offset: u64) -> i16 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i16>();
+        }
+
+        def readU64(offset: u64) -> u64 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u64>();
+        }
+
+        def readI64(offset: u64) -> i64 {
+                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i64>();
+        }
+
+        // --- Recovery ---
+
+        // Validate both slots and redo the valid records in ascending txnSeq
+        // order. Records are idempotent after-images, so re-replaying an
+        // already-durable record on a later mount is harmless -- no replay
+        // floor is tracked.
+        def recover() -> DualWalRecovery {
+                if (!openOk) return DualWalRecovery.CORRUPT;
+                slotSeqs[0] = validateSlot(0);
+                slotSeqs[1] = validateSlot(1);
+                def maxSeq = if(slotSeqs[0] > slotSeqs[1], slotSeqs[0], slotSeqs[1]);
+                if (maxSeq == 0u64) {
+                        nextTxnSeq = 1u64;
+                        lastCommittedSeq = 0u64;
+                        dataDurableSeq = 0u64;
+                        return DualWalRecovery.CLEAN;
+                }
+                for (slot < 2) {
+                        if (slotSeqs[slot] != 0u64 && slotSeqs[slot] < maxSeq) redoSlot(slot);
+                }
+                redoSlot(slotIndexOf(maxSeq));
+                lastCommittedSeq = maxSeq;
+                nextTxnSeq = maxSeq + 1u64;
+                // The replay is published only once the redone data is durable.
+                // On failure the slots stay valid and the overwrite guard keeps
+                // them from being destroyed, so a later mount replays them again.
+                if (!backendRegion.persistChanges()) return DualWalRecovery.PERSIST_FAILED;
+                dataDurableSeq = maxSeq;
+                return DualWalRecovery.REPLAYED;
+        }
+
+        private def redoSlot(slot: int) {
+                def absStart = slotAddr(slot);
+                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
+                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                for (i < entryCount) {
+                        applyUpdate(
+                                recordLoadU64(entryAddr, LogEntry.offset.offset),
+                                recordLoadU64(entryAddr, LogEntry.value.offset),
+                                recordLoadU8(entryAddr, LogEntry.width.offset));
+                        entryAddr += u64.!(LogEntry.size);
+                }
+        }
+
+        // --- Lifecycle ---
+
+        def close() {
+        }
+
+        private def initializeHeader() {
+                nextTxnSeq = 1u64;
+                lastCommittedSeq = 0u64;
+                dataDurableSeq = 0u64;
+                zeroBytes(logChunkAddr, u64.!(DualWalHeader.size));
+                headerStoreU64(DualWalHeader.magic.offset, DualTxnWalConstants.HEADER_MAGIC);
+                headerStoreU32(DualWalHeader.version.offset, DualTxnWalConstants.VERSION);
+                headerStoreU64(DualWalHeader.headerSize.offset, u64.!(DualWalHeader.size));
+                headerStoreU64(DualWalHeader.slotBytes.offset, slotBytes);
+                headerStoreU32(DualWalHeader.slotCount.offset, DualTxnWalConstants.SLOT_COUNT);
+                headerStoreU64(DualWalHeader.reserved.offset, 0u64);
+                headerStoreU64(DualWalHeader.checksum.offset, computeHeaderChecksum());
+                // Invalidate stale record bytes in the slots: a re-format can run
+                // over a region that previously held WAL contents.
+                zeroBytes(slotAddr(0), u64.!(TxnRecordHeader.size));
+                zeroBytes(slotAddr(1), u64.!(TxnRecordHeader.size));
+                // Header and slot 0's scrubbed header prefix are contiguous.
+                var ok = backendRegion.persistRange(logChunkOffset, u64.!(DualWalHeader.size) + u64.!(TxnRecordHeader.size));
+                ok = backendRegion.persistRange(slotAddr(1) - regionStart, u64.!(TxnRecordHeader.size)) && ok;
+                openOk = ok;
+        }
+
+        def validateHeader() -> bool {
+                if (headerLoadU64(DualWalHeader.magic.offset) != DualTxnWalConstants.HEADER_MAGIC) return false;
+                if (headerLoadU32(DualWalHeader.version.offset) != DualTxnWalConstants.VERSION) return false;
+                if (headerLoadU64(DualWalHeader.headerSize.offset) != u64.!(DualWalHeader.size)) return false;
+                if (headerLoadU64(DualWalHeader.slotBytes.offset) != slotBytes) return false;
+                if (headerLoadU32(DualWalHeader.slotCount.offset) != DualTxnWalConstants.SLOT_COUNT) return false;
+                if (headerLoadU64(DualWalHeader.reserved.offset) != 0u64) return false;
+                return headerLoadU64(DualWalHeader.checksum.offset) == computeHeaderChecksum();
+        }
+
+        // Derive the sequence state from the slot contents. Only nextTxnSeq is
+        // adopted here: lastCommittedSeq/dataDurableSeq stay 0, so the overwrite
+        // guard refuses to destroy unrecovered records until recover() runs.
+        private def scanSlots() {
+                slotSeqs[0] = validateSlot(0);
+                slotSeqs[1] = validateSlot(1);
+                def maxSeq = if(slotSeqs[0] > slotSeqs[1], slotSeqs[0], slotSeqs[1]);
+                nextTxnSeq = maxSeq + 1u64;
+        }
+
+        // Validate the record in a slot. Returns its txnSeq, or 0 if the slot
+        // does not hold a complete, well-formed record of this slot's parity.
+        def validateSlot(slot: int) -> u64 {
+                def absStart = slotAddr(slot);
+                def recordLen = recordLoadU32(absStart, TxnRecordHeader.recordLen.offset);
+                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
+                def txnSeq = recordLoadU64(absStart, TxnRecordHeader.txnSeq.offset);
+                if (recordLoadU64(absStart, TxnRecordHeader.magic.offset) != DualTxnWalConstants.RECORD_MAGIC) return 0u64;
+                if (recordLoadU16(absStart, TxnRecordHeader.version.offset) != DualTxnWalConstants.RECORD_VERSION) return 0u64;
+                if (recordLoadU16(absStart, TxnRecordHeader.headerSize.offset) != u16.!(TxnRecordHeader.size)) return 0u64;
+                if (recordLoadU16(absStart, TxnRecordHeader.entrySize.offset) != u16.!(LogEntry.size)) return 0u64;
+                if (recordLoadU64(absStart, TxnRecordHeader.logEpoch.offset) != 0u64) return 0u64;      // reserved
+                if (txnSeq == 0u64) return 0u64;
+                if (slotIndexOf(txnSeq) != slot) return 0u64;
+                if (recordLen < u32.!(TxnRecordHeader.size + TxnCommitTrailer.size)) return 0u64;
+                if (u64.view(recordLen) % DualTxnWalConstants.ALIGNMENT != 0u64) return 0u64;
+                if (u64.view(recordLen) > slotBytes) return 0u64;
+
+                def trailerAddr = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
+                if (trailerAddr + u64.!(TxnCommitTrailer.size) > absStart + u64.view(recordLen)) return 0u64;
+                if (recordLoadU64(trailerAddr, TxnCommitTrailer.magic.offset) != DualTxnWalConstants.TRAILER_MAGIC) return 0u64;
+                if (recordLoadU32(trailerAddr, TxnCommitTrailer.recordLen.offset) != recordLen) return 0u64;
+                if (recordLoadU32(trailerAddr, TxnCommitTrailer.entryCount.offset) != entryCount) return 0u64;
+                if (recordLoadU64(trailerAddr, TxnCommitTrailer.logEpoch.offset) != 0u64) return 0u64;  // reserved
+                if (recordLoadU64(trailerAddr, TxnCommitTrailer.txnSeq.offset) != txnSeq) return 0u64;
+                if (recordLoadU64(trailerAddr, TxnCommitTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return 0u64;
+
+                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                for (i < entryCount) {
+                        if (!validEntryFields(
+                                recordLoadU64(entryAddr, LogEntry.offset.offset),
+                                recordLoadU8(entryAddr, LogEntry.width.offset))) return 0u64;
+                        entryAddr += u64.!(LogEntry.size);
+                }
+                return txnSeq;
+        }
+
+        // --- Geometry and helpers ---
+
+        def slotIndexOf(txnSeq: u64) -> int {
+                return int.!(txnSeq % 2u64);
+        }
+
+        def slotAddr(slot: int) -> u64 {
+                return logChunkAddr + u64.!(DualWalHeader.size) + u64.view(slot) * slotBytes;
+        }
+
+        private def alignedRecordLen(entryCount: u32) -> u64 {
+                def raw = u64.!(TxnRecordHeader.size + TxnCommitTrailer.size) + u64.view(entryCount) * u64.!(LogEntry.size);
+                return alignUp(raw, DualTxnWalConstants.ALIGNMENT);
+        }
+
+        private def alignUp(n: u64, alignment: u64) -> u64 {
+                return ((n + alignment - 1u64) / alignment) * alignment;
+        }
+
+        private def alignDown(n: u64, alignment: u64) -> u64 {
+                return (n / alignment) * alignment;
+        }
+
+        private def validEntryFields(offset: u64, width: u8) -> bool {
+                if (width != 1u8 && width != 2u8 && width != 4u8 && width != 8u8) return false;
+                if (backendRegion == null) return false;
+                def size = u64.view(width);
+                def regionSize = u64.!(backendRegion.range.length);
+                if (offset > regionSize || size > regionSize - offset) return false;
+                def end = offset + size;
+                def walStart = logChunkOffset;
+                def walEnd = logChunkOffset + logChunkSize;
+                if (offset < walEnd && walStart < end) return false;
+                return true;
+        }
+
+        private def writeAfterImage(offset: u64, value: u64, width: u8) {
+                def addr = PWRegionUtils.pointerFromU64(regionStart + offset);
+                match (width) {
+                        1 => addr.store<u8>(u8.view(value));
+                        2 => addr.store<u16>(u16.view(value));
+                        4 => addr.store<u32>(u32.view(value));
+                        8 => addr.store<u64>(value);
+                        _ => ;
+                }
+        }
+
+        private def computeHeaderChecksum() -> u64 {
+                def skip = logChunkAddr + u64.view(DualWalHeader.checksum.offset);
+                return checksumBytes(logChunkAddr, u64.!(DualWalHeader.size), skip, 8u64);
+        }
+
+        private def computeRecordChecksum(absStart: u64, recordLen: u64) -> u64 {
+                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
+                def skip = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+                return checksumBytes(absStart, recordLen, skip, 8u64);
+        }
+
+        private def checksumBytes(start: u64, len: u64, skipStart: u64, skipLen: u64) -> u64 {
+                var h = 0x9E37_79B9_7F4A_7C15_u64;
+                var ptr = start;
+                def end = start + len;
+                def skipEnd = skipStart + skipLen;
+                while (ptr < end) {
+                        var b: u64 = 0u64;
+                        if (!(ptr >= skipStart && ptr < skipEnd)) {
+                                b = u64.view(PWRegionUtils.pointerFromU64(ptr).load<u8>());
+                        }
+                        h = (h << 7) | (h >> 57);
+                        h = (h ^ b) * 0x1000_0000_01B3_u64;
+                        ptr++;
+                }
+                return h;
+        }
+
+        private def zeroBytes(start: u64, len: u64) {
+                var ptr = start;
+                def end = start + len;
+                while (ptr < end) {
+                        PWRegionUtils.pointerFromU64(ptr).store<u8>(0u8);
+                        ptr++;
+                }
+        }
+
+        def headerAt() -> Ref<DualWalHeader> {
+                return Ref<DualWalHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(logChunkAddr), DualWalHeader.size));
+        }
+
+        def recordHeaderAt(addr: u64) -> Ref<TxnRecordHeader> {
+                return Ref<TxnRecordHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), TxnRecordHeader.size));
+        }
+
+        def commitTrailerAt(addr: u64) -> Ref<TxnCommitTrailer> {
+                return Ref<TxnCommitTrailer>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), TxnCommitTrailer.size));
+        }
+
+        def logEntryAt(addr: u64) -> Ref<LogEntry> {
+                return Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LogEntry.size));
+        }
+
+        private def headerLoadU64(offset: int) -> u64 {
+                return PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).load<u64>();
+        }
+
+        private def headerLoadU32(offset: int) -> u32 {
+                return PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).load<u32>();
+        }
+
+        private def headerStoreU64(offset: int, value: u64) {
+                PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).store<u64>(value);
+        }
+
+        private def headerStoreU32(offset: int, value: u32) {
+                PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).store<u32>(value);
+        }
+
+        private def recordLoadU64(addr: u64, offset: int) -> u64 {
+                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u64>();
+        }
+
+        private def recordLoadU32(addr: u64, offset: int) -> u32 {
+                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u32>();
+        }
+
+        private def recordLoadU16(addr: u64, offset: int) -> u16 {
+                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u16>();
+        }
+
+        private def recordLoadU8(addr: u64, offset: int) -> u8 {
+                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u8>();
+        }
+
+        private def recordStoreU64(addr: u64, offset: int, value: u64) {
+                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u64>(value);
+        }
+
+        private def recordStoreU32(addr: u64, offset: int, value: u32) {
+                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u32>(value);
+        }
+
+        private def recordStoreU16(addr: u64, offset: int, value: u16) {
+                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u16>(value);
+        }
+
+        private def recordStoreU8(addr: u64, offset: int, value: u8) {
+                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u8>(value);
+        }
+}
