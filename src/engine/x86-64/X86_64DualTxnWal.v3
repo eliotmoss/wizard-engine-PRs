@@ -48,9 +48,8 @@ component DualTxnWalConstants {
         def ALIGNMENT = 64u64;
 }
 
-// Outcome of DualTxnWal.recover(). Distinguishes the cases that MultiTxnWal's
-// bool return conflated: nothing to replay, a successful replay, an unusable
-// log, and a replay whose data persist failed.
+// Outcome of DualTxnWal.recover(). Distinguishes nothing to replay, a
+// successful replay, an unusable log, and a replay whose data persist failed.
 enum DualWalRecovery {
         CLEAN,          // no valid records; nothing was replayed
         REPLAYED,       // valid records were replayed and their data persisted

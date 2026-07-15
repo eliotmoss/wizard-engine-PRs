@@ -61,6 +61,16 @@ type WalPendingEntry(offset: u64, value: u64, width: u8) #unboxed { }
 
 type WalActiveRecord(txnSeq: u64, startOffset: u64, recordLen: u32, entryCount: u32) #unboxed { }
 
+// Outcome of MultiTxnWal.recover(). A caller must be able to distinguish an
+// ordinary clean mount from an unusable log or a replay that was not made
+// durable.
+enum MultiWalRecovery {
+        CLEAN,          // no contiguous committed records needed replay
+        REPLAYED,       // committed records were replayed and made durable
+        CORRUPT,        // no valid superblock could be opened
+        PERSIST_FAILED  // replay/epoch publication did not reach durability
+}
+
 class MultiTxnWal {
         def regionStart: u64;
         def logChunkAddr: u64;
@@ -82,6 +92,7 @@ class MultiTxnWal {
         def var activeBytes: u64 = 0;           // Running sum of recordLen over activeRecords; drives the occupancy watermark
         def var checkpointTxnThreshold: u64 = MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE;
         def var checkpointFillPercent: u64 = MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE;
+        def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
         def var openOk = false;
 
@@ -91,6 +102,10 @@ class MultiTxnWal {
                 ringBase = logChunkAddr + 2u64 * u64.!(WalSuperblock.size);
                 ringBytes = blockSize - 2u64 * u64.!(WalSuperblock.size);
                 activeRecords = Vector<WalActiveRecord>.new();
+                if (backendRegion == null) {
+                        Trace.OUT.puts("multi-transaction WAL requires a backend region").ln();
+                        return;
+                }
                 configureCheckpointPolicy();
                 if (initializeFresh) {
                         initializeSuperblocks();
@@ -104,29 +119,36 @@ class MultiTxnWal {
 
         // --- WAL operations ---
 
-        def append(offset: u64, value: u64, width: u8) {
-                if (!validEntryFields(offset, width)) return;
+        // Invalid entries poison the whole pending transaction. Silently
+        // dropping one would allow commit() to acknowledge an incomplete redo
+        // record and lose the omitted write after a crash.
+        def append(offset: u64, value: u64, width: u8) -> bool {
+                if (!openOk || !validEntryFields(offset, width)) {
+                        poisoned = true;
+                        return false;
+                }
                 pendingEntries.put(WalPendingEntry(offset, value, width));
+                return true;
         }
 
         def commit() -> u64 {
                 def txnSeq = appendCommittedRecord(pendingEntries);
                 pendingEntries.resize(0);
+                poisoned = false;
                 return txnSeq;
         }
 
         def clear() {
                 pendingEntries.resize(0);
+                poisoned = false;
         }
 
         // --- Data application ---
 
         def applyUpdate(offset: u64, value: u64, width: u8) {
-                if (!validEntryFields(offset, width)) return;
+                if (!openOk || !validEntryFields(offset, width)) return;
                 writeAfterImage(offset, value, width);
-                if (backendRegion != null) {
-                        backendRegion.prepareChangedRange(offset, u64.view(width));
-                }
+                backendRegion.prepareChangedRange(offset, u64.view(width));
         }
 
         def noteApplied(txnSeq: u64) {
@@ -141,6 +163,7 @@ class MultiTxnWal {
         // are chosen per backend in configureCheckpointPolicy(). Best-effort: a
         // failed checkpoint leaves data recoverable from the WAL.
         def maybeCheckpoint() -> bool {
+                if (!openOk) return false;
                 def lag = appliedSeqVolatile - durableAppliedSeq;
                 if (lag == 0u64) return true;                                                   // nothing applied to publish
                 if (lag >= checkpointTxnThreshold) return checkpoint(appliedSeqVolatile);       // bound recovery replay length
@@ -149,7 +172,7 @@ class MultiTxnWal {
         }
 
         private def configureCheckpointPolicy() {
-                def cost = if(backendRegion != null, backendRegion.checkpointCost(), CheckpointCost.EXPENSIVE);
+                def cost = backendRegion.checkpointCost();
                 match (cost) {
                         FREE => {
                                 checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_FREE;
@@ -167,12 +190,13 @@ class MultiTxnWal {
         }
 
         def checkpoint(targetSeq: u64) -> bool {
+                if (!openOk) return false;
                 if (targetSeq > appliedSeqVolatile) return false;
                 if (targetSeq <= durableAppliedSeq) return true;
                 // Checkpoint ordering is the durable-data boundary: all after-images
                 // up to targetSeq must reach the backend before the superblock
                 // publishes durableAppliedSeq.
-                if (backendRegion != null && !backendRegion.persistChanges()) return false;
+                if (!backendRegion.persistChanges()) return false;
                 if (!writeSuperblock(targetSeq, logEpoch)) return false;
                 durableAppliedSeq = targetSeq;
                 reclaimAppliedRecords();
@@ -184,9 +208,8 @@ class MultiTxnWal {
         }
 
         def appendCommittedRecord(entries: Vector<WalPendingEntry>) -> u64 {
-                if (!openOk) return 0u64;
+                if (!openOk || poisoned) return 0u64;
                 def entryCount = u32.!(entries.length);
-                if (entryCount == 0u32) return durableAppliedSeq;
                 for (i < entries.length) {
                         def e = entries[i];
                         if (!validEntryFields(e.offset, e.width)) return 0u64;
@@ -233,7 +256,7 @@ class MultiTxnWal {
 
                 // The WAL persistRange is the transaction commit point. Region data
                 // is applied only after this contiguous record is durable.
-                if (backendRegion != null && !backendRegion.persistRange(absStart - regionStart, recordLen64)) {
+                if (!backendRegion.persistRange(absStart - regionStart, recordLen64)) {
                         // The fully-written record must not survive the failure: a
                         // retry reuses this txnSeq, and two valid records with the
                         // same sequence let recovery replay the failed attempt's
@@ -317,8 +340,8 @@ class MultiTxnWal {
 
         // --- Recovery ---
 
-        def recover() -> bool {
-                if (!openOk) return false;
+        def recover() -> MultiWalRecovery {
+                if (!openOk) return MultiWalRecovery.CORRUPT;
                 def candidates = scanCommittedRecords();
                 def selected = selectContiguousPrefix(candidates);
                 if (selected.length == 0) {
@@ -327,14 +350,16 @@ class MultiTxnWal {
                                 // abandoned by advancing the epoch. They are not applied.
                                 // writeSuperblock publishes the new epoch and adopts it
                                 // (and the new generation) in memory on success.
-                                writeSuperblock(durableAppliedSeq, logEpoch + 1u64);
+                                if (!writeSuperblock(durableAppliedSeq, logEpoch + 1u64)) {
+                                        return MultiWalRecovery.PERSIST_FAILED;
+                                }
                         }
                         nextTxnSeq = durableAppliedSeq + 1u64;
                         appliedSeqVolatile = durableAppliedSeq;
                         headOffset = 0u64;
                         activeRecords.resize(0);
                         activeBytes = 0u64;
-                        return false;
+                        return MultiWalRecovery.CLEAN;
                 }
 
                 for (i < selected.length) {
@@ -345,16 +370,16 @@ class MultiTxnWal {
                 // Recovery publishes the replay only after persisted data reaches
                 // the backend. The epoch bump makes stale current-epoch records
                 // impossible to replay again after this checkpoint.
-                if (backendRegion != null && !backendRegion.persistChanges()) return false;
+                if (!backendRegion.persistChanges()) return MultiWalRecovery.PERSIST_FAILED;
                 def recoveredMaxSeq = selected[selected.length - 1].txnSeq;
-                if (!writeSuperblock(recoveredMaxSeq, logEpoch + 1u64)) return false;
+                if (!writeSuperblock(recoveredMaxSeq, logEpoch + 1u64)) return MultiWalRecovery.PERSIST_FAILED;
                 durableAppliedSeq = recoveredMaxSeq;
                 appliedSeqVolatile = durableAppliedSeq;
                 nextTxnSeq = durableAppliedSeq + 1u64;
                 headOffset = 0u64;
                 activeRecords.resize(0);
                 activeBytes = 0u64;
-                return true;
+                return MultiWalRecovery.REPLAYED;
         }
 
         private def scanCommittedRecords() -> Vector<WalActiveRecord> {
@@ -469,10 +494,7 @@ class MultiTxnWal {
                 superblockStoreU64(index, WalSuperblock.durableAppliedSeq.offset, durableSeq);
                 superblockStoreU64(index, WalSuperblock.reserved.offset, 0u64);
                 superblockStoreU64(index, WalSuperblock.checksum.offset, computeSuperblockChecksum(index));
-                if (backendRegion != null) {
-                        return backendRegion.persistRange(superblockAddr(index) - regionStart, u64.!(WalSuperblock.size));
-                }
-                return true;
+                return backendRegion.persistRange(superblockAddr(index) - regionStart, u64.!(WalSuperblock.size));
         }
 
         private def validateRecord(offset: u64) -> WalActiveRecord {

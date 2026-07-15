@@ -93,7 +93,7 @@ Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, p
 
 **File:** `src/engine/x86-64/X86_64MultiTxnWal.v3`
 
-`MultiTxnWal` is the active WAL: a **circular redo log** supporting multiple outstanding transactions with generation-based crash recovery. It occupies block 1 of a `PWRegion`. `append()` buffers one memory write; `commit()` writes a single contiguous, checksummed transaction record and returns its sequence number; `checkpoint()` publishes how far the region data is durable and reclaims log space; `recover()` replays the committed tail on remount.
+`MultiTxnWal` is a retained comparison WAL: a **circular redo log** supporting multiple outstanding transactions with generation-based crash recovery. (`DualTxnWal` is the implementation currently wired into `PWRegion`.) It occupies one log chunk. `append()` validates and buffers one memory write; `commit()` writes a single contiguous, checksummed transaction record and returns its sequence number; `checkpoint()` publishes how far the region data is durable and reclaims log space; `recover()` replays the committed tail on remount.
 
 > The earlier single-transaction `SingleTxnWal` (`src/engine/x86-64/X86_64SingleTxnWal.v3`, `LogHeader` + `LogEntry[]`, `status` commit flag) is **superseded and no longer wired in**. It is retained as a reference implementation for comparison against `MultiTxnWal` — see `docs/wal-comparison.md`.
 
@@ -133,7 +133,8 @@ Block 1  (256 KB)
 ### Commit protocol
 
 ```
-append(offset, value, width)   -- validated, buffered into pendingEntries
+append(offset, value, width) -> bool   -- validated, buffered into pendingEntries;
+                                         invalid input poisons the transaction
 
 commit() -> txnSeq             -- appendCommittedRecord(pendingEntries); clears pending
   1. reserveRecord(len)        -- find a free, contiguous, aligned slot in the ring;
@@ -143,6 +144,8 @@ commit() -> txnSeq             -- appendCommittedRecord(pendingEntries); clears 
   3. backendRegion.persistRange(record_range)   -- COMMIT POINT: record durable
   4. push WalActiveRecord; nextTxnSeq++; return txnSeq   (0 on failure)
 ```
+
+An empty commit follows the same protocol with `entryCount=0`, so every successful commit returns a nonzero sequence number.
 
 After the WAL record is durable, `RegionTransaction` applies the cached writes to region memory and calls `noteApplied(txnSeq)` (advances `appliedSeqVolatile` in order).
 
@@ -158,7 +161,7 @@ checkpoint(targetSeq) -> bool  -- targetSeq must be ≤ appliedSeqVolatile
 ### Recovery protocol
 
 ```
-recover() -> bool
+recover() -> MultiWalRecovery
   load winning superblock (higher generation among the two valid copies)
   scanCommittedRecords()                 -- stride the ring at 64B, validateRecord each
        validateRecord rejects on: bad magic/version/size, recordLen misalignment,
@@ -167,16 +170,16 @@ recover() -> bool
   selectContiguousPrefix()               -- contiguous txnSeq run from durableAppliedSeq+1
   if no contiguous prefix:
        if stray valid records exist, bump epoch + rewrite superblock to abandon them
-       return false
+       return CLEAN (or PERSIST_FAILED if publishing the epoch bump fails)
   for each selected record: redoRecord() ; appliedSeqVolatile = txnSeq
   backendRegion.persistChanges()         -- replayed data durable
   writeSuperblock(maxSeq, logEpoch + 1)  -- publish + bump epoch so replay can't recur
-  return true
+  return REPLAYED
 ```
 
-The epoch bump is the key anti-double-replay guard: once recovery republishes at `logEpoch + 1`, every record written under the old epoch fails `validateRecord` on any future mount.
+The other results are `CORRUPT` when no valid superblock can be opened and `PERSIST_FAILED` when replayed data or its superblock publication does not reach durability. The epoch bump is the key anti-double-replay guard: once recovery republishes at `logEpoch + 1`, every record written under the old epoch fails `validateRecord` on any future mount.
 
-> **TODO:** When a record will not fit even after a checkpoint, `appendCommittedRecord` returns `0` and `RegionTransaction.commit` returns early with the cache still dirty — data is retained but the failure is not surfaced to the caller. `maybeCheckpoint()` is also still a no-op stub, so checkpoints currently happen only lazily under ring pressure.
+`append()`/`commit()` failures and recovery outcomes are explicit. Because this WAL is no longer wired into `PWRegion`, its callers are the comparison tests; the active `DualTxnWal` path has its own equivalent propagation into mount and allocator operations.
 
 ---
 
@@ -394,9 +397,9 @@ PWRegion.mount()
 |---|---|---|
 | `TxnPWRegionTest.v3` | `test/unittest/x86-64-linux/` | format/mount, alloc/free, coalescing, WAL recovery, corrupt-WAL detection (via `MultiTxnWal` record checksum), file-backed persistence |
 | `WALCacheTest.v3` | `test/unittest/x86-64-linux/` | cache read/write, cache-miss fallthrough, commit flow over `MultiTxnWal`, clean-txn no-op |
-| `MultiTxnWalTest.v3` | `test/unittest/x86-64-linux/` | fresh superblock init, newest-generation selection, corrupt-newer-superblock fallback, single-record recovery, record-checksum rejection, invalid-width rejection, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, crash-mid-log recovery |
+| `MultiTxnWalTest.v3` | `test/unittest/x86-64-linux/` | superblock selection/corruption, single/multi-record recovery, record-checksum rejection, poisoned invalid append, empty commits, required backend, explicit recovery outcomes, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, crash-mid-log recovery |
 
-**Coverage gaps:** the `MultiTxnWal` core paths — epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery — are now tested. The remaining untested behaviour is checkpoint-failure / commit-failure propagation, which is still a known stub (see Open items #2).
+The core durability and API-hardening paths are covered, including commit-point failure retry and recovery persist failure.
 
 Run with:
 
@@ -411,7 +414,6 @@ test/unit.sh
 | # | Location | Description |
 |---|---|---|
 | 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
-| 2 | `X86_64MultiTxnWal.v3` | When a record won't fit even after a checkpoint, `commit` returns `0` and `RegionTransaction.commit` returns early with the cache still dirty — failure is not surfaced to the caller. `maybeCheckpoint()` is a no-op stub (checkpoints only fire lazily on ring-full). |
 | 3 | `TxnBackend.v3:36` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:177` | `RegionFileIO.openOrCreate` should be split into `open` and `create`; `create` must initialise bytes to zero. |
 | 5 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |

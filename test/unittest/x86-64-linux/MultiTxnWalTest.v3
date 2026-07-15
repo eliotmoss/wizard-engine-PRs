@@ -6,9 +6,15 @@ def MTWX = [
 	MTW("fresh_superblocks", test_multi_fresh_superblocks),
 	MTW("selects_newest_superblock", test_multi_selects_newest_superblock),
 	MTW("ignores_corrupt_newer_superblock", test_multi_ignores_corrupt_newer_superblock),
+	MTW("corrupt_superblocks_reported", test_multi_corrupt_superblocks_reported),
 	MTW("recovers_persisted_record", test_multi_recovers_persisted_record),
 	MTW("invalid_checksum_ignored", test_multi_invalid_checksum_ignored),
 	MTW("invalid_width_rejected", test_multi_invalid_width_rejected),
+	MTW("empty_commit_has_sequence", test_multi_empty_commit_has_sequence),
+	MTW("invalid_append_poisons_transaction", test_multi_invalid_append_poisons_transaction),
+	MTW("null_backend_rejected", test_multi_null_backend_rejected),
+	MTW("recovery_persist_failure_reported", test_multi_recovery_persist_failure_reported),
+	MTW("gap_abandon_persist_failure_reported", test_multi_gap_abandon_persist_failure_reported),
 	MTW("contiguous_prefix_only", test_multi_contiguous_prefix_only),
 	MTW("epoch_stale_rejected", test_multi_epoch_stale_rejected),
 	MTW("wraparound_checkpoint_reserve", test_multi_wraparound_checkpoint_reserve),
@@ -62,6 +68,7 @@ class MultiTxnWalTestRegion extends BackendRegion {
 // failed-commit-point path in appendCommittedRecord.
 class FailingRegion extends BackendRegion {
 	var failNextPersistRange = false;
+	var failNextPersistChanges = false;
 
 	new(range: Range<byte>) super(range) { }
 
@@ -80,6 +87,10 @@ class FailingRegion extends BackendRegion {
 	}
 
 	def persistChanges() -> bool {
+		if (failNextPersistChanges) {
+			failNextPersistChanges = false;
+			return false;
+		}
 		return true;
 	}
 }
@@ -186,10 +197,18 @@ def test_multi_ignores_corrupt_newer_superblock(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(2u64, reopened.currentGeneration);
 }
 
+def test_multi_corrupt_superblocks_reported(tc: MultiTxnWalTester) {
+	PWRegionUtils.pointerFromU64(tc.logAddr).store<u64>(0u64);
+	PWRegionUtils.pointerFromU64(tc.logAddr + u64.!(WalSuperblock.size)).store<u64>(0u64);
+	def reopened = tc.reopen();
+	tc.t.assertz(false, reopened.openOk);
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CORRUPT);
+}
+
 def test_multi_recovers_persisted_record(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover());
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
 }
@@ -198,14 +217,83 @@ def test_multi_invalid_checksum_ignored(tc: MultiTxnWalTester) {
 	tc.writeTxn(200u64, 0x55u64, 1u8);
 	tc.corruptChecksumAt(0u64);
 	var reopened = tc.reopen();
-	tc.t.assertz(false, reopened.recover());
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 }
 
 def test_multi_invalid_width_rejected(tc: MultiTxnWalTester) {
-	tc.wal.append(200u64, 0x55u64, 3u8);
+	tc.t.assertz(false, tc.wal.append(200u64, 0x55u64, 3u8));
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+}
+
+// Empty commits are real zero-entry records. They consume a sequence number so
+// success can never collide with commit()'s zero failure sentinel.
+def test_multi_empty_commit_has_sequence(tc: MultiTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.wal.commit());
+	tc.t.assert_eq(1, tc.wal.activeRecords.length);
+	tc.t.assert_eq(0u32, tc.wal.activeRecords[0].entryCount);
+	def reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
+}
+
+// Once any append fails validation, the pending transaction must fail as a
+// whole. commit() clears the poison and buffered entries so a later transaction
+// can proceed normally without inheriting a partial write set.
+def test_multi_invalid_append_poisons_transaction(tc: MultiTxnWalTester) {
+	tc.t.assertz(true, tc.wal.append(200u64, 0x11u64, 1u8));
+	tc.t.assertz(false, tc.wal.append(201u64, 0x22u64, 3u8));
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+	tc.t.assert_eq(1u64, tc.wal.nextTxnSeq);
+
+	tc.t.assertz(true, tc.wal.append(202u64, 0x33u64, 1u8));
+	tc.t.assert_eq(1u64, tc.wal.commit());
+	def reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assert_eq(0x33u8, tc.data[202]);
+}
+
+// MultiTxnWal requires a real backend: accepting null made persistence methods
+// act as no-ops while entry validation dereferenced the missing region.
+def test_multi_null_backend_rejected(tc: MultiTxnWalTester) {
+	def wal = MultiTxnWal.new(tc.regionStart, tc.logAddr, 1024u64, null, true);
+	tc.t.assertz(false, wal.openOk);
+	tc.t.assertz(false, wal.maybeCheckpoint());
+	tc.t.assertz(true, wal.recover() == MultiWalRecovery.CORRUPT);
+}
+
+// Recovery reports a failed data durability boundary distinctly. The record
+// remains replayable, so retrying recovery can finish and publish it.
+def test_multi_recovery_persist_failure_reported(tc: MultiTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
+	def region = FailingRegion.new(tc.data[0 ..+ tc.data.length]);
+	def reopened = MultiTxnWal.new(tc.regionStart, tc.logAddr, 1024u64, region, false);
+	region.failNextPersistChanges = true;
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.PERSIST_FAILED);
+	tc.t.assert_eq(0x55u8, tc.data[200]);
+	tc.t.assert_eq(0u64, reopened.durableAppliedSeq);
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
+}
+
+// The no-prefix path also publishes an epoch bump to abandon valid records
+// after a sequence gap. Failure of that superblock persist must not be reported
+// as an ordinary clean mount.
+def test_multi_gap_abandon_persist_failure_reported(tc: MultiTxnWalTester) {
+	tc.writeTxn(200u64, 0x11u64, 1u8);
+	tc.writeTxn(201u64, 0x22u64, 1u8);
+	tc.corruptChecksumAt(0u64);                    // seq 2 survives after a gap
+	def region = FailingRegion.new(tc.data[0 ..+ tc.data.length]);
+	def reopened = MultiTxnWal.new(tc.regionStart, tc.logAddr, 1024u64, region, false);
+	region.failNextPersistRange = true;
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.PERSIST_FAILED);
+	tc.t.assert_eq(1u64, reopened.logEpoch);       // failed publication was not adopted
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CLEAN);
+	tc.t.assert_eq(2u64, reopened.logEpoch);
+	tc.t.assert_eq(0u8, tc.data[201]);
 }
 
 def test_multi_contiguous_prefix_only(tc: MultiTxnWalTester) {
@@ -214,7 +302,7 @@ def test_multi_contiguous_prefix_only(tc: MultiTxnWalTester) {
 	tc.writeTxn(201u64, 0x22u64, 1u8);
 	tc.corruptChecksumAt(0u64);
 	var reopened = tc.reopen();
-	tc.t.assertz(false, reopened.recover());
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(0u8, tc.data[201]);
 	tc.t.assertz(true, secondOffset > 0u64);
@@ -235,7 +323,7 @@ def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
 	// First recovery finds no contiguous prefix (seq 1 invalid) but sees the
 	// stray seq 2, so it abandons it by bumping the epoch and republishing.
 	var r1 = tc.reopen();
-	tc.t.assertz(false, r1.recover());
+	tc.t.assertz(true, r1.recover() == MultiWalRecovery.CLEAN);
 
 	// Reopen reads the persisted, freshly bumped epoch. The stray seq 2 record
 	// is still physically present, still checksum-valid, and its txnSeq (2) is
@@ -244,7 +332,7 @@ def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
 	var r2 = tc.reopen();
 	tc.t.assert_eq(2u64, r2.logEpoch);              // bumped from the original 1
 	tc.t.assert_eq(0u64, r2.durableAppliedSeq);     // nothing was ever committed durably
-	tc.t.assertz(false, r2.recover());              // stray epoch-1 record rejected
+	tc.t.assertz(true, r2.recover() == MultiWalRecovery.CLEAN); // stray epoch-1 record rejected
 	tc.t.assert_eq(0u8, tc.data[201]);              // and never applied
 	tc.t.assertz(true, strayOffset > 0u64);
 }
@@ -289,7 +377,7 @@ def test_multi_recovers_multiple_records(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(3u64, tc.writeTxn(202u64, 0x33u64, 1u8));
 
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover());
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x11u8, tc.data[200]);
 	tc.t.assert_eq(0x22u8, tc.data[201]);
 	tc.t.assert_eq(0x33u8, tc.data[202]);
@@ -312,7 +400,7 @@ def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
 	tc.corruptChecksumAt(tornOffset);
 
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover());         // committed prefix still replays
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED); // committed prefix still replays
 	tc.t.assert_eq(0x11u8, tc.data[200]);           // seq 1 applied
 	tc.t.assert_eq(0x22u8, tc.data[201]);           // seq 2 applied
 	tc.t.assert_eq(0u8, tc.data[202]);              // torn seq 3 NOT applied
@@ -330,7 +418,7 @@ def test_multi_commit_after_recovery_survives(tc: MultiTxnWalTester) {
 
 	// First crash + recovery: replays seq 1 and publishes epoch 2.
 	var recovered = tc.reopen();
-	tc.t.assertz(true, recovered.recover());
+	tc.t.assertz(true, recovered.recover() == MultiWalRecovery.REPLAYED);
 	tc.t.assert_eq(2u64, recovered.logEpoch);       // in-memory epoch == published epoch
 
 	// Commit seq 2 on the recovered WAL, then crash again before any checkpoint.
@@ -341,7 +429,7 @@ def test_multi_commit_after_recovery_survives(tc: MultiTxnWalTester) {
 	// stale-epoch.
 	var reopened = tc.reopen();
 	tc.t.assert_eq(2u64, reopened.logEpoch);
-	tc.t.assertz(true, reopened.recover());
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x66u8, tc.data[210]);
 	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
 }
@@ -383,7 +471,7 @@ def test_multi_failed_persist_no_duplicate(tc: MultiTxnWalTester) {
 
 	// Crash + recover: only the acknowledged retry's contents are replayed.
 	def reopened = MultiTxnWal.new(base, log, 1024u64, region, false);
-	tc.t.assertz(true, reopened.recover());
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, data[200]);              // seq 1
 	tc.t.assert_eq(0x22u8, data[210]);              // retry's value, not 0x11
 	tc.t.assert_eq(0x33u8, data[211]);              // retry's extra entry
