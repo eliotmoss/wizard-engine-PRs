@@ -23,7 +23,16 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Recovery: checksum verify → redo entries → fence → clear status durably
 - **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `MultiTxnWal` instead. Renamed `RegionWal` → `SingleTxnWal` and retained as a reference implementation for comparison against `MultiTxnWal` (see `docs/wal-comparison.md`).
 
-### Two-slot redo WAL, phase A (`X86_64DualTxnWal.v3`) — active
+### Two-slot redo WAL, phase B (`X86_64DualTxnWal.v3`) — active
+- **Piggybacked boundary — one per commit in steady state.** The commit point is now `prepareChangedRange(record) + persistChanges()`: one boundary persists the new record *together with* the previous transaction's applied after-images (one `SFENCE` over all flushed lines on PMEM; one `fdatasync` on file, which subsumes both). The committing transaction's own after-images are applied write-behind afterwards and ride the *next* commit's boundary. `dataDurableSeq` advances to `lastCommittedSeq` at each successful boundary — the induction property (valid record N+1 ⇒ txn N's data durable) made explicit
+- Contract: the caller must apply a committed transaction's entries before committing the next one (`RegionTransaction` guarantees this); the boundary only covers already-applied after-images
+- `RegionTransaction.commit()` is now `appendToWal → wal.commit (combined boundary) → applyToRegion → clear`; the per-commit `persistAppliedData()` (phase A boundary 2) dropped out. Explicit `RegionTransaction.flush()` added for idle-time durability
+- `close()` is the clean-unmount flush: persists the deferred data (`persistAppliedData()`), then scrubs reclaimable slots (only those with `slotSeq ≤ dataDurableSeq` — unrecovered records are never destroyed) so a clean remount recovers `CLEAN`, replay-free. A failed final persist leaves the records intact for the next mount's replay; a failed scrub persist is harmless (idempotent replay). `PWRegion.deallocate()` already routes through `wal.close()`
+- Failed-boundary semantics unchanged from phase A: seq not burned, parity maps the retry onto the same slot, overwrite guard retries the data persist before destroying a slot covering not-yet-durable data
+- Tests: `DualTxnWalTest.v3` grew to 19 cases — crash after apply/before next commit, back-to-back commits then crash, one-boundary-per-commit + induction property (counting region: 1 `persistChanges`, 0 `persistRange` per commit), explicit-flush durability, close-scrubs-for-clean-remount, close-keeps-unrecovered-records; failed-persist test re-pointed at `persistChanges` (the new commit point). `WALCacheTest.v3`: boundary counts re-pinned (record+data prepares, 1 `persistChanges`/commit), piggybacked-durability and `flush()` tests added
+- `docs/wal-comparison.md` extended with a third column for `DualTxnWal` and a "why two slots superseded the ring" section
+
+### Two-slot redo WAL, phase A (`X86_64DualTxnWal.v3`) — superseded by phase B above
 - `DualTxnWal` — redo log holding at most 2 transactions in two fixed slots after a minimal `DualWalHeader` (64 B: magic/version/headerSize/slotBytes/slotCount/checksum) in the block-1 log chunk; `slotBytes = alignDown((blockSize − 64) / 2, 64)`
 - Slot selected by sequence parity (`txnSeq % 2`); records reuse the `TxnRecordHeader`/`TxnCommitTrailer`/`LogEntry` layouts with the `logEpoch` fields reserved (must be 0) and distinct magics (`DWALHEAD`/`DWALTXHD`/`DWALTXCM`) so stale `MultiTxnWal` ring bytes in a reused chunk can never validate
 - Phase A commit = write record into slot `txnSeq % 2` → `persistRange` (boundary 1, the commit point) → apply after-images → `persistChanges` (boundary 2). Recovery = validate both slots → replay valid records in ascending `txnSeq` → persist → `nextTxnSeq = max + 1`. No superblocks, epochs, replay floor, or checkpoint policy
@@ -76,7 +85,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 ## In Progress
 
 - **Design pivot (2026-07-09, decided with supervisor):** a redo log holding **at most 2 transactions** is good enough for our use case — it achieves the persistence-boundary reduction that motivated `MultiTxnWal` at a fraction of the complexity. The two-slot WAL (`DualTxnWal`, Next Steps #1) is now the priority; finishing `MultiTxnWal` hardening is second priority (Next Steps #2).
-- **Phase A of `DualTxnWal` is implemented and wired in** (see Completed): two persistence boundaries per commit, replacing `MultiTxnWal` on the commit path. `MultiTxnWal` is retained alongside `SingleTxnWal` as a comparison implementation. Next: phase B (piggybacked boundary, one per commit steady-state).
+- **Phase A and phase B of `DualTxnWal` are implemented and wired in** (see Completed): phase B reaches one persistence boundary per commit in steady state (piggybacked boundary), with `close()` providing the clean-unmount flush + slot scrub. `MultiTxnWal` is retained alongside `SingleTxnWal` as a comparison implementation.
 - Multi-transaction WAL core paths are test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is implemented (hybrid count-OR-occupancy, per-backend thresholds). Commit-failure propagation is implemented (see Completed).
 - A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus several API-hardening items — see Next Steps #2 follow-ups and Open Issues #7–8. Both durability bugs are fixed (regression-tested by `multi_wal:commit_after_recovery_survives` and `multi_wal:failed_persist_no_duplicate`).
 
@@ -84,7 +93,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ## Next Steps
 
-### 1. Two-slot redo WAL (`DualTxnWal`) — current priority
+### 1. Two-slot redo WAL (`DualTxnWal`) — done (phases A and B)
 
 **Decision (2026-07-09):** replace `MultiTxnWal` on the commit path with a redo log that holds at most 2 transactions (two fixed slots in the block-1 log chunk). Built in two phases: phase A commits with two persistence boundaries (log, then data); phase B piggybacks the previous transaction's data persist onto the next transaction's log boundary, reaching one boundary per commit in steady state.
 
@@ -104,13 +113,13 @@ commit = write record into slot `txnSeq % 2` → **persist record** (boundary 1,
 - [x] Wired into `RegionTransaction`/`PWRegion` in place of `MultiTxnWal` — commit pipeline is `appendToWal → wal.commit → applyToRegion → persistAppliedData → clear`; `noteApplied`/`maybeCheckpoint` dropped out. Added an overwrite guard: a slot covering not-yet-durable data is never destroyed (commit retries the data persist or fails cleanly)
 - [x] Tests: `DualTxnWalTest.v3` (13 cases — fresh init, commit→crash→recover, torn-record rejection, two-valid-slots replay order, retry-after-failed-persist reuses the same slot/seq, oversize-commit failure, poisoned-append failure, unrecovered-slot overwrite guard, clean remount, corrupt-header result); `WALCacheTest`/`TxnPWRegionTest` recovery paths re-pointed
 
-**Phase B — piggybacked boundary (one per commit steady-state):** defer transaction N's data persist; the log-persist boundary at transaction N+1's commit also covers it. Slot N is reclaimable only once a later record is durable.
-- File backend: free — `fdatasync`/`msync` flush the whole mapping, so txn N+1's boundary 1 subsumes txn N's data persist
+**Phase B — piggybacked boundary (one per commit steady-state)** — **done (see Completed)**: defer transaction N's data persist; the log-persist boundary at transaction N+1's commit also covers it. Slot N is reclaimable only once a later record is durable.
+- File backend: free — `fdatasync` flushes the whole mapping, so txn N+1's commit boundary subsumes txn N's data persist
 - PMEM backend: flush txn N's changed lines (already accumulated via `prepareChangedRange`) together with the new record's lines under one `SFENCE`
-- [ ] Track the pending-data transaction and fold its data persist into the next commit's boundary; explicit `fenceAppliedUpdates()`-style flush for unmount/idle
-- [ ] Recovery tests: crash after log persist / before apply; crash after apply / before next commit; back-to-back commits then crash; verify the induction property (valid record N+1 ⇒ txn N data durable)
-- [ ] Optional: scrub reclaimed slots on clean `close()` so clean remounts are replay-free (design note inherited from `MultiTxnWal`)
-- [ ] Extend `docs/wal-comparison.md` with a third column for `DualTxnWal`
+- [x] Track the pending-data transaction and fold its data persist into the next commit's boundary (commit point is now `prepareChangedRange(record) + persistChanges()`; `dataDurableSeq` advances at each boundary); explicit flush for unmount/idle (`RegionTransaction.flush()`, `DualTxnWal.persistAppliedData()`, `close()`)
+- [x] Recovery tests: crash after log persist / before apply (`commit_crash_recover`); crash after apply / before next commit (`apply_then_crash_recover`); back-to-back commits then crash (`back_to_back_commits_then_crash`); induction property verified (`one_boundary_per_commit`: 1 `persistChanges` + 0 `persistRange` per commit, `dataDurableSeq == N` once record N+1 is durable)
+- [x] Scrub reclaimed slots on clean `close()` so clean remounts are replay-free — only slots with `slotSeq ≤ dataDurableSeq`; unrecovered records survive close (`close_scrubs_for_clean_remount`, `close_keeps_unrecovered_records`)
+- [x] Extended `docs/wal-comparison.md` with a third column for `DualTxnWal` (+ boundary-count row and "why two slots superseded the ring" section)
 
 ### 2. Multi-transaction WAL — deprioritized (second priority)
 **Deprioritized 2026-07-09** in favor of the two-slot WAL (#1): the superblock/epoch/ring/checkpoint machinery buys burst absorption and bounded replay we don't need for allocator-sized transactions. `DualTxnWal` phase A has landed and replaced it on the commit path; `MultiTxnWal` is now retained alongside `SingleTxnWal` as a comparison implementation (its own unit tests still run). The unchecked items below are paused unless they block the comparison write-up.

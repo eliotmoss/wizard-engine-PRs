@@ -375,23 +375,27 @@ class RegionTransaction {
                 return addrs.length != 0;
         }
 
-        // Phase A commit: two persistence boundaries. wal.commit() persists the
-        // record (boundary 1, the commit point); persistAppliedData() persists
-        // the applied after-images (boundary 2). A boundary-2 failure does not
-        // fail the transaction -- the durable record keeps the data recoverable,
-        // and the WAL's overwrite guard protects the slot until a later persist
-        // succeeds.
+        // Phase B commit: one persistence boundary in steady state.
+        // wal.commit() persists the record together with the *previous*
+        // transaction's applied after-images (the piggybacked boundary); this
+        // transaction's own after-images are applied write-behind afterwards
+        // and ride the next commit's boundary, an explicit flush(), or the
+        // WAL's close(). Until then the durable record keeps them
+        // recoverable, and the WAL's overwrite guard protects the slot.
         def commit() -> bool {
                 if (!isDirty()) return true;
                 appendToWal();
                 def txnSeq = wal.commit();
                 if (txnSeq == 0u64) return false;
                 applyToRegion();
-                if (!wal.persistAppliedData()) {
-                        Trace.OUT.put1("data persist failed after commit of txnSeq %d (best-effort, data remains WAL-recoverable)", txnSeq).ln();
-                }
                 clear();
                 return true;
+        }
+
+        // Explicit boundary for idle/unmount: complete durability for applied
+        // after-images that have not yet ridden a later commit's boundary.
+        def flush() -> bool {
+                return wal.persistAppliedData();
         }
 
         def recover() -> DualWalRecovery {

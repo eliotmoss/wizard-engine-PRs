@@ -1,4 +1,5 @@
-// Dual-Transaction Redo WAL (two-slot log, phase A: two persistence boundaries per commit)
+// Dual-Transaction Redo WAL (two-slot log, phase B: piggybacked persistence
+// boundary, one boundary per commit in steady state)
 //
 // Replaces the ring/superblock machinery of MultiTxnWal with two fixed record
 // slots in the block-1 log chunk, selected by transaction-sequence parity
@@ -10,10 +11,16 @@
 // retried commit overwrites the same slot, so no scrub/rollback protocol is
 // needed either.
 //
-// Commit (phase A) = write record into slot txnSeq % 2 -> persist record
-// (boundary 1, the commit point) -> apply after-images to region -> persist
-// data (boundary 2) -> slot reclaimable. Recovery = validate both slots ->
-// replay valid records in seq order -> persist data -> nextTxnSeq = max + 1.
+// Commit (phase B) = write record into slot txnSeq % 2 -> one persistence
+// boundary (the commit point) that covers the record TOGETHER with the
+// previous transaction's applied after-images, via prepareChangedRange(record)
+// + persistChanges(). The committing transaction's own after-images are
+// applied to the region afterwards and ride the NEXT commit's boundary, an
+// explicit persistAppliedData(), or close(). Correctness by induction: a
+// valid record N+1 on-region implies the boundary at its commit completed, so
+// txn N's data is durable; replaying the <=2 valid records always restores
+// the latest acknowledged state. Recovery = validate both slots -> replay
+// valid records in seq order -> persist data -> nextTxnSeq = max + 1.
 //
 // Record slots reuse the TxnRecordHeader/TxnCommitTrailer/LogEntry layouts
 // from MultiTxnWal; the logEpoch fields are reserved here and must be zero.
@@ -110,10 +117,17 @@ class DualTxnWal {
         }
 
         // Commit the pending transaction: write its record into slot
-        // txnSeq % 2 and persist it (boundary 1, the commit point). Returns the
-        // record's txnSeq, or 0 on failure. An empty transaction commits as an
-        // entryCount=0 record, so a successful commit always returns a nonzero
-        // sequence and the failure sentinel is unambiguous.
+        // txnSeq % 2 and persist it (the commit point). The boundary also
+        // completes durability for the previous transaction's applied
+        // after-images (the piggybacked boundary), so steady state is one
+        // boundary per commit. Returns the record's txnSeq, or 0 on failure.
+        // An empty transaction commits as an entryCount=0 record, so a
+        // successful commit always returns a nonzero sequence and the failure
+        // sentinel is unambiguous.
+        //
+        // CONTRACT: the caller must apply a committed transaction's entries
+        // (applyUpdate) before committing the next transaction; the boundary
+        // here only covers after-images that have already been applied.
         def commit() -> u64 {
                 def txnSeq = appendCommittedRecord(pendingEntries);
                 pendingEntries.resize(0);
@@ -134,10 +148,13 @@ class DualTxnWal {
                 backendRegion.prepareChangedRange(offset, u64.view(width));
         }
 
-        // Boundary 2: complete durability for all after-images applied so far.
-        // A failure is not fatal to any acknowledged transaction -- the data
-        // remains recoverable from the slot records -- but the affected slots
-        // stay unreclaimable until a later persist succeeds (see the overwrite
+        // Explicit boundary: complete durability for all after-images applied
+        // so far. In phase B the per-commit data persist is piggybacked onto
+        // the next commit's boundary, so this is only needed for unmount/idle
+        // (close() calls it) and by the overwrite guard. A failure is not
+        // fatal to any acknowledged transaction -- the data remains
+        // recoverable from the slot records -- but the affected slots stay
+        // unreclaimable until a later persist succeeds (see the overwrite
         // guard in appendCommittedRecord).
         def persistAppliedData() -> bool {
                 if (!backendRegion.persistChanges()) return false;
@@ -195,13 +212,19 @@ class DualTxnWal {
                 recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, 0u64);
                 recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, computeRecordChecksum(absStart, recordLen64));
 
-                // The record persistRange is the transaction commit point
-                // (boundary 1). The sequence is deliberately not burned on
-                // failure: parity maps the retry back onto this same slot, so a
-                // duplicate-seq record at another location is structurally
-                // impossible and no scrub or rollback is needed.
-                if (!backendRegion.persistRange(absStart - regionStart, recordLen64)) return 0u64;
+                // The transaction commit point: one boundary persists the new
+                // record together with the previous transaction's applied
+                // after-images (their ranges were prepared by applyUpdate). On
+                // PMEM that is one SFENCE over all flushed lines; on a file
+                // backend one fdatasync subsumes both. The sequence is
+                // deliberately not burned on failure: parity maps the retry
+                // back onto this same slot, so a duplicate-seq record at
+                // another location is structurally impossible and no scrub or
+                // rollback is needed.
+                if (!backendRegion.prepareChangedRange(absStart - regionStart, recordLen64)) return 0u64;
+                if (!backendRegion.persistChanges()) return 0u64;
 
+                dataDurableSeq = lastCommittedSeq;      // previous txn's data rode this boundary
                 slotSeqs[slot] = txnSeq;
                 lastCommittedSeq = txnSeq;
                 nextTxnSeq++;
@@ -272,7 +295,23 @@ class DualTxnWal {
 
         // --- Lifecycle ---
 
+        // Clean unmount: complete durability for the last transaction's
+        // applied data (whose persist was deferred to the next boundary that
+        // will now never come), then scrub the now-reclaimable slots so a
+        // clean remount is replay-free. Slots whose data is not known durable
+        // -- an unrecovered mount, or a failed final persist -- are left
+        // intact so the next mount replays them; a failed scrub persist is
+        // likewise harmless (the surviving record replays idempotently).
         def close() {
+                clear();
+                if (!openOk) return;
+                if (!persistAppliedData()) return;
+                for (slot < 2) {
+                        if (slotSeqs[slot] == 0u64 || slotSeqs[slot] > dataDurableSeq) continue;
+                        zeroBytes(slotAddr(slot), u64.!(TxnRecordHeader.size));
+                        backendRegion.persistRange(slotAddr(slot) - regionStart, u64.!(TxnRecordHeader.size));
+                        slotSeqs[slot] = 0u64;
+                }
         }
 
         private def initializeHeader() {

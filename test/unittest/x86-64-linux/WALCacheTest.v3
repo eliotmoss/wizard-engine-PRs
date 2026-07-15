@@ -8,6 +8,8 @@ def X = [
 	T("read_fallthrough", test_read_fallthrough),
 	T("commit_applies_and_clears", test_commit_applies_and_clears),
 	T("commit_uses_persistence_api", test_commit_uses_persistence_api),
+	T("next_commit_persists_previous_data", test_next_commit_persists_previous_data),
+	T("flush_completes_durability", test_flush_completes_durability),
 	T("commit_clean_noop", test_commit_clean_noop),
 	T("commit_overflow_returns_false", test_commit_overflow_returns_false),
 	T("commit_overflow_then_success", test_commit_overflow_then_success),
@@ -171,13 +173,14 @@ def test_commit_applies_and_clears(tc: RegionTransactionTester) {
 	tc.t.assert_eq(1u32, tc.recordHeader().entryCount);
 	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
 	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
-	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);	// phase A: boundary 2 ran in commit()
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);	// phase B: data persist deferred to the next boundary
 	tc.t.assert_eq(val, tc.readRamU64(200));
 	tc.t.assertz(false, tc.txn.isDirty());
 }
 
-// Test 5: WAL commit uses range persistence for the record (boundary 1) and
-// dirty batching + persistChanges for the applied data (boundary 2).
+// Test 5: WAL commit uses one persistence boundary (phase B): the record is
+// prepared and persisted via persistChanges (no per-record persistRange), and
+// the applied data is only prepared -- its persist rides the next boundary.
 def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(200);
 	var val = 0x0102_0304_0506_0708u64;
@@ -185,11 +188,37 @@ def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	tc.txn.writeU64(addr, val);
 	tc.txn.commit();
 
-	tc.t.assert_eq(1, tc.backend.persistRangeCount);
-	tc.t.assert_eq(1, tc.backend.prepareChangedRangeCount);
+	tc.t.assert_eq(0, tc.backend.persistRangeCount);
+	tc.t.assert_eq(2, tc.backend.prepareChangedRangeCount);	// record + applied data
 	tc.t.assert_eq(1, tc.backend.persistChangesCount);
 	tc.t.assert_eq(addr - tc.wal.regionStart, tc.backend.lastDirtyOffset);
 	tc.t.assert_eq(8u64, tc.backend.lastDirtySize);
+}
+
+// Test 5b: the piggybacked boundary -- the next commit's single boundary
+// completes durability for the previous transaction's applied data.
+def test_next_commit_persists_previous_data(tc: RegionTransactionTester) {
+	tc.txn.writeU64(tc.getAddr(200), 0x11u64);
+	tc.txn.commit();
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+
+	tc.txn.writeU64(tc.getAddr(208), 0x22u64);
+	tc.txn.commit();
+	tc.t.assert_eq(2, tc.backend.persistChangesCount);	// still one boundary per commit
+	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);		// record 2 durable => txn 1 data durable
+	tc.t.assert_eq(2u64, tc.wal.lastCommittedSeq);
+}
+
+// Test 5c: flush() is the explicit idle/unmount boundary for the data whose
+// persist was deferred past the last commit.
+def test_flush_completes_durability(tc: RegionTransactionTester) {
+	tc.txn.writeU64(tc.getAddr(200), 0x11u64);
+	tc.txn.commit();
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+
+	tc.t.assertz(true, tc.txn.flush());
+	tc.t.assert_eq(2, tc.backend.persistChangesCount);	// commit boundary + flush
+	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);
 }
 
 // Test 6: Committing a clean transaction is a no-op.

@@ -112,7 +112,7 @@ PWRegion (block allocator)
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, `ImmixPWRegion` |
 | `X86_64SingleTxnWal.v3` | Single-transaction in-region WAL — superseded, **not wired in**; kept as a reference implementation (see `docs/wal-comparison.md`) |
 | `X86_64PWRegion.v3` | Thin x86-64 convenience wrappers (`X86_64PWMemRegion`, `X86_64PWNVRegion`, `X86_64PWBlockDeviceRegion`, Immix variants) |
-| `X86_64DualTxnWal.v3` | Active two-slot WAL (phase A) — two parity-selected record slots, per-record checksum, poisoning `append()`, `DualWalRecovery` result; drives `PWRegion`/`RegionTransaction` |
+| `X86_64DualTxnWal.v3` | Active two-slot WAL (phase B) — two parity-selected record slots, per-record checksum, poisoning `append()`, `DualWalRecovery` result, piggybacked persistence boundary (one per commit steady-state); drives `PWRegion`/`RegionTransaction` |
 | `X86_64MultiTxnWal.v3` | Multi-transaction ring WAL (dual superblock, epoch fencing, checkpoint policy) — superseded, **not wired in**; kept as a comparison implementation |
 | `test/unittest/x86-64-linux/TxnPWRegionTest.v3` | PWRegion + backend region unit tests (incl. remount/recovery) |
 | `test/unittest/x86-64-linux/WALCacheTest.v3` | `RegionTransaction` write-behind cache unit tests |
@@ -129,13 +129,14 @@ Block N-1: Metadata overhead (block table, MetaDataDesc[])
 Entry N:   End-of-region marker (no backing data)
 ```
 
-### WAL commit protocol (two-slot, current — `DualTxnWal`, phase A)
+### WAL commit protocol (two-slot, current — `DualTxnWal`, phase B)
 
 1. Writes buffered in `RegionTransaction` (HashMap-backed write-behind cache)
-2. `commit()`: `appendToWal → wal.commit` (write one checksummed record into slot `txnSeq % 2`, persist it — boundary 1, the commit point) `→ applyToRegion → persistAppliedData` (boundary 2) `→ clear`
-3. On mount: validate the `DualWalHeader`, validate both slots, replay the valid records in ascending `txnSeq` (idempotent after-images, so re-replay is harmless), persist, set `nextTxnSeq = max + 1`. `recover()` returns `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`)
+2. `commit()`: `appendToWal → wal.commit` (write one checksummed record into slot `txnSeq % 2`, then ONE persistence boundary — `prepareChangedRange(record) + persistChanges()` — that persists the record together with the *previous* transaction's applied after-images; the commit point) `→ applyToRegion` (this transaction's after-images, applied write-behind; their persist rides the next commit's boundary) `→ clear`
+3. Unmount/idle: `wal.close()` (called by `PWRegion.deallocate()`) persists the deferred data and scrubs reclaimable slots so a clean remount is replay-free; `RegionTransaction.flush()` is the explicit idle boundary
+4. On mount: validate the `DualWalHeader`, validate both slots, replay the valid records in ascending `txnSeq` (idempotent after-images, so re-replay is harmless), persist, set `nextTxnSeq = max + 1`. `recover()` returns `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`)
 
-An overwrite guard keeps a slot from being destroyed while it covers not-yet-durable data; a failed commit-point persist retries with the same seq into the same slot (parity), so duplicate-seq records cannot exist. Phase B (planned) piggybacks boundary 2 onto the next commit's boundary 1, reaching one boundary per commit in steady state.
+One boundary per commit in steady state (one `SFENCE` on PMEM, one `fdatasync` on file); correctness by induction — a valid record N+1 implies the boundary at its commit completed, so txn N's data is durable. An overwrite guard keeps a slot from being destroyed while it covers not-yet-durable data; a failed commit-point persist retries with the same seq into the same slot (parity), so duplicate-seq records cannot exist. Contract: a committed transaction's entries must be applied before the next commit (`RegionTransaction` guarantees this).
 
 The superseded protocols are retained for comparison, **not wired in** — `SingleTxnWal` (persist entries → `status=1` → apply → fence → `status=0`) and `MultiTxnWal` (ring + superblock + epoch fencing + checkpoint policy) — see `docs/wal-comparison.md`.
 
