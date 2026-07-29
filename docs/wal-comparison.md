@@ -29,6 +29,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 | API results | `commit()` → `void` (persist implied) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `MultiWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) |
 | Clean-unmount replay | Log cleared after every commit — remount is replay-free | `close()` is empty; even a clean unmount replays the tail | `close()` persists deferred data and scrubs reclaimable slots — clean remounts recover `CLEAN` |
 | Wired into `PWRegion` | No (reference only) | No (reference only) | Yes |
+| Roadmap-related tests (2026-07-29 audit) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 19 in `DualTxnWalTest.v3`, plus 46 cache/allocator/backend tests in `WALCacheTest.v3` and `TxnPWRegionTest.v3` |
 
 ## Why the multi-transaction design superseded the single-transaction one
 
@@ -58,9 +59,13 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
   on-region implies the boundary at its commit completed, so transaction N's
   data is durable. At any moment at most one transaction's data is not yet
   durable plus the record being committed — exactly two slots.
-- **Failure hazards become structural non-issues.** Parity slot selection means
-  a retried commit reuses the same slot and seq, so the duplicate-`txnSeq`
-  hazard that required `MultiTxnWal`'s scrub/rollback protocol cannot occur.
+- **The duplicate-location failure hazard becomes a structural non-issue.**
+  Parity slot selection means a retried commit reuses the same slot and seq, so
+  two copies of the same `txnSeq` cannot occupy different slots. This does not
+  by itself settle the crash-before-retry outcome: a failed phase-B boundary
+  currently leaves complete checksummed bytes in that slot. The 2026-07-29
+  audit therefore tracks an immediate reopen-after-failure regression and the
+  required durable invalidation/publication semantics separately.
 - **Accepted trade-offs.** Per-transaction capacity is ~half the log chunk
   (ample for allocator-sized transactions; oversize commits fail cleanly); no
   burst absorption of many committed-but-unpersisted transactions; on PMEM,
@@ -78,3 +83,12 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 - **Controls for comparison.** Together they isolate the cost and complexity
   each increment of WAL machinery adds, which is why they are kept here rather
   than deleted.
+
+## Verification status
+
+The implementation-specific x86-64 Linux suite contains 87 tests across four
+files, all passing as of the 2026-07-29 audit. Coverage is strongest for normal
+phase-B commit/recovery and the intended one-boundary induction property. The
+highest-risk missing case is an immediate crash/reopen after the active WAL's
+record boundary returns failure, before a same-slot retry. The complete
+prioritised gap list is maintained in `docs/ROADMAP.md` Next Steps #3.

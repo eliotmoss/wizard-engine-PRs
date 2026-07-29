@@ -21,14 +21,14 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `LogEntry` layout: `offset` (region-relative), `value`, `width` (1/2/4/8)
 - Commit protocol: persist entries → set status=1 → apply to region → fence → clear status
 - Recovery: checksum verify → redo entries → fence → clear status durably
-- **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `MultiTxnWal` instead. Renamed `RegionWal` → `SingleTxnWal` and retained as a reference implementation for comparison against `MultiTxnWal` (see `docs/wal-comparison.md`).
+- **No longer wired in** — `PWRegion`/`RegionTransaction` now drive `DualTxnWal` instead. Renamed `RegionWal` → `SingleTxnWal` and retained as a reference implementation for comparison against `MultiTxnWal` and `DualTxnWal` (see `docs/wal-comparison.md`).
 
 ### Two-slot redo WAL, phase B (`X86_64DualTxnWal.v3`) — active
 - **Piggybacked boundary — one per commit in steady state.** The commit point is now `prepareChangedRange(record) + persistChanges()`: one boundary persists the new record *together with* the previous transaction's applied after-images (one `SFENCE` over all flushed lines on PMEM; one `fdatasync` on file, which subsumes both). The committing transaction's own after-images are applied write-behind afterwards and ride the *next* commit's boundary. `dataDurableSeq` advances to `lastCommittedSeq` at each successful boundary — the induction property (valid record N+1 ⇒ txn N's data durable) made explicit
 - Contract: the caller must apply a committed transaction's entries before committing the next one (`RegionTransaction` guarantees this); the boundary only covers already-applied after-images
 - `RegionTransaction.commit()` is now `appendToWal → wal.commit (combined boundary) → applyToRegion → clear`; the per-commit `persistAppliedData()` (phase A boundary 2) dropped out. Explicit `RegionTransaction.flush()` added for idle-time durability
 - `close()` is the clean-unmount flush: persists the deferred data (`persistAppliedData()`), then scrubs reclaimable slots (only those with `slotSeq ≤ dataDurableSeq` — unrecovered records are never destroyed) so a clean remount recovers `CLEAN`, replay-free. A failed final persist leaves the records intact for the next mount's replay; a failed scrub persist is harmless (idempotent replay). `PWRegion.deallocate()` already routes through `wal.close()`
-- Failed-boundary semantics unchanged from phase A: seq not burned, parity maps the retry onto the same slot, overwrite guard retries the data persist before destroying a slot covering not-yet-durable data
+- Failed-boundary retry semantics unchanged from phase A: seq not burned, parity maps the retry onto the same slot, and the overwrite guard retries the data persist before destroying a slot covering not-yet-durable data. The separate crash-before-retry outcome is unresolved by the 2026-07-29 audit (Next Steps #3)
 - Tests: `DualTxnWalTest.v3` grew to 19 cases — crash after apply/before next commit, back-to-back commits then crash, one-boundary-per-commit + induction property (counting region: 1 `persistChanges`, 0 `persistRange` per commit), explicit-flush durability, close-scrubs-for-clean-remount, close-keeps-unrecovered-records; failed-persist test re-pointed at `persistChanges` (the new commit point). `WALCacheTest.v3`: boundary counts re-pinned (record+data prepares, 1 `persistChanges`/commit), piggybacked-durability and `flush()` tests added
 - `docs/wal-comparison.md` extended with a third column for `DualTxnWal` and a "why two slots superseded the ring" section
 
@@ -38,7 +38,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Phase A commit = write record into slot `txnSeq % 2` → `persistRange` (boundary 1, the commit point) → apply after-images → `persistChanges` (boundary 2). Recovery = validate both slots → replay valid records in ascending `txnSeq` → persist → `nextTxnSeq = max + 1`. No superblocks, epochs, replay floor, or checkpoint policy
 - **Open Issue #7 fixed from day one**: `append()` returns `bool` and poisons the pending transaction on an invalid entry, so `commit()` fails instead of committing with a silently missing write. Empty commits write an `entryCount=0` record, so a successful commit always returns a nonzero seq (no failure-sentinel collision)
 - **Open Issue #8 fixed from day one**: `recover()` returns `DualWalRecovery` (`CLEAN` / `REPLAYED` / `CORRUPT` / `PERSIST_FAILED`); `PWRegion.mount()` consumes it and traces the bad outcomes
-- Failed commit-point persist burns nothing: the seq is not advanced and parity maps the retry onto the same slot, so a duplicate-seq record at another location is structurally impossible (no scrub/rollback protocol)
+- Failed commit-point persist burns nothing: the seq is not advanced and parity maps the retry onto the same slot, so a duplicate-seq record at another location is structurally impossible. This removes the ring WAL's head rollback requirement; whether the failed slot still needs durable invalidation before an immediate crash is tracked separately in Next Steps #3
 - Overwrite guard: a slot whose record covers not-yet-durable data (boundary-2 failure, or a mount that skipped `recover()`) cannot be overwritten — commit retries the data persist and otherwise fails cleanly through the existing `bool` propagation
 - Wired into `RegionTransaction`/`PWRegion` in place of `MultiTxnWal`: `commit()` is `appendToWal → wal.commit → applyToRegion → persistAppliedData → clear`; `noteApplied`/`maybeCheckpoint` dropped out. A boundary-2 failure does not fail the transaction (data remains WAL-recoverable); it emits a `Trace.OUT` diagnostic
 - Tests: `DualTxnWalTest.v3` (fresh init, slot alternation, empty-commit seq, commit→crash→recover, clean remount, torn-record rejection, two-slot ascending replay, overwrite + latest-two replay, oversize-commit failure, poisoned-append commit failure, unrecovered-slot overwrite guard, failed-persist same-slot/same-seq retry, corrupt-header recovery result); `WALCacheTest.v3`/`TxnPWRegionTest.v3` re-pointed (slot geometry, boundary-2 persist counts, recovery paths)
@@ -60,7 +60,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 ### Transaction cache
 - `RegionTransaction` — write-behind `HashMap<u64, CachedUpdate>` buffering writes in DRAM
 - Read path: cache hit returns buffered value; miss falls through to live region memory
-- `commit()` pipeline: appendToWal → wal.commit → applyToRegion → fence → clear log → clear cache
+- Active phase-B `commit()` pipeline: `appendToWal → wal.commit` (new record + previous data boundary) `→ applyToRegion → clear cache`; `flush()` / `DualTxnWal.close()` provide the idle/unmount boundary for the last applied transaction
 - `isDirty()` guard so clean commits are no-ops
 
 ### Block allocator
@@ -78,9 +78,14 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `X86_64ImmixPWMemRegion`, `X86_64ImmixPWNVRegion`
 
 ### Tests
-- `WALCacheTest.v3` — `RegionTransaction` cache read/write, miss fallthrough, commit flow (now over `MultiTxnWal`: durable record written, only cache cleared on commit), clean-txn no-op, aligned-access constraint, commit-failure propagation (oversized transaction overflows the ring, `commit()` returns `false`, cache stays dirty, WAL remains usable for subsequent transactions)
-- `TxnPWRegionTest.v3` — format/mount, alloc/free, coalescing, exhaustion; block-device remount, WAL recovery, corrupt-WAL rejection (now via `MultiTxnWal` record checksum); `FileMmapRegion`/`PmemMmapRegion` state and lifecycle; small-ring WAL-overflow commit-failure propagation through `allocChunk`
-- `MultiTxnWalTest.v3` — fresh superblock init, newest-generation superblock selection, corrupt-newer-superblock fallback, single/multi-record recovery, record-checksum rejection, poisoned invalid append, empty-commit sequence, required-backend contract, explicit corrupt/persist-failed recovery results, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, crash-mid-log recovery, per-backend checkpoint-policy thresholds, `maybeCheckpoint` count-cap and occupancy-watermark paths
+
+**Audited 2026-07-29:** the four implementation-specific x86-64 Linux test files contain **87 registered tests**. All 87 passed in the existing x86-64 Linux test binary; none are listed as expected failures.
+
+- `DualTxnWalTest.v3` — **19 tests** for the active two-slot WAL: format/geometry, slot alternation, empty commits, crash recovery, corrupt/torn records, replay ordering, overwrite guard, oversize/poisoned commits, failed-persist retry, the phase-B one-boundary induction property, explicit flush, and clean/unrecovered close paths
+- `WALCacheTest.v3` — **13 tests** for `RegionTransaction` over the active `DualTxnWal`: cache read/write and fallthrough, write-behind apply/clear, phase-B persistence call counts, piggybacked durability, explicit flush, clean no-op, overwrite/alignment behavior, and oversize-commit propagation
+- `TxnPWRegionTest.v3` — **33 tests** across allocator (`pwregion:`), overflow propagation (`pwregion_overflow:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, `DualTxnWal` recovery/checksum rejection, mmap/PMEM state and lifecycle, and file-backed persistence
+- `MultiTxnWalTest.v3` — **22 tests** for the retained comparison WAL: superblocks, recovery, record validation, failure outcomes, epoch/gap handling, wrap-around/checkpoint reserve, crash-mid-log recovery, failed-persist scrub/rollback, and checkpoint policy
+- `SingleTxnWal` has **no dedicated tests**; it remains compiled as a reference implementation only
 
 ---
 
@@ -90,6 +95,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - **Phase A and phase B of `DualTxnWal` are implemented and wired in** (see Completed): phase B reaches one persistence boundary per commit in steady state (piggybacked boundary), with `close()` providing the clean-unmount flush + slot scrub. `MultiTxnWal` is retained alongside `SingleTxnWal` as a comparison implementation.
 - Multi-transaction WAL core paths are test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is implemented (hybrid count-OR-occupancy, per-backend thresholds). Commit-failure propagation is implemented (see Completed).
 - A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus four API-hardening items. All are fixed and regression-tested; see Next Steps #2 follow-ups.
+- The 2026-07-29 test audit found that the happy paths and intended phase-B boundary count are strong, but active-WAL failure/crash semantics, full allocator-transaction recovery, Immix/platform wrappers, and several backend/validation paths remain untested. These are tracked in Next Steps #3.
 
 ---
 
@@ -101,7 +107,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 **Assessment — why 2 slots is enough:**
 - Redo entries are **idempotent absolute after-images** (`offset`/`value`/`width` stores), so re-applying an already-durable record is harmless. Recovery can therefore validate both slots and replay the valid records in ascending `txnSeq` — no `durableAppliedSeq` replay floor is needed, which deletes the dual superblock, generation selection, epoch fencing, checkpoint policy, and all ring bookkeeping (`reserveRecord`/`rangeFree`/`reclaimAppliedRecords`) in one stroke.
-- Slot selection by sequence parity (`txnSeq % 2`) makes the duplicate-`txnSeq`-after-failed-`persistRange` hazard (2026-07-02 review) **structurally impossible**: a retried commit overwrites the same slot, so no magic-scrub / head-rollback protocol is needed.
+- Slot selection by sequence parity (`txnSeq % 2`) makes the duplicate-`txnSeq`-at-different-locations hazard (2026-07-02 review) **structurally impossible**: a retried commit overwrites the same slot, so no ring-head rollback is needed. This does not by itself settle whether a failed, checksummed slot must be durably invalidated before a crash; that outcome is tracked in Next Steps #3.
 - In phase B, at any moment at most one transaction's data is not yet durable (the previous one) plus the record being committed — exactly 2 slots. Correctness by induction: if record N+1 is valid on-region, the boundary at its commit completed, so txn N's data is durable; replaying the ≤2 valid records always restores the latest acknowledged state.
 - The invariant that makes redo-only logging sufficient carries over unchanged: `RegionTransaction`'s write-behind cache guarantees uncommitted data never reaches the region (apply happens strictly after the log record is durable).
 - Boundary count: phase A is 2/commit; phase B is 1/commit in steady state — matching checkpointed `MultiTxnWal` (~1/commit amortized) while also dropping its superblock `persistRange`, and far below `SingleTxnWal`'s 3 (entries+status, post-apply fence, status clear).
@@ -153,10 +159,32 @@ Design notes (no action yet, keep in mind):
 - `close()` is empty, so even a clean unmount replays the tail on the next mount; a `fenceAppliedUpdates()` call there would make clean remounts replay-free.
 - Per-commit constant factors: `zeroBytes` + field stores + `checksumBytes` are three byte-at-a-time passes over each record.
 
-### 3. CLWB/SFENCE intrinsics
+### 3. Test-audit follow-ups — open (2026-07-29)
+
+Priority 0 — active WAL failure/crash semantics:
+
+- [ ] Add `DualTxnWal` regressions that reopen **immediately after** `prepareChangedRange(record)` or `persistChanges()` fails, before any retry. A failed `commit()` must not later replay the unacknowledged record. The implementation currently leaves a complete, checksummed record in the slot and only clears the transient `slotSeqs[slot]`, so this test is expected to expose whether durable invalidation/publication is missing.
+- [ ] Complete the `DualTxnWal` fault-injection matrix: `DualWalRecovery.PERSIST_FAILED` + retry, failed `applyUpdate()` range preparation, failed explicit `flush()`, failed final-data persist in `close()`, failed slot-scrub persist, and fresh-header persistence failure.
+- [ ] Define and test how a failed `prepareChangedRange()` is propagated. `DualTxnWal.applyUpdate()` currently ignores its boolean result, yet a later boundary can advance `dataDurableSeq`; the durability claim must not advance unless every changed range was prepared successfully.
+
+Priority 1 — allocator and backend integration:
+
+- [ ] Recover complete multi-entry allocator transactions, not only a manually injected one-byte `BlockEntry.used` update. Cover allocation split/exact-fit and free left/right coalescing at the commit→crash→recover and apply→crash→recover windows, then validate all memory-order and free-list links.
+- [ ] Cover `freeChunk()` commit-failure propagation, retry/abort behavior after a failed allocation leaves the shared transaction dirty, and invalid inputs (`allocChunk(0)`, oversized requests, null/double/foreign frees).
+- [ ] Add structural/property tests over mixed allocate/free/remount sequences so allocator list invariants are checked directly instead of inferred only from whether a later allocation succeeds.
+- [ ] Add metadata/Immix coverage (`MetaDataDesc`, line-mark lookup/reset and persistence policy) and instantiate each `X86_64PW*` / `X86_64ImmixPW*` wrapper.
+- [ ] Add backend-format/mount tests for `fresh=true` truncation + zero-fill, missing-file attach fallback, stored block-size/num-block mismatch, and the legacy `PWRegionHeader.logChunk == 0` fallback.
+
+Priority 2 — validation and retained comparisons:
+
+- [ ] Add active commit/recovery coverage for widths 2/4/8 and signed `i16`/`i64`, out-of-region and WAL-overlapping entries, and malformed record header/trailer fields—not only checksum corruption.
+- [ ] Add baseline tests for retained `SingleTxnWal` (commit/recover/checksum/boundary count and its known silent-overflow behavior).
+- [ ] Extend retained `MultiTxnWal` fault tests to initial superblock-write failure, checkpoint data/superblock failure with records retained, oversize/ring-full failure when nothing is checkpointable, and failure to persist the failed-commit scrub.
+
+### 4. CLWB/SFENCE intrinsics
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
 
-### 4. Minor cleanups
+### 5. Minor cleanups
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
 - [x] Add log-chunk offset to `PWRegionHeader` — new `logChunk` field (region-relative byte offset) written by `format()` and read by `mount()`, so recovery locates the log via the header instead of assuming block 1. Header grew 72 → 80 bytes; `mount()` keeps a defensive fallback to block 1 when the field reads as `0`. Covered by `TxnPWRegionTest.v3` (`format_header_fields` asserts the field; the remount/recovery tests exercise the header-driven read path).
 - [x] `RegionTransaction.clear()` — no longer reallocates the `HashMap`; empties it in place via `cache.remove()` over the `addrs` key set (both `HashMap.remove` and `Vector.clear` retain their backing storage), reusing the map and vector across commits. Covered by the existing `wal_cache:` and `pwregion:` unit tests (commit→clear cycle, remount/recovery).
@@ -173,5 +201,7 @@ Design notes (no action yet, keep in mind):
 | 2 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
 | 3 | `X86_64TxnPWRegion.v3` | Line-mark field not linked in `createChunk()` |
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
-| 5 | `TxnBackend.v3:106` | `Backends.getMmap()` declared but not implemented |
+| 5 | `TxnBackend.v3:132` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
+| 7 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B commit leaves a complete checksummed record in the slot. Reopen-before-retry is untested and may replay an unacknowledged transaction; define the failure outcome and add durable invalidation/publication as required. |
+| 8 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores `BackendRegion.prepareChangedRange()` failure, so later code can claim data durability without knowing that every changed range was prepared. |

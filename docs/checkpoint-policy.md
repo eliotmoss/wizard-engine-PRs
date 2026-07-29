@@ -1,14 +1,20 @@
 # `maybeCheckpoint()` Policy — Design Options
 
-Design discussion for the next `MultiTxnWal` step: replacing the no-op
-`maybeCheckpoint()` stub (`return true`) with a real checkpoint policy.
+> **Status:** historical design record for the retained `MultiTxnWal`.
+> Option E + light F was implemented and is covered by `MultiTxnWalTest.v3`,
+> but `MultiTxnWal` is no longer wired into `PWRegion`; the active
+> `DualTxnWal` has no checkpoint policy.
 
-`maybeCheckpoint()` is called by `RegionTransaction.commit()` after `noteApplied(txnSeq)`
-and before `clear()`. It decides whether to invoke the (already-implemented)
+This document records the design discussion that replaced the original no-op
+`maybeCheckpoint()` stub with a real checkpoint policy.
+
+In the former `MultiTxnWal` wiring, `maybeCheckpoint()` was called by
+`RegionTransaction.commit()` after `noteApplied(txnSeq)` and before `clear()`.
+It decides whether to invoke the
 `checkpoint(targetSeq)`, which persists applied region data, publishes
 `durableAppliedSeq` via the superblock, and reclaims now-durable ring records.
-Today checkpoints fire *only* lazily inside `reserveRecord`/`appendCommittedRecord`
-when the ring is full.
+Before the implemented policy, checkpoints fired only lazily inside
+`reserveRecord`/`appendCommittedRecord` when the ring was full.
 
 ---
 

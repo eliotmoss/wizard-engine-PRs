@@ -14,7 +14,7 @@ The system is organised into four layers that sit between raw storage media and 
 ├─────────────────────────────────────────────┤
 │  Transaction cache  (RegionTransaction)      │  write-behind DRAM buffer
 ├─────────────────────────────────────────────┤
-│  Write-ahead log    (MultiTxnWal)            │  circular redo log + recovery
+│  Write-ahead log    (DualTxnWal)             │  two-slot redo log + recovery
 ├─────────────────────────────────────────────┤
 │  Backend region     (BackendRegion)          │  storage abstraction: memory / file / PMEM
 └─────────────────────────────────────────────┘
@@ -39,7 +39,7 @@ BackendRegion (abstract class)
     persistRange(offset, size)               // synchronously flush a specific range (used by WAL)
 
 TxnRegionBackend (abstract class)           // factory for BackendRegion instances
-    create(size: u64, prot: BackendProt) -> BackendRegion
+    create(size: u64, prot: BackendProt, fresh: bool) -> BackendRegion
     isPersistent() -> bool
     name() -> string
 ```
@@ -81,7 +81,7 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
 - `open(path)` — opens an existing file (`O_RDWR`, mode `0644`); returns `-errno` if it does not exist
 - `create(path)` — creates/re-creates a fresh file (`O_RDWR | O_CREAT | O_TRUNC`, mode `0644`); `O_TRUNC` plus the `ensureSize` `ftruncate` extension leaves the region zero-initialised
 - `openBacking(path, fresh)` — selects `create` for a fresh format, otherwise `open` (falling back to `create` when the file is missing)
-- `ensureSize(fd, size)` — `ftruncate` + `fdatasync` to guarantee file extent
+- `ensureSize(fd, size)` — `ftruncate` + `fsync` to guarantee file extent
 - `fdatasync(fd)` — data-only sync (no metadata)
 - `close(fd)`, `unlink(path)`
 
@@ -91,95 +91,77 @@ Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, p
 
 ## Layer 2 — Write-Ahead Log
 
-**File:** `src/engine/x86-64/X86_64MultiTxnWal.v3`
+**Active file:** `src/engine/x86-64/X86_64DualTxnWal.v3`
 
-`MultiTxnWal` is a retained comparison WAL: a **circular redo log** supporting multiple outstanding transactions with generation-based crash recovery. (`DualTxnWal` is the implementation currently wired into `PWRegion`.) It occupies one log chunk. `append()` validates and buffers one memory write; `commit()` writes a single contiguous, checksummed transaction record and returns its sequence number; `checkpoint()` publishes how far the region data is durable and reclaims log space; `recover()` replays the committed tail on remount.
+**Comparison files:** `src/engine/x86-64/X86_64MultiTxnWal.v3`, `src/engine/x86-64/X86_64SingleTxnWal.v3`
 
-> The earlier single-transaction `SingleTxnWal` (`src/engine/x86-64/X86_64SingleTxnWal.v3`, `LogHeader` + `LogEntry[]`, `status` commit flag) is **superseded and no longer wired in**. It is retained as a reference implementation for comparison against `MultiTxnWal` — see `docs/wal-comparison.md`.
+`DualTxnWal` is the WAL wired into `PWRegion` and `RegionTransaction`. It keeps at most two committed transactions in fixed slots selected by `txnSeq % 2`. Redo entries are absolute, idempotent after-images, so recovery validates both slots and replays them in ascending sequence order without a superblock, epoch, replay floor, ring, or checkpoint policy.
 
-### On-disk layout
+`MultiTxnWal` remains compiled and has dedicated comparison tests, but it is no longer on the allocator commit path. `SingleTxnWal` remains a reference implementation and currently has no dedicated tests. See `docs/wal-comparison.md` for the design comparison and `docs/checkpoint-policy.md` for the retained ring-WAL policy record.
 
-Block 1 begins with two fixed superblock copies, followed by the record ring:
+### Active on-region layout
 
-```
-Block 1  (256 KB)
-  ┌─────────────────────────────┐  offset 0
-  │  WalSuperblock  copy 0 (64B) │
-  ├─────────────────────────────┤  offset 64
-  │  WalSuperblock  copy 1 (64B) │
-  ├─────────────────────────────┤  ringBase = logChunkAddr + 2 * 64
-  │  record ring  (ringBytes =  │
-  │   blockSize - 2 * 64)       │
-  │   TxnRecord[]  (variable,    │
-  │   64-byte aligned, may wrap) │
-  └─────────────────────────────┘
-```
-
-**`WalSuperblock` (64 bytes, two copies)**
-
-| Field | Type | Meaning |
-|---|---|---|
-| `magic` | u64 | `"WALSUPER"` signature |
-| `version` | u32 | format version (1) |
-| `superblockSize` | u64 | size of this layout |
-| `generation` | u64 | monotonic copy number; recovery picks the higher valid copy |
-| `logEpoch` | u64 | current WAL incarnation; records from other epochs are stale |
-| `durableAppliedSeq` | u64 | highest txn whose region updates are known durable |
-| `reserved` | u64 | must be zero in v1 |
-| `checksum` | u64 | checksum over the superblock, excluding this field |
-
-**`TxnRecord`** = `TxnRecordHeader` (64 B) + `LogEntry[]` + `TxnCommitTrailer` (48 B), padded up to a 64-byte (`ALIGNMENT`) boundary. The header (`"WALTXNHD"`) and trailer (`"WALTXNCM"`) carry redundant `recordLen` / `entryCount` / `logEpoch` / `txnSeq`, and the trailer holds an FNV-style `checksum` over the whole record (excluding the checksum field). `LogEntry` is unchanged: `offset` (region-relative), `value`, `width` (1/2/4/8).
-
-### Commit protocol
+The log chunk begins with a minimal header followed by two equal, 64-byte-aligned slots:
 
 ```
-append(offset, value, width) -> bool   -- validated, buffered into pendingEntries;
-                                         invalid input poisons the transaction
+Log chunk
+  ┌──────────────────────────────┐  offset 0
+  │ DualWalHeader           64 B │
+  ├──────────────────────────────┤
+  │ slot 0: TxnRecord            │  even txnSeq
+  ├──────────────────────────────┤
+  │ slot 1: TxnRecord            │  odd txnSeq
+  └──────────────────────────────┘
 
-commit() -> txnSeq             -- appendCommittedRecord(pendingEntries); clears pending
-  1. reserveRecord(len)        -- find a free, contiguous, aligned slot in the ring;
-                                  wrap to offset 0 if needed; if full, lazily checkpoint
-                                  the applied tail and retry
-  2. zero slot; write header, entries, trailer; compute + store record checksum
-  3. backendRegion.persistRange(record_range)   -- COMMIT POINT: record durable
-  4. push WalActiveRecord; nextTxnSeq++; return txnSeq   (0 on failure)
+slotBytes = alignDown((blockSize - 64) / 2, 64)
 ```
 
-An empty commit follows the same protocol with `entryCount=0`, so every successful commit returns a nonzero sequence number.
+Each slot contains `TxnRecordHeader` (64 B) + `LogEntry[]` + `TxnCommitTrailer` (48 B), padded to 64-byte alignment. The dual WAL uses distinct header/record/trailer magics so stale `MultiTxnWal` bytes cannot validate. The record header and trailer redundantly encode length, entry count and transaction sequence; `logEpoch` is reserved and must be zero. The trailer checksum covers the complete aligned record except its own checksum field.
 
-After the WAL record is durable, `RegionTransaction` applies the cached writes to region memory and calls `noteApplied(txnSeq)` (advances `appliedSeqVolatile` in order).
-
-```
-checkpoint(targetSeq) -> bool  -- targetSeq must be ≤ appliedSeqVolatile
-  1. backendRegion.persistChanges()             -- applied region data durable
-  2. writeSuperblock(targetSeq, logEpoch)        -- inactive copy, persist, bump generation, swap
-  3. durableAppliedSeq = targetSeq; reclaim now-durable records from activeRecords
-```
-
-`fenceAppliedUpdates()` is `checkpoint(appliedSeqVolatile)`.
-
-### Recovery protocol
+### Phase-B commit protocol
 
 ```
-recover() -> MultiWalRecovery
-  load winning superblock (higher generation among the two valid copies)
-  scanCommittedRecords()                 -- stride the ring at 64B, validateRecord each
-       validateRecord rejects on: bad magic/version/size, recordLen misalignment,
-       trailer mismatch, epoch ≠ current logEpoch, txnSeq ≤ durableAppliedSeq,
-       checksum mismatch, or any invalid entry field
-  selectContiguousPrefix()               -- contiguous txnSeq run from durableAppliedSeq+1
-  if no contiguous prefix:
-       if stray valid records exist, bump epoch + rewrite superblock to abandon them
-       return CLEAN (or PERSIST_FAILED if publishing the epoch bump fails)
-  for each selected record: redoRecord() ; appliedSeqVolatile = txnSeq
-  backendRegion.persistChanges()         -- replayed data durable
-  writeSuperblock(maxSeq, logEpoch + 1)  -- publish + bump epoch so replay can't recur
+append(offset, value, width) -> bool
+  validate width, region bounds and non-overlap with the WAL chunk
+  invalid input poisons the whole pending transaction
+
+commit() -> txnSeq
+  1. select slot = nextTxnSeq % 2
+  2. if that slot protects data not yet known durable:
+       persistAppliedData(); fail if the slot is still unreclaimable
+  3. write the complete checksummed record into the slot
+  4. prepareChangedRange(record)
+  5. persistChanges()                         -- COMMIT POINT
+       persists the new record together with the previous transaction's
+       already-applied after-images
+  6. dataDurableSeq = previous lastCommittedSeq
+  7. publish slotSeq/lastCommittedSeq; advance nextTxnSeq
+```
+
+The caller then applies the committing transaction's after-images. Their ranges remain pending and ride the next transaction's commit boundary, `RegionTransaction.flush()`, or `DualTxnWal.close()`. Thus steady state uses one persistence boundary per commit. An empty transaction writes a real zero-entry record, so every successful commit has a nonzero sequence and `0` is failure-only.
+
+The phase-B contract requires the caller to apply transaction N before committing N+1. `RegionTransaction.commit()` provides that ordering.
+
+### Recovery and close
+
+```
+recover() -> DualWalRecovery
+  validate both slots
+  if neither is valid: return CLEAN
+  replay valid slots in ascending txnSeq order
+  persistChanges()
+  if persistence fails: return PERSIST_FAILED and retain both records
+  dataDurableSeq = maxSeq; nextTxnSeq = maxSeq + 1
   return REPLAYED
 ```
 
-The other results are `CORRUPT` when no valid superblock can be opened and `PERSIST_FAILED` when replayed data or its superblock publication does not reach durability. The epoch bump is the key anti-double-replay guard: once recovery republishes at `logEpoch + 1`, every record written under the old epoch fails `validateRecord` on any future mount.
+`CORRUPT` reports an invalid dual-WAL header. Recovery leaves valid records in place; replaying an already-durable after-image again is harmless.
 
-`append()`/`commit()` failures and recovery outcomes are explicit. Because this WAL is no longer wired into `PWRegion`, its callers are the comparison tests; the active `DualTxnWal` path has its own equivalent propagation into mount and allocator operations.
+`close()` is the clean-unmount boundary: it persists the last applied transaction and scrubs only slots whose data is known durable. Unrecovered records and records protected by a failed final persist remain available for the next mount.
+
+### Failure-semantics audit note
+
+The 2026-07-29 test audit found an unverified boundary case: after phase-B `prepareChangedRange(record)` or `persistChanges()` fails, the current code returns `0` but leaves a complete checksummed record in the slot. Existing tests retry before reopening; they do not reopen immediately after the failure. The required outcome—an unacknowledged failed commit must not later replay—and the necessary durable invalidation/publication protocol are tracked in `docs/ROADMAP.md` Next Steps #3.
 
 ---
 
@@ -205,17 +187,16 @@ writeU8 / writeI16 / writeU64 / writeI64(addr, val)
 
 ```
 commit()
-  if !isDirty() → return
+  if !isDirty() → return true
   appendToWal()             // iterate addrs → wal.append(offset, value, width)
   txnSeq = wal.commit()     // write one durable WAL record; 0 == failure
-  if txnSeq == 0 → return   // leave cache dirty for retry (see Layer 2 TODO)
-  applyToRegion()           // write cache values into region bytes
-  wal.noteApplied(txnSeq)   // advance appliedSeqVolatile in order
-  wal.maybeCheckpoint()     // policy hook (currently a no-op stub)
-  clear()                   // reset cache
+  if txnSeq == 0 → return false  // leave cache dirty for retry/inspection
+  applyToRegion()           // write cache values and prepare their ranges
+  clear()                   // reuse the cache/map storage
+  return true
 ```
 
-Unlike the old single-transaction flow, `commit()` no longer fences and clears the log per call. The WAL record stays live until a `checkpoint()` (lazy, on ring-full) proves the region data durable and reclaims its space; only the DRAM cache is cleared here.
+The committing transaction's applied after-images are recoverable from its durable slot, but their direct data persistence is deferred. The next commit's single phase-B boundary persists those pending ranges together with the next record. `flush()` calls `wal.persistAppliedData()` when an idle/unmount boundary is required, and `PWRegion.deallocate()` reaches the same operation through `wal.close()`.
 
 ### Read path (cache miss)
 
@@ -234,7 +215,7 @@ readU8(addr)
 
 **File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `PWRegion`)
 
-`PWRegion` implements a buddy-style block allocator over the persistent region. All metadata mutations go through `RegionTransaction` so they are WAL-protected.
+`PWRegion` implements a first-fit block allocator over the persistent region. All metadata mutations go through `RegionTransaction` so they are WAL-protected.
 
 ### Region layout
 
@@ -257,7 +238,7 @@ Block N..M   Metadata   (block table, sentinels, descriptors)
 | `metaData` | u64 | offset to metadata area |
 | `metaDataDescs` | u64 | offset to descriptor table |
 | `magic` | u64 | `0x50_57_41_53_4D` ("PWASM") |
-| `blockSize` | u64 | bytes per block (default 256 KB) |
+| `blockSize` | u64 | bytes per block (wrapper default 512 KB) |
 | `logChunk` | u64 | region-relative offset of the WAL log chunk (block 1 in the current layout) |
 
 ### `BlockEntry` (40 bytes)
@@ -301,7 +282,7 @@ mount(blockSize)
   verify blockSize and numBlocks match header
   restore block table handle
   locate log chunk via header.logChunk       -- fall back to block 1 if unset (0)
-  init MultiTxnWal + RegionTransaction
+  init DualTxnWal + RegionTransaction
   txn.recover()                              -- replay committed WAL if present
 ```
 
@@ -357,9 +338,8 @@ PWRegion.allocChunk(n)
   → performCommit() → txn.commit()
       appendToWal()           -- wal.append per cache entry
       txnSeq = wal.commit()   -- write one durable, checksummed WAL record
-      applyToRegion()         -- write values into region bytes
-      wal.noteApplied(txnSeq)
-      wal.maybeCheckpoint()   -- no-op stub; checkpoint happens lazily on ring-full
+                               -- same boundary persists the previous txn's data
+      applyToRegion()         -- write values + prepare ranges for next boundary
       cache.clear()
 ```
 
@@ -377,29 +357,28 @@ BlockEntryHandle.getUsedCached(txn)
 ```
 PWRegion.mount()
   → txn.recover() → wal.recover()
-      load winning superblock (higher generation of the two valid copies)
-      scan ring; select contiguous txnSeq prefix from durableAppliedSeq+1
-      if a committed prefix exists:
-        redo each record into region bytes
-        persistChanges()                       -- replayed data durable
-        writeSuperblock(maxSeq, logEpoch + 1)   -- publish + bump epoch
-        return true
-      else:
-        if stray valid records exist, bump epoch to abandon them
-        return false
+      validate the WAL header; if invalid → return CORRUPT
+      validate the two fixed slots
+      if neither slot is valid → return CLEAN
+      replay valid records in ascending txnSeq order
+      persistChanges()                 -- replayed data durable
+      return REPLAYED / PERSIST_FAILED
 ```
 
 ---
 
 ## Testing
 
-| Test file | Location | What it covers |
-|---|---|---|
-| `TxnPWRegionTest.v3` | `test/unittest/x86-64-linux/` | format/mount, alloc/free, coalescing, WAL recovery, corrupt-WAL detection (via `MultiTxnWal` record checksum), file-backed persistence |
-| `WALCacheTest.v3` | `test/unittest/x86-64-linux/` | cache read/write, cache-miss fallthrough, commit flow over `MultiTxnWal`, clean-txn no-op |
-| `MultiTxnWalTest.v3` | `test/unittest/x86-64-linux/` | superblock selection/corruption, single/multi-record recovery, record-checksum rejection, poisoned invalid append, empty commits, required backend, explicit recovery outcomes, contiguous-prefix-only replay, epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, crash-mid-log recovery |
+Audited 2026-07-29: the implementation-specific x86-64 Linux suite contains 87 registered tests, all passing in the existing x86-64 Linux test binary. None are expected failures.
 
-The core durability and API-hardening paths are covered, including commit-point failure retry and recovery persist failure.
+| Test file | Tests | What it covers |
+|---|---:|---|
+| `DualTxnWalTest.v3` | 19 | active two-slot WAL, phase-B boundary count, recovery, overwrite guard, failure retry, flush and close |
+| `WALCacheTest.v3` | 13 | transaction cache and active `DualTxnWal` integration, commit/flush propagation and oversize failure |
+| `TxnPWRegionTest.v3` | 33 | allocator, overflow propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
+| `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
+
+`SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have no dedicated tests. The highest-priority missing regression is reopen/crash immediately after an active phase-B commit boundary fails, before retry. Full gaps and priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
 
 Run with:
 
@@ -414,8 +393,9 @@ test/unit.sh
 | # | Location | Description |
 |---|---|---|
 | 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
-| 3 | `TxnBackend.v3:36` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
-| 4 | `X86_64TxnBackend.v3:177` | `RegionFileIO.openOrCreate` should be split into `open` and `create`; `create` must initialise bytes to zero. |
+| 2 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B record boundary leaves complete checksummed slot bytes; reopen-before-retry semantics need a regression and may require durable invalidation/publication. |
+| 3 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores failure from `prepareChangedRange()`, weakening the `dataDurableSeq` claim. |
+| 4 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 5 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 6 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
 | 7 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
