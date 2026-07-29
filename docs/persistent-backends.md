@@ -1,6 +1,6 @@
 # Persistent Backends: Design and Implementation
 
-This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX or file-backed mmap) with crash-consistent allocation via a write-ahead log (WAL).
+This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX or file-backed mmap) with crash-consistent allocation via a write-ahead log (WAL). See `docs/pmem-emulation.md` for the supported emulated-PMEM development environment and validation limits.
 
 ---
 
@@ -86,6 +86,30 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
 - `close(fd)`, `unlink(path)`
 
 Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, prot, fresh)`: `PWRegion` passes its `forceFormat` flag down, so a fresh format zero-initialises the backing store while a mount attaches to the existing one.
+
+### Supported PMEM path
+
+`PmemMmapBackend` expects a **regular file on an fsdax filesystem**, not a raw
+device path:
+
+```text
+/dev/pmem0 → ext4/XFS mounted with DAX → /mnt/pmem/wizard-region
+                                           └─ PmemMmapBackend path
+```
+
+This follows from both sides of the contract. Linux supports `MAP_SYNC` only
+for DAX files, while `PmemMmapBackend` uses the regular-file operations
+`open`, `lseek`, and `ftruncate` before mapping. A raw fsdax block device does
+not itself provide filesystem DAX, and `/dev/daxX.Y` has fixed-size,
+alignment-sensitive character-device semantics that do not fit
+`RegionFileIO.ensureSize()`.
+
+For machines without physical PMEM, the recommended development setup is a
+QEMU-emulated NVDIMM exposed as `/dev/pmem0` inside an x86-64 Linux guest,
+then formatted and mounted as fsdax. Native Linux `memmap=<size>!<start>` RAM
+reservation is an alternative. Both validate the DAX programming interface;
+neither proves survival of host power loss. See `docs/pmem-emulation.md` for
+setup, safety constraints, and the staged validation plan.
 
 ---
 
@@ -319,10 +343,10 @@ Convenience subclasses that wire a backend to `PWRegion` / `ImmixPWRegion`:
 | Class | Backend |
 |---|---|
 | `X86_64PWMemRegion` | `VolatileBackend` |
-| `X86_64PWNVRegion` | `PmemMmapBackend` (PMEM/DAX path) |
+| `X86_64PWNVRegion` | `PmemMmapBackend` (regular file on an fsdax mount) |
 | `X86_64PWBlockDeviceRegion` | `FileMmapBackend` |
 | `X86_64ImmixPWMemRegion` | `VolatileBackend` + Immix metadata |
-| `X86_64ImmixPWNVRegion` | `PmemMmapBackend` + Immix metadata |
+| `X86_64ImmixPWNVRegion` | `PmemMmapBackend` over fsdax + Immix metadata |
 
 ---
 
@@ -380,6 +404,14 @@ Audited 2026-07-29: the implementation-specific x86-64 Linux suite contains 87 r
 
 `SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have no dedicated tests. The highest-priority missing regression is reopen/crash immediately after an active phase-B commit boundary fails, before retry. Full gaps and priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
 
+The PMEM-labelled unit coverage is structural only:
+`txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping
+in `PmemMmapRegion`. It does not call `PmemMmapBackend.create()` and therefore
+does not exercise `MAP_SYNC`, filesystem DAX, an emulated `/dev/pmem0`, or a
+real PMEM device. The three-stage integration plan—DAX/remount, guest
+crash/restart, then real-hardware durability—is documented in
+`docs/pmem-emulation.md`.
+
 Run with:
 
 ```bash
@@ -400,3 +432,4 @@ test/unit.sh
 | 6 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
 | 7 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
 | 8 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
+| 9 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |

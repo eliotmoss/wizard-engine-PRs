@@ -1,6 +1,6 @@
 # Persistent Region Allocator — Roadmap
 
-Work log for the `pwregions` branch. See `docs/persistent-backends.md` for design detail.
+Work log for the `pwregions` branch. See `docs/persistent-backends.md` for design detail and `docs/pmem-emulation.md` for the emulated-PMEM development and validation plan.
 
 ---
 
@@ -86,6 +86,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `TxnPWRegionTest.v3` — **33 tests** across allocator (`pwregion:`), overflow propagation (`pwregion_overflow:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, `DualTxnWal` recovery/checksum rejection, mmap/PMEM state and lifecycle, and file-backed persistence
 - `MultiTxnWalTest.v3` — **22 tests** for the retained comparison WAL: superblocks, recovery, record validation, failure outcomes, epoch/gap handling, wrap-around/checkpoint reserve, crash-mid-log recovery, failed-persist scrub/rollback, and checkpoint policy
 - `SingleTxnWal` has **no dedicated tests**; it remains compiled as a reference implementation only
+- The PMEM-labelled test is structural only: `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping and bypasses `PmemMmapBackend.create()`, `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`
 
 ---
 
@@ -96,6 +97,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Multi-transaction WAL core paths are test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is implemented (hybrid count-OR-occupancy, per-backend thresholds). Commit-failure propagation is implemented (see Completed).
 - A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus four API-hardening items. All are fixed and regression-tested; see Next Steps #2 follow-ups.
 - The 2026-07-29 test audit found that the happy paths and intended phase-B boundary count are strong, but active-WAL failure/crash semantics, full allocator-transaction recovery, Immix/platform wrappers, and several backend/validation paths remain untested. These are tracked in Next Steps #3.
+- **PMEM emulation assessment (2026-07-29):** use a QEMU file-backed ACPI NVDIMM as the primary development environment and native x86-64 Linux `memmap=<size>!<start>` as an alternative. In both cases, expose `/dev/pmem0`, create an fsdax filesystem, and give `PmemMmapBackend` a regular file on that mount. Validation is staged as DAX/remount integration, guest crash/restart testing, then real-hardware durability; see `docs/pmem-emulation.md`.
 
 ---
 
@@ -184,7 +186,21 @@ Priority 2 — validation and retained comparisons:
 ### 4. CLWB/SFENCE intrinsics
 `MmapRegionUtils.flushCacheLine()` and `storeFence()` are no-op placeholders. PMEM durability is not functional until these emit real `CLWB`/`CLFLUSHOPT` and `SFENCE` instructions. Requires either Virgil inline-asm support or a small native stub.
 
-### 5. Minor cleanups
+### 5. PMEM emulation and validation
+
+**Assessment complete (2026-07-29):** QEMU ACPI NVDIMM emulation can provide
+the Linux `/dev/pmem0` → fsdax → `MAP_SYNC` path needed by the current
+regular-file-oriented `PmemMmapBackend`. It is suitable for functional and
+software crash-consistency testing, but an ordinary host backing file cannot
+establish host power-loss durability. Native Linux `memmap` reservation
+provides the same development interface with more invasive host setup.
+
+- [x] Document QEMU as the primary workflow, Linux `memmap` as the alternative, the fsdax regular-file requirement, unsupported alternatives, and the three validation stages (`docs/pmem-emulation.md`).
+- [ ] **Stage 1 — DAX/remount integration:** add an opt-in x86-64 Linux test that uses a caller-supplied file on a prepared fsdax mount; require `PmemMmapBackend.create()`/`MAP_SYNC`, format, allocation, close/remount, and WAL recovery to succeed. Keep it out of the default unit and CI suites.
+- [ ] **Stage 2 — guest crash/restart:** automate process termination at WAL boundaries and reopen the same file; add guest reset/QEMU restart experiments with the same NVDIMM backing file. Treat the results as software crash-consistency evidence, not physical durability proof.
+- [ ] **Stage 3 — real PMEM durability:** after the CLWB/SFENCE work in #4, repeat the integration and controlled crash/power-interruption campaign on physical PMEM. Only this stage can support a host power-loss durability claim.
+
+### 6. Minor cleanups
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
 - [x] Add log-chunk offset to `PWRegionHeader` — new `logChunk` field (region-relative byte offset) written by `format()` and read by `mount()`, so recovery locates the log via the header instead of assuming block 1. Header grew 72 → 80 bytes; `mount()` keeps a defensive fallback to block 1 when the field reads as `0`. Covered by `TxnPWRegionTest.v3` (`format_header_fields` asserts the field; the remount/recovery tests exercise the header-driven read path).
 - [x] `RegionTransaction.clear()` — no longer reallocates the `HashMap`; empties it in place via `cache.remove()` over the `addrs` key set (both `HashMap.remove` and `Vector.clear` retain their backing storage), reusing the map and vector across commits. Covered by the existing `wal_cache:` and `pwregion:` unit tests (commit→clear cycle, remount/recovery).
@@ -205,3 +221,4 @@ Priority 2 — validation and retained comparisons:
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
 | 7 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B commit leaves a complete checksummed record in the slot. Reopen-before-retry is untested and may replay an unacknowledged transaction; define the failure outcome and add durable invalidation/publication as required. |
 | 8 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores `BackendRegion.prepareChangedRange()` failure, so later code can claim data durability without knowing that every changed range was prepared. |
+| 9 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; no fsdax/emulated-device integration test exists yet. |
