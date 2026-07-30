@@ -183,17 +183,43 @@ recover() -> DualWalRecovery
 
 `close()` is the clean-unmount boundary: it persists the last applied transaction and scrubs only slots whose data is known durable. Unrecovered records and records protected by a failed final persist remain available for the next mount.
 
-### Failure-semantics audit note
+### Persistence-failure contract
 
-The 2026-07-29 test audit found an unverified boundary case: after phase-B
-`prepareChangedRange(record)` or `persistChanges()` reports failure, the
-current code returns `0` but leaves a complete checksummed record in the slot.
-Existing tests retry before reopening; they do not reopen immediately after
-the failure. Because a failed persistence call can be indeterminate—some bytes
-may already be durable—the project must define whether `0` means definitely
-aborted or outcome unknown, then make recovery and any durable
-invalidation/publication protocol match that contract. This is tracked in
-`docs/ROADMAP.md` Next Steps #3.
+The project adopts a **recovery-required** contract for phase-B persistence
+failures:
+
+- A nonzero `commit()` result is **acknowledged**. The persistence boundary
+  reported success and the returned value is the transaction sequence.
+- If `prepareChangedRange(record)` or `persistChanges()` reports failure after
+  the complete record has been constructed, `commit()` returns `0`, but this
+  means **unacknowledged**, not aborted. Any complete valid record that reached
+  durable storage may be replayed.
+- After an unacknowledged result, the mounted region must not accept another
+  normal transaction, retry, flush, or clean close. It is in a
+  **recovery-required** state. The process must abandon that mount, reopen the
+  region, and run recovery; only successful recovery establishes the durable
+  state from which work may continue.
+- `recover() == CLEAN` resolves the attempted transaction as absent.
+  `recover() == REPLAYED` may include it. `CORRUPT` or `PERSIST_FAILED` leaves
+  the region unavailable for normal use.
+
+Redo entries are `(offset, width, after-image)` stores. Replaying the same
+valid record, including one whose original caller received `0`, is therefore
+byte-level idempotent and does not require durable invalidation merely to
+prevent a duplicate effect.
+
+Invalid input and capacity rejection can be known before a persistence
+boundary and are definite non-commits internally. The current `u64`/`bool`
+interfaces do not expose that distinction to higher layers, however, so a
+public `commit() == 0`/`false` must conservatively be treated as
+recovery-required. A future result enum could preserve ordinary validation
+errors without changing the persistence-failure contract.
+
+The shadow test makes the rule executable: copy-then-fail returns `0`, crash
+restores the complete durable record, and recovery is allowed to replay it.
+The current implementation produces that recovery result, but it does not yet
+latch or enforce the recovery-required state after returning failure. That
+enforcement work is tracked in `docs/ROADMAP.md` Next Steps #3.
 
 ---
 
@@ -401,23 +427,24 @@ PWRegion.mount()
 
 ## Testing
 
-Audited 2026-07-29: the implementation-specific x86-64 Linux suite contains 87 registered tests, all passing in the existing x86-64 Linux test binary. None are expected failures.
+Audited 2026-07-30: the implementation-specific x86-64 Linux suite contains 94 registered tests, all passing. None are expected failures.
 
 | Test file | Tests | What it covers |
 |---|---:|---|
-| `DualTxnWalTest.v3` | 19 | active two-slot WAL, phase-B boundary count, recovery, overwrite guard, failure retry, flush and close |
+| `DualTxnWalTest.v3` | 26 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, overwrite guard, persistence outcomes including unacknowledged record replay, legacy retry-gap characterization, flush and close |
 | `RegionTransactionTest.v3` | 13 | transaction cache and active `DualTxnWal` integration, commit/flush propagation and oversize failure |
 | `TxnPWRegionTest.v3` | 33 | allocator, overflow propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 `SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have
-no dedicated tests. The current `DualTxnWalTest` crash cases construct a new
-WAL over the same `Array<byte>` and use persistence methods that return success
-without maintaining a separate durable state. These tests are useful evidence
-for record validation, replay order, overwrite protection and API boundary
-counts, but unpersisted live writes cannot disappear during their simulated
-crash. They therefore do not by themselves validate the byte-level persistence
-claims of the protocol.
+no dedicated tests. As of 2026-07-30, the direct `DualTxnWalTest` crash cases
+use `ShadowDurableRegion`: a newly mounted WAL sees a live image restored from
+separate durable bytes, so unpersisted writes disappear. The core phase-B
+commit/apply/N+1, replay, flush, close, corruption, fail-before and torn-record
+windows now have byte-level protocol-model evidence. A normative
+copy-then-fail test confirms the recovery-required contract: when the complete
+record becomes durable but `persistChanges()` reports failure, `commit()`
+returns `0` and recovery may replay that record.
 
 The file-backed tests exercise the actual `fdatasync` and page-aligned
 `msync(MS_SYNC)` code paths, including basic failure propagation, committed-WAL
@@ -456,7 +483,7 @@ and finally physical durability.
 
 ### Shadow durable-memory test backend
 
-The immediate test priority is a test-only `ShadowDurableRegion` implementing
+`DualTxnWalTest.v3` now contains a test-only `ShadowDurableRegion` implementing
 the existing `BackendRegion` interface. It is not a fourth production storage
 backend. It is an executable model of the persistence contract:
 
@@ -479,7 +506,7 @@ ordinary Pointer stores                  persistence operation
   and clearing pending ranges. A newly constructed `DualTxnWal` then mounts
   those surviving bytes.
 
-The model must support at least three injected persistence outcomes:
+The model supports three injected persistence outcomes:
 
 1. **fail before copy** — no requested bytes become durable;
 2. **copy then fail** — bytes become durable but the caller receives an error,
@@ -487,17 +514,17 @@ The model must support at least three injected persistence outcomes:
 3. **partial copy then fail** — only a prefix or selected ranges survive,
    modelling a torn record/data update.
 
-This distinction is important for the active open issue. A failed phase-B
-boundary currently returns `0` while a complete checksummed record remains in
-the live slot. If the persistence operation made those bytes durable before
-reporting failure, recovery can validate and replay an attempt that the caller
-did not see succeed. The tests must first force this outcome, then the project
-must define whether the public result is definitely aborted or indeterminate.
-Possible designs include durable invalidation before returning an ordinary
-failure, retry/fatal handling until the outcome is resolved, or a result enum
-such as `COMMITTED`/`ABORTED`/`INDETERMINATE`.
+This distinction exercises the recovery-required contract. A failed phase-B
+boundary returns `0` while a complete checksummed record may remain in the
+durable slot. Recovery is allowed to validate and replay that unacknowledged
+attempt because replaying after-images is idempotent. The
+`indeterminate_persist_record_replays` test forces exactly this outcome:
+`commit()` returns `0`, a simulated crash restores the complete durable record,
+and recovery replays it. No durable invalidation is required by this contract.
 
-Start with direct `DualTxnWal` tests. Once that protocol matrix passes, a
+The direct `DualTxnWal` core crash matrix and backend self-tests are in place.
+The remaining protocol work is to latch and enforce recovery-required state,
+then complete the recovery/flush/close/header fault matrix. After that, a
 test-only `ShadowTxnBackend` factory can expose the same live/durable pair to
 `PWRegion` so complete allocation split/exact-fit and free/coalescing
 transactions are checked after simulated crashes. The shadow model establishes
@@ -517,8 +544,8 @@ test/unit.sh
 | # | Location | Description |
 |---|---|---|
 | 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
-| 2 | `DualTxnWalTest.v3` | Add `ShadowDurableRegion` and move the active crash/fault matrix onto separate live/durable bytes before treating those tests as protocol-durability evidence. |
-| 3 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B record boundary leaves complete checksummed slot bytes; reopen-before-retry semantics and the aborted-versus-indeterminate result contract need a shadow-backed regression and may require durable invalidation/publication. |
+| 2 | `DualTxnWalTest.v3` | Extend the implemented `ShadowDurableRegion` from the core WAL matrix to the remaining fault cases and a `ShadowTxnBackend` allocator integration factory. |
+| 3 | `X86_64DualTxnWal.v3:223-224` | Enforce the chosen recovery-required contract: latch the WAL/region after a persistence-related failure, reject normal retry/flush/close operations on that mount, and require reopen + successful recovery before reuse. |
 | 4 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores failure from `prepareChangedRange()`, weakening the `dataDurableSeq` claim. |
 | 5 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 6 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |

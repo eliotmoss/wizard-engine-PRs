@@ -42,11 +42,19 @@ This original concern is resolved: `PWRegionHeader.logChunk` now stores the regi
 
 ---
 
-## 5. Oversized transactions fail safely but lack retry/abort orchestration
+## 5. Oversized transactions fail safely but lack recovery-required enforcement
 
 `RegionTransaction` can still accumulate more `(addr, value)` pairs than one `DualTxnWal` slot can hold. The active path now fails safely: `DualTxnWal.commit()` returns `0`, `RegionTransaction.commit()` returns `false`, allocator operations propagate failure, and the dirty cache is retained instead of acknowledging a partial record.
 
-What remains unspecified is how the caller should recover. There is no split, abort or rollback operation, and a failed allocator mutation remains in the shared transaction cache. A later operation on the same `PWRegion` can therefore observe and extend that dirty state. Tests cover the failure sentinel and prove a second independent `RegionTransaction` can still use the WAL, but do not cover retry/abort behavior through the allocator's shared transaction.
+The chosen conservative contract treats every public `false` as
+recovery-required until validation/capacity rejection can be distinguished
+from persistence failure. The caller must abandon the mount, thereby
+discarding this volatile cache, then reopen and recover. The implementation
+does not yet enforce that rule: a later operation on the same `PWRegion` can
+still observe and extend the dirty transaction. Existing tests cover the
+failure sentinel and show that a second independent `RegionTransaction` can
+still use the WAL; under the chosen contract that behavior is an enforcement
+gap, not a supported retry path.
 
 ---
 
@@ -70,19 +78,31 @@ The allocator is self-contained but has no connection to WASM execution. There i
 
 ## 9. A failed phase-B commit can leave an apparently valid record
 
-`DualTxnWal.appendCommittedRecord()` builds the complete record and checksum before calling `prepareChangedRange(record)` and `persistChanges()`. If either boundary operation fails, `commit()` returns `0` and does not advance the in-memory sequence state, but the record magic and checksum remain in the mapped slot. The existing regression retries into the same parity slot before reopening, which proves duplicate sequences cannot occupy different slots; it does not prove that a crash immediately after the failed call cannot replay the unacknowledged attempt.
+`DualTxnWal.appendCommittedRecord()` builds the complete record and checksum
+before calling `prepareChangedRange(record)` and `persistChanges()`. If either
+boundary operation fails, `commit()` returns `0` and does not advance the
+in-memory sequence state, but the record magic and checksum remain in the
+mapped slot. The older regression retries into the same parity slot before
+reopening, which proves duplicate sequences cannot occupy different slots. The
+new shadow durable-memory regression covers the missing immediate crash:
+when persistence copies the complete record and then reports failure, recovery
+validates and replays it even though `commit()` returned `0`.
 
-The required failure contract needs to be explicit. A persistence operation can
-copy all or part of the record and still report failure, so `0` currently
-conflates a definitely aborted transaction with an indeterminate result. If
-`0` is retained as a definite abort, recovery must not make the attempt visible
-later and the implementation needs a successfully persisted invalidation or
-equivalent publication rule. Otherwise the API must expose the indeterminate
-outcome and document that recovery may resolve it as committed.
+The chosen contract treats this result as **unacknowledged**, not definitely
+aborted. The mount becomes recovery-required and must accept no retry, new
+transaction, flush, or clean close. Reopen plus successful recovery determines
+the durable state: a complete valid record may be replayed, while an absent or
+torn record is ignored. That is safe at the byte level because every redo entry
+is an idempotent `(offset, width, after-image)` store; durable invalidation is
+not required.
 
-The immediate test-audit follow-up is a test-only shadow durable-memory backend
-with separate live and durable byte arrays. Its fail-before-copy,
-copy-then-fail and partial-copy modes can reproduce this ambiguity
-deterministically, including an immediate crash before the current same-slot
-retry masks the record. This supplies protocol-level evidence only; syscall,
-process/VM crash and physical-media evidence remain separate outer layers.
+The test-only shadow durable-memory backend is now implemented with separate
+live and durable byte arrays. Its fail-before-copy, copy-then-fail and
+partial-copy modes reproduce this ambiguity deterministically, including an
+immediate crash before the same-slot retry masks the record. The open work is
+now to latch and propagate recovery-required state; the current code still
+allows same-mount retry after returning failure. Until validation/capacity
+rejection is distinguishable from persistence failure at the public API,
+higher layers must conservatively treat every `false` as recovery-required.
+The shadow supplies protocol-level evidence only; syscall, process/VM crash
+and physical-media evidence remain separate outer layers.

@@ -190,11 +190,16 @@ The complete layer definitions and their evidence boundaries are documented in
 
 ### Stage 0 — deterministic protocol model
 
-Before depending on DAX or QEMU, implement a test-only shadow durable-memory
-backend for the active `DualTxnWal`. It keeps separate live and durable byte
-arrays, makes `persistRange`/`persistChanges` copy into the durable shadow, and
-restores live bytes from that shadow on simulated crash. It must inject
-fail-before-copy, copy-then-fail and partial-copy outcomes.
+The direct active-`DualTxnWal` tests now use a test-only shadow durable-memory
+backend. It keeps separate live and durable byte arrays, makes
+`persistRange`/`persistChanges` copy into the durable shadow, restores live
+bytes from that shadow on simulated crash, and injects fail-before-copy,
+copy-then-fail and partial-copy outcomes. Remaining Stage-0 work is the
+recovery-required-state enforcement, the rest of the fault matrix, and a
+`ShadowTxnBackend` factory for complete allocator transactions. Under the
+chosen contract, a persistence-related failure is unacknowledged rather than a
+guaranteed abort: the failed mount stops normal use, and reopen plus successful
+recovery may replay any complete valid record.
 
 Stage 0 answers whether the WAL is correct under the abstract `BackendRegion`
 persistence contract. It is fast, deterministic and suitable for the default

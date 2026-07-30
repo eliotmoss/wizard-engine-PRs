@@ -26,10 +26,10 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 | Checkpointing | None — the log is implicitly emptied on `clear()` | `checkpoint(targetSeq)` reclaims ring space + advances `durableAppliedSeq`; `maybeCheckpoint()` runs a hybrid count-OR-occupancy policy with per-backend thresholds (`CheckpointCost.FREE`/`CHEAP`/`EXPENSIVE`) | None: transaction N's data persist piggybacks on commit N+1's boundary; an overwrite guard retries the data persist before a slot covering not-yet-durable data is destroyed |
 | Persistence boundaries per commit | 3 (entries+status, post-apply fence, status clear) | ~1 amortized (record persist; superblock persist per checkpoint) | Phase A: 2 (record, then data). Phase B (current): 1 in steady state — `prepareChangedRange(record)` + `persistChanges()` covers the new record and the previous transaction's applied data together (one `SFENCE` on PMEM, one `fdatasync` on file). Unmount/idle uses an explicit `persistAppliedData()` / `close()` |
 | Log-full handling | `append()` silently drops the entry when the log is full (correctness hole) | `reserveRecord` wraps around and triggers a lazy checkpoint; `commit()` returns `0` if a record still cannot fit. An invalid `append()` poisons the transaction so `commit()` fails | Per-transaction capacity is fixed at `slotBytes` (~half the chunk); an oversize commit fails cleanly with `0` before touching the slot. An invalid `append()` poisons the transaction so `commit()` fails |
-| API results | `commit()` → `void` (persist implied) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `MultiWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) |
+| API results | `commit()` → `void` (persist implied) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `MultiWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) | `commit()` → `u64`; nonzero is acknowledged, while a persistence-related `0` is unacknowledged and requires reopen/recovery rather than guaranteeing abort. `recover()` → `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) |
 | Clean-unmount replay | Log cleared after every commit — remount is replay-free | `close()` is empty; even a clean unmount replays the tail | `close()` persists deferred data and scrubs reclaimable slots — clean remounts recover `CLEAN` |
 | Wired into `PWRegion` | No (reference only) | No (reference only) | Yes |
-| Roadmap-related tests (2026-07-29 audit) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 19 in `DualTxnWalTest.v3`, plus 46 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
+| Roadmap-related tests (2026-07-30 audit) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 26 in `DualTxnWalTest.v3`, plus 46 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
 
 ## Why the multi-transaction design superseded the single-transaction one
 
@@ -61,11 +61,11 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
   durable plus the record being committed — exactly two slots.
 - **The duplicate-location failure hazard becomes a structural non-issue.**
   Parity slot selection means a retried commit reuses the same slot and seq, so
-  two copies of the same `txnSeq` cannot occupy different slots. This does not
-  by itself settle the crash-before-retry outcome: a failed phase-B boundary
-  currently leaves complete checksummed bytes in that slot. The 2026-07-29
-  audit therefore tracks an immediate reopen-after-failure regression and the
-  required durable invalidation/publication semantics separately.
+  two copies of the same `txnSeq` cannot occupy different slots. The chosen
+  contract nevertheless forbids same-mount retry after a persistence failure:
+  the result is unacknowledged and the mount requires reopen/recovery. A
+  complete checksummed record left in the slot may then be replayed safely
+  because its entries are idempotent after-images.
 - **Accepted trade-offs.** Per-transaction capacity is ~half the log chunk
   (ample for allocator-sized transactions; oversize commits fail cleanly); no
   burst absorption of many committed-but-unpersisted transactions; on PMEM,
@@ -86,21 +86,22 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 
 ## Verification status
 
-The implementation-specific x86-64 Linux suite contains 87 tests across four
-files, all passing as of the 2026-07-29 audit. Coverage is strongest for normal
-phase-B commit/recovery and the intended one-boundary induction property.
-However, the active WAL unit tests currently reopen the same in-memory byte
-array; their persistence methods do not maintain a separate durable image, so
-unpersisted writes cannot disappear during a simulated crash. File-backed
-tests exercise `fdatasync`/`msync` and graceful remount but not abrupt process,
-VM or power loss.
+The implementation-specific x86-64 Linux suite contains 94 tests across four
+files, all passing as of the 2026-07-30 audit. Coverage is strongest for normal
+phase-B commit/recovery, the intended one-boundary induction property, and the
+core shadow-backed crash matrix. The active WAL tests now restore live memory
+from a separate durable image before reopening, so unpersisted after-images
+genuinely disappear and recovery must reconstruct them from surviving records.
+File-backed tests exercise `fdatasync`/`msync` and graceful remount but not
+abrupt process, VM or power loss.
 
-The immediate next step is a test-only shadow durable-memory backend that
-separates live and durable bytes, restores the durable image on crash, and
-injects fail-before-copy, copy-then-fail and torn outcomes. This supplies the
-innermost layer of the correctness argument: WAL behavior under the
-`BackendRegion` persistence contract. Backend syscall/instruction integration,
-abrupt process/guest recovery, and physical-media testing then provide
-progressively stronger outer layers. The complete layer definitions are in
-`docs/persistent-backends.md`; the prioritised implementation list is in
-`docs/ROADMAP.md` Next Steps #3.
+The implemented shadow durable-memory backend supplies the innermost layer of
+the correctness argument: WAL behavior under the `BackendRegion` persistence
+contract. The chosen copy-then-fail contract treats the result as
+unacknowledged and makes the mount recovery-required; recovery may replay the
+complete record because redo after-images are idempotent. The implementation
+still needs to enforce that no further normal operations occur on the failed
+mount. Backend syscall/instruction integration, abrupt process/guest recovery,
+and physical-media testing provide progressively stronger outer layers. The
+complete layer definitions are in `docs/persistent-backends.md`; the
+prioritised implementation list is in `docs/ROADMAP.md` Next Steps #3.
