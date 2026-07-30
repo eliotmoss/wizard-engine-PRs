@@ -99,9 +99,11 @@ The implemented shadow durable-memory backend supplies the innermost layer of
 the correctness argument: WAL behavior under the `BackendRegion` persistence
 contract. The chosen copy-then-fail contract treats the result as
 unacknowledged and makes the mount recovery-required; recovery may replay the
-complete record because redo after-images are idempotent. The implementation
-still needs to enforce that no further normal operations occur on the failed
-mount. Backend syscall/instruction integration, abrupt process/guest recovery,
-and physical-media testing provide progressively stronger outer layers. The
-complete layer definitions are in `docs/persistent-backends.md`; the
-prioritised implementation list is in `docs/ROADMAP.md` Next Steps #3.
+complete record because redo after-images are idempotent. `DualTxnWal` now
+enforces that rule for commit-originated failures by latching the instance and
+requiring a newly constructed instance to recover. Other persistence-failure
+sources and higher-layer propagation remain open. Backend syscall/instruction
+integration, abrupt process/guest recovery, and physical-media testing provide
+progressively stronger outer layers. The complete layer definitions are in
+`docs/persistent-backends.md`; the prioritised implementation list is in
+`docs/ROADMAP.md` Next Steps #3.

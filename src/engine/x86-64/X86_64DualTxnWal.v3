@@ -54,8 +54,9 @@ enum DualWalRecovery {
         CLEAN,          // no valid records; nothing was replayed
         REPLAYED,       // valid records were replayed and their data persisted
         CORRUPT,        // WAL header invalid; log contents were ignored
-        PERSIST_FAILED  // replay was applied in memory, but persisting it failed;
-                        // the records stay valid and replay again on the next mount
+        PERSIST_FAILED  // this instance requires reopen, or replay was applied
+                        // in memory but could not be persisted; valid records
+                        // stay available for recovery by the next instance
 }
 
 class DualTxnWal {
@@ -72,6 +73,7 @@ class DualTxnWal {
         def var slotSeqs = Array<u64>.new(2);   // txnSeq of the valid record in each slot (0 = empty/unknown)
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
+        private var recoveryRequired = false;   // A commit persistence result was unacknowledged
         def var openOk = false;
 
         new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
@@ -107,6 +109,7 @@ class DualTxnWal {
         // fails: a transaction must never commit successfully while silently
         // missing one of its writes.
         def append(offset: u64, value: u64, width: u8) -> bool {
+                if (recoveryRequired) return false;
                 if (!validEntryFields(offset, width)) {
                         poisoned = true;
                         return false;
@@ -128,10 +131,18 @@ class DualTxnWal {
         // (applyUpdate) before committing the next transaction; the boundary
         // here only covers after-images that have already been applied.
         def commit() -> u64 {
+                if (recoveryRequired) return 0u64;
                 def txnSeq = appendCommittedRecord(pendingEntries);
                 pendingEntries.resize(0);
                 poisoned = false;
                 return txnSeq;
+        }
+
+        // A commit persistence failure is unacknowledged rather than aborted.
+        // This instance cannot establish which bytes survived; only a newly
+        // constructed instance may inspect the durable image and recover it.
+        def requiresRecovery() -> bool {
+                return recoveryRequired;
         }
 
         def clear() {
@@ -142,6 +153,7 @@ class DualTxnWal {
         // --- Data application ---
 
         def applyUpdate(offset: u64, value: u64, width: u8) {
+                if (recoveryRequired) return;
                 if (!validEntryFields(offset, width)) return;
                 writeAfterImage(offset, value, width);
                 backendRegion.prepareChangedRange(offset, u64.view(width));
@@ -156,6 +168,7 @@ class DualTxnWal {
         // unreclaimable until a later persist succeeds (see the overwrite
         // guard in appendCommittedRecord).
         def persistAppliedData() -> bool {
+                if (recoveryRequired) return false;
                 if (!backendRegion.persistChanges()) return false;
                 dataDurableSeq = lastCommittedSeq;
                 return true;
@@ -177,7 +190,11 @@ class DualTxnWal {
                 // without recover()), the persist cannot cover it and the commit
                 // must fail until recover() runs.
                 if (slotSeqs[slot] != 0u64 && slotSeqs[slot] > dataDurableSeq) {
-                        if (!persistAppliedData() || slotSeqs[slot] > dataDurableSeq) return 0u64;
+                        if (!persistAppliedData()) {
+                                recoveryRequired = true;
+                                return 0u64;
+                        }
+                        if (slotSeqs[slot] > dataDurableSeq) return 0u64;
                 }
 
                 def absStart = slotAddr(slot);
@@ -216,12 +233,17 @@ class DualTxnWal {
                 // after-images (their ranges were prepared by applyUpdate). On
                 // PMEM that is one SFENCE over all flushed lines; on a file
                 // backend one fdatasync subsumes both. The sequence is
-                // deliberately not burned on failure: parity maps the retry
-                // back onto this same slot, so a duplicate-seq record at
-                // another location is structurally impossible and no scrub or
-                // rollback is needed.
-                if (!backendRegion.prepareChangedRange(absStart - regionStart, recordLen64)) return 0u64;
-                if (!backendRegion.persistChanges()) return 0u64;
+                // deliberately not burned on failure. A failed persistence
+                // result is unacknowledged, so this instance is latched until
+                // the durable image is reopened and recovered.
+                if (!backendRegion.prepareChangedRange(absStart - regionStart, recordLen64)) {
+                        recoveryRequired = true;
+                        return 0u64;
+                }
+                if (!backendRegion.persistChanges()) {
+                        recoveryRequired = true;
+                        return 0u64;
+                }
 
                 dataDurableSeq = lastCommittedSeq;      // previous txn's data rode this boundary
                 slotSeqs[slot] = txnSeq;
@@ -255,6 +277,7 @@ class DualTxnWal {
         // already-durable record on a later mount is harmless -- no replay
         // floor is tracked.
         def recover() -> DualWalRecovery {
+                if (recoveryRequired) return DualWalRecovery.PERSIST_FAILED;
                 if (!openOk) return DualWalRecovery.CORRUPT;
                 slotSeqs[0] = validateSlot(0);
                 slotSeqs[1] = validateSlot(1);
@@ -303,6 +326,7 @@ class DualTxnWal {
         // likewise harmless (the surviving record replays idempotently).
         def close() {
                 clear();
+                if (recoveryRequired) return;
                 if (!openOk) return;
                 if (!persistAppliedData()) return;
                 for (slot < 2) {

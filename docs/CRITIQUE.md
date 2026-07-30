@@ -46,15 +46,15 @@ This original concern is resolved: `PWRegionHeader.logChunk` now stores the regi
 
 `RegionTransaction` can still accumulate more `(addr, value)` pairs than one `DualTxnWal` slot can hold. The active path now fails safely: `DualTxnWal.commit()` returns `0`, `RegionTransaction.commit()` returns `false`, allocator operations propagate failure, and the dirty cache is retained instead of acknowledging a partial record.
 
-The chosen conservative contract treats every public `false` as
-recovery-required until validation/capacity rejection can be distinguished
-from persistence failure. The caller must abandon the mount, thereby
-discarding this volatile cache, then reopen and recover. The implementation
-does not yet enforce that rule: a later operation on the same `PWRegion` can
-still observe and extend the dirty transaction. Existing tests cover the
-failure sentinel and show that a second independent `RegionTransaction` can
-still use the WAL; under the chosen contract that behavior is an enforcement
-gap, not a supported retry path.
+`DualTxnWal.requiresRecovery()` now distinguishes commit persistence failure
+from definite validation/capacity rejection. `RegionTransaction` and
+`PWRegion` do not yet propagate that distinction, however, so their public
+`false` must conservatively be treated as recovery-required. The caller must
+abandon the mount, thereby discarding this volatile cache, then reopen and
+recover. A later operation on the same `PWRegion` can currently still observe
+and extend the dirty transaction; existing tests that use a second independent
+`RegionTransaction` therefore describe an enforcement gap, not a supported
+retry path.
 
 ---
 
@@ -100,9 +100,11 @@ The test-only shadow durable-memory backend is now implemented with separate
 live and durable byte arrays. Its fail-before-copy, copy-then-fail and
 partial-copy modes reproduce this ambiguity deterministically, including an
 immediate crash before the same-slot retry masks the record. The open work is
-now to latch and propagate recovery-required state; the current code still
-allows same-mount retry after returning failure. Until validation/capacity
-rejection is distinguishable from persistence failure at the public API,
-higher layers must conservatively treat every `false` as recovery-required.
-The shadow supplies protocol-level evidence only; syscall, process/VM crash
-and physical-media evidence remain separate outer layers.
+now narrower: `DualTxnWal` latches commit-originated persistence failures and
+rejects same-instance retry, while `requiresRecovery()` distinguishes them
+from definite validation/capacity rejection. Failures originating directly in
+recovery/flush/close and propagation through `RegionTransaction`/`PWRegion`
+remain open; until that propagation exists, higher layers must conservatively
+treat every `false` as recovery-required. The shadow supplies protocol-level
+evidence only; syscall, process/VM crash and physical-media evidence remain
+separate outer layers.
