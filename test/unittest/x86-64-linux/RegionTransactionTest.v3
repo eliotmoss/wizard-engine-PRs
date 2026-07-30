@@ -1,7 +1,7 @@
 // RegionTransaction Tests
 // Tests cached transactional writes and the encapsulated redo-log commit flow.
 
-def T = UnitTests.registerT("wal_cache:", _, RegionTransactionTester.new, _);
+def T = UnitTests.registerT("region_transaction:", _, RegionTransactionTester.new, _);
 def X = [
 	T("basic_u8_flow", test_basic_u8_flow),
 	T("basic_u64_flow", test_basic_u64_flow),

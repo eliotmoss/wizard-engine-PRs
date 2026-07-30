@@ -115,7 +115,7 @@ PWRegion (block allocator)
 | `X86_64DualTxnWal.v3` | Active two-slot WAL (phase B) — two parity-selected record slots, per-record checksum, poisoning `append()`, `DualWalRecovery` result, piggybacked persistence boundary (one per commit steady-state); drives `PWRegion`/`RegionTransaction` |
 | `X86_64MultiTxnWal.v3` | Multi-transaction ring WAL (dual superblock, epoch fencing, checkpoint policy) — superseded, **not wired in**; kept as a comparison implementation |
 | `test/unittest/x86-64-linux/TxnPWRegionTest.v3` | PWRegion + backend region unit tests (incl. remount/recovery) |
-| `test/unittest/x86-64-linux/WALCacheTest.v3` | `RegionTransaction` write-behind cache unit tests |
+| `test/unittest/x86-64-linux/RegionTransactionTest.v3` | `RegionTransaction` write-behind cache unit tests |
 | `test/unittest/x86-64-linux/DualTxnWalTest.v3` | `DualTxnWal` unit tests (commit/recovery/guard/failure paths) |
 | `test/unittest/x86-64-linux/MultiTxnWalTest.v3` | `MultiTxnWal` unit tests (comparison implementation) |
 

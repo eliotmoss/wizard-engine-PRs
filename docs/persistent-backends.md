@@ -398,7 +398,7 @@ Audited 2026-07-29: the implementation-specific x86-64 Linux suite contains 87 r
 | Test file | Tests | What it covers |
 |---|---:|---|
 | `DualTxnWalTest.v3` | 19 | active two-slot WAL, phase-B boundary count, recovery, overwrite guard, failure retry, flush and close |
-| `WALCacheTest.v3` | 13 | transaction cache and active `DualTxnWal` integration, commit/flush propagation and oversize failure |
+| `RegionTransactionTest.v3` | 13 | transaction cache and active `DualTxnWal` integration, commit/flush propagation and oversize failure |
 | `TxnPWRegionTest.v3` | 33 | allocator, overflow propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
