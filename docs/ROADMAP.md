@@ -88,6 +88,17 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - `SingleTxnWal` has **no dedicated tests**; it remains compiled as a reference implementation only
 - The PMEM-labelled test is structural only: `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping and bypasses `PmemMmapBackend.create()`, `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`
 
+**Evidence limitation:** the active-WAL unit tests model a "crash" by constructing
+a new `DualTxnWal` over the same `Array<byte>`, while their persistence methods
+are no-ops or call counters. They verify the recovery state machine, validation,
+ordering and boundary API usage, but unpersisted bytes never disappear. The
+file-backed tests exercise real `fdatasync`/`msync` paths and graceful remount,
+but a remount in the same kernel can still observe page-cache contents and does
+not establish abrupt-crash or power-loss durability. A test-only shadow
+durability model and progressively stronger integration tests are now the
+immediate validation work; see Next Steps #3 and
+`docs/persistent-backends.md`.
+
 ---
 
 ## In Progress
@@ -97,6 +108,7 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Multi-transaction WAL core paths are test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is implemented (hybrid count-OR-occupancy, per-backend thresholds). Commit-failure propagation is implemented (see Completed).
 - A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus four API-hardening items. All are fixed and regression-tested; see Next Steps #2 follow-ups.
 - The 2026-07-29 test audit found that the happy paths and intended phase-B boundary count are strong, but active-WAL failure/crash semantics, full allocator-transaction recovery, Immix/platform wrappers, and several backend/validation paths remain untested. These are tracked in Next Steps #3.
+- **Validation direction (2026-07-30):** implement a test-only shadow durable-memory backend before expanding hardware-specific testing. Separate live bytes from a durable shadow, make persistence operations copy between them, and restore live bytes from the shadow on simulated crash. This supplies byte-level evidence for the WAL protocol under the `BackendRegion` contract; syscall integration, abrupt process/VM tests, and physical-media testing supply the progressively stronger outer layers of the correctness argument.
 - **PMEM emulation assessment (2026-07-29):** use a QEMU file-backed ACPI NVDIMM as the primary development environment and native x86-64 Linux `memmap=<size>!<start>` as an alternative. In both cases, expose `/dev/pmem0`, create an fsdax filesystem, and give `PmemMmapBackend` a regular file on that mount. Validation is staged as DAX/remount integration, guest crash/restart testing, then real-hardware durability; see `docs/pmem-emulation.md`.
 
 ---
@@ -165,12 +177,16 @@ Design notes (no action yet, keep in mind):
 
 Priority 0 — active WAL failure/crash semantics:
 
-- [ ] Add `DualTxnWal` regressions that reopen **immediately after** `prepareChangedRange(record)` or `persistChanges()` fails, before any retry. A failed `commit()` must not later replay the unacknowledged record. The implementation currently leaves a complete, checksummed record in the slot and only clears the transient `slotSeqs[slot]`, so this test is expected to expose whether durable invalidation/publication is missing.
-- [ ] Complete the `DualTxnWal` fault-injection matrix: `DualWalRecovery.PERSIST_FAILED` + retry, failed `applyUpdate()` range preparation, failed explicit `flush()`, failed final-data persist in `close()`, failed slot-scrub persist, and fresh-header persistence failure.
+- [ ] Add a test-only `ShadowDurableRegion` for `DualTxnWalTest.v3`. It must maintain separate **live** and **durable** byte arrays: direct WAL/data stores change only live bytes; `persistRange()` copies its range to the durable shadow; `prepareChangedRange()` queues ranges for `persistChanges()`; and `crash()` restores live bytes from the durable shadow and clears transient state. First add backend self-tests proving that unpersisted bytes disappear and persisted bytes survive.
+- [ ] Re-run the phase-B crash matrix against the shadow rather than the current single-array no-op backend: commit boundary→crash→recover, apply→crash→recover, N+1 commit→crash (txn N data already durable, txn N+1 recoverable), replay persistence, explicit flush, and close. Assert durable bytes and recovered allocator-visible state, not only `dataDurableSeq` or persistence-call counts.
+- [ ] Give the shadow persistence operations deterministic outcomes: fail before copying, copy then report failure (indeterminate outcome), and partial/torn copy. Use them to complete the `DualTxnWal` fault-injection matrix: `DualWalRecovery.PERSIST_FAILED` + retry, failed `applyUpdate()` range preparation, failed explicit `flush()`, failed final-data persist in `close()`, failed slot-scrub persist, and fresh-header persistence failure.
+- [ ] Define the commit result contract for persistence errors before fixing the implementation. A failed `fdatasync`/`msync` or PMEM operation does not necessarily prove that no bytes reached durable media. Distinguish a definitely aborted attempt from an **indeterminate** attempt, then choose and document one of: successful durable invalidation before returning an ordinary failure, retry/fatal handling until the outcome is resolved, or a result type that exposes `COMMITTED`/`ABORTED`/`INDETERMINATE` instead of collapsing all outcomes into `0`/`false`.
+- [ ] Add `DualTxnWal` regressions that crash/reopen **immediately after** `prepareChangedRange(record)` or `persistChanges()` reports failure, before any retry. The implementation currently leaves a complete, checksummed record in the slot and only clears the transient `slotSeqs[slot]`; a copy-then-fail shadow outcome should reveal whether recovery can publish an attempt whose caller received failure. The assertion must follow the newly defined aborted/indeterminate contract.
 - [ ] Define and test how a failed `prepareChangedRange()` is propagated. `DualTxnWal.applyUpdate()` currently ignores its boolean result, yet a later boundary can advance `dataDurableSeq`; the durability claim must not advance unless every changed range was prepared successfully.
 
 Priority 1 — allocator and backend integration:
 
+- [ ] Add abrupt-process tests for the file backend. Run the writer in a child process, terminate with `_exit`/`SIGKILL` at WAL protocol boundaries without `deallocate()`/`close()`, then reopen and verify in a separate process. Trace or intercept `fdatasync`/`msync` to check ordering and inject errors. This establishes independence from graceful shutdown and exercises the real syscall translation, but must be described as process-crash consistency rather than host power-loss proof.
 - [ ] Recover complete multi-entry allocator transactions, not only a manually injected one-byte `BlockEntry.used` update. Cover allocation split/exact-fit and free left/right coalescing at the commit→crash→recover and apply→crash→recover windows, then validate all memory-order and free-list links.
 - [ ] Cover `freeChunk()` commit-failure propagation, retry/abort behavior after a failed allocation leaves the shared transaction dirty, and invalid inputs (`allocChunk(0)`, oversized requests, null/double/foreign frees).
 - [ ] Add structural/property tests over mixed allocate/free/remount sequences so allocator list invariants are checked directly instead of inferred only from whether a later allocation succeeds.
@@ -219,6 +235,6 @@ provides the same development interface with more invasive host setup.
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 5 | `TxnBackend.v3:132` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
-| 7 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B commit leaves a complete checksummed record in the slot. Reopen-before-retry is untested and may replay an unacknowledged transaction; define the failure outcome and add durable invalidation/publication as required. |
+| 7 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B commit leaves a complete checksummed record in the slot. Reopen-before-retry is untested and may replay an attempt whose caller received failure; define definite-abort versus indeterminate semantics with the shadow durability model, then add durable invalidation/publication or a richer result as required. |
 | 8 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores `BackendRegion.prepareChangedRange()` failure, so later code can claim data durability without knowing that every changed range was prepared. |
 | 9 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; no fsdax/emulated-device integration test exists yet. |

@@ -175,6 +175,33 @@ host boot configuration.
 
 ## Validation stages
 
+The PMEM stages are the outer parts of the project's layered correctness
+argument. They do not replace deterministic WAL protocol testing:
+
+```text
+shadow durable-memory model
+  → backend syscall/instruction integration
+    → abrupt process/guest crash recovery
+      → physical-media power-loss durability
+```
+
+The complete layer definitions and their evidence boundaries are documented in
+`docs/persistent-backends.md`.
+
+### Stage 0 — deterministic protocol model
+
+Before depending on DAX or QEMU, implement a test-only shadow durable-memory
+backend for the active `DualTxnWal`. It keeps separate live and durable byte
+arrays, makes `persistRange`/`persistChanges` copy into the durable shadow, and
+restores live bytes from that shadow on simulated crash. It must inject
+fail-before-copy, copy-then-fail and partial-copy outcomes.
+
+Stage 0 answers whether the WAL is correct under the abstract `BackendRegion`
+persistence contract. It is fast, deterministic and suitable for the default
+unit suite. It cannot establish that `MAP_SYNC`, cache-line write-back
+instructions, Linux, QEMU or physical media implement that contract; those are
+the purposes of Stages 1–3.
+
 ### Stage 1 — DAX and recovery integration
 
 The first stage should prove that the intended Linux interface and the
@@ -211,7 +238,10 @@ include:
 These experiments strengthen evidence for software crash consistency. They
 do not prove survival of host power loss: QEMU's fake NVDIMM is backed by
 ordinary host storage, and host caching or emulator behavior can differ from
-physical PMEM.
+physical PMEM. The analogous file-backend experiment should use a child writer
+terminated with `_exit`/`SIGKILL` at the same WAL boundaries and a separate
+verifier process. Neither experiment substitutes for the deterministic
+fail-before/fail-after/torn outcomes in Stage 0.
 
 ### Stage 3 — real PMEM durability
 

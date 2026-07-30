@@ -88,7 +88,19 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 
 The implementation-specific x86-64 Linux suite contains 87 tests across four
 files, all passing as of the 2026-07-29 audit. Coverage is strongest for normal
-phase-B commit/recovery and the intended one-boundary induction property. The
-highest-risk missing case is an immediate crash/reopen after the active WAL's
-record boundary returns failure, before a same-slot retry. The complete
-prioritised gap list is maintained in `docs/ROADMAP.md` Next Steps #3.
+phase-B commit/recovery and the intended one-boundary induction property.
+However, the active WAL unit tests currently reopen the same in-memory byte
+array; their persistence methods do not maintain a separate durable image, so
+unpersisted writes cannot disappear during a simulated crash. File-backed
+tests exercise `fdatasync`/`msync` and graceful remount but not abrupt process,
+VM or power loss.
+
+The immediate next step is a test-only shadow durable-memory backend that
+separates live and durable bytes, restores the durable image on crash, and
+injects fail-before-copy, copy-then-fail and torn outcomes. This supplies the
+innermost layer of the correctness argument: WAL behavior under the
+`BackendRegion` persistence contract. Backend syscall/instruction integration,
+abrupt process/guest recovery, and physical-media testing then provide
+progressively stronger outer layers. The complete layer definitions are in
+`docs/persistent-backends.md`; the prioritised implementation list is in
+`docs/ROADMAP.md` Next Steps #3.

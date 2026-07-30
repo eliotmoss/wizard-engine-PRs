@@ -27,6 +27,13 @@ The stack now routes through `DualTxnWal`, a two-slot redo log chosen because at
 
 Similarly, `persistChanges()` issues a store fence for PMEM but an `fdatasync` for file-backed storage. The WAL commit protocol calls the same sequence in both cases, but the ordering guarantees between log commit and data application differ between backends in ways that are invisible to the WAL layer. This needs to be explicitly specified and verified, not just structurally similar code.
 
+The verification plan now treats this as a layered argument rather than asking
+one test to prove everything: a shadow durable-memory model checks the WAL
+protocol under the abstract `BackendRegion` contract; backend tests check the
+translation to syscalls or cache instructions; abrupt process/VM tests check
+software crash recovery; and only controlled real-media interruption can
+support physical-durability claims. See `docs/persistent-backends.md`.
+
 ---
 
 ## 4. Log-chunk location is explicit, but format validation remains narrow
@@ -65,4 +72,17 @@ The allocator is self-contained but has no connection to WASM execution. There i
 
 `DualTxnWal.appendCommittedRecord()` builds the complete record and checksum before calling `prepareChangedRange(record)` and `persistChanges()`. If either boundary operation fails, `commit()` returns `0` and does not advance the in-memory sequence state, but the record magic and checksum remain in the mapped slot. The existing regression retries into the same parity slot before reopening, which proves duplicate sequences cannot occupy different slots; it does not prove that a crash immediately after the failed call cannot replay the unacknowledged attempt.
 
-The required failure contract needs to be explicit. If `0` means the transaction was not acknowledged, recovery must not make that attempt visible later; that may require a durable invalidation/publication mechanism even though parity already solves the duplicate-location problem. This is the highest-priority test-audit follow-up in `docs/ROADMAP.md`.
+The required failure contract needs to be explicit. A persistence operation can
+copy all or part of the record and still report failure, so `0` currently
+conflates a definitely aborted transaction with an indeterminate result. If
+`0` is retained as a definite abort, recovery must not make the attempt visible
+later and the implementation needs a successfully persisted invalidation or
+equivalent publication rule. Otherwise the API must expose the indeterminate
+outcome and document that recovery may resolve it as committed.
+
+The immediate test-audit follow-up is a test-only shadow durable-memory backend
+with separate live and durable byte arrays. Its fail-before-copy,
+copy-then-fail and partial-copy modes can reproduce this ambiguity
+deterministically, including an immediate crash before the current same-slot
+retry masks the record. This supplies protocol-level evidence only; syscall,
+process/VM crash and physical-media evidence remain separate outer layers.

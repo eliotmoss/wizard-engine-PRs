@@ -185,7 +185,15 @@ recover() -> DualWalRecovery
 
 ### Failure-semantics audit note
 
-The 2026-07-29 test audit found an unverified boundary case: after phase-B `prepareChangedRange(record)` or `persistChanges()` fails, the current code returns `0` but leaves a complete checksummed record in the slot. Existing tests retry before reopening; they do not reopen immediately after the failure. The required outcome—an unacknowledged failed commit must not later replay—and the necessary durable invalidation/publication protocol are tracked in `docs/ROADMAP.md` Next Steps #3.
+The 2026-07-29 test audit found an unverified boundary case: after phase-B
+`prepareChangedRange(record)` or `persistChanges()` reports failure, the
+current code returns `0` but leaves a complete checksummed record in the slot.
+Existing tests retry before reopening; they do not reopen immediately after
+the failure. Because a failed persistence call can be indeterminate—some bytes
+may already be durable—the project must define whether `0` means definitely
+aborted or outcome unknown, then make recovery and any durable
+invalidation/publication protocol match that contract. This is tracked in
+`docs/ROADMAP.md` Next Steps #3.
 
 ---
 
@@ -402,7 +410,22 @@ Audited 2026-07-29: the implementation-specific x86-64 Linux suite contains 87 r
 | `TxnPWRegionTest.v3` | 33 | allocator, overflow propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
-`SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have no dedicated tests. The highest-priority missing regression is reopen/crash immediately after an active phase-B commit boundary fails, before retry. Full gaps and priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
+`SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have
+no dedicated tests. The current `DualTxnWalTest` crash cases construct a new
+WAL over the same `Array<byte>` and use persistence methods that return success
+without maintaining a separate durable state. These tests are useful evidence
+for record validation, replay order, overwrite protection and API boundary
+counts, but unpersisted live writes cannot disappear during their simulated
+crash. They therefore do not by themselves validate the byte-level persistence
+claims of the protocol.
+
+The file-backed tests exercise the actual `fdatasync` and page-aligned
+`msync(MS_SYNC)` code paths, including basic failure propagation, committed-WAL
+recovery and graceful close/remount. They do not terminate the process at a WAL
+boundary, clear the kernel page cache, reset a VM, or interrupt power. A same-
+kernel remount can observe cached data that has not been shown to survive a
+system crash. Full gaps and priorities are maintained in `docs/ROADMAP.md`
+Next Steps #3.
 
 The PMEM-labelled unit coverage is structural only:
 `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping
@@ -411,6 +434,75 @@ does not exercise `MAP_SYNC`, filesystem DAX, an emulated `/dev/pmem0`, or a
 real PMEM device. The three-stage integration plan—DAX/remount, guest
 crash/restart, then real-hardware durability—is documented in
 `docs/pmem-emulation.md`.
+
+### Correctness argument by layers
+
+No single test backend or experiment proves end-to-end durability. The project
+uses a layered argument so that each class of evidence has a precise claim:
+
+| Layer | Claim | Required evidence |
+|---|---|---|
+| 1. WAL protocol | `DualTxnWal` and `RegionTransaction` preserve acknowledged updates and recover correctly at every abstract persistence boundary. | Deterministic shadow durable-memory tests that separate live and durable bytes, discard unpersisted bytes on crash, and inject success, failure, indeterminate and torn outcomes. |
+| 2. Backend translation | A `BackendRegion` implementation maps the abstract operations to the intended mechanism and propagates its result: `fdatasync`/`msync` for files, cache-line write-back/fence for PMEM. | Backend unit/integration tests, syscall or instruction tracing where practical, bounds/error tests, and explicit failure injection. |
+| 3. Software crash consistency | The complete allocator and WAL recover after the running process or VM disappears without a clean close. | Child-process `_exit`/`SIGKILL` tests for the file backend; DAX integration plus guest reset/QEMU restart for emulated PMEM; structural allocator-invariant checks after reopen. |
+| 4. Physical durability | Acknowledged state survives loss of the host and volatile hardware caches on the target medium. | Implemented `CLWB`/`CLFLUSHOPT`/`CLFLUSH` + `SFENCE` path and controlled power-interruption tests on real PMEM. |
+
+Evidence at an outer layer does not replace an inner layer. For example, a
+successful filesystem remount is not an exhaustive WAL fault model, while a
+shadow backend cannot establish that Linux or a storage device honoured a
+syscall. Together the layers support a scoped conclusion: protocol correctness
+under the abstraction, correct backend translation, software crash consistency,
+and finally physical durability.
+
+### Shadow durable-memory test backend
+
+The immediate test priority is a test-only `ShadowDurableRegion` implementing
+the existing `BackendRegion` interface. It is not a fourth production storage
+backend. It is an executable model of the persistence contract:
+
+```text
+ordinary Pointer stores                  persistence operation
+          │                                       │
+          v                                       v
+    live byte array  -------------------->  durable shadow
+          ^                                       │
+          └----------- crash restore -------------┘
+```
+
+- Direct WAL and after-image stores modify only the live array.
+- `persistRange(offset, size)` copies exactly that live range to the durable
+  shadow.
+- `prepareChangedRange(offset, size)` records a pending range;
+  `persistChanges()` copies every prepared range to the shadow and clears the
+  pending set.
+- `crash()` discards volatile state by restoring the live array from the shadow
+  and clearing pending ranges. A newly constructed `DualTxnWal` then mounts
+  those surviving bytes.
+
+The model must support at least three injected persistence outcomes:
+
+1. **fail before copy** — no requested bytes become durable;
+2. **copy then fail** — bytes become durable but the caller receives an error,
+   modelling an indeterminate syscall outcome; and
+3. **partial copy then fail** — only a prefix or selected ranges survive,
+   modelling a torn record/data update.
+
+This distinction is important for the active open issue. A failed phase-B
+boundary currently returns `0` while a complete checksummed record remains in
+the live slot. If the persistence operation made those bytes durable before
+reporting failure, recovery can validate and replay an attempt that the caller
+did not see succeed. The tests must first force this outcome, then the project
+must define whether the public result is definitely aborted or indeterminate.
+Possible designs include durable invalidation before returning an ordinary
+failure, retry/fatal handling until the outcome is resolved, or a result enum
+such as `COMMITTED`/`ABORTED`/`INDETERMINATE`.
+
+Start with direct `DualTxnWal` tests. Once that protocol matrix passes, a
+test-only `ShadowTxnBackend` factory can expose the same live/durable pair to
+`PWRegion` so complete allocation split/exact-fit and free/coalescing
+transactions are checked after simulated crashes. The shadow model establishes
+Layer 1; it complements rather than replaces the file/DAX and hardware work in
+Layers 2–4.
 
 Run with:
 
@@ -425,11 +517,12 @@ test/unit.sh
 | # | Location | Description |
 |---|---|---|
 | 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
-| 2 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B record boundary leaves complete checksummed slot bytes; reopen-before-retry semantics need a regression and may require durable invalidation/publication. |
-| 3 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores failure from `prepareChangedRange()`, weakening the `dataDurableSeq` claim. |
-| 4 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
-| 5 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
-| 6 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
-| 7 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
-| 8 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
-| 9 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |
+| 2 | `DualTxnWalTest.v3` | Add `ShadowDurableRegion` and move the active crash/fault matrix onto separate live/durable bytes before treating those tests as protocol-durability evidence. |
+| 3 | `X86_64DualTxnWal.v3:223-224` | A failed phase-B record boundary leaves complete checksummed slot bytes; reopen-before-retry semantics and the aborted-versus-indeterminate result contract need a shadow-backed regression and may require durable invalidation/publication. |
+| 4 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores failure from `prepareChangedRange()`, weakening the `dataDurableSeq` claim. |
+| 5 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
+| 6 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
+| 7 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
+| 8 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
+| 9 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
+| 10 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |
