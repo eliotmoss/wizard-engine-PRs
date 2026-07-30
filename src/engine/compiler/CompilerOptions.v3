@@ -3,7 +3,7 @@
 
 // Parses command-line options that configure an engine.
 component CompilerOptions {
-	def JIT_FILTER = Option.new<DeclFilter>("jit-filter", null, DeclFilters.parseString);
+	def JIT_FILTER = Option<DeclFilter>.new("jit-filter", null, DeclFilters.parseString);
 	var group: OptionGroup;
 
 	new() {

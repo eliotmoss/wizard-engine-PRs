@@ -52,7 +52,7 @@ class OptionGroup(name: string, o: BasicOptions) {
 	var list: List<OptionGroupEntry>;
 
 	def newDeclFilterOption(name: string, help: string) -> Option<DeclFilter> {
-		var r = Option.new<DeclFilter>(name, null, DeclFilters.parseString);
+		var r = Option<DeclFilter>.new(name, null, DeclFilters.parseString);
 		return add(o.add(r), "=<function patterns>", help);
 	}
 	def newIntOption(name: string, defval: int, help: string) -> Option<int> {
