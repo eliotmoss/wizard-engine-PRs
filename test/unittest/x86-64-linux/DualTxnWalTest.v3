@@ -29,6 +29,7 @@ def DWTX = [
 	DWT("flush_failure_requires_reopen", test_dual_flush_failure_requires_reopen),
 	DWT("close_scrubs_for_clean_remount", test_dual_close_scrubs_for_clean_remount),
 	DWT("close_data_persist_failure_requires_reopen", test_dual_close_data_persist_failure_requires_reopen),
+	DWT("close_scrub_persist_failure_requires_reopen", test_dual_close_scrub_persist_failure_requires_reopen),
 	DWT("close_keeps_unrecovered_records", test_dual_close_keeps_unrecovered_records),
 	DWT("shadow_crash_restores_durable_bytes", test_shadow_crash_restores_durable_bytes),
 	DWT("shadow_copy_then_fail_is_durable", test_shadow_copy_then_fail_is_durable),
@@ -659,6 +660,37 @@ def test_dual_close_data_persist_failure_requires_reopen(tc: DualTxnWalTester) {
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0x77u8, tc.data[200]);
+}
+
+// If persisting a slot scrub fails, the data is already durable but the
+// record's durable state is uncertain. close() must latch recovery-required,
+// retain conservative slot metadata, and stop before scrubbing another slot.
+def test_dual_close_scrub_persist_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x88u64, 1u8));
+	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x99u64, 1u8));
+
+	def persistRangeCount = tc.shadowRegion.persistRangeCount;
+	tc.shadowRegion.nextPersistRangeOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.wal.close();
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(2u64, tc.wal.dataDurableSeq);
+	tc.t.assert_eq(2u64, tc.wal.slotSeqs[0]);
+	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
+	tc.t.assert_eq(persistRangeCount + 1, tc.shadowRegion.persistRangeCount);
+
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	tc.wal.close();
+	tc.t.assert_eq(persistRangeCount + 1, tc.shadowRegion.persistRangeCount);
+	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x88u8, tc.data[200]);
+	tc.t.assert_eq(0x99u8, tc.data[201]);
+	tc.t.assert_eq(2u64, reopened.dataDurableSeq);
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0x88u8, tc.data[200]);
+	tc.t.assert_eq(0x99u8, tc.data[201]);
 }
 
 // close() must never scrub a slot whose data is not known durable: records

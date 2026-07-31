@@ -326,8 +326,10 @@ class DualTxnWal {
         // will now never come), then scrub the now-reclaimable slots so a
         // clean remount is replay-free. Slots whose data is not known durable
         // -- an unrecovered mount, or a failed final persist -- are left
-        // intact so the next mount replays them; a failed scrub persist is
-        // likewise harmless (the surviving record replays idempotently).
+        // intact so the next mount replays them. A failed scrub persist is
+        // harmless to data correctness (the surviving record replays
+        // idempotently), but its durable outcome is uncertain, so this
+        // instance must latch recovery-required and stop.
         def close() {
                 clear();
                 if (recoveryRequired) return;
@@ -336,7 +338,10 @@ class DualTxnWal {
                 for (slot < 2) {
                         if (slotSeqs[slot] == 0u64 || slotSeqs[slot] > dataDurableSeq) continue;
                         zeroBytes(slotAddr(slot), u64.!(TxnRecordHeader.size));
-                        backendRegion.persistRange(slotAddr(slot) - regionStart, u64.!(TxnRecordHeader.size));
+                        if (!backendRegion.persistRange(slotAddr(slot) - regionStart, u64.!(TxnRecordHeader.size))) {
+                                recoveryRequired = true;
+                                return;
+                        }
                         slotSeqs[slot] = 0u64;
                 }
         }

@@ -100,11 +100,10 @@ the correctness argument: WAL behavior under the `BackendRegion` persistence
 contract. The chosen copy-then-fail contract treats the result as
 unacknowledged and makes the mount recovery-required; recovery may replay the
 complete record because redo after-images are idempotent. `DualTxnWal` now
-enforces that rule for commit-, recovery-, explicit-flush-, and
-final-data-close-originated failures by latching the instance and requiring a
-newly constructed instance to recover. Slot-scrub failure enforcement and
-higher-layer propagation remain open. Backend syscall/instruction
-integration, abrupt process/guest recovery, and physical-media testing provide
-progressively stronger outer layers. The complete layer definitions are in
-`docs/persistent-backends.md`; the prioritised implementation list is in
-`docs/ROADMAP.md` Next Steps #3.
+enforces that rule for commit-, recovery-, explicit-flush-, final-data-close-,
+and slot-scrub-originated failures by latching the instance and requiring a
+newly constructed instance to recover. Higher-layer propagation remains open.
+Backend syscall/instruction integration, abrupt process/guest recovery, and
+physical-media testing provide progressively stronger outer layers. The
+complete layer definitions are in `docs/persistent-backends.md`; the
+prioritised implementation list is in `docs/ROADMAP.md` Next Steps #3.
