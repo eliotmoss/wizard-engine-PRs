@@ -73,7 +73,7 @@ class DualTxnWal {
         def var slotSeqs = Array<u64>.new(2);   // txnSeq of the valid record in each slot (0 = empty/unknown)
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
-        private var recoveryRequired = false;   // A commit persistence result was unacknowledged
+        private var recoveryRequired = false;   // A persistence result left durable state uncertain
         def var openOk = false;
 
         new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
@@ -138,7 +138,7 @@ class DualTxnWal {
                 return txnSeq;
         }
 
-        // A commit persistence failure is unacknowledged rather than aborted.
+        // A persistence failure is indeterminate rather than a definite abort.
         // This instance cannot establish which bytes survived; only a newly
         // constructed instance may inspect the durable image and recover it.
         def requiresRecovery() -> bool {
@@ -297,7 +297,10 @@ class DualTxnWal {
                 // The replay is published only once the redone data is durable.
                 // On failure the slots stay valid and the overwrite guard keeps
                 // them from being destroyed, so a later mount replays them again.
-                if (!backendRegion.persistChanges()) return DualWalRecovery.PERSIST_FAILED;
+                if (!backendRegion.persistChanges()) {
+                        recoveryRequired = true;
+                        return DualWalRecovery.PERSIST_FAILED;
+                }
                 dataDurableSeq = maxSeq;
                 return DualWalRecovery.REPLAYED;
         }

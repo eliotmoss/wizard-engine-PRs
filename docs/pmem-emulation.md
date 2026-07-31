@@ -194,10 +194,10 @@ The direct active-`DualTxnWal` tests now use a test-only shadow durable-memory
 backend. It keeps separate live and durable byte arrays, makes
 `persistRange`/`persistChanges` copy into the durable shadow, restores live
 bytes from that shadow on simulated crash, and injects fail-before-copy,
-copy-then-fail and partial-copy outcomes. The `DualTxnWal` commit path now
-latches an unacknowledged persistence failure, rejects further same-instance
-work, and requires a fresh instance to recover. Remaining Stage-0 work is
-enforcement for recovery/flush/close-originated failures, higher-layer
+copy-then-fail and partial-copy outcomes. The `DualTxnWal` commit and recovery
+paths now latch persistence failures, reject further same-instance work, and
+require a fresh instance to recover. Remaining Stage-0 work is enforcement for
+flush/close-originated failures, higher-layer
 propagation, the rest of the fault matrix, and a `ShadowTxnBackend` factory for
 complete allocator transactions.
 

@@ -100,10 +100,10 @@ The test-only shadow durable-memory backend is now implemented with separate
 live and durable byte arrays. Its fail-before-copy, copy-then-fail and
 partial-copy modes reproduce this ambiguity deterministically, including an
 immediate crash before the same-slot retry masks the record. The open work is
-now narrower: `DualTxnWal` latches commit-originated persistence failures and
-rejects same-instance retry, while `requiresRecovery()` distinguishes them
-from definite validation/capacity rejection. Failures originating directly in
-recovery/flush/close and propagation through `RegionTransaction`/`PWRegion`
+now narrower: `DualTxnWal` latches commit- and recovery-originated persistence
+failures and rejects same-instance retry, while `requiresRecovery()`
+distinguishes them from definite validation/capacity rejection. Failures
+originating directly in flush/close and propagation through `RegionTransaction`/`PWRegion`
 remain open; until that propagation exists, higher layers must conservatively
 treat every `false` as recovery-required. The shadow supplies protocol-level
 evidence only; syscall, process/VM crash and physical-media evidence remain
