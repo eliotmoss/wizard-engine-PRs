@@ -9,6 +9,8 @@
 def DWT = UnitTests.registerT("dual_wal:", _, DualTxnWalTester.new, _);
 def DWTX = [
 	DWT("fresh_header", test_dual_fresh_header),
+	DWT("fresh_header_fail_before_copy_requires_reformat", test_dual_fresh_header_fail_before_copy_requires_reformat),
+	DWT("fresh_header_copy_then_fail_reopens_clean", test_dual_fresh_header_copy_then_fail_reopens_clean),
 	DWT("empty_commit_returns_seq", test_dual_empty_commit_returns_seq),
 	DWT("commit_alternates_slots", test_dual_commit_alternates_slots),
 	DWT("commit_crash_recover", test_dual_commit_crash_recover),
@@ -35,6 +37,8 @@ def DWTX = [
 	DWT("shadow_copy_then_fail_is_durable", test_shadow_copy_then_fail_is_durable),
 	DWT("shadow_partial_copy_then_fail", test_shadow_partial_copy_then_fail),
 	DWT("failed_prepare_then_crash_is_clean", test_dual_failed_prepare_then_crash_is_clean),
+	DWT("apply_prepare_failure_requires_reopen", test_dual_apply_prepare_failure_requires_reopen),
+	DWT("recovery_prepare_failure_requires_reopen", test_dual_recovery_prepare_failure_requires_reopen),
 	DWT("failed_persist_before_copy_then_crash_is_clean", test_dual_failed_persist_before_copy_then_crash_is_clean),
 	DWT("indeterminate_persist_record_replays", test_dual_indeterminate_persist_record_replays),
 	DWT("partial_record_persist_then_crash_is_rejected", test_dual_partial_record_persist_then_crash_is_rejected),
@@ -261,6 +265,67 @@ def test_dual_fresh_header(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0u64, tc.wal.slotSeqs[1]);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(0));
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(1));
+}
+
+// A definite failure before the fresh header reaches durable storage leaves no
+// mountable WAL. Initialization latches immediately, performs no second
+// persist, and requires another fresh format rather than same-instance retry.
+def test_dual_fresh_header_fail_before_copy_requires_reformat(tc: DualTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def log = base + 1024u64;
+	def region = ShadowDurableRegion.new(data[0 ..+ data.length]);
+	region.nextPersistRangeOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+
+	def failed = DualTxnWal.new(base, log, 1024u64, region, true);
+	tc.t.assertz(false, failed.openOk);
+	tc.t.assertz(true, failed.requiresRecovery());
+	tc.t.assert_eq(1, region.persistRangeCount);
+
+	def prepareCount = region.prepareChangedRangeCount;
+	def persistChangesCount = region.persistChangesCount;
+	tc.t.assertz(false, failed.append(200u64, 0x55u64, 1u8));
+	tc.t.assert_eq(0u64, failed.commit());
+	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	failed.close();
+	tc.t.assert_eq(prepareCount, region.prepareChangedRangeCount);
+	tc.t.assert_eq(1, region.persistRangeCount);
+	tc.t.assert_eq(persistChangesCount, region.persistChangesCount);
+
+	region.crash();
+	def corrupt = DualTxnWal.new(base, log, 1024u64, region, false);
+	tc.t.assertz(false, corrupt.openOk);
+	tc.t.assertz(false, corrupt.requiresRecovery());
+	tc.t.assertz(true, corrupt.recover() == DualWalRecovery.CORRUPT);
+
+	def reformatted = DualTxnWal.new(base, log, 1024u64, region, true);
+	tc.t.assertz(true, reformatted.openOk);
+	tc.t.assertz(false, reformatted.requiresRecovery());
+	tc.t.assertz(true, reformatted.recover() == DualWalRecovery.CLEAN);
+}
+
+// A fresh-header persist can copy every byte and still report failure. The
+// creating instance must latch, but after a crash a new instance may validate
+// the complete durable header and open the empty WAL normally.
+def test_dual_fresh_header_copy_then_fail_reopens_clean(tc: DualTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def log = base + 1024u64;
+	def region = ShadowDurableRegion.new(data[0 ..+ data.length]);
+	region.nextPersistRangeOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
+
+	def failed = DualTxnWal.new(base, log, 1024u64, region, true);
+	tc.t.assertz(false, failed.openOk);
+	tc.t.assertz(true, failed.requiresRecovery());
+	tc.t.assert_eq(1, region.persistRangeCount);
+
+	region.crash();
+	def reopened = DualTxnWal.new(base, log, 1024u64, region, false);
+	tc.t.assertz(true, reopened.openOk);
+	tc.t.assertz(false, reopened.requiresRecovery());
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
 }
 
 // An empty transaction commits as an entryCount=0 record: a successful commit
@@ -761,6 +826,65 @@ def test_dual_failed_prepare_then_crash_is_clean(tc: DualTxnWalTester) {
 	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
+}
+
+// Once an acknowledged transaction's live after-image cannot be prepared for
+// the next boundary, the WAL must not claim or attempt further durability on
+// this instance. The retained record restores the update after reopen.
+def test_dual_apply_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
+	tc.shadowRegion.failNextPrepareChangedRange = true;
+	tc.t.assertz(false, tc.wal.applyUpdate(200u64, 0x67u64, 1u8));
+	tc.t.assert_eq(0x67u8, tc.data[200]);
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+
+	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
+	def persistRangeCount = tc.shadowRegion.persistRangeCount;
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	tc.t.assertz(false, tc.wal.append(201u64, 0x68u64, 1u8));
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assertz(false, tc.wal.applyUpdate(201u64, 0x68u64, 1u8));
+	tc.t.assertz(false, tc.wal.persistAppliedData());
+	tc.t.assertz(true, tc.wal.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.wal.close();
+	tc.t.assert_eq(0u8, tc.data[201]);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
+	tc.t.assert_eq(persistRangeCount, tc.shadowRegion.persistRangeCount);
+	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x67u8, tc.data[200]);
+	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0x67u8, tc.data[200]);
+}
+
+// The same preparation failure can occur while recovery is applying a valid
+// record. Recovery must stop before persistChanges(), retain the record, and
+// report PERSIST_FAILED so another instance can replay the complete update.
+def test_dual_recovery_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x69u64, 1u8));
+
+	var failed = tc.crashAndReopen();
+	tc.shadowRegion.failNextPrepareChangedRange = true;
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(true, failed.requiresRecovery());
+	tc.t.assert_eq(0x69u8, tc.data[200]);
+	tc.t.assert_eq(0u64, failed.dataDurableSeq);
+	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0u8, tc.data[200]);
+	var reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x69u8, tc.data[200]);
+	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0x69u8, tc.data[200]);
 }
 
 // A definite fail-before-copy outcome leaves no durable record, so immediate

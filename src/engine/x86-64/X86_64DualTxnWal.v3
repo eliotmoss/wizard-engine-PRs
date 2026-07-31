@@ -54,9 +54,9 @@ enum DualWalRecovery {
         CLEAN,          // no valid records; nothing was replayed
         REPLAYED,       // valid records were replayed and their data persisted
         CORRUPT,        // WAL header invalid; log contents were ignored
-        PERSIST_FAILED  // this instance requires reopen, or replay was applied
-                        // in memory but could not be persisted; valid records
-                        // stay available for recovery by the next instance
+        PERSIST_FAILED  // this instance requires reopen, or replay could not
+                        // prepare/persist every after-image; valid records stay
+                        // available for recovery by the next instance
 }
 
 class DualTxnWal {
@@ -73,7 +73,7 @@ class DualTxnWal {
         def var slotSeqs = Array<u64>.new(2);   // txnSeq of the valid record in each slot (0 = empty/unknown)
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
-        private var recoveryRequired = false;   // A persistence result left durable state uncertain
+        private var recoveryRequired = false;   // Persistence work left this mount unable to continue safely
         def var openOk = false;
 
         new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
@@ -152,11 +152,18 @@ class DualTxnWal {
 
         // --- Data application ---
 
-        def applyUpdate(offset: u64, value: u64, width: u8) {
-                if (recoveryRequired) return;
-                if (!validEntryFields(offset, width)) return;
+        // Apply one acknowledged after-image and prepare its range for the next
+        // boundary. If range preparation fails, the durable slot remains the
+        // source of truth and only a new WAL instance may replay it.
+        def applyUpdate(offset: u64, value: u64, width: u8) -> bool {
+                if (recoveryRequired) return false;
+                if (!validEntryFields(offset, width)) return false;
                 writeAfterImage(offset, value, width);
-                backendRegion.prepareChangedRange(offset, u64.view(width));
+                if (!backendRegion.prepareChangedRange(offset, u64.view(width))) {
+                        recoveryRequired = true;
+                        return false;
+                }
+                return true;
         }
 
         // Explicit boundary: complete durability for all after-images applied
@@ -290,9 +297,11 @@ class DualTxnWal {
                         return DualWalRecovery.CLEAN;
                 }
                 for (slot < 2) {
-                        if (slotSeqs[slot] != 0u64 && slotSeqs[slot] < maxSeq) redoSlot(slot);
+                        if (slotSeqs[slot] != 0u64 && slotSeqs[slot] < maxSeq && !redoSlot(slot)) {
+                                return DualWalRecovery.PERSIST_FAILED;
+                        }
                 }
-                redoSlot(slotIndexOf(maxSeq));
+                if (!redoSlot(slotIndexOf(maxSeq))) return DualWalRecovery.PERSIST_FAILED;
                 lastCommittedSeq = maxSeq;
                 nextTxnSeq = maxSeq + 1u64;
                 // The replay is published only once the redone data is durable.
@@ -306,17 +315,18 @@ class DualTxnWal {
                 return DualWalRecovery.REPLAYED;
         }
 
-        private def redoSlot(slot: int) {
+        private def redoSlot(slot: int) -> bool {
                 def absStart = slotAddr(slot);
                 def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
                 var entryAddr = absStart + u64.!(TxnRecordHeader.size);
                 for (i < entryCount) {
-                        applyUpdate(
+                        if (!applyUpdate(
                                 recordLoadU64(entryAddr, LogEntry.offset.offset),
                                 recordLoadU64(entryAddr, LogEntry.value.offset),
-                                recordLoadU8(entryAddr, LogEntry.width.offset));
+                                recordLoadU8(entryAddr, LogEntry.width.offset))) return false;
                         entryAddr += u64.!(LogEntry.size);
                 }
+                return true;
         }
 
         // --- Lifecycle ---
@@ -363,9 +373,21 @@ class DualTxnWal {
                 zeroBytes(slotAddr(0), u64.!(TxnRecordHeader.size));
                 zeroBytes(slotAddr(1), u64.!(TxnRecordHeader.size));
                 // Header and slot 0's scrubbed header prefix are contiguous.
-                var ok = backendRegion.persistRange(logChunkOffset, u64.!(DualWalHeader.size) + u64.!(TxnRecordHeader.size));
-                ok = backendRegion.persistRange(slotAddr(1) - regionStart, u64.!(TxnRecordHeader.size)) && ok;
-                openOk = ok;
+                // Stop at the first failed ordered write: the result is
+                // indeterminate, so this instance cannot safely continue.
+                if (!backendRegion.persistRange(
+                                logChunkOffset,
+                                u64.!(DualWalHeader.size) + u64.!(TxnRecordHeader.size))) {
+                        recoveryRequired = true;
+                        return;
+                }
+                if (!backendRegion.persistRange(
+                                slotAddr(1) - regionStart,
+                                u64.!(TxnRecordHeader.size))) {
+                        recoveryRequired = true;
+                        return;
+                }
+                openOk = true;
         }
 
         def validateHeader() -> bool {

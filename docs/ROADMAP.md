@@ -28,9 +28,9 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 - Contract: the caller must apply a committed transaction's entries before committing the next one (`RegionTransaction` guarantees this); the boundary only covers already-applied after-images
 - `RegionTransaction.commit()` is now `appendToWal → wal.commit (combined boundary) → applyToRegion → clear`; the per-commit `persistAppliedData()` (phase A boundary 2) dropped out. Explicit `RegionTransaction.flush()` added for idle-time durability
 - `close()` is the clean-unmount flush: persists the deferred data (`persistAppliedData()`), then scrubs reclaimable slots (only those with `slotSeq ≤ dataDurableSeq` — unrecovered records are never destroyed) so a clean remount recovers `CLEAN`, replay-free. A failed final persist leaves the records intact for the next mount's replay; a failed scrub persist latches recovery-required and any surviving record replays idempotently. `PWRegion.deallocate()` already routes through `wal.close()`
-- Commit-, recovery-, explicit-flush-, final-data-close-, and slot-scrub-originated persistence failures now latch `DualTxnWal` in a recovery-required state. The sequence is not burned, but the same instance rejects append, commit, apply, persist, recovery and close persistence work; only a newly constructed instance may inspect and recover the durable image
-- Persistence-failure contract chosen 2026-07-30: a boundary-related `commit() == 0` is **unacknowledged**, not a guaranteed abort. Recovery may replay any complete durable record because entries are idempotent after-images. The core commit, recovery, explicit-flush, final-data-close and slot-scrub paths enforce this rule; propagation through `RegionTransaction`/`PWRegion` remains in Next Steps #3
-- Tests: `DualTxnWalTest.v3` grew to 30 cases — crash after apply/before next commit, back-to-back commits then crash, one-boundary-per-commit + induction property (counting region: 1 `persistChanges`, 0 `persistRange` per commit), explicit-flush durability, flush/final-data-close/slot-scrub failure requiring reopen, close-scrubs-for-clean-remount, close-keeps-unrecovered-records, recovery-persist failure requiring reopen, and a shadow durable-memory model with fail-before/copy-then-fail/partial-copy outcomes; the copy-then-fail regression is now the normative recovery-required outcome. `RegionTransactionTest.v3`: boundary counts re-pinned (record+data prepares, 1 `persistChanges`/commit), piggybacked-durability and `flush()` tests added
+- Fresh-header, commit-record, after-image preparation, recovery, explicit-flush, final-data-close, and slot-scrub persistence failures now latch `DualTxnWal` in a recovery-required state. `applyUpdate()` reports success/failure, and recovery stops before its persistence boundary if an after-image range cannot be prepared. The same instance rejects append, commit, apply, persist, recovery and close persistence work; only a newly constructed instance may inspect and recover the durable image
+- Persistence-failure contract chosen 2026-07-30: a boundary-related `commit() == 0` is **unacknowledged**, not a guaranteed abort. Recovery may replay any complete durable record because entries are idempotent after-images. The core fresh-init, commit, apply, recovery, explicit-flush, final-data-close and slot-scrub paths enforce recovery-required state; propagation through `RegionTransaction`/`PWRegion` remains in Next Steps #3
+- Tests: `DualTxnWalTest.v3` grew to 34 cases — crash after apply/before next commit, back-to-back commits then crash, one-boundary-per-commit + induction property (counting region: 1 `persistChanges`, 0 `persistRange` per commit), explicit-flush durability, commit/apply/recovery/flush/final-data-close/slot-scrub failure requiring reopen, fresh-header fail-before-copy and copy-then-fail outcomes, close-scrubs-for-clean-remount, close-keeps-unrecovered-records, and a shadow durable-memory model with fail-before/copy-then-fail/partial-copy outcomes; the copy-then-fail regressions make indeterminate persistence executable. `RegionTransactionTest.v3`: boundary counts re-pinned (record+data prepares, 1 `persistChanges`/commit), piggybacked-durability and `flush()` tests added
 - `docs/wal-comparison.md` extended with a third column for `DualTxnWal` and a "why two slots superseded the ring" section
 
 ### Two-slot redo WAL, phase A (`X86_64DualTxnWal.v3`) — superseded by phase B above
@@ -80,25 +80,24 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ### Tests
 
-**Audited 2026-07-31:** the four implementation-specific x86-64 Linux test files contain **98 registered tests**. All 98 pass; none are listed as expected failures.
+**Audited 2026-07-31:** the four implementation-specific x86-64 Linux test files contain **102 registered tests**. All 102 pass; none are listed as expected failures.
 
-- `DualTxnWalTest.v3` — **30 tests** for the active two-slot WAL: format/geometry, slot alternation, empty commits, crash recovery against separate live/durable byte images, corrupt/torn records, replay ordering, overwrite guard, oversize/poisoned commits, commit/recovery/flush/final-data-close/slot-scrub recovery-required enforcement, fail-before/copy-then-fail/partial-copy shadow outcomes, the normative unacknowledged-record replay, the phase-B one-boundary induction property, explicit flush, and clean/unrecovered close paths
+- `DualTxnWalTest.v3` — **34 tests** for the active two-slot WAL: format/geometry, fresh-header persistence failures, slot alternation, empty commits, crash recovery against separate live/durable byte images, corrupt/torn records, replay ordering, overwrite guard, oversize/poisoned commits, commit/apply/recovery/flush/final-data-close/slot-scrub recovery-required enforcement, fail-before/copy-then-fail/partial-copy shadow outcomes, the normative unacknowledged-record replay, the phase-B one-boundary induction property, explicit flush, and clean/unrecovered close paths
 - `RegionTransactionTest.v3` — **13 tests** for `RegionTransaction` over the active `DualTxnWal`: cache read/write and fallthrough, write-behind apply/clear, phase-B persistence call counts, piggybacked durability, explicit flush, clean no-op, overwrite/alignment behavior, and oversize-commit propagation
 - `TxnPWRegionTest.v3` — **33 tests** across allocator (`pwregion:`), overflow propagation (`pwregion_overflow:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, `DualTxnWal` recovery/checksum rejection, mmap/PMEM state and lifecycle, and file-backed persistence
 - `MultiTxnWalTest.v3` — **22 tests** for the retained comparison WAL: superblocks, recovery, record validation, failure outcomes, epoch/gap handling, wrap-around/checkpoint reserve, crash-mid-log recovery, failed-persist scrub/rollback, and checkpoint policy
 - `SingleTxnWal` has **no dedicated tests**; it remains compiled as a reference implementation only
 - The PMEM-labelled test is structural only: `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping and bypasses `PmemMmapBackend.create()`, `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`
 
-**Evidence limitation:** the active-WAL unit tests model a "crash" by constructing
-a new `DualTxnWal` over the same `Array<byte>`, while their persistence methods
-are no-ops or call counters. They verify the recovery state machine, validation,
-ordering and boundary API usage, but unpersisted bytes never disappear. The
-file-backed tests exercise real `fdatasync`/`msync` paths and graceful remount,
-but a remount in the same kernel can still observe page-cache contents and does
-not establish abrupt-crash or power-loss durability. A test-only shadow
-durability model and progressively stronger integration tests are now the
-immediate validation work; see Next Steps #3 and
-`docs/persistent-backends.md`.
+**Evidence limitation:** the active-WAL crash and failure tests restore live
+bytes from a separate durable shadow, so unpersisted bytes disappear; counting
+tests still use no-op persistence to pin API boundary counts. This establishes
+the WAL protocol under the `BackendRegion` contract, not the correctness of a
+backend's syscall or instruction translation. The file-backed tests exercise
+real `fdatasync`/`msync` paths and graceful remount, but a remount in the same
+kernel can still observe page-cache contents and does not establish abrupt-crash
+or power-loss durability. Progressively stronger integration tests remain in
+Next Steps #3 and `docs/persistent-backends.md`.
 
 ---
 
@@ -109,7 +108,7 @@ immediate validation work; see Next Steps #3 and
 - Multi-transaction WAL core paths are test-covered (`MultiTxnWalTest.v3`): epoch-stale rejection, wrap-around / log-full→checkpoint→reserve, multi-record recovery, and crash-mid-log recovery. The `maybeCheckpoint()` policy is implemented (hybrid count-OR-occupancy, per-backend thresholds). Commit-failure propagation is implemented (see Completed).
 - A design review of `MultiTxnWal` (2026-07-02) found two durability bugs (epoch double-increment in `recover()`, duplicate `txnSeq` after a failed `persistRange`) plus four API-hardening items. All are fixed and regression-tested; see Next Steps #2 follow-ups.
 - The 2026-07-29 test audit found that the happy paths and intended phase-B boundary count are strong, but active-WAL failure/crash semantics, full allocator-transaction recovery, Immix/platform wrappers, and several backend/validation paths remain untested. These are tracked in Next Steps #3.
-- **Validation direction (2026-07-30):** the test-only shadow durable-memory backend is implemented for `DualTxnWal`. It separates live bytes from a durable shadow, makes persistence operations copy between them, and restores live bytes from the shadow on simulated crash. The core crash matrix now supplies byte-level evidence for the WAL protocol under the `BackendRegion` contract and verifies the chosen recovery-required response to copy-then-fail; completing the fault matrix and allocator-level shadow factory comes before hardware-specific testing. Syscall integration, abrupt process/VM tests, and physical-media testing supply the progressively stronger outer layers of the correctness argument.
+- **Validation direction (2026-07-30):** the test-only shadow durable-memory backend is implemented for `DualTxnWal`. It separates live bytes from a durable shadow, makes persistence operations copy between them, and restores live bytes from the shadow on simulated crash. The core crash/fault matrix now supplies byte-level evidence for the WAL protocol under the `BackendRegion` contract, including after-image preparation and fresh-header persistence failures; higher-layer propagation and an allocator-level shadow factory come before hardware-specific testing. Syscall integration, abrupt process/VM tests, and physical-media testing supply the progressively stronger outer layers of the correctness argument.
 - **PMEM emulation assessment (2026-07-29):** use a QEMU file-backed ACPI NVDIMM as the primary development environment and native x86-64 Linux `memmap=<size>!<start>` as an alternative. In both cases, expose `/dev/pmem0`, create an fsdax filesystem, and give `PmemMmapBackend` a regular file on that mount. Validation is staged as DAX/remount integration, guest crash/restart testing, then real-hardware durability; see `docs/pmem-emulation.md`.
 
 ---
@@ -185,12 +184,12 @@ Priority 0 — active WAL failure/crash semantics:
 - [x] Cover `DualWalRecovery.PERSIST_FAILED` with the shadow backend: replay-persist failure latches the current instance, retained records recover through a new instance, and the successfully replayed after-image survives a second crash.
 - [x] Cover failed explicit `flush()` and failed final-data persist in `close()`: either failure latches recovery-required, retains the durable record, rejects same-instance retry, and recovers the after-image through a new instance.
 - [x] Cover failed slot-scrub persistence in `close()`: latch recovery-required, stop before scrubbing the second slot, retain conservative slot metadata, and recover the durable data plus surviving idempotent records through a new instance.
-- [ ] Complete the remaining `DualTxnWal` fault-injection matrix: failed `applyUpdate()` range preparation and fresh-header persistence failure.
+- [x] Complete the remaining `DualTxnWal` fault-injection matrix. `applyUpdate()` and recovery now latch on after-image range-preparation failure without issuing or claiming a later boundary; fresh-header fail-before-copy requires reformat, while copy-then-fail may reopen as a valid clean header. Covered by four shadow regressions.
 - [x] Define the persistence-failure contract. A boundary-related `commit() == 0` is **unacknowledged**, not definitely aborted. The mounted region is recovery-required and must not accept retry, another transaction, flush, or clean close; reopen plus successful recovery determines whether the valid record is absent or replayed. Idempotent after-images make either recovery result safe, so durable invalidation is unnecessary.
 - [x] Make the copy-then-fail test normative for that contract: `commit()` returns `0`, but crash/reopen recovery may validate and replay the complete durable record.
 - [x] Enforce commit-originated recovery-required state in `DualTxnWal`. Record prepare/persist and overwrite-guard persistence failure latch the instance; `requiresRecovery()` distinguishes this from definite validation/capacity rejection; subsequent append/commit/apply/persist/recover/close work is rejected without reaching the backend; a new instance must recover.
 - [ ] Propagate/query recovery-required state through `RegionTransaction` and `PWRegion`. Until higher layers expose the distinction supplied by `DualTxnWal.requiresRecovery()`, their public `false` must conservatively require recovery.
-- [ ] Define and test how a failed `prepareChangedRange()` is propagated. `DualTxnWal.applyUpdate()` currently ignores its boolean result, yet a later boundary can advance `dataDurableSeq`; the durability claim must not advance unless every changed range was prepared successfully.
+- [x] Define and test how a failed `prepareChangedRange()` is propagated. `DualTxnWal.applyUpdate()` now returns `bool`, latches recovery-required on backend preparation failure, and makes recovery return `PERSIST_FAILED` before `persistChanges()` or `dataDurableSeq` advancement. Higher-layer exposure remains the preceding open item.
 
 Priority 1 — allocator and backend integration:
 
@@ -243,6 +242,5 @@ provides the same development interface with more invasive host setup.
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 5 | `TxnBackend.v3:132` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
-| 7 | `X86_64DualTxnWal.v3:223-224` | Commit-, recovery-, explicit-flush-, final-data-close-, and slot-scrub-originated failures now latch `DualTxnWal` and require a new instance for recovery. Remaining work is to propagate the state through `RegionTransaction`/`PWRegion`. |
-| 8 | `X86_64DualTxnWal.v3:144-148` | `applyUpdate()` ignores `BackendRegion.prepareChangedRange()` failure, so later code can claim data durability without knowing that every changed range was prepared. |
-| 9 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; no fsdax/emulated-device integration test exists yet. |
+| 7 | `X86_64DualTxnWal.v3` | Persistence failures now latch `DualTxnWal` and require a new instance for recovery. Remaining work is to propagate/query that state through `RegionTransaction`/`PWRegion`. |
+| 8 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; no fsdax/emulated-device integration test exists yet. |

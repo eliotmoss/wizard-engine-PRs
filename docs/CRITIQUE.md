@@ -99,12 +99,15 @@ not required.
 The test-only shadow durable-memory backend is now implemented with separate
 live and durable byte arrays. Its fail-before-copy, copy-then-fail and
 partial-copy modes reproduce this ambiguity deterministically, including an
-immediate crash before the same-slot retry masks the record. The open work is
-now narrower: `DualTxnWal` latches commit-, recovery-, explicit-flush-,
-final-data-close-, and slot-scrub-originated persistence failures and rejects
-same-instance retry, while `requiresRecovery()` distinguishes them from
-definite validation/capacity rejection. Propagation through
+immediate crash before the same-slot retry masks the record. The completed core
+fault matrix now covers fresh-header initialization and after-image range
+preparation as well: `applyUpdate()` returns `false` and latches before any
+later boundary can advance `dataDurableSeq`, and recovery reports
+`PERSIST_FAILED` without issuing `persistChanges()`. `DualTxnWal` rejects
+same-instance work after any fresh-init, commit, apply, recovery, flush or close
+persistence failure, while `requiresRecovery()` distinguishes those failures
+from definite validation/capacity rejection. Propagation through
 `RegionTransaction`/`PWRegion` remains open; until that propagation exists,
 higher layers must conservatively treat every `false` as recovery-required.
-The shadow supplies protocol-level evidence only; syscall, process/VM crash
-and physical-media evidence remain separate outer layers.
+The shadow supplies protocol-level evidence only; syscall, process/VM crash and
+physical-media evidence remain separate outer layers.
