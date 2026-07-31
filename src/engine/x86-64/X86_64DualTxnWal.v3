@@ -165,11 +165,15 @@ class DualTxnWal {
         // (close() calls it) and by the overwrite guard. A failure is not
         // fatal to any acknowledged transaction -- the data remains
         // recoverable from the slot records -- but the affected slots stay
-        // unreclaimable until a later persist succeeds (see the overwrite
-        // guard in appendCommittedRecord).
+        // unreclaimable. As with every indeterminate persistence result, the
+        // current instance cannot safely retry: explicit flush and close
+        // callers must reopen and recover.
         def persistAppliedData() -> bool {
                 if (recoveryRequired) return false;
-                if (!backendRegion.persistChanges()) return false;
+                if (!backendRegion.persistChanges()) {
+                        recoveryRequired = true;
+                        return false;
+                }
                 dataDurableSeq = lastCommittedSeq;
                 return true;
         }
@@ -190,10 +194,7 @@ class DualTxnWal {
                 // without recover()), the persist cannot cover it and the commit
                 // must fail until recover() runs.
                 if (slotSeqs[slot] != 0u64 && slotSeqs[slot] > dataDurableSeq) {
-                        if (!persistAppliedData()) {
-                                recoveryRequired = true;
-                                return 0u64;
-                        }
+                        if (!persistAppliedData()) return 0u64;
                         if (slotSeqs[slot] > dataDurableSeq) return 0u64;
                 }
 

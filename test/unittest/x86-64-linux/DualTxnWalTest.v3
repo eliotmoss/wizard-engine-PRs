@@ -26,7 +26,9 @@ def DWTX = [
 	DWT("back_to_back_commits_then_crash", test_dual_back_to_back_commits_then_crash),
 	DWT("one_boundary_per_commit", test_dual_one_boundary_per_commit),
 	DWT("flush_persists_applied_data", test_dual_flush_persists_applied_data),
+	DWT("flush_failure_requires_reopen", test_dual_flush_failure_requires_reopen),
 	DWT("close_scrubs_for_clean_remount", test_dual_close_scrubs_for_clean_remount),
+	DWT("close_data_persist_failure_requires_reopen", test_dual_close_data_persist_failure_requires_reopen),
 	DWT("close_keeps_unrecovered_records", test_dual_close_keeps_unrecovered_records),
 	DWT("shadow_crash_restores_durable_bytes", test_shadow_crash_restores_durable_bytes),
 	DWT("shadow_copy_then_fail_is_durable", test_shadow_copy_then_fail_is_durable),
@@ -589,6 +591,34 @@ def test_dual_flush_persists_applied_data(tc: DualTxnWalTester) {
 	tc.t.assert_eq(3u64, tc.commitAndApply(202u64, 0x66u64, 1u8));
 }
 
+// An explicit flush failure leaves the persistence outcome uncertain. The
+// current instance must reject all further work; after a crash, a new instance
+// replays the retained record and makes the after-image durable.
+def test_dual_flush_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x45u64, 1u8));
+	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.t.assertz(false, tc.wal.persistAppliedData());
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
+
+	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	tc.t.assertz(false, tc.wal.persistAppliedData());
+	tc.t.assertz(false, tc.wal.append(201u64, 0x46u64, 1u8));
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
+	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x45u8, tc.data[200]);
+	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0x45u8, tc.data[200]);
+}
+
 // A clean close() persists the deferred data and scrubs the reclaimable
 // slots, so a clean remount is replay-free (CLEAN, sequence restarts).
 def test_dual_close_scrubs_for_clean_remount(tc: DualTxnWalTester) {
@@ -603,6 +633,32 @@ def test_dual_close_scrubs_for_clean_remount(tc: DualTxnWalTester) {
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 	tc.t.assert_eq(0x11u8, tc.data[200]);	// data persisted by close()
 	tc.t.assert_eq(0x22u8, tc.data[201]);
+}
+
+// close() uses the same final-data persistence boundary as explicit flush. If
+// it fails, close must retain the record, latch recovery-required, and perform
+// no slot scrubbing so a new instance can replay after a crash.
+def test_dual_close_data_persist_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x77u64, 1u8));
+	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.wal.close();
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
+
+	def persistRangeCount = tc.shadowRegion.persistRangeCount;
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	tc.wal.close();
+	tc.t.assert_eq(persistRangeCount, tc.shadowRegion.persistRangeCount);
+	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x77u8, tc.data[200]);
+	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0x77u8, tc.data[200]);
 }
 
 // close() must never scrub a slot whose data is not known durable: records

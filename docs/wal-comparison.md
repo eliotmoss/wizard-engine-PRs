@@ -29,7 +29,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 | API results | `commit()` → `void` (persist implied) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `MultiWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) | `commit()` → `u64`; nonzero is acknowledged, while a persistence-related `0` is unacknowledged and requires reopen/recovery rather than guaranteeing abort. `recover()` → `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) |
 | Clean-unmount replay | Log cleared after every commit — remount is replay-free | `close()` is empty; even a clean unmount replays the tail | `close()` persists deferred data and scrubs reclaimable slots — clean remounts recover `CLEAN` |
 | Wired into `PWRegion` | No (reference only) | No (reference only) | Yes |
-| Roadmap-related tests (2026-07-31 audit) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 27 in `DualTxnWalTest.v3`, plus 46 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
+| Roadmap-related tests (2026-07-31 audit) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 29 in `DualTxnWalTest.v3`, plus 46 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
 
 ## Why the multi-transaction design superseded the single-transaction one
 
@@ -86,7 +86,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 
 ## Verification status
 
-The implementation-specific x86-64 Linux suite contains 95 tests across four
+The implementation-specific x86-64 Linux suite contains 97 tests across four
 files, all passing as of the 2026-07-31 audit. Coverage is strongest for normal
 phase-B commit/recovery, the intended one-boundary induction property, and the
 core shadow-backed crash matrix. The active WAL tests now restore live memory
@@ -100,9 +100,10 @@ the correctness argument: WAL behavior under the `BackendRegion` persistence
 contract. The chosen copy-then-fail contract treats the result as
 unacknowledged and makes the mount recovery-required; recovery may replay the
 complete record because redo after-images are idempotent. `DualTxnWal` now
-enforces that rule for commit- and recovery-originated failures by latching the
-instance and requiring a newly constructed instance to recover. Flush/close
-failure enforcement and higher-layer propagation remain open. Backend syscall/instruction
+enforces that rule for commit-, recovery-, explicit-flush-, and
+final-data-close-originated failures by latching the instance and requiring a
+newly constructed instance to recover. Slot-scrub failure enforcement and
+higher-layer propagation remain open. Backend syscall/instruction
 integration, abrupt process/guest recovery, and physical-media testing provide
 progressively stronger outer layers. The complete layer definitions are in
 `docs/persistent-backends.md`; the prioritised implementation list is in
