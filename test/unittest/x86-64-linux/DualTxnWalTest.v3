@@ -18,6 +18,8 @@ def DWTX = [
 	DWT("invalid_entry_ranges_rejected", test_dual_invalid_entry_ranges_rejected),
 	DWT("clean_empty_recover", test_dual_clean_empty_recover),
 	DWT("torn_record_rejected", test_dual_torn_record_rejected),
+	DWT("malformed_record_headers_rejected", test_dual_malformed_record_headers_rejected),
+	DWT("malformed_record_trailers_rejected", test_dual_malformed_record_trailers_rejected),
 	DWT("two_slots_replay_in_order", test_dual_two_slots_replay_in_order),
 	DWT("replay_latest_two_after_overwrite", test_dual_replay_latest_two_after_overwrite),
 	DWT("oversize_commit_fails", test_dual_oversize_commit_fails),
@@ -255,6 +257,43 @@ class DualTxnWalTester(t: Tester) {
 		PWRegionUtils.pointerFromU64(addr).store<u64>(old + 1u64);
 		return addr;
 	}
+
+	// Replace the log with one canonical, durable one-entry record in slot 1.
+	// Malformed-record tests use this before each independent mutation.
+	def resetCommittedRecord() -> u64 {
+		wal = DualTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, true);
+		writeTxn(200u64, 0x55u64, 1u8);
+		return wal.slotAddr(1);
+	}
+
+	def trailerAddrOfSlot(slot: int) -> u64 {
+		def recordAddr = wal.slotAddr(slot);
+		def entryCount = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
+		return recordAddr + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
+	}
+
+	// Recompute the production record checksum after a structural mutation.
+	// This makes each rejection exercise the named format guard rather than
+	// passing only because arbitrary byte corruption invalidated the checksum.
+	def recomputeChecksumOfSlot(slot: int) {
+		def recordAddr = wal.slotAddr(slot);
+		def recordLen = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.recordLen.offset)).load<u32>();
+		def checksumAddr = trailerAddrOfSlot(slot) + u64.view(TxnCommitTrailer.checksum.offset);
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		var ptr = recordAddr;
+		def end = recordAddr + u64.view(recordLen);
+		def skipEnd = checksumAddr + 8u64;
+		while (ptr < end) {
+			var b: u64 = 0u64;
+			if (!(ptr >= checksumAddr && ptr < skipEnd)) {
+				b = u64.view(PWRegionUtils.pointerFromU64(ptr).load<u8>());
+			}
+			h = (h << 7) | (h >> 57);
+			h = (h ^ b) * 0x1000_0000_01B3_u64;
+			ptr++;
+		}
+		PWRegionUtils.pointerFromU64(checksumAddr).store<u64>(h);
+	}
 }
 
 // Fresh initialization: a valid header, computed slot geometry, empty slots.
@@ -459,6 +498,96 @@ def test_dual_torn_record_rejected(tc: DualTxnWalTester) {
 	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
+}
+
+// Header format guards must reject structurally malformed records even when
+// the mutation is covered by a freshly valid checksum.
+def test_dual_malformed_record_headers_rejected(tc: DualTxnWalTester) {
+	def slot = 1;
+	var recordAddr = tc.resetCommittedRecord();
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(1u64, tc.wal.validateSlot(slot));
+
+	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.magic.offset)).store<u64>(0u64);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.version.offset)).store<u16>(2u16);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.headerSize.offset)).store<u16>(0u16);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entrySize.offset)).store<u16>(0u16);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.logEpoch.offset)).store<u64>(1u64);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	// Keep header/trailer sequences mutually consistent so parity is the only
+	// invalid sequence property in this final case.
+	recordAddr = tc.resetCommittedRecord();
+	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.txnSeq.offset)).store<u64>(2u64);
+	PWRegionUtils.pointerFromU64(tc.trailerAddrOfSlot(slot) + u64.view(TxnCommitTrailer.txnSeq.offset)).store<u64>(2u64);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	// Exercise mount/recovery, not only the validator directly.
+	tc.t.assertz(true, tc.shadowRegion.persistRange(recordAddr - tc.regionStart, tc.wal.slotBytes));
+	var reopened = tc.crashAndReopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assert_eq(0u8, tc.data[200]);
+}
+
+// Trailer identity and header-mirroring guards receive the same checksummed
+// mutation treatment, preventing a malformed commit marker from replaying.
+def test_dual_malformed_record_trailers_rejected(tc: DualTxnWalTester) {
+	def slot = 1;
+	var recordAddr = tc.resetCommittedRecord();
+	var trailerAddr = tc.trailerAddrOfSlot(slot);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(1u64, tc.wal.validateSlot(slot));
+
+	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.magic.offset)).store<u64>(0u64);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	trailerAddr = tc.trailerAddrOfSlot(slot);
+	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.recordLen.offset)).store<u32>(0u32);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	trailerAddr = tc.trailerAddrOfSlot(slot);
+	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.entryCount.offset)).store<u32>(0u32);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	trailerAddr = tc.trailerAddrOfSlot(slot);
+	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.logEpoch.offset)).store<u64>(1u64);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	recordAddr = tc.resetCommittedRecord();
+	trailerAddr = tc.trailerAddrOfSlot(slot);
+	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.txnSeq.offset)).store<u64>(2u64);
+	tc.recomputeChecksumOfSlot(slot);
+	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
+
+	tc.t.assertz(true, tc.shadowRegion.persistRange(recordAddr - tc.regionStart, tc.wal.slotBytes));
+	var reopened = tc.crashAndReopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assert_eq(0u8, tc.data[200]);
 }
 
 // Two valid slots replay in ascending txnSeq order: the later record's
