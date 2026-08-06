@@ -884,6 +884,7 @@ def BX = [
 	BT("sigkill_exact_fit_alloc_commit_boundary_recovers", test_bd_sigkill_exact_fit_alloc_commit_boundary_recovers),
 	BT("sigkill_coalescing_free_commit_boundary_recovers", test_bd_sigkill_coalescing_free_commit_boundary_recovers),
 	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
+	BT("sigkill_exact_fit_alloc_recovers_transaction", test_bd_sigkill_exact_fit_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
 ];
@@ -1917,6 +1918,69 @@ def test_bd_sigkill_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTest
 
 	def recovered = tc.remount();
 	tc.assertRecoveredSplitAllocation(recovered);
+
+	tc.cleanup();
+}
+
+// Cover the same non-cooperative applied-after-image crash window for an
+// exact-fit allocation. Unlike the split path, the transaction removes the
+// only free extent, so recovery must preserve the empty free lists and the
+// shortened memory-order chain after the parent kills the stopped child.
+def test_bd_sigkill_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateExactFitAbruptly();
+		if (childStatus != 0) {
+			Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+			return;
+		}
+
+		def childPid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+		def stopResult = Linux.syscall(LinuxConst.SYS_kill, (childPid, BD_SIGSTOP)).0;
+		// Reaching this exit means SIGSTOP failed or somebody resumed the child.
+		if (stopResult == 0) Linux.syscall(LinuxConst.SYS_exit_group, 10);
+		else Linux.syscall(LinuxConst.SYS_exit_group, 11);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waitedForStop = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), BD_WUNTRACED, Pointer.NULL)).0;
+	def expectedStopStatus = BD_SIGSTOP * 256 + 127;
+	tc.t.assert_eq(pid, waitedForStop);
+	tc.t.assert_eq(expectedStopStatus, waitStatus[0]);
+	if (waitedForStop != pid || waitStatus[0] != expectedStopStatus) {
+		Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL));
+		Linux.syscall(LinuxConst.SYS_wait4,
+			(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL));
+		tc.cleanup();
+		return;
+	}
+
+	def killResult = Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL)).0;
+	def waitedForKill = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(0, killResult);
+	tc.t.assert_eq(pid, waitedForKill);
+	tc.t.assert_eq(BD_SIGKILL, waitStatus[0]);
+	if (killResult != 0 || waitedForKill != pid || waitStatus[0] != BD_SIGKILL) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredExactFitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
 
 	tc.cleanup();
 }
