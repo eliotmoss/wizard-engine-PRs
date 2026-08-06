@@ -360,6 +360,7 @@ def test_alloc_overflow_returns_blank(tc: SmallRingPWRegionTester) {
 def PRT = UnitTests.registerT("pwregion_recovery:", _, RecoveryPWRegionTester.new, _);
 def PRX = [
 	PRT("alloc_persist_failure_requires_recovery", test_alloc_persist_failure_requires_recovery),
+	PRT("free_persist_failure_requires_recovery", test_free_persist_failure_requires_recovery),
 	()
 ];
 
@@ -445,6 +446,31 @@ def test_alloc_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
 	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
 	tc.t.assertz(false, tc.region.freeChunk(committedChunk));
 	tc.t.assertz(true, tc.region.chunkToBlockEntry(committedChunk).getUsed());
+	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
+}
+
+// freeChunk() must propagate its own commit-point persistence failure rather
+// than report that the chunk was released. The buffered free remains visible
+// through the shared transaction, but its after-images have not reached live
+// region memory; the latched mount rejects later allocator work without
+// issuing another persistence boundary.
+def test_free_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
+	def chunk = tc.region.allocChunk(1u32);
+	def entry = tc.region.chunkToBlockEntry(chunk);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+	tc.t.assertz(true, entry.getUsed());
+	tc.backend.region.failNextPersistChanges = true;
+
+	tc.t.assertz(false, tc.region.freeChunk(chunk));
+	tc.t.assertz(true, tc.region.requiresRecovery());
+	tc.t.assertz(true, tc.region.txn.isDirty());
+	tc.t.assertz(false, entry.getUsedCached(tc.region.txn));
+	tc.t.assertz(true, entry.getUsed());
+
+	def persistChangesCount = tc.backend.region.persistChangesCount;
+	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
+	tc.t.assertz(false, tc.region.freeChunk(chunk));
+	tc.t.assertz(true, entry.getUsed());
 	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
 }
 
