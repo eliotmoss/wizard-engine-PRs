@@ -1,0 +1,193 @@
+// SingleTxnWal Tests
+//
+// Baseline coverage for the superseded single-transaction redo log. These
+// tests preserve it as an executable comparison point; they intentionally
+// characterize the known silent-overflow behavior rather than changing it.
+
+def SWT = UnitTests.registerT("single_wal:", _, SingleTxnWalTester.new, _);
+def SWTX = [
+	SWT("commit_persists_entries_then_header", test_single_commit_persists_entries_then_header),
+	SWT("recover_replays_and_clears", test_single_recover_replays_and_clears),
+	SWT("checksum_mismatch_rejected", test_single_checksum_mismatch_rejected),
+	SWT("silent_overflow_drops_entry", test_single_silent_overflow_drops_entry),
+	()
+];
+
+// Operation codes recorded by SingleWalCountingRegion. Persist-range calls
+// are split into entry and header events so tests can pin the protocol order.
+component SingleWalTestOp {
+	def PERSIST_ENTRIES = 1;
+	def PERSIST_HEADER = 2;
+	def PREPARE_DATA = 3;
+	def PERSIST_DATA = 4;
+}
+
+class SingleWalCountingRegion extends BackendRegion {
+	def logOffset: u64;
+	var operations = Vector<int>.new();
+	var persistRangeOffsets = Vector<u64>.new();
+	var persistRangeSizes = Vector<u64>.new();
+	var preparedOffsets = Vector<u64>.new();
+	var preparedSizes = Vector<u64>.new();
+
+	new(range: Range<byte>, logOffset: u64) super(range) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		operations.put(SingleWalTestOp.PREPARE_DATA);
+		preparedOffsets.put(offset);
+		preparedSizes.put(size);
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		operations.put(SingleWalTestOp.PERSIST_DATA);
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		operations.put(if(offset == logOffset, SingleWalTestOp.PERSIST_HEADER, SingleWalTestOp.PERSIST_ENTRIES));
+		persistRangeOffsets.put(offset);
+		persistRangeSizes.put(size);
+		return true;
+	}
+
+	def clearOperations() {
+		operations.clear();
+		persistRangeOffsets.clear();
+		persistRangeSizes.clear();
+		preparedOffsets.clear();
+		preparedSizes.clear();
+	}
+}
+
+class SingleTxnWalTester(t: Tester) {
+	var data: Array<byte>;
+	var region: SingleWalCountingRegion;
+	var wal: SingleTxnWal;
+	var regionStart: u64;
+	var logAddr: u64;
+	var logOffset: u64 = 1024u64;
+
+	new() {
+		data = Array<byte>.new(4096);
+		for (i < data.length) data[i] = 0u8;
+		regionStart = u64.view(Pointer.atElement(data, 0));
+		logAddr = regionStart + logOffset;
+		region = SingleWalCountingRegion.new(data[0 ..+ data.length], logOffset);
+		wal = SingleTxnWal.new(regionStart, logAddr, 1024u64, region);
+	}
+
+	def reopen(blockSize: u64) -> SingleTxnWal {
+		return SingleTxnWal.new(regionStart, logAddr, blockSize, region);
+	}
+
+	def entryAt(index: u32) -> Ref<LogEntry> {
+		def addr = wal.entryBase + u64.view(index) * u64.!(LogEntry.size);
+		return Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LogEntry.size));
+	}
+}
+
+// Commit publishes the entry bytes before the committed header. The stored
+// fields and exact persistence ranges make the two-boundary commit executable.
+def test_single_commit_persists_entries_then_header(tc: SingleTxnWalTester) {
+	def value64 = 0x8877_6655_4433_2211_u64;
+	tc.wal.append(200u64, 0x5Au64, 1u8);
+	tc.wal.append(208u64, value64, 8u8);
+	tc.wal.commit();
+
+	tc.t.assert_eq(2u32, tc.wal.header.numEntries);
+	tc.t.assert_eq(1u8, tc.wal.header.status);
+	tc.t.assert_eq(PWRegionUtils.calculateLogChecksum(tc.wal.entryBase, 2u32), tc.wal.header.checksum);
+	tc.t.assert_eq(2u32, tc.wal.currentEntryIndex);
+
+	def first = tc.entryAt(0u32);
+	def second = tc.entryAt(1u32);
+	tc.t.assert_eq(200u64, first.offset);
+	tc.t.assert_eq(0x5Au64, first.value);
+	tc.t.assert_eq(1u8, first.width);
+	tc.t.assert_eq(208u64, second.offset);
+	tc.t.assert_eq(value64, second.value);
+	tc.t.assert_eq(8u8, second.width);
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assert_eq(0u64, PWRegionUtils.pointerFromU64(tc.regionStart + 208u64).load<u64>());
+
+	tc.t.assert_eq(2, tc.region.operations.length);
+	tc.t.assert_eq(SingleWalTestOp.PERSIST_ENTRIES, tc.region.operations[0]);
+	tc.t.assert_eq(SingleWalTestOp.PERSIST_HEADER, tc.region.operations[1]);
+	tc.t.assert_eq(tc.wal.entryBase - tc.regionStart, tc.region.persistRangeOffsets[0]);
+	tc.t.assert_eq(2u64 * u64.!(LogEntry.size), tc.region.persistRangeSizes[0]);
+	tc.t.assert_eq(tc.logOffset, tc.region.persistRangeOffsets[1]);
+	tc.t.assert_eq(u64.!(LogHeader.size), tc.region.persistRangeSizes[1]);
+}
+
+// Recovery applies every checksummed after-image, persists the data once, and
+// then durably clears the commit marker so a second mount does no work.
+def test_single_recover_replays_and_clears(tc: SingleTxnWalTester) {
+	def value64 = 0xAABB_CCDD_EEFF_0011_u64;
+	tc.wal.append(200u64, 0x6Bu64, 1u8);
+	tc.wal.append(208u64, value64, 8u8);
+	tc.wal.commit();
+	tc.region.clearOperations();
+
+	def reopened = tc.reopen(1024u64);
+	tc.t.assertz(true, reopened.recover());
+	tc.t.assert_eq(0x6Bu8, tc.data[200]);
+	tc.t.assert_eq(value64, PWRegionUtils.pointerFromU64(tc.regionStart + 208u64).load<u64>());
+	tc.t.assert_eq(0u8, reopened.header.status);
+
+	tc.t.assert_eq(4, tc.region.operations.length);
+	tc.t.assert_eq(SingleWalTestOp.PREPARE_DATA, tc.region.operations[0]);
+	tc.t.assert_eq(SingleWalTestOp.PREPARE_DATA, tc.region.operations[1]);
+	tc.t.assert_eq(SingleWalTestOp.PERSIST_DATA, tc.region.operations[2]);
+	tc.t.assert_eq(SingleWalTestOp.PERSIST_HEADER, tc.region.operations[3]);
+	tc.t.assert_eq(200u64, tc.region.preparedOffsets[0]);
+	tc.t.assert_eq(1u64, tc.region.preparedSizes[0]);
+	tc.t.assert_eq(208u64, tc.region.preparedOffsets[1]);
+	tc.t.assert_eq(8u64, tc.region.preparedSizes[1]);
+
+	def operationCount = tc.region.operations.length;
+	tc.t.assertz(false, tc.reopen(1024u64).recover());
+	tc.t.assert_eq(operationCount, tc.region.operations.length);
+}
+
+// A committed marker alone is insufficient: corruption of a logged entry must
+// prevent replay and clear the marker without issuing a data persistence call.
+def test_single_checksum_mismatch_rejected(tc: SingleTxnWalTester) {
+	tc.wal.append(200u64, 0x7Cu64, 1u8);
+	tc.wal.commit();
+	tc.entryAt(0u32).value = 0x7Du64;
+	tc.region.clearOperations();
+
+	def reopened = tc.reopen(1024u64);
+	tc.t.assertz(false, reopened.recover());
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assert_eq(0u8, reopened.header.status);
+	tc.t.assert_eq(1, tc.region.operations.length);
+	tc.t.assert_eq(SingleWalTestOp.PERSIST_HEADER, tc.region.operations[0]);
+	tc.t.assert_eq(tc.logOffset, tc.region.persistRangeOffsets[0]);
+	tc.t.assert_eq(u64.!(LogHeader.size), tc.region.persistRangeSizes[0]);
+}
+
+// Preserve the known comparison behavior: once maxEntries is reached,
+// append() silently drops later writes and commit() still publishes success.
+def test_single_silent_overflow_drops_entry(tc: SingleTxnWalTester) {
+	def oneEntryBlockSize = u64.!(LogHeader.size + LogEntry.size);
+	tc.wal = SingleTxnWal.new(tc.regionStart, tc.logAddr, oneEntryBlockSize, tc.region);
+	tc.t.assert_eq(1u32, tc.wal.maxEntries);
+
+	tc.wal.append(200u64, 0x11u64, 1u8);
+	tc.wal.append(201u64, 0x22u64, 1u8);
+	tc.t.assert_eq(1u32, tc.wal.currentEntryIndex);
+	tc.wal.commit();
+	tc.t.assert_eq(1u32, tc.wal.header.numEntries);
+	tc.t.assert_eq(1u8, tc.wal.header.status);
+
+	tc.region.clearOperations();
+	tc.t.assertz(true, tc.reopen(oneEntryBlockSize).recover());
+	tc.t.assert_eq(0x11u8, tc.data[200]);
+	tc.t.assert_eq(0u8, tc.data[201]);
+	tc.t.assert_eq(1, tc.region.preparedOffsets.length);
+	tc.t.assert_eq(200u64, tc.region.preparedOffsets[0]);
+}

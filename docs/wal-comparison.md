@@ -29,7 +29,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 | API results | `commit()` → `void` (persist implied) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `MultiWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) | `commit()` → `u64`; nonzero is acknowledged, while a persistence-related `0` is unacknowledged and requires reopen/recovery rather than guaranteeing abort. `recover()` → `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) |
 | Clean-unmount replay | Log cleared after every commit — remount is replay-free | `close()` is empty; even a clean unmount replays the tail | `close()` persists deferred data and scrubs reclaimable slots — clean remounts recover `CLEAN` |
 | Wired into `PWRegion` | No (reference only) | No (reference only) | Yes |
-| Roadmap-related tests (extended 2026-08-06) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 38 in `DualTxnWalTest.v3`, plus 72 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
+| Roadmap-related tests (extended 2026-08-06) | 4 in `SingleTxnWalTest.v3` | 22 in `MultiTxnWalTest.v3` | 38 in `DualTxnWalTest.v3`, plus 72 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
 
 ## Why the multi-transaction design superseded the single-transaction one
 
@@ -86,7 +86,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 
 ## Verification status
 
-The implementation-specific x86-64 Linux suite contains 132 tests across four
+The implementation-specific x86-64 Linux suite contains 136 tests across five
 files, all passing as of the 2026-08-06 extension. Coverage is strongest for normal
 phase-B commit/recovery, the intended one-boundary induction property, and the
 core shadow-backed crash matrix. The active WAL tests now restore live memory
