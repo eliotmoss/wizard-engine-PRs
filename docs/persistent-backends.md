@@ -447,7 +447,7 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-06: the implementation-specific
-x86-64 Linux suite contains 124 registered tests. All 124 pass with no expected
+x86-64 Linux suite contains 125 registered tests. All 125 pass with no expected
 failures when run in an amd64 Docker container on the current Darwin arm64
 host.
 
@@ -455,7 +455,7 @@ host.
 |---|---:|---|
 | `DualTxnWalTest.v3` | 34 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 52 | allocator, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 53 | allocator, direct mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 `SingleTxnWal` and the platform wrapper classes have no dedicated tests. Immix

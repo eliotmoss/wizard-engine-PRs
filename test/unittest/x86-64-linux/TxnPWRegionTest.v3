@@ -839,6 +839,7 @@ def BX = [
 	BT("coalesce",              test_bd_coalesce),
 	BT("persist_and_remount",   test_bd_persist_and_remount),
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
+	BT("mixed_sequence_preserves_invariants", test_bd_mixed_sequence_preserves_invariants),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
 	BT("abrupt_writer_recovers_committed_wal", test_bd_abrupt_writer_recovers_committed_wal),
 	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
@@ -881,6 +882,134 @@ class BlockDevicePWRegionTester(t: Tester) {
 		}
 		region = openRegion(false);
 		return region;
+	}
+
+	private def isBlockTableEntry(candidate: PWRegion, entry: BlockEntryHandle) -> bool {
+		if (entry.isNull()) return false;
+		if (entry.addr < candidate.blockTableHandle.addr) return false;
+		def delta = entry.addr - candidate.blockTableHandle.addr;
+		if (delta % u64.!(BlockEntry.size) != 0) return false;
+		return delta / u64.!(BlockEntry.size) <= candidate.numBlocks;
+	}
+
+	private def walkFreeList(
+		candidate: PWRegion,
+		sentinel: BlockEntryHandle,
+		kind: ListKind,
+		listed: Array<bool>) {
+
+		var previous = sentinel;
+		var current = sentinel.getListNext();
+		var steps = 0;
+		while (!current.isNull()) {
+			if (steps > int.!(candidate.numBlocks)) {
+				t.fail("free-list cycle detected");
+				return;
+			}
+			if (!isBlockTableEntry(candidate, current)) {
+				t.fail("free list points outside block table");
+				return;
+			}
+
+			def index = int.!(candidate.blockIndexOf(current));
+			if (listed[index]) {
+				t.fail1("block %d appears more than once on free lists", index);
+				return;
+			}
+			listed[index] = true;
+			t.assert_eq(kind.code, current.getListNum());
+			t.assertz(false, current.getUsed());
+			t.assert_eq(previous.addr, current.getListPrev().addr);
+
+			previous = current;
+			current = current.getListNext();
+			steps++;
+		}
+	}
+
+	// Walk both allocator structures directly. The memory-order chain must be
+	// acyclic, ordered, and doubly linked; each free extent must be classified by
+	// its actual span and appear exactly once on the matching free list.
+	def assertAllocatorInvariants(candidate: PWRegion) {
+		def entryCount = int.!(candidate.numBlocks + 1u64);
+		var memorySeen = Array<bool>.new(entryCount);
+		var freeByIndex = Array<bool>.new(entryCount);
+		var listed = Array<bool>.new(entryCount);
+		var previous = BlockEntryHandle(0u64);
+		var current = candidate.blockTableHandle[0u64];
+		var reachedEnd = false;
+		var steps = 0;
+
+		while (!current.isNull()) {
+			if (steps >= entryCount) {
+				t.fail("memory-order cycle detected");
+				return;
+			}
+			if (!isBlockTableEntry(candidate, current)) {
+				t.fail("memory-order link points outside block table");
+				return;
+			}
+
+			def index = candidate.blockIndexOf(current);
+			def arrayIndex = int.!(index);
+			if (memorySeen[arrayIndex]) {
+				t.fail1("block %d appears twice in memory order", arrayIndex);
+				return;
+			}
+			memorySeen[arrayIndex] = true;
+			t.assert_eq(previous.addr, current.getPrev().addr);
+
+			def next = current.getNext();
+			if (index == candidate.numBlocks) {
+				t.assertz(true, current.getUsed());
+				t.assert_eq(ListKind.NONE.code, current.getListNum());
+				t.assertz(true, next.isNull());
+				t.assertz(true, current.getListPrev().isNull());
+				t.assertz(true, current.getListNext().isNull());
+				reachedEnd = true;
+				break;
+			}
+			if (!isBlockTableEntry(candidate, next)) {
+				t.fail("memory-order chain ends before region marker");
+				return;
+			}
+
+			def nextIndex = candidate.blockIndexOf(next);
+			if (nextIndex <= index) {
+				t.fail("memory-order block indices are not increasing");
+				return;
+			}
+			t.assert_eq(current.addr, next.getPrev().addr);
+
+			if (current.getUsed()) {
+				def kind = current.getListNum();
+				t.assertz(true, kind == ListKind.NONE.code || kind == ListKind.METADATA.code);
+				t.assertz(true, current.getListPrev().isNull());
+				t.assertz(true, current.getListNext().isNull());
+			} else {
+				def extentBlocks = nextIndex - index;
+				def expectedKind = if(
+					extentBlocks == 1u64,
+					ListKind.SMALL_FREE.code,
+					ListKind.LARGE_FREE.code);
+				t.assert_eq(expectedKind, current.getListNum());
+				if (!previous.isNull()) t.assertz(true, previous.getUsed());
+				freeByIndex[arrayIndex] = true;
+			}
+
+			previous = current;
+			current = next;
+			steps++;
+		}
+
+		t.assertz(true, reachedEnd);
+		walkFreeList(candidate, candidate.smallSentinel, ListKind.SMALL_FREE, listed);
+		walkFreeList(candidate, candidate.largeSentinel, ListKind.LARGE_FREE, listed);
+		for (i < entryCount) {
+			t.assertz(freeByIndex[i], listed[i]);
+		}
+		t.assertz(false, candidate.requiresRecovery());
+		t.assertz(false, candidate.txn.isDirty());
 	}
 
 	def writeCommittedWalUpdate(region: PWRegion, addr: u64, value: u64, width: u8) {
@@ -1218,6 +1347,62 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 	var chunk3 = region2.allocChunk(1u32);
 	tc.t.assertz(false, tc.allocSucceeded(chunk3));
 
+	tc.cleanup();
+}
+
+// Exercise split allocation, isolated free extents, left/right coalescing, and
+// repeated clean remounts in one history. Unlike allocation-probe tests, the
+// invariant walker checks the complete memory-order and free-list structures
+// after every mutation and after every remount.
+def test_bd_mixed_sequence_preserves_invariants(tc: BlockDevicePWRegionTester) {
+	tc.assertAllocatorInvariants(tc.region);
+
+	def twoBlocks = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, twoBlocks.isNull());
+	if (twoBlocks.isNull()) {
+		tc.cleanup();
+		return;
+	}
+	tc.assertAllocatorInvariants(tc.region);
+
+	def middle = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, middle.isNull());
+	if (middle.isNull()) {
+		tc.cleanup();
+		return;
+	}
+	tc.assertAllocatorInvariants(tc.region);
+
+	def right = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, right.isNull());
+	if (right.isNull()) {
+		tc.cleanup();
+		return;
+	}
+	tc.assertAllocatorInvariants(tc.region);
+
+	// Freeing the middle allocation leaves two distinct one-block free extents.
+	tc.t.assertz(true, tc.region.freeChunk(middle));
+	tc.assertAllocatorInvariants(tc.region);
+
+	var recovered = tc.remount();
+	tc.assertAllocatorInvariants(recovered);
+
+	// The old handles belonged to the unmapped address range. Rebuild handles
+	// from stable block-table indices before continuing the history.
+	def recoveredLeft = recovered.blockEntryToChunk(recovered.blockTableHandle[2u64]);
+	tc.t.assertz(true, recovered.freeChunk(recoveredLeft));
+	tc.assertAllocatorInvariants(recovered);
+
+	recovered = tc.remount();
+	tc.assertAllocatorInvariants(recovered);
+
+	def recoveredRight = recovered.blockEntryToChunk(recovered.blockTableHandle[5u64]);
+	tc.t.assertz(true, recovered.freeChunk(recoveredRight));
+	tc.assertAllocatorInvariants(recovered);
+
+	recovered = tc.remount();
+	tc.assertAllocatorInvariants(recovered);
 	tc.cleanup();
 }
 
