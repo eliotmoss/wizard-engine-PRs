@@ -220,8 +220,9 @@ Invalid input and capacity rejection can be known before a persistence
 boundary and are definite non-commits. `DualTxnWal.requiresRecovery()`
 distinguishes those results from commit-originated persistence failure without
 changing the `u64` result or on-region format. `RegionTransaction` and
-`PWRegion` do not yet propagate that distinction, so their public
-`commit() == false` must conservatively be treated as recovery-required.
+`PWRegion` now expose the same distinction through `requiresRecovery()`, so a
+public failure with a clear latch remains a definite validation/capacity
+rejection while a set latch requires abandon, reopen, and recovery.
 
 The shadow tests make the rule executable: copy-then-fail can leave either a
 replayable record or a valid fresh header despite returning failure, while
@@ -230,8 +231,9 @@ fresh-header, commit-record, after-image preparation, overwrite-guard, recovery,
 explicit-flush, final-data-close, and slot-scrub persistence failures. Once
 latched, the instance rejects append, commit, apply, persist, recover and close
 persistence work without another backend call. Only a new instance may inspect
-or recover the durable image. Higher-layer propagation remains tracked in
-`docs/ROADMAP.md` Next Steps #3.
+or recover the durable image. The transaction facade retains its dirty cache
+when after-image application fails, and allocator entry points reject new work
+on the latched mount.
 
 ---
 
@@ -257,12 +259,13 @@ writeU8 / writeI16 / writeU64 / writeI64(addr, val)
 
 ```
 commit()
+  if requiresRecovery() → return false
   if !isDirty() → return true
   appendToWal()             // iterate addrs → wal.append(offset, value, width)
   txnSeq = wal.commit()     // write one durable WAL record; 0 == failure
-  if txnSeq == 0 → return false  // leave cache dirty; higher layer must
-                                 // propagate wal.requiresRecovery()
-  applyToRegion()           // wal.applyUpdate() writes values and prepares ranges
+  if txnSeq == 0 → return false  // leave cache dirty; query requiresRecovery()
+  if !applyToRegion() → return false // acknowledged record remains recoverable;
+                                      // leave cache dirty and require reopen
   clear()                   // reuse the cache/map storage
   return true
 ```
@@ -270,9 +273,10 @@ commit()
 The committing transaction's applied after-images are recoverable from its durable slot, but their direct data persistence is deferred. The next commit's single phase-B boundary persists those pending ranges together with the next record. `flush()` calls `wal.persistAppliedData()` when an idle/unmount boundary is required, and `PWRegion.deallocate()` reaches the same operation through `wal.close()`.
 
 `DualTxnWal.applyUpdate()` now returns `false` and latches recovery-required if
-range preparation fails. `RegionTransaction.applyToRegion()` does not yet
-surface that result; exposing the latch through `RegionTransaction` and
-`PWRegion` is the next roadmap item.
+range preparation fails. `RegionTransaction.applyToRegion()` surfaces that
+result without clearing buffered writes. `RegionTransaction.requiresRecovery()`
+delegates to the WAL, and `PWRegion.requiresRecovery()` exposes it to allocator
+callers; allocation and free entry points reject work after the latch is set.
 
 ### Read path (cache miss)
 
@@ -445,13 +449,17 @@ PWRegion.mount()
 
 ## Testing
 
-Audited 2026-07-31: the implementation-specific x86-64 Linux suite contains 102 registered tests, all passing. None are expected failures.
+Audited 2026-07-31 and extended 2026-08-06: the implementation-specific
+x86-64 Linux suite contains 106 registered tests. The original 102 all passed
+with no expected failures. The four recovery-propagation regressions added on
+2026-08-06 compile in the Linux unit target but were not executable on the
+current Darwin arm64 host.
 
 | Test file | Tests | What it covers |
 |---|---:|---|
 | `DualTxnWalTest.v3` | 34 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
-| `RegionTransactionTest.v3` | 13 | transaction cache and active `DualTxnWal` integration, commit/flush propagation and oversize failure |
-| `TxnPWRegionTest.v3` | 33 | allocator, overflow propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
+| `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
+| `TxnPWRegionTest.v3` | 34 | allocator, overflow and recovery-required propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 `SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have
@@ -545,9 +553,9 @@ copy-then-fail/clean-reopen outcomes.
 The direct `DualTxnWal` core crash/fault matrix and backend self-tests are in
 place. Fresh initialization, commit, apply, recovery, explicit flush,
 final-data close and slot scrub now latch and enforce recovery-required state.
-The remaining core integration work is to propagate/query that state through
-`RegionTransaction`/`PWRegion`. After that, a test-only `ShadowTxnBackend`
-factory can expose the same live/durable pair to `PWRegion` so complete
+That state now propagates through `RegionTransaction`/`PWRegion`. The remaining
+core integration work is a test-only `ShadowTxnBackend` factory that exposes
+the same live/durable pair to `PWRegion` so complete
 allocation split/exact-fit and free/coalescing transactions are checked after
 simulated crashes. The shadow model establishes Layer 1; it complements rather
 than replaces the file/DAX and hardware work in Layers 2–4.
@@ -566,10 +574,9 @@ test/unit.sh
 |---|---|---|
 | 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
 | 2 | `DualTxnWalTest.v3` | Extend the shadow live/durable model through a `ShadowTxnBackend` allocator integration factory. |
-| 3 | `X86_64DualTxnWal.v3` | Propagate/query the implemented `requiresRecovery()` state through `RegionTransaction`/`PWRegion`. |
-| 4 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
-| 5 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
-| 6 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
-| 7 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
-| 8 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
-| 9 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |
+| 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
+| 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
+| 5 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
+| 6 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
+| 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
+| 8 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |

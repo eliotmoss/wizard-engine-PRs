@@ -13,6 +13,9 @@ def X = [
 	T("commit_clean_noop", test_commit_clean_noop),
 	T("commit_overflow_returns_false", test_commit_overflow_returns_false),
 	T("commit_overflow_then_success", test_commit_overflow_then_success),
+	T("commit_persist_failure_requires_recovery", test_commit_persist_failure_requires_recovery),
+	T("apply_prepare_failure_requires_recovery", test_apply_prepare_failure_requires_recovery),
+	T("flush_failure_requires_recovery", test_flush_failure_requires_recovery),
 	T("overwrite_update", test_overwrite_update),
 	T("is_dirty_check", test_is_dirty_check),
 	T("misaligned_access", test_misaligned_access),
@@ -26,6 +29,8 @@ class CountingBackend extends TxnRegionBackend {
 	def var persistChangesCount = 0;
 	def var lastDirtyOffset: u64 = 0;
 	def var lastDirtySize: u64 = 0;
+	def var failPrepareChangedRangeAt = 0;
+	def var failNextPersistChanges = false;
 
 	new(range) { }
 
@@ -53,6 +58,10 @@ class CountingRegion extends BackendRegion {
 		counter.prepareChangedRangeCount++;
 		counter.lastDirtyOffset = offset;
 		counter.lastDirtySize = size;
+		if (counter.prepareChangedRangeCount == counter.failPrepareChangedRangeAt) {
+			counter.failPrepareChangedRangeAt = 0;
+			return false;
+		}
 		return true;
 	}
 
@@ -63,6 +72,10 @@ class CountingRegion extends BackendRegion {
 
 	def persistChanges() -> bool {
 		counter.persistChangesCount++;
+		if (counter.failNextPersistChanges) {
+			counter.failNextPersistChanges = false;
+			return false;
+		}
 		return true;
 	}
 }
@@ -289,6 +302,7 @@ def test_commit_overflow_returns_false(tc: RegionTransactionTester) {
 	tc.t.assert_eq(0u64, tc.wal.lastCommittedSeq);
 	tc.t.assert_eq(0u64, tc.wal.slotSeqs[0]);
 	tc.t.assert_eq(0u64, tc.wal.slotSeqs[1]);
+	tc.t.assertz(false, tc.txn.requiresRecovery());
 }
 
 // Test 11: A failed commit must not wedge the shared WAL: the oversized-record
@@ -301,10 +315,63 @@ def test_commit_overflow_then_success(tc: RegionTransactionTester) {
 	}
 	tc.t.assertz(false, tc.txn.commit());
 	tc.t.assertz(true, tc.txn.isDirty());
+	tc.t.assertz(false, tc.txn.requiresRecovery());
 
 	var txn2 = RegionTransaction.new(tc.wal, tc.wal.regionStart);
 	txn2.writeU64(tc.getAddr(3000), 0x99u64);
 	tc.t.assertz(true, txn2.commit());
 	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
 	tc.t.assertz(false, txn2.isDirty());
+}
+
+// A failed commit boundary is indeterminate. RegionTransaction must expose the
+// WAL latch, retain its buffered writes, and reject a same-instance retry
+// without issuing another persistence operation.
+def test_commit_persist_failure_requires_recovery(tc: RegionTransactionTester) {
+	def addr = tc.getAddr(200);
+	tc.backend.failNextPersistChanges = true;
+	tc.txn.writeU64(addr, 0x1234u64);
+
+	tc.t.assertz(false, tc.txn.commit());
+	tc.t.assertz(true, tc.txn.requiresRecovery());
+	tc.t.assertz(true, tc.txn.isDirty());
+	tc.t.assert_eq(0u64, tc.wal.lastCommittedSeq);
+	tc.t.assert_eq(0x1234u64, tc.txn.readU64(addr));
+
+	def persistChangesCount = tc.backend.persistChangesCount;
+	tc.t.assertz(false, tc.txn.commit());
+	tc.t.assert_eq(persistChangesCount, tc.backend.persistChangesCount);
+}
+
+// A record can be acknowledged before preparing its live after-image fails.
+// The facade must propagate applyUpdate()'s failure and keep the cache dirty so
+// it never reports a fully completed transaction on the poisoned mount.
+def test_apply_prepare_failure_requires_recovery(tc: RegionTransactionTester) {
+	def addr = tc.getAddr(200);
+	// The record is prepared first; fail the second preparation, for the data.
+	tc.backend.failPrepareChangedRangeAt = 2;
+	tc.txn.writeU64(addr, 0x5678u64);
+
+	tc.t.assertz(false, tc.txn.commit());
+	tc.t.assertz(true, tc.txn.requiresRecovery());
+	tc.t.assertz(true, tc.txn.isDirty());
+	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+	tc.t.assert_eq(0x5678u64, tc.readRamU64(200));
+}
+
+// flush() failures latch the same state even after commit cleared the cache.
+// A clean commit is no longer allowed to mask that the mount needs recovery.
+def test_flush_failure_requires_recovery(tc: RegionTransactionTester) {
+	tc.txn.writeU64(tc.getAddr(200), 0x9ABCu64);
+	tc.t.assertz(true, tc.txn.commit());
+	tc.t.assertz(false, tc.txn.isDirty());
+
+	tc.backend.failNextPersistChanges = true;
+	tc.t.assertz(false, tc.txn.flush());
+	tc.t.assertz(true, tc.txn.requiresRecovery());
+
+	def persistChangesCount = tc.backend.persistChangesCount;
+	tc.t.assertz(false, tc.txn.commit());
+	tc.t.assert_eq(persistChangesCount, tc.backend.persistChangesCount);
 }

@@ -196,9 +196,9 @@ backend. It keeps separate live and durable byte arrays, makes
 bytes from that shadow on simulated crash, and injects fail-before-copy,
 copy-then-fail and partial-copy outcomes. The `DualTxnWal` commit and recovery
 paths now latch persistence failures, reject further same-instance work, and
-require a fresh instance to recover. Remaining Stage-0 work is enforcement for
-flush/close-originated failures, higher-layer
-propagation, the rest of the fault matrix, and a `ShadowTxnBackend` factory for
+require a fresh instance to recover. Fresh initialization, after-image
+preparation, flush, close, transaction-facade, and allocator propagation are
+covered as well. The remaining Stage-0 work is a `ShadowTxnBackend` factory for
 complete allocator transactions.
 
 Stage 0 answers whether the WAL is correct under the abstract `BackendRegion`

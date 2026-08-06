@@ -29,7 +29,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 | API results | `commit()` → `void` (persist implied) | `commit()` → `u64`; empty commits write an `entryCount=0` record so success is always nonzero. `recover()` → `MultiWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) | `commit()` → `u64`; nonzero is acknowledged, while a persistence-related `0` is unacknowledged and requires reopen/recovery rather than guaranteeing abort. `recover()` → `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`) |
 | Clean-unmount replay | Log cleared after every commit — remount is replay-free | `close()` is empty; even a clean unmount replays the tail | `close()` persists deferred data and scrubs reclaimable slots — clean remounts recover `CLEAN` |
 | Wired into `PWRegion` | No (reference only) | No (reference only) | Yes |
-| Roadmap-related tests (2026-07-31 audit) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 29 in `DualTxnWalTest.v3`, plus 46 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
+| Roadmap-related tests (extended 2026-08-06) | No dedicated tests | 22 in `MultiTxnWalTest.v3` | 34 in `DualTxnWalTest.v3`, plus 50 cache/allocator/backend tests in `RegionTransactionTest.v3` and `TxnPWRegionTest.v3` |
 
 ## Why the multi-transaction design superseded the single-transaction one
 
@@ -103,7 +103,9 @@ complete record because redo after-images are idempotent. `DualTxnWal` now
 latches fresh-header, commit-record, after-image preparation, recovery,
 explicit-flush, final-data-close, and slot-scrub persistence failures and
 requires a newly constructed instance to inspect or recover durable state.
-Higher-layer propagation remains open.
+`RegionTransaction` and `PWRegion` now expose that latch, after-image failures
+propagate without clearing the cache, and allocator entry points reject new
+work on a recovery-required mount.
 Backend syscall/instruction integration, abrupt process/guest recovery, and
 physical-media testing provide progressively stronger outer layers. The
 complete layer definitions are in `docs/persistent-backends.md`; the

@@ -375,6 +375,13 @@ class RegionTransaction {
                 return addrs.length != 0;
         }
 
+        // Persistence failures leave the durable outcome indeterminate. The
+        // current WAL instance cannot safely accept more work; callers must
+        // abandon this mount, reopen it, and recover the durable image.
+        def requiresRecovery() -> bool {
+                return wal.requiresRecovery();
+        }
+
         // Phase B commit: one persistence boundary in steady state.
         // wal.commit() persists the record together with the *previous*
         // transaction's applied after-images (the piggybacked boundary); this
@@ -383,11 +390,12 @@ class RegionTransaction {
         // WAL's close(). Until then the durable record keeps them
         // recoverable, and the WAL's overwrite guard protects the slot.
         def commit() -> bool {
+                if (requiresRecovery()) return false;
                 if (!isDirty()) return true;
                 appendToWal();
                 def txnSeq = wal.commit();
                 if (txnSeq == 0u64) return false;
-                applyToRegion();
+                if (!applyToRegion()) return false;
                 clear();
                 return true;
         }
@@ -466,13 +474,13 @@ class RegionTransaction {
                 );
         }
 
-        private def applyToRegion() {
-                addrs.apply(
-                        fun (addr: u64) {
-                                def c: CachedUpdate = cache[addr];
-                                wal.applyUpdate(addr - regionStart, c.value, c.size);
-                        }
-                );
+        private def applyToRegion() -> bool {
+                for (i < addrs.length) {
+                        def addr = addrs[i];
+                        def c: CachedUpdate = cache[addr];
+                        if (!wal.applyUpdate(addr - regionStart, c.value, c.size)) return false;
+                }
+                return true;
         }
 
         // Hash function: Convert u64 -> i32
@@ -813,6 +821,7 @@ class PWRegion {
         }
 
         def allocChunk(numBlocks: u32) -> ChunkHandle {
+                if (requiresRecovery()) return blankChunkHandle;
                 if (numBlocks == 1) {
                         // Try the small free block list
                         var firstHandle = smallSentinel.getListNextCached(txn);
@@ -877,6 +886,7 @@ class PWRegion {
         }
 
         def freeChunk(chunk: ChunkHandle) -> bool {
+                if (requiresRecovery()) return false;
                 if (chunk.isNull()) return false;
 
                 var entry = chunkToBlockEntry(chunk);
@@ -920,6 +930,13 @@ class PWRegion {
                         insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
                 }
                 return performCommit();
+        }
+
+        // Distinguish an ordinary allocator rejection (for example, no fitting
+        // chunk or an oversized WAL record) from a persistence failure that
+        // makes this mounted instance unsafe to continue using.
+        def requiresRecovery() -> bool {
+                return txn != null && txn.requiresRecovery();
         }
 
         // Insert entry into list immediately after sentinel (head insertion)

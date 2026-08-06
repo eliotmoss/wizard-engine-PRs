@@ -241,6 +241,103 @@ def test_alloc_overflow_returns_blank(tc: SmallRingPWRegionTester) {
 	var chunk = tc.region.allocChunk(2u32);
 	tc.t.assertz(false, tc.allocSucceeded(chunk));
 	tc.t.assertz(true, tc.region.txn.isDirty());
+	tc.t.assertz(false, tc.region.requiresRecovery());
+}
+
+
+// =============================================================================
+// Recovery-required propagation (injected persistence failure)
+// =============================================================================
+
+def PRT = UnitTests.registerT("pwregion_recovery:", _, RecoveryPWRegionTester.new, _);
+def PRX = [
+	PRT("alloc_persist_failure_requires_recovery", test_alloc_persist_failure_requires_recovery),
+	()
+];
+
+class RecoveryPWRegionBackend extends TxnRegionBackend {
+	var region: RecoveryPWBackendRegion;
+
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def data = Array<byte>.new(int.!(size));
+		region = RecoveryPWBackendRegion.new(data[0 ..+ data.length]);
+		return region;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "recovery-test";
+	}
+}
+
+class RecoveryPWBackendRegion extends BackendRegion {
+	var failNextPersistChanges = false;
+	var persistChangesCount = 0;
+
+	new(range: Range<byte>) super(range) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		persistChangesCount++;
+		if (failNextPersistChanges) {
+			failNextPersistChanges = false;
+			return false;
+		}
+		return true;
+	}
+}
+
+class RecoveryPWRegionTester(t: Tester) {
+	var backend: RecoveryPWRegionBackend;
+	var region: PWRegion;
+
+	new() {
+		backend = RecoveryPWRegionBackend.new();
+		region = PWRegion.new(
+			backend,
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			true
+		);
+	}
+
+	def allocSucceeded(chunk: ChunkHandle) -> bool {
+		return !chunk.isNull();
+	}
+}
+
+// A failed allocator commit must remain distinguishable from exhaustion or
+// capacity rejection at the PWRegion API. The shared transaction stays dirty,
+// and the mounted allocator rejects later work without another boundary.
+def test_alloc_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
+	tc.t.assertz(false, tc.region.requiresRecovery());
+	def committedChunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.allocSucceeded(committedChunk));
+	tc.backend.region.failNextPersistChanges = true;
+
+	def failedChunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, tc.allocSucceeded(failedChunk));
+	tc.t.assertz(true, tc.region.requiresRecovery());
+	tc.t.assertz(true, tc.region.txn.isDirty());
+
+	def persistChangesCount = tc.backend.region.persistChangesCount;
+	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
+	tc.t.assertz(false, tc.region.freeChunk(committedChunk));
+	tc.t.assertz(true, tc.region.chunkToBlockEntry(committedChunk).getUsed());
+	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
 }
 
 

@@ -42,19 +42,20 @@ This original concern is resolved: `PWRegionHeader.logChunk` now stores the regi
 
 ---
 
-## 5. Oversized transactions fail safely but lack recovery-required enforcement
+## 5. Oversized transactions fail safely; recovery-required state is exposed
 
 `RegionTransaction` can still accumulate more `(addr, value)` pairs than one `DualTxnWal` slot can hold. The active path now fails safely: `DualTxnWal.commit()` returns `0`, `RegionTransaction.commit()` returns `false`, allocator operations propagate failure, and the dirty cache is retained instead of acknowledging a partial record.
 
 `DualTxnWal.requiresRecovery()` now distinguishes commit persistence failure
 from definite validation/capacity rejection. `RegionTransaction` and
-`PWRegion` do not yet propagate that distinction, however, so their public
-`false` must conservatively be treated as recovery-required. The caller must
-abandon the mount, thereby discarding this volatile cache, then reopen and
-recover. A later operation on the same `PWRegion` can currently still observe
-and extend the dirty transaction; existing tests that use a second independent
-`RegionTransaction` therefore describe an enforcement gap, not a supported
-retry path.
+`PWRegion` expose the same state through `requiresRecovery()`: an ordinary
+oversize failure leaves it clear, while a persistence or after-image
+preparation failure sets it and requires abandon/reopen/recover. The
+transaction retains its dirty cache on failure, clean commits cannot mask a
+latch, and `PWRegion` allocation/free entry points reject later work. The
+void-returning direct cache write methods can still accumulate volatile data if
+a caller ignores `requiresRecovery()`, but no commit on that WAL instance will
+accept it.
 
 ---
 
@@ -106,8 +107,8 @@ later boundary can advance `dataDurableSeq`, and recovery reports
 `PERSIST_FAILED` without issuing `persistChanges()`. `DualTxnWal` rejects
 same-instance work after any fresh-init, commit, apply, recovery, flush or close
 persistence failure, while `requiresRecovery()` distinguishes those failures
-from definite validation/capacity rejection. Propagation through
-`RegionTransaction`/`PWRegion` remains open; until that propagation exists,
-higher layers must conservatively treat every `false` as recovery-required.
+from definite validation/capacity rejection. `RegionTransaction` propagates a
+failed `applyUpdate()` without clearing the cache, and both it and `PWRegion`
+expose the latch; allocator entry points reject subsequent work on that mount.
 The shadow supplies protocol-level evidence only; syscall, process/VM crash and
 physical-media evidence remain separate outer layers.
