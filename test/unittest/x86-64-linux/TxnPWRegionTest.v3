@@ -206,6 +206,7 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 
 def IRT = UnitTests.registerT("pwregion_immix:", _, ImmixPWRegionTester.new, _);
 def IRX = [
+	IRT("descriptor_controls_line_size", test_immix_descriptor_controls_line_size),
 	IRT("chunk_links_first_line_mark", test_immix_chunk_links_first_line_mark),
 	()
 ];
@@ -220,7 +221,7 @@ class ImmixPWRegionTester(t: Tester) {
 		def desc = Ref<MetaDataDesc>.at(descBytes, 0);
 		desc.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
 		desc.fixedBytes = 0;
-		desc.unitSize = u32.!(ImmixPWRegions.ImmixLineSize);
+		desc.unitSize = 128u32;
 		desc.bytesPerUnit = u32.!(LineMark.size);
 
 		descs = Array<Ref<MetaDataDesc>>.new(1);
@@ -229,11 +230,20 @@ class ImmixPWRegionTester(t: Tester) {
 	}
 }
 
+// The persisted metadata descriptor, rather than a global constant, controls
+// both the line-table geometry and chunk-to-line-mark indexing.
+def test_immix_descriptor_controls_line_size(tc: ImmixPWRegionTester) {
+	def expectedMarks = (8u64 * 4096u64 + 127u64) / 128u64;
+
+	tc.t.assert_eq(128u64, tc.region.lineSize);
+	tc.t.assert_eq(expectedMarks, tc.region.numLineMarks);
+}
+
 // createChunk() must link to the mark covering the chunk's actual region
 // offset, not merely to the start of the global line-mark table.
 def test_immix_chunk_links_first_line_mark(tc: ImmixPWRegionTester) {
 	def chunk = tc.region.allocChunk(1u32);
-	def lineIndex = tc.region.offsetInRegion(chunk.addr) / u64.!(ImmixPWRegions.ImmixLineSize);
+	def lineIndex = tc.region.offsetInRegion(chunk.addr) / tc.region.lineSize;
 	def expectedOffset = tc.region.lineMarks[lineIndex].addr - tc.region.regionStart;
 
 	tc.t.assertz(false, chunk.isNull());

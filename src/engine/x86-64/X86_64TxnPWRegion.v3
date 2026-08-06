@@ -1007,14 +1007,16 @@ class ImmixPWRegion extends PWRegion {
         // Line mark definitions
         def var lineMarks: LineMarkTableHandle;
         def var numLineMarks: u64;
+        def var lineSize: u64;
 
         private def getLineMarks() -> LineMarkTableHandle {
                 var hdr = getHeader();
                 for (i < hdr.numDescs) {
                         var r = getMetaDataDesc(u64.!(i));
                         if (r.kind == ImmixPWRegions.ImmixLineMarkMetaKind) {
+                                lineSize = u64.!(r.unitSize);
                                 var spaceSize = numBlocks * blockSize;
-                                numLineMarks = spaceSize / u64.!(ImmixPWRegions.ImmixLineSize);
+                                numLineMarks = (spaceSize + lineSize - 1) / lineSize;
                                 var lmrng = this.rng[r.offset ..+ numLineMarks * u64.!(LineMark.size)];
                                 return LineMarkTableHandle(u64.view(Pointer.atElement(lmrng, 0) - Pointer.NULL), numLineMarks);
                         }
@@ -1027,12 +1029,11 @@ class ImmixPWRegion extends PWRegion {
                         chunk.setLinemarksCached(txn, 0);
                         return;
                 }
-                def lineIndex = offsetInRegion(chunk.addr) / u64.!(ImmixPWRegions.ImmixLineSize);
+                def lineIndex = offsetInRegion(chunk.addr) / lineSize;
                 chunk.setLinemarksCached(txn, lineMarks[lineIndex].addr - regionStart);
         }
 
         def resetAllLineMarks() {
-                var lineSize = u64.!(ImmixPWRegions.ImmixLineSize);
                 for (index < numLineMarks) {
                         lineMarks[index].getRef().mark = ImmixPWRegions.ImmixLineMarkResetValue;
                 }
@@ -1042,7 +1043,7 @@ class ImmixPWRegion extends PWRegion {
 component ImmixPWRegions {
         def ImmixLineMarkMetaKind = 0x0000_0001_0000_0000u64;
         def ImmixLineMarkResetValue = 0u8;
-        def ImmixLineSize = 256;  // sample - needs to be done using the metadata descriptior
+        def DefaultImmixLineSize = 256u32;
 
         // Line mark states (matching original Immix paper)
         // Lines are either free (unmarked) or contain live objects (marked)
@@ -1059,7 +1060,7 @@ component MemRegions {
                 var r = lineMarkDescRef;
                 r.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
                 r.fixedBytes = 0;
-                r.unitSize = u32.!(ImmixPWRegions.ImmixLineSize);
+                r.unitSize = ImmixPWRegions.DefaultImmixLineSize;
                 r.bytesPerUnit = u32.!(LineMark.size);
                 // leave offset unset (i.e., 0)
         }

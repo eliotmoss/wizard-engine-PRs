@@ -381,11 +381,9 @@ These are zero-allocation wrappers around raw memory addresses:
 
 **File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `ImmixPWRegion`)
 
-`ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. Line size is currently hardcoded at 256 bytes.
+`ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. The persisted line-mark metadata descriptor's `unitSize` controls the line size; the built-in `MemRegions` descriptor defaults it to 256 bytes.
 
 - `resetAllLineMarks()` — clears all line marks at the start of a GC cycle.
-
-> **TODO:** Line size should come from the metadata descriptor rather than being hardcoded.
 
 ---
 
@@ -575,7 +573,5 @@ test/unit.sh
 | 2 | `DualTxnWalTest.v3` | Extend the shadow live/durable model through a `ShadowTxnBackend` allocator integration factory. |
 | 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
-| 5 | `X86_64TxnPWRegion.v3` | Line-mark field is not yet linked during `createChunk()`. |
-| 6 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` is hardcoded as 256 bytes; should come from the metadata descriptor. |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
 | 8 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |
