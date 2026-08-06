@@ -761,6 +761,7 @@ def BX = [
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
 	BT("abrupt_writer_recovers_committed_wal", test_bd_abrupt_writer_recovers_committed_wal),
 	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
+	BT("abrupt_exact_fit_alloc_recovers_transaction", test_bd_abrupt_exact_fit_alloc_recovers_transaction),
 	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
@@ -840,6 +841,24 @@ class BlockDevicePWRegionTester(t: Tester) {
 		return 0;
 	}
 
+	// Run the exact-fit allocator path in a forked child. allocChunk(5) consumes
+	// the entire initial large-free extent, so recovery must preserve both the
+	// empty free lists and the shortened memory-order chain.
+	def allocateExactFitAbruptly() -> int {
+		region = openRegion(false);
+		if (region.backendRegion == null || region.txn == null) return 2;
+
+		def chunk = region.allocChunk(5u32);
+		if (chunk.isNull()) return 3;
+		if (region.requiresRecovery()) return 4;
+		if (region.txn.isDirty()) return 5;
+		if (!region.blockTableHandle[2u64].getUsed()) return 6;
+		if (!region.largeSentinel.getListNext().isNull()) return 7;
+		if (!FileMmapRegion.?(region.backendRegion)) return 8;
+		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 9;
+		return 0;
+	}
+
 	def assertRecoveredSplitAllocation(recovered: PWRegion) {
 		def logEntry = recovered.blockTableHandle[1u64];
 		def allocated = recovered.blockTableHandle[2u64];
@@ -868,6 +887,41 @@ class BlockDevicePWRegionTester(t: Tester) {
 		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
 		t.assert_eq(4096u64, chunk.getLimit());
 		t.assert_eq(4096u64, chunk.getChunkLimit());
+		t.assert_eq(0u64, chunk.getLinemarks());
+		t.assertz(false, recovered.requiresRecovery());
+		t.assertz(false, recovered.txn.isDirty());
+	}
+
+	def assertRecoveredExactFitAllocation(recovered: PWRegion) {
+		def logEntry = recovered.blockTableHandle[1u64];
+		def allocated = recovered.blockTableHandle[2u64];
+		def metadata = recovered.blockTableHandle[7u64];
+		def endMarker = recovered.blockTableHandle[8u64];
+		def chunk = recovered.blockEntryToChunk(allocated);
+
+		// Memory order skips the consumed extent's interior table entries.
+		t.assertz(true, allocated.getUsed());
+		t.assert_eq(ListKind.NONE.code, allocated.getListNum());
+		t.assert_eq(allocated.addr, logEntry.getNext().addr);
+		t.assert_eq(logEntry.addr, allocated.getPrev().addr);
+		t.assert_eq(metadata.addr, allocated.getNext().addr);
+		t.assertz(true, metadata.getUsed());
+		t.assert_eq(ListKind.METADATA.code, metadata.getListNum());
+		t.assert_eq(allocated.addr, metadata.getPrev().addr);
+		t.assert_eq(endMarker.addr, metadata.getNext().addr);
+		t.assertz(true, metadata.getListPrev().isNull());
+		t.assertz(true, metadata.getListNext().isNull());
+		t.assert_eq(metadata.addr, endMarker.getPrev().addr);
+
+		// Exact fit consumes the only free extent.
+		t.assertz(true, allocated.getListPrev().isNull());
+		t.assertz(true, allocated.getListNext().isNull());
+		t.assertz(true, recovered.smallSentinel.getListNext().isNull());
+		t.assertz(true, recovered.largeSentinel.getListNext().isNull());
+
+		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
+		t.assert_eq(5u64 * 4096u64, chunk.getLimit());
+		t.assert_eq(5u64 * 4096u64, chunk.getChunkLimit());
 		t.assert_eq(0u64, chunk.getLinemarks());
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
@@ -1072,6 +1126,43 @@ def test_bd_abrupt_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTeste
 
 	def recovered = tc.remount();
 	tc.assertRecoveredSplitAllocation(recovered);
+
+	tc.cleanup();
+}
+
+// Exercise a second complete allocator transaction at the applied-after-image
+// crash window. Unlike the split path, exact fit removes the only free-list
+// node and leaves no remainder; remount must recover that distinct structure
+// from the multi-entry WAL record without child cleanup.
+def test_bd_abrupt_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateExactFitAbruptly();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waited = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(pid, waited);
+	tc.t.assert_eq(0, waitStatus[0]);
+	if (waited != pid || waitStatus[0] != 0) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredExactFitAllocation(recovered);
 
 	tc.cleanup();
 }
