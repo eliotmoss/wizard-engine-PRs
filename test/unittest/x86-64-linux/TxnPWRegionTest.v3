@@ -882,6 +882,7 @@ def BX = [
 	BT("abrupt_coalescing_free_recovers_transaction", test_bd_abrupt_coalescing_free_recovers_transaction),
 	BT("sigkill_split_alloc_commit_boundary_recovers", test_bd_sigkill_split_alloc_commit_boundary_recovers),
 	BT("sigkill_exact_fit_alloc_commit_boundary_recovers", test_bd_sigkill_exact_fit_alloc_commit_boundary_recovers),
+	BT("sigkill_coalescing_free_commit_boundary_recovers", test_bd_sigkill_coalescing_free_commit_boundary_recovers),
 	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
@@ -1134,6 +1135,30 @@ class BlockDevicePWRegionTester(t: Tester) {
 		// Reaching this return means the expected SIGSTOP did not hold the child
 		// at the commit boundary.
 		return 5;
+	}
+
+	// The parent prepares two adjacent allocations and frees the first before
+	// this child opens the file. Freeing block 3 then coalesces with both the
+	// free block on its left and the large remainder on its right. The custom
+	// backend stops after that complete transaction's WAL record is durable but
+	// before freeChunk() can apply any of its structural after-images.
+	def coalesceFreeAtCommitBoundary() -> int {
+		region = PWRegion.new(
+			CommitBoundaryStopFileMmapBackend.new(BD_PATH),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			false
+		);
+		if (region.backendRegion == null || region.txn == null) return 2;
+		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+
+		def allocatedRight = region.blockTableHandle[3u64];
+		if (!allocatedRight.getUsed()) return 4;
+		if (!region.freeChunk(region.blockEntryToChunk(allocatedRight))) return 5;
+		// Reaching this return means the expected SIGSTOP did not hold the child
+		// at the commit boundary.
+		return 6;
 	}
 
 	// Run the exact-fit allocator path in a forked child. allocChunk(5) consumes
@@ -1759,6 +1784,76 @@ def test_bd_sigkill_exact_fit_alloc_commit_boundary_recovers(tc: BlockDevicePWRe
 
 	def recovered = tc.remount();
 	tc.assertRecoveredExactFitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
+
+	tc.cleanup();
+}
+
+// Prepare the allocator so freeing block 3 must coalesce both neighbors, then
+// stop immediately after that multi-entry WAL record reaches fdatasync. The
+// child is killed before any after-image is applied; recovery must rebuild the
+// original five-block extent using the record alone.
+def test_bd_sigkill_coalescing_free_commit_boundary_recovers(tc: BlockDevicePWRegionTester) {
+	def first = tc.region.allocChunk(1u32);
+	def second = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, !first.isNull());
+	tc.t.assertz(true, !second.isNull());
+	if (first.isNull() || second.isNull()) {
+		tc.cleanup();
+		return;
+	}
+	tc.t.assertz(true, tc.region.freeChunk(first));
+	if (tc.region.blockTableHandle[2u64].getUsed() ||
+		!tc.region.blockTableHandle[3u64].getUsed()) {
+		tc.t.fail("coalescing-free setup failed");
+		tc.cleanup();
+		return;
+	}
+	tc.assertAllocatorInvariants(tc.region);
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.coalesceFreeAtCommitBoundary();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waitedForStop = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), BD_WUNTRACED, Pointer.NULL)).0;
+	def expectedStopStatus = BD_SIGSTOP * 256 + 127;
+	tc.t.assert_eq(pid, waitedForStop);
+	tc.t.assert_eq(expectedStopStatus, waitStatus[0]);
+	if (waitedForStop != pid || waitStatus[0] != expectedStopStatus) {
+		Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL));
+		Linux.syscall(LinuxConst.SYS_wait4,
+			(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL));
+		tc.cleanup();
+		return;
+	}
+
+	def killResult = Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL)).0;
+	def waitedForKill = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(0, killResult);
+	tc.t.assert_eq(pid, waitedForKill);
+	tc.t.assert_eq(BD_SIGKILL, waitStatus[0]);
+	if (killResult != 0 || waitedForKill != pid || waitStatus[0] != BD_SIGKILL) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredCoalescingFree(recovered);
 	tc.assertAllocatorInvariants(recovered);
 
 	tc.cleanup();
