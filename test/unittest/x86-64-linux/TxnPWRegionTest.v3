@@ -875,6 +875,7 @@ def BX = [
 	BT("persist_and_remount",   test_bd_persist_and_remount),
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
 	BT("mixed_sequence_preserves_invariants", test_bd_mixed_sequence_preserves_invariants),
+	BT("seeded_mixed_histories_preserve_invariants", test_bd_seeded_mixed_histories_preserve_invariants),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
 	BT("abrupt_writer_recovers_committed_wal", test_bd_abrupt_writer_recovers_committed_wal),
 	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
@@ -921,6 +922,15 @@ class BlockDevicePWRegionTester(t: Tester) {
 			region.deallocate();
 		}
 		region = openRegion(false);
+		return region;
+	}
+
+	// Start another generated history from a newly formatted backing file.
+	def reformat() -> PWRegion {
+		if (region != null) {
+			region.deallocate();
+		}
+		region = openRegion(true);
 		return region;
 	}
 
@@ -1050,6 +1060,42 @@ class BlockDevicePWRegionTester(t: Tester) {
 		}
 		t.assertz(false, candidate.requiresRecovery());
 		t.assertz(false, candidate.txn.isDirty());
+	}
+
+	// Cross-check the allocator against the generated history's compact model.
+	// Each nonzero element is an allocated extent beginning at that block index.
+	def assertTrackedAllocations(candidate: PWRegion, allocationSizes: Array<u32>) {
+		for (i = 2; i < 7; i++) {
+			def size = allocationSizes[i];
+			if (size == 0u32) continue;
+
+			def entry = candidate.blockTableHandle[u64.view(i)];
+			def next = entry.getNext();
+			t.assertz(true, entry.getUsed());
+			t.assert_eq(ListKind.NONE.code, entry.getListNum());
+			t.assert_eq(u64.view(i) + u64.view(size), candidate.blockIndexOf(next));
+
+			def chunk = candidate.blockEntryToChunk(entry);
+			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getLimit());
+			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getChunkLimit());
+		}
+
+		// The reverse check prevents an unexpected allocated extent from being
+		// accepted merely because every modeled extent was found.
+		var current = candidate.blockTableHandle[0u64];
+		var steps = 0;
+		while (!current.isNull()) {
+			if (steps > int.!(candidate.numBlocks)) {
+				t.fail("allocation-model walk found a memory-order cycle");
+				return;
+			}
+			def index = candidate.blockIndexOf(current);
+			if (index >= 2u64 && index < 7u64) {
+				t.assertz(current.getUsed(), allocationSizes[int.!(index)] != 0u32);
+			}
+			current = current.getNext();
+			steps++;
+		}
 	}
 
 	def writeCommittedWalUpdate(region: PWRegion, addr: u64, value: u64, width: u8) {
@@ -1509,6 +1555,114 @@ def test_bd_mixed_sequence_preserves_invariants(tc: BlockDevicePWRegionTester) {
 
 	recovered = tc.remount();
 	tc.assertAllocatorInvariants(recovered);
+	tc.cleanup();
+}
+
+// A small deterministic property test. Multiple fixed seeds generate bounded
+// allocate/free/remount histories, making failures exactly reproducible while
+// covering many more fragmentation and coalescing orders than the hand-written
+// history above. The model stores stable block indices because remount changes
+// every mapped address and invalidates the old ChunkHandles.
+def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTester) {
+	def seeds = [1, 0x5EED, 0xBEEF, 0xCAFE];
+	for (seedIndex < seeds.length) {
+		if (seedIndex > 0) tc.reformat();
+		var state = seeds[seedIndex];
+		var allocationSizes = Array<u32>.new(9);
+
+		tc.assertAllocatorInvariants(tc.region);
+		for (step < 64) {
+			state = (state * 25173 + 13849) % 65536;
+			def operation = state % 7;
+
+			var activeCount = 0;
+			for (i = 2; i < 7; i++) {
+				if (allocationSizes[i] != 0u32) activeCount++;
+			}
+
+			if (operation == 0) {
+				tc.remount();
+			} else if (operation <= 3 && activeCount > 0) {
+				state = (state * 25173 + 13849) % 65536;
+				var ordinal = state % activeCount;
+				var selected = -1;
+				for (i = 2; i < 7; i++) {
+					if (allocationSizes[i] == 0u32) continue;
+					if (ordinal == 0) {
+						selected = i;
+						break;
+					}
+					ordinal--;
+				}
+
+				tc.t.assertz(true, selected >= 2);
+				if (selected < 2) {
+					tc.cleanup();
+					return;
+				}
+				def entry = tc.region.blockTableHandle[u64.view(selected)];
+				def freed = tc.region.freeChunk(tc.region.blockEntryToChunk(entry));
+				tc.t.assertz(true, freed);
+				if (!freed) {
+					tc.cleanup();
+					return;
+				}
+				allocationSizes[selected] = 0u32;
+			} else {
+				state = (state * 25173 + 13849) % 65536;
+				def request = u32.!(1 + state % 3);
+				def chunk = tc.region.allocChunk(request);
+				if (chunk.isNull()) {
+					// Exhaustion or fragmentation is an ordinary failed operation and
+					// must not leave transactional state behind.
+					tc.t.assertz(false, tc.region.requiresRecovery());
+					tc.t.assertz(false, tc.region.txn.isDirty());
+				} else {
+					def index = int.!(tc.region.blockIndexOf(tc.region.chunkToBlockEntry(chunk)));
+					def limit = index + int.!(request);
+					tc.t.assertz(true, index >= 2 && limit <= 7);
+					if (index < 2 || limit > 7) {
+						tc.cleanup();
+						return;
+					}
+
+					var disjoint = true;
+					for (i = 2; i < 7; i++) {
+						def trackedSize = int.!(allocationSizes[i]);
+						if (trackedSize == 0) continue;
+						if (!(i + trackedSize <= index || limit <= i)) disjoint = false;
+					}
+					tc.t.assertz(true, disjoint);
+					if (!disjoint) {
+						tc.cleanup();
+						return;
+					}
+					allocationSizes[index] = request;
+				}
+			}
+
+			tc.assertAllocatorInvariants(tc.region);
+			tc.assertTrackedAllocations(tc.region, allocationSizes);
+		}
+
+		// Finish each history by freeing every modeled allocation. This adds a
+		// final coalescing sweep and proves the resulting state survives remount.
+		for (i = 2; i < 7; i++) {
+			if (allocationSizes[i] == 0u32) continue;
+			def entry = tc.region.blockTableHandle[u64.view(i)];
+			def freed = tc.region.freeChunk(tc.region.blockEntryToChunk(entry));
+			tc.t.assertz(true, freed);
+			if (!freed) {
+				tc.cleanup();
+				return;
+			}
+			allocationSizes[i] = 0u32;
+			tc.assertAllocatorInvariants(tc.region);
+		}
+		tc.remount();
+		tc.assertAllocatorInvariants(tc.region);
+		tc.assertTrackedAllocations(tc.region, allocationSizes);
+	}
 	tc.cleanup();
 }
 

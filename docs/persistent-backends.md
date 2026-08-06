@@ -447,7 +447,7 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-06: the implementation-specific
-x86-64 Linux suite contains 139 registered tests. All 139 pass with no expected
+x86-64 Linux suite contains 140 registered tests. All 140 pass with no expected
 failures when run in an amd64 Docker container on the current Darwin arm64
 host.
 
@@ -456,7 +456,7 @@ host.
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
 | `DualTxnWalTest.v3` | 38 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 58 | allocator, direct mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 59 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 23 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 The platform wrapper classes have no dedicated tests. Immix
