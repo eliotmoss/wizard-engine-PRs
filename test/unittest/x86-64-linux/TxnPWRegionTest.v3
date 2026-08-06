@@ -483,6 +483,8 @@ def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
 
 def MT = UnitTests.registerT("txn_backend:", _, FileMmapBackendTester.new, _);
 def MX = [
+	MT("fresh_truncates_and_zero_fills", test_fresh_truncates_and_zero_fills),
+	MT("missing_attach_creates_zeroed_file", test_missing_attach_creates_zeroed_file),
 	MT("mapped_file_region_owns_state", test_mapped_file_region_owns_state),
 	MT("mapped_file_persist_changes_clears_dirty_flag", test_mapped_file_persist_changes_clears_dirty_flag),
 	MT("mapped_file_persist_changes_keeps_other_region_dirty", test_mapped_file_persist_changes_keeps_other_region_dirty),
@@ -516,6 +518,82 @@ class FileMmapBackendTester(t: Tester) {
 		}
 		RegionFileIO.unlink(BACKEND_PATH);
 	}
+}
+
+// A fresh open must discard both stale contents and a stale larger extent.
+// Fill an 8 KiB backing file with nonzero bytes, then recreate it at 4 KiB and
+// verify the kernel-provided post-truncation extent is entirely zeroed.
+def test_fresh_truncates_and_zero_fills(tc: FileMmapBackendTester) {
+	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
+	tc.region1 = tc.backend.create(8192u64, prot, false);
+
+	if (tc.region1 == null) {
+		tc.t.fail("initial mapped file backend creation failed");
+		tc.cleanup();
+		return;
+	}
+
+	for (i < tc.region1.range.length) {
+		Pointer.atElement(tc.region1.range, i).store<u8>(0xa5u8);
+	}
+	tc.t.assertz(true, tc.region1.persistRange(0u64, 8192u64));
+	tc.region1.destroy();
+	tc.region1 = null;
+
+	tc.region1 = tc.backend.create(4096u64, prot, true);
+	if (tc.region1 == null) {
+		tc.t.fail("fresh mapped file backend creation failed");
+		tc.cleanup();
+		return;
+	}
+
+	var allZero = true;
+	for (i < tc.region1.range.length) {
+		if (Pointer.atElement(tc.region1.range, i).load<u8>() != 0u8) allZero = false;
+	}
+	tc.t.assertz(true, allZero);
+	tc.t.assert_eq(4096, tc.region1.range.length);
+
+	def fd = RegionFileIO.open(BACKEND_PATH);
+	if (fd < 0) {
+		tc.t.fail("fresh backing file could not be reopened");
+	} else {
+		def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
+		tc.t.assert_eq(4096u64, u64.view(size));
+		RegionFileIO.close(fd);
+	}
+
+	tc.cleanup();
+}
+
+// Mount intent on a missing path falls back to creating a fresh, zero-filled
+// backing file rather than failing or exposing unspecified bytes.
+def test_missing_attach_creates_zeroed_file(tc: FileMmapBackendTester) {
+	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
+	tc.region1 = tc.backend.create(4096u64, prot, false);
+
+	if (tc.region1 == null) {
+		tc.t.fail("missing-file attach fallback failed");
+		tc.cleanup();
+		return;
+	}
+
+	var allZero = true;
+	for (i < tc.region1.range.length) {
+		if (Pointer.atElement(tc.region1.range, i).load<u8>() != 0u8) allZero = false;
+	}
+	tc.t.assertz(true, allZero);
+	tc.t.assert_eq(4096, tc.region1.range.length);
+
+	def fd = RegionFileIO.open(BACKEND_PATH);
+	tc.t.assertz(true, fd >= 0);
+	if (fd >= 0) {
+		def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
+		tc.t.assert_eq(4096u64, u64.view(size));
+		RegionFileIO.close(fd);
+	}
+
+	tc.cleanup();
 }
 
 def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
@@ -752,6 +830,9 @@ def BT = UnitTests.registerT("pwregion_bd:", _, BlockDevicePWRegionTester.new, _
 def BX = [
 	BT("format_magic",          test_bd_format_magic),
 	BT("initializes_file_size", test_bd_initializes_file_size),
+	BT("stored_block_size_mismatch_rejected", test_bd_stored_block_size_mismatch_rejected),
+	BT("stored_num_blocks_mismatch_rejected", test_bd_stored_num_blocks_mismatch_rejected),
+	BT("legacy_log_chunk_fallback", test_bd_legacy_log_chunk_fallback),
 	BT("alloc_valid",           test_bd_alloc_valid),
 	BT("alloc_sets_used",       test_bd_alloc_sets_used),
 	BT("free_clears_used",      test_bd_free_clears_used),
@@ -778,6 +859,11 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 	def allocSucceeded(chunk: ChunkHandle) -> bool {
 		return !chunk.isNull();
+	}
+
+	def persistHeaderU64(offset: int, value: u64) -> bool {
+		Pointer.atElement(region.backendRegion.range, offset).store<u64>(value);
+		return region.backendRegion.persistRange(u64.view(offset), 8u64);
 	}
 
 	def cleanup() {
@@ -1025,6 +1111,46 @@ def test_bd_initializes_file_size(tc: BlockDevicePWRegionTester) {
 	def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
 	RegionFileIO.close(fd);
 	tc.t.assert_eq(8u64 * 4096u64, u64.view(size));
+	tc.cleanup();
+}
+
+// Mount must reject a region whose persisted block size no longer matches the
+// constructor geometry, before constructing a transaction or WAL facade.
+def test_bd_stored_block_size_mismatch_rejected(tc: BlockDevicePWRegionTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.blockSize.offset, 2048u64));
+
+	def region2 = tc.remount();
+	tc.t.assert_eq(2048u64, region2.getHeader().blockSize);
+	tc.t.assertz(true, region2.txn == null);
+	tc.t.assertz(true, region2.logChunk.isNull());
+
+	tc.cleanup();
+}
+
+// Mount performs the same early rejection when the persisted block count does
+// not match, even though the mapped byte extent still has the requested size.
+def test_bd_stored_num_blocks_mismatch_rejected(tc: BlockDevicePWRegionTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.numBlocks.offset, 7u64));
+
+	def region2 = tc.remount();
+	tc.t.assert_eq(7u64, region2.getHeader().numBlocks);
+	tc.t.assertz(true, region2.txn == null);
+	tc.t.assertz(true, region2.logChunk.isNull());
+
+	tc.cleanup();
+}
+
+// Older formatted regions have no explicit WAL offset. A zero value must map
+// to block 1, produce a healthy transaction, and remain usable after mount.
+def test_bd_legacy_log_chunk_fallback(tc: BlockDevicePWRegionTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.logChunk.offset, 0u64));
+
+	def region2 = tc.remount();
+	tc.t.assert_eq(0u64, region2.getHeader().logChunk);
+	tc.t.assertz(false, region2.txn == null);
+	tc.t.assert_eq(4096u64, region2.offsetInRegion(region2.logChunk.addr));
+	tc.t.assertz(true, tc.allocSucceeded(region2.allocChunk(1u32)));
+
 	tc.cleanup();
 }
 

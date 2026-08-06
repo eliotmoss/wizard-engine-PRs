@@ -38,7 +38,7 @@ support physical-durability claims. See `docs/persistent-backends.md`.
 
 ## 4. Log-chunk location is explicit, but format validation remains narrow
 
-This original concern is resolved: `PWRegionHeader.logChunk` now stores the region-relative WAL location, and mount uses it with a defensive block-1 fallback for older headers where the field is zero. The remaining risk is validation: there are no dedicated tests for the zero-field fallback, stored block-size/num-block mismatch, or a nonzero log offset that points outside the mapped region.
+This original concern is resolved: `PWRegionHeader.logChunk` now stores the region-relative WAL location, and mount uses it with a defensive block-1 fallback for older headers where the field is zero. Dedicated tests now cover the zero-field fallback and stored block-size/num-block mismatch. The remaining validation risk is a nonzero log offset that points outside the mapped region.
 
 ---
 
