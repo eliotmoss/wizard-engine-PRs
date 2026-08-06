@@ -15,6 +15,7 @@ def DWTX = [
 	DWT("commit_alternates_slots", test_dual_commit_alternates_slots),
 	DWT("commit_crash_recover", test_dual_commit_crash_recover),
 	DWT("mixed_width_signed_values_recover", test_dual_mixed_width_signed_values_recover),
+	DWT("invalid_entry_ranges_rejected", test_dual_invalid_entry_ranges_rejected),
 	DWT("clean_empty_recover", test_dual_clean_empty_recover),
 	DWT("torn_record_rejected", test_dual_torn_record_rejected),
 	DWT("two_slots_replay_in_order", test_dual_two_slots_replay_in_order),
@@ -400,6 +401,44 @@ def test_dual_mixed_width_signed_values_recover(tc: DualTxnWalTester) {
 	tc.t.assert_eq(i16.view(u16.view(value16)), addr16.load<i16>());
 	tc.t.assert_eq(u32.view(value32), addr32.load<u32>());
 	tc.t.assert_eq(i64.view(value64), addr64.load<i64>());
+}
+
+// Appends must reject entries that escape the backend or overlap any part of
+// the WAL chunk. Exact neighbors remain valid user-data offsets and recover
+// normally, proving that the overlap checks do not exclude adjacent bytes.
+def test_dual_invalid_entry_ranges_rejected(tc: DualTxnWalTester) {
+	def regionSize = u64.!(tc.data.length);
+	def walStart = tc.wal.logChunkOffset;
+	def walEnd = walStart + tc.wal.logChunkSize;
+
+	// Outside or crossing the region end, including an offset whose addition
+	// would overflow if validation computed offset + width first.
+	tc.t.assertz(false, tc.wal.append(regionSize, 0x11u64, 1u8));
+	tc.t.assertz(false, tc.wal.append(regionSize - 1u64, 0x22u64, 2u8));
+	tc.t.assertz(false, tc.wal.append(0xFFFF_FFFF_FFFF_FFFF_u64, 0x33u64, 8u8));
+
+	// Crossing into, starting within, and crossing out of the WAL are all
+	// forbidden, even though the enclosing backend range is otherwise valid.
+	tc.t.assertz(false, tc.wal.append(walStart - 1u64, 0x44u64, 2u8));
+	tc.t.assertz(false, tc.wal.append(walStart, 0x55u64, 1u8));
+	tc.t.assertz(false, tc.wal.append(walEnd - 1u64, 0x66u64, 2u8));
+	tc.t.assertz(true, tc.wal.poisoned);
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assertz(false, tc.wal.poisoned);
+	tc.t.assertz(false, tc.wal.requiresRecovery());
+	tc.t.assert_eq(1u64, tc.wal.nextTxnSeq);
+	tc.t.assert_eq(0, tc.shadowRegion.persistChangesCount);
+
+	// The final byte before and the first eight bytes after the WAL are legal.
+	def valueAfter = 0x8877_6655_4433_2211_u64;
+	tc.t.assertz(true, tc.wal.append(walStart - 1u64, 0xAAu64, 1u8));
+	tc.t.assertz(true, tc.wal.append(walEnd, valueAfter, 8u8));
+	tc.t.assert_eq(1u64, tc.wal.commit());
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0xAAu8, tc.data[int.!(walStart - 1u64)]);
+	tc.t.assert_eq(valueAfter, PWRegionUtils.pointerFromU64(tc.regionStart + walEnd).load<u64>());
 }
 
 // Remounting a WAL that never committed anything is clean.
