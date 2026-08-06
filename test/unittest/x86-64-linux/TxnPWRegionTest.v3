@@ -826,6 +826,41 @@ def BD_SIGKILL = 9;
 def BD_SIGSTOP = 19;
 def BD_WUNTRACED = 2;
 
+// Test-only file backend that stops its process after the real fdatasync at a
+// WAL commit boundary, but before persistChanges() returns to DualTxnWal and
+// RegionTransaction can apply the allocator after-images. The parent can then
+// SIGKILL the stopped child to make this otherwise tiny protocol window fully
+// deterministic.
+class CommitBoundaryStopFileMmapRegion extends FileMmapRegion {
+	var stopNextPersistChanges = true;
+
+	new(mapping: Mapping, fd: int) super(mapping, fd) { }
+
+	def persistChanges() -> bool {
+		if (mapping == null || fd < 0) return false;
+		if (!hasDirtyChanges) return true;
+		if (!RegionFileIO.fdatasync(fd)) return false;
+
+		if (stopNextPersistChanges) {
+			stopNextPersistChanges = false;
+			def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+			Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGSTOP));
+		}
+		// The test always kills the stopped process. If it is unexpectedly
+		// resumed, report failure rather than claiming the dirty state was reset.
+		return false;
+	}
+}
+
+class CommitBoundaryStopFileMmapBackend extends FileMmapBackend {
+	new(path: string) super(path) { }
+
+	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+		if (newMapping == null) return null;
+		return CommitBoundaryStopFileMmapRegion.new(newMapping, fd);
+	}
+}
+
 def BT = UnitTests.registerT("pwregion_bd:", _, BlockDevicePWRegionTester.new, _);
 def BX = [
 	BT("format_magic",          test_bd_format_magic),
@@ -845,6 +880,7 @@ def BX = [
 	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
 	BT("abrupt_exact_fit_alloc_recovers_transaction", test_bd_abrupt_exact_fit_alloc_recovers_transaction),
 	BT("abrupt_coalescing_free_recovers_transaction", test_bd_abrupt_coalescing_free_recovers_transaction),
+	BT("sigkill_split_alloc_commit_boundary_recovers", test_bd_sigkill_split_alloc_commit_boundary_recovers),
 	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
@@ -1055,6 +1091,27 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (!FileMmapRegion.?(region.backendRegion)) return 7;
 		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 8;
 		return 0;
+	}
+
+	// The custom backend stops inside persistChanges() after fdatasync has made
+	// the split transaction's WAL record durable. allocChunk() must not return:
+	// its multi-entry after-images have not yet been applied at this point.
+	def allocateSplitAtCommitBoundary() -> int {
+		region = PWRegion.new(
+			CommitBoundaryStopFileMmapBackend.new(BD_PATH),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			false
+		);
+		if (region.backendRegion == null || region.txn == null) return 2;
+		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+
+		def chunk = region.allocChunk(1u32);
+		if (chunk.isNull()) return 4;
+		// Reaching this return means the expected SIGSTOP did not hold the child
+		// at the commit boundary.
+		return 5;
 	}
 
 	// Run the exact-fit allocator path in a forked child. allocChunk(5) consumes
@@ -1573,6 +1630,60 @@ def test_bd_abrupt_coalescing_free_recovers_transaction(tc: BlockDevicePWRegionT
 
 	def recovered = tc.remount();
 	tc.assertRecoveredCoalescingFree(recovered);
+
+	tc.cleanup();
+}
+
+// Stop immediately after the split allocation's multi-entry WAL record reaches
+// fdatasync, then kill the child before persistChanges() returns and before any
+// allocator after-image is applied. A fresh mapping must reconstruct the full
+// split allocation from that record, including links and the chunk header.
+def test_bd_sigkill_split_alloc_commit_boundary_recovers(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateSplitAtCommitBoundary();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waitedForStop = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), BD_WUNTRACED, Pointer.NULL)).0;
+	def expectedStopStatus = BD_SIGSTOP * 256 + 127;
+	tc.t.assert_eq(pid, waitedForStop);
+	tc.t.assert_eq(expectedStopStatus, waitStatus[0]);
+	if (waitedForStop != pid || waitStatus[0] != expectedStopStatus) {
+		Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL));
+		Linux.syscall(LinuxConst.SYS_wait4,
+			(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL));
+		tc.cleanup();
+		return;
+	}
+
+	def killResult = Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL)).0;
+	def waitedForKill = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(0, killResult);
+	tc.t.assert_eq(pid, waitedForKill);
+	tc.t.assert_eq(BD_SIGKILL, waitStatus[0]);
+	if (killResult != 0 || waitedForKill != pid || waitStatus[0] != BD_SIGKILL) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
 
 	tc.cleanup();
 }
