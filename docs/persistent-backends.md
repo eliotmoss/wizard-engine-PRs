@@ -447,7 +447,7 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-06: the implementation-specific
-x86-64 Linux suite contains 115 registered tests. All 115 pass with no expected
+x86-64 Linux suite contains 116 registered tests. All 116 pass with no expected
 failures when run in an amd64 Docker container on the current Darwin arm64
 host.
 
@@ -455,7 +455,7 @@ host.
 |---|---:|---|
 | `DualTxnWalTest.v3` | 34 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 43 | allocator, invalid-input rejection, Immix line geometry/linkage, overflow and recovery-required propagation, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 44 | allocator, invalid-input rejection, Immix line geometry/linkage, overflow and recovery-required propagation, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 `SingleTxnWal` and the platform wrapper classes have no dedicated tests. Immix
@@ -472,15 +472,15 @@ complete header may reopen even though the original persistence call failed.
 
 The file-backed tests exercise the actual `fdatasync` and page-aligned
 `msync(MS_SYNC)` code paths, including basic failure propagation, committed-WAL
-recovery, graceful close/remount, and forked writers that call `exit_group`
-without cleanup immediately before or after allocator after-image application.
-The applied-after-image case covers a complete split-allocation transaction and
-validates its memory-order links, free-list links, used/list state, and chunk
-header after remount. These tests do not yet use `SIGKILL`, clear the kernel
-page cache, reset a VM, interrupt power, trace syscall ordering, or inject
-syscall failures. A same-kernel remount can observe cached data that has not
-been shown to survive a system crash. Full gaps and priorities are maintained
-in `docs/ROADMAP.md` Next Steps #3.
+recovery, graceful close/remount, forked writers that call `exit_group`, and a
+writer deterministically stopped after allocator after-image application before
+the parent sends `SIGKILL`. The applied-after-image cases cover a complete
+split-allocation transaction and validate its memory-order links, free-list
+links, used/list state, and chunk header after remount. These tests do not yet
+clear the kernel page cache, reset a VM, interrupt power, trace syscall
+ordering, or inject syscall failures. A same-kernel remount can observe cached
+data that has not been shown to survive a system crash. Full gaps and priorities
+are maintained in `docs/ROADMAP.md` Next Steps #3.
 
 The PMEM-labelled unit coverage is structural only:
 `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping

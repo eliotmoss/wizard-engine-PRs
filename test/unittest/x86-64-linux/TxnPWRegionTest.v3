@@ -718,6 +718,9 @@ def test_pmem_region_tracks_pending_writeback(tc: FileMmapBackendTester) {
 // =============================================================================
 
 def BD_PATH = "/tmp/wiz_test_bd_region";
+def BD_SIGKILL = 9;
+def BD_SIGSTOP = 19;
+def BD_WUNTRACED = 2;
 
 def BT = UnitTests.registerT("pwregion_bd:", _, BlockDevicePWRegionTester.new, _);
 def BX = [
@@ -732,6 +735,7 @@ def BX = [
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
 	BT("abrupt_writer_recovers_committed_wal", test_bd_abrupt_writer_recovers_committed_wal),
 	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
+	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
 ];
@@ -808,6 +812,39 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (!FileMmapRegion.?(region.backendRegion)) return 7;
 		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 8;
 		return 0;
+	}
+
+	def assertRecoveredSplitAllocation(recovered: PWRegion) {
+		def logEntry = recovered.blockTableHandle[1u64];
+		def allocated = recovered.blockTableHandle[2u64];
+		def remainder = recovered.blockTableHandle[3u64];
+		def metadata = recovered.blockTableHandle[7u64];
+		def chunk = recovered.blockEntryToChunk(allocated);
+
+		// Memory-order chain: log block -> allocated block -> remainder -> metadata.
+		t.assertz(true, allocated.getUsed());
+		t.assert_eq(ListKind.NONE.code, allocated.getListNum());
+		t.assert_eq(logEntry.addr, allocated.getPrev().addr);
+		t.assert_eq(remainder.addr, allocated.getNext().addr);
+		t.assertz(true, allocated.getListPrev().isNull());
+		t.assertz(true, allocated.getListNext().isNull());
+
+		t.assertz(false, remainder.getUsed());
+		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum());
+		t.assert_eq(allocated.addr, remainder.getPrev().addr);
+		t.assert_eq(metadata.addr, remainder.getNext().addr);
+		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev().addr);
+		t.assertz(true, remainder.getListNext().isNull());
+		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext().addr);
+		t.assert_eq(remainder.addr, metadata.getPrev().addr);
+
+		// The same transaction also initialized the allocated chunk header.
+		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
+		t.assert_eq(4096u64, chunk.getLimit());
+		t.assert_eq(4096u64, chunk.getChunkLimit());
+		t.assert_eq(0u64, chunk.getLinemarks());
+		t.assertz(false, recovered.requiresRecovery());
+		t.assertz(false, recovered.txn.isDirty());
 	}
 
 	// Corrupt the record written by writeCommittedWalUpdate: its txnSeq 1
@@ -1008,36 +1045,69 @@ def test_bd_abrupt_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTeste
 	}
 
 	def recovered = tc.remount();
-	def logEntry = recovered.blockTableHandle[1u64];
-	def allocated = recovered.blockTableHandle[2u64];
-	def remainder = recovered.blockTableHandle[3u64];
-	def metadata = recovered.blockTableHandle[7u64];
-	def chunk = recovered.blockEntryToChunk(allocated);
+	tc.assertRecoveredSplitAllocation(recovered);
 
-	// Memory-order chain: log block -> allocated block -> remainder -> metadata.
-	tc.t.assertz(true, allocated.getUsed());
-	tc.t.assert_eq(ListKind.NONE.code, allocated.getListNum());
-	tc.t.assert_eq(logEntry.addr, allocated.getPrev().addr);
-	tc.t.assert_eq(remainder.addr, allocated.getNext().addr);
-	tc.t.assertz(true, allocated.getListPrev().isNull());
-	tc.t.assertz(true, allocated.getListNext().isNull());
+	tc.cleanup();
+}
 
-	tc.t.assertz(false, remainder.getUsed());
-	tc.t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum());
-	tc.t.assert_eq(allocated.addr, remainder.getPrev().addr);
-	tc.t.assert_eq(metadata.addr, remainder.getNext().addr);
-	tc.t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev().addr);
-	tc.t.assertz(true, remainder.getListNext().isNull());
-	tc.t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext().addr);
-	tc.t.assert_eq(remainder.addr, metadata.getPrev().addr);
+// Repeat the applied-after-image crash window with a non-cooperative process
+// death. The child stops itself only after the allocator transaction and its
+// structural checks complete; the parent observes that stop, sends SIGKILL,
+// and remounts without allowing any child cleanup code to run.
+def test_bd_sigkill_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
 
-	// The same transaction also initialized the allocated chunk header.
-	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
-	tc.t.assert_eq(4096u64, chunk.getLimit());
-	tc.t.assert_eq(4096u64, chunk.getChunkLimit());
-	tc.t.assert_eq(0u64, chunk.getLinemarks());
-	tc.t.assertz(false, recovered.requiresRecovery());
-	tc.t.assertz(false, recovered.txn.isDirty());
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateSplitAbruptly();
+		if (childStatus != 0) {
+			Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+			return;
+		}
+
+		def childPid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+		def stopResult = Linux.syscall(LinuxConst.SYS_kill, (childPid, BD_SIGSTOP)).0;
+		// Reaching this exit means SIGSTOP failed or somebody resumed the child.
+		if (stopResult == 0) Linux.syscall(LinuxConst.SYS_exit_group, 10);
+		else Linux.syscall(LinuxConst.SYS_exit_group, 11);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waitedForStop = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), BD_WUNTRACED, Pointer.NULL)).0;
+	def expectedStopStatus = BD_SIGSTOP * 256 + 127;
+	tc.t.assert_eq(pid, waitedForStop);
+	tc.t.assert_eq(expectedStopStatus, waitStatus[0]);
+	if (waitedForStop != pid || waitStatus[0] != expectedStopStatus) {
+		Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL));
+		Linux.syscall(LinuxConst.SYS_wait4,
+			(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL));
+		tc.cleanup();
+		return;
+	}
+
+	def killResult = Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGKILL)).0;
+	def waitedForKill = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(0, killResult);
+	tc.t.assert_eq(pid, waitedForKill);
+	tc.t.assert_eq(BD_SIGKILL, waitStatus[0]);
+	if (killResult != 0 || waitedForKill != pid || waitStatus[0] != BD_SIGKILL) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
 
 	tc.cleanup();
 }
