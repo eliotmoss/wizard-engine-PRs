@@ -1,6 +1,6 @@
 # Persistent Backends: Design and Implementation
 
-This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX or file-backed mmap) with crash-consistent allocation via a write-ahead log (WAL). See `docs/pmem-emulation.md` for the supported emulated-PMEM development environment and validation limits.
+This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX or file-backed mmap) with crash-consistent allocation via a write-ahead log (WAL). See [PMEM Emulation](pmem-emulation.md) for the supported emulated-PMEM development environment and validation limits, and [PMEM Crash Model](pmem-crash-model.md) for the proposed store/`CLWB`/`SFENCE` trace explorer.
 
 ---
 
@@ -497,7 +497,8 @@ uses a layered argument so that each class of evidence has a precise claim:
 
 | Layer | Claim | Required evidence |
 |---|---|---|
-| 1. WAL protocol | `DualTxnWal` and `RegionTransaction` preserve acknowledged updates and recover correctly at every abstract persistence boundary. | Deterministic shadow durable-memory tests that separate live and durable bytes, discard unpersisted bytes on crash, and inject success, failure, indeterminate and torn outcomes. |
+| 1a. Abstract WAL protocol | `DualTxnWal` and `RegionTransaction` preserve acknowledged updates and recover correctly at every abstract persistence boundary. | Deterministic shadow durable-memory tests that separate live and durable bytes, discard unpersisted bytes on crash, and inject success, failure, indeterminate and torn outcomes. |
+| 1b. PMEM event model | The protocol recovers for every explored ordering of dirty-line eviction, asynchronous `CLWB` completion, `SFENCE`, and crash within a declared bound and persistence-domain model. | A trace-driven state explorer that generates concrete durable images and feeds them into the production recovery implementation; see [PMEM Crash Model](pmem-crash-model.md). |
 | 2. Backend translation | A `BackendRegion` implementation maps the abstract operations to the intended mechanism and propagates its result: `fdatasync`/`msync` for files, cache-line write-back/fence for PMEM. | Backend unit/integration tests, syscall or instruction tracing where practical, bounds/error tests, and explicit failure injection. |
 | 3. Software crash consistency | The complete allocator and WAL recover after the running process or VM disappears without a clean close. | Child-process `_exit`/`SIGKILL` tests for the file backend; DAX integration plus guest reset/QEMU restart for emulated PMEM; structural allocator-invariant checks after reopen. |
 | 4. Physical durability | Acknowledged state survives loss of the host and volatile hardware caches on the target medium. | Implemented `CLWB`/`CLFLUSHOPT`/`CLFLUSH` + `SFENCE` path and controlled power-interruption tests on real PMEM. |
@@ -505,9 +506,9 @@ uses a layered argument so that each class of evidence has a precise claim:
 Evidence at an outer layer does not replace an inner layer. For example, a
 successful filesystem remount is not an exhaustive WAL fault model, while a
 shadow backend cannot establish that Linux or a storage device honoured a
-syscall. Together the layers support a scoped conclusion: protocol correctness
-under the abstraction, correct backend translation, software crash consistency,
-and finally physical durability.
+syscall. Together the layers support scoped conclusions: protocol correctness
+under the abstract boundary and bounded PMEM event model, correct backend
+translation, software crash consistency, and finally physical durability.
 
 ### Shadow durable-memory test backend
 
@@ -542,6 +543,15 @@ The model supports three injected persistence outcomes:
 3. **partial copy then fail** — only a prefix or selected ranges survive,
    modelling a torn record/data update.
 
+This model operates at persistence-call granularity. Ordinary stores never
+reach the durable image through background eviction, `prepareChangedRange()`
+only queues whole ranges, and `persistChanges()` chooses one outcome for all
+queued ranges. Consequently it does not enumerate arbitrary cache-line subsets
+or model `CLWB` completing before a later `SFENCE`. Those are deliberate scope
+limits, not claims about real PMEM. The planned trace-driven extension and its
+machine-model assumptions are specified in
+[PMEM Crash Model](pmem-crash-model.md).
+
 This distinction exercises the recovery-required contract. A failed phase-B
 boundary returns `0` while a complete checksummed record may remain in the
 durable slot. Recovery is allowed to validate and replay that unacknowledged
@@ -558,8 +568,9 @@ That state now propagates through `RegionTransaction`/`PWRegion`. The remaining
 core integration work is a test-only `ShadowTxnBackend` factory that exposes
 the same live/durable pair to `PWRegion` so complete
 allocation split/exact-fit and free/coalescing transactions are checked after
-simulated crashes. The shadow model establishes Layer 1; it complements rather
-than replaces the file/DAX and hardware work in Layers 2–4.
+simulated crashes. The shadow model establishes Layer 1a; it complements the
+planned Layer-1b trace explorer rather than replacing the file/DAX and hardware
+work in Layers 2–4.
 
 Run with:
 
@@ -579,3 +590,4 @@ test/unit.sh
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
 | 8 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |
+| 9 | `docs/pmem-crash-model.md` | Add an instrumentable persistent-store/flush/fence seam and a bounded trace explorer for background eviction, asynchronous `CLWB`, `SFENCE`, and crash schedules. |

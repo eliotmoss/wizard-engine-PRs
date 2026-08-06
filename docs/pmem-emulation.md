@@ -10,6 +10,11 @@ Both approaches reproduce the Linux PMEM/DAX programming interface. Neither
 turns volatile DRAM or an ordinary host file into media that survives host
 power loss.
 
+Deterministic cache/persistence simulation does not require DAX: an ordinary
+file or byte array can hold simulated live and durable images while a model
+decides when stores and cache-line writebacks reach persistence. That separate
+plan is specified in [PMEM Crash Model](pmem-crash-model.md).
+
 ## What the project requires
 
 `PmemMmapBackend.create()`:
@@ -179,16 +184,19 @@ The PMEM stages are the outer parts of the project's layered correctness
 argument. They do not replace deterministic WAL protocol testing:
 
 ```text
-shadow durable-memory model
-  → backend syscall/instruction integration
-    → abrupt process/guest crash recovery
-      → physical-media power-loss durability
+abstract shadow durable-memory model
+  → store/CLWB/SFENCE trace exploration
+    → backend syscall/instruction integration
+      → abrupt process/guest crash recovery
+        → physical-media power-loss durability
 ```
 
 The complete layer definitions and their evidence boundaries are documented in
 `docs/persistent-backends.md`.
 
-### Stage 0 — deterministic protocol model
+### Stage 0 — deterministic protocol models
+
+#### Stage 0a — abstract persistence-boundary model
 
 The direct active-`DualTxnWal` tests now use a test-only shadow durable-memory
 backend. It keeps separate live and durable byte arrays, makes
@@ -198,14 +206,38 @@ copy-then-fail and partial-copy outcomes. The `DualTxnWal` commit and recovery
 paths now latch persistence failures, reject further same-instance work, and
 require a fresh instance to recover. Fresh initialization, after-image
 preparation, flush, close, transaction-facade, and allocator propagation are
-covered as well. The remaining Stage-0 work is a `ShadowTxnBackend` factory for
-complete allocator transactions.
+covered as well. The remaining Stage-0a work is a `ShadowTxnBackend` factory
+for complete allocator transactions.
 
-Stage 0 answers whether the WAL is correct under the abstract `BackendRegion`
+Stage 0a answers whether the WAL is correct under the abstract `BackendRegion`
 persistence contract. It is fast, deterministic and suitable for the default
 unit suite. It cannot establish that `MAP_SYNC`, cache-line write-back
 instructions, Linux, QEMU or physical media implement that contract; those are
 the purposes of Stages 1–3.
+
+#### Stage 0b — store/CLWB/SFENCE trace exploration
+
+The current shadow model deliberately makes ordinary stores live-only and
+copies prepared ranges at an abstract persistence call. A more faithful PMEM
+model must also allow dirty cache lines to be written back without `CLWB`, a
+`CLWB` to complete immediately or later, arbitrary permitted subsets of lines
+to survive before a fence, and an `SFENCE` to complete the earlier writebacks
+on which the protocol relies.
+
+The proposed implementation records the production ordering of persistent
+`STORE`, `CLWB`, and `SFENCE` actions, explores every distinct durable image
+for short bounded scenarios, and invokes the real WAL/allocator recovery code
+against each image. An ordinary file or byte array is sufficient because the
+simulator—not DAX or the host page cache—defines durability. Exhaustive short
+scenarios should be supplemented, not replaced, by seeded randomized schedules
+for longer allocator histories. See
+[PMEM Crash Model](pmem-crash-model.md) for the event semantics, explicit
+hardware assumptions, state-space reductions, recovery integration, and
+evidence limits.
+
+Stage 0b still cannot prove that the compiler and native backend emit the
+intended instructions. Instruction tracing and DAX/hardware integration remain
+separate validation layers.
 
 ### Stage 1 — DAX and recovery integration
 
