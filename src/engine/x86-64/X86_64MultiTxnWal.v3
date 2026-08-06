@@ -435,8 +435,12 @@ class MultiTxnWal {
                 appliedSeqVolatile = 0u64;
                 nextTxnSeq = 1u64;
                 headOffset = 0u64;
-                writeSuperblockCopy(0, 1u64, logEpoch, durableAppliedSeq);
-                writeSuperblockCopy(1, 2u64, logEpoch, durableAppliedSeq);
+                def firstPersisted = writeSuperblockCopy(0, 1u64, logEpoch, durableAppliedSeq);
+                def secondPersisted = writeSuperblockCopy(1, 2u64, logEpoch, durableAppliedSeq);
+                if (!firstPersisted || !secondPersisted) {
+                        Trace.OUT.puts("failed to persist fresh multi-transaction WAL superblocks").ln();
+                        return;
+                }
                 currentGeneration = 2u64;
                 currentSuperblockIndex = 1;
                 nextSuperblockIndex = 0;

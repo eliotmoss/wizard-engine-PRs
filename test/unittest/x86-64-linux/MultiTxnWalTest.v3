@@ -4,6 +4,7 @@
 def MTW = UnitTests.registerT("multi_wal:", _, MultiTxnWalTester.new, _);
 def MTWX = [
 	MTW("fresh_superblocks", test_multi_fresh_superblocks),
+	MTW("fresh_superblock_persist_failure_rejected", test_multi_fresh_superblock_persist_failure_rejected),
 	MTW("selects_newest_superblock", test_multi_selects_newest_superblock),
 	MTW("ignores_corrupt_newer_superblock", test_multi_ignores_corrupt_newer_superblock),
 	MTW("corrupt_superblocks_reported", test_multi_corrupt_superblocks_reported),
@@ -69,6 +70,8 @@ class MultiTxnWalTestRegion extends BackendRegion {
 class FailingRegion extends BackendRegion {
 	var failNextPersistRange = false;
 	var failNextPersistChanges = false;
+	var persistRangeCalls = 0;
+	var failPersistRangeCall = 0;
 
 	new(range: Range<byte>) super(range) { }
 
@@ -79,6 +82,8 @@ class FailingRegion extends BackendRegion {
 	}
 
 	def persistRange(offset: u64, size: u64) -> bool {
+		persistRangeCalls++;
+		if (persistRangeCalls == failPersistRangeCall) return false;
 		if (failNextPersistRange) {
 			failNextPersistRange = false;
 			return false;
@@ -176,6 +181,32 @@ def test_multi_fresh_superblocks(tc: MultiTxnWalTester) {
 	tc.t.assertz(true, tc.wal.validateSuperblock(1));
 	tc.t.assert_eq(1u64, tc.wal.logEpoch);
 	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
+}
+
+// Fresh formatting requires both redundant superblock copies to reach their
+// persistence boundaries. A failure of either copy leaves the current WAL
+// unusable rather than allowing transactions on an indeterminately formatted
+// log.
+def test_multi_fresh_superblock_persist_failure_rejected(tc: MultiTxnWalTester) {
+	def firstData = Array<byte>.new(4096);
+	def firstStart = u64.view(Pointer.atElement(firstData, 0));
+	def firstRegion = FailingRegion.new(firstData[0 ..+ firstData.length]);
+	firstRegion.failPersistRangeCall = 1;
+	def firstWal = MultiTxnWal.new(firstStart, firstStart + 1024u64, 1024u64, firstRegion, true);
+	tc.t.assertz(false, firstWal.openOk);
+	tc.t.assertz(false, firstWal.append(200u64, 0x55u64, 1u8));
+	tc.t.assert_eq(0u64, firstWal.commit());
+	tc.t.assertz(true, firstWal.recover() == MultiWalRecovery.CORRUPT);
+
+	def secondData = Array<byte>.new(4096);
+	def secondStart = u64.view(Pointer.atElement(secondData, 0));
+	def secondRegion = FailingRegion.new(secondData[0 ..+ secondData.length]);
+	secondRegion.failPersistRangeCall = 2;
+	def secondWal = MultiTxnWal.new(secondStart, secondStart + 1024u64, 1024u64, secondRegion, true);
+	tc.t.assertz(false, secondWal.openOk);
+	tc.t.assertz(false, secondWal.append(200u64, 0x55u64, 1u8));
+	tc.t.assert_eq(0u64, secondWal.commit());
+	tc.t.assertz(true, secondWal.recover() == MultiWalRecovery.CORRUPT);
 }
 
 def test_multi_selects_newest_superblock(tc: MultiTxnWalTester) {
