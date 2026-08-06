@@ -447,7 +447,7 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-06: the implementation-specific
-x86-64 Linux suite contains 126 registered tests. All 126 pass with no expected
+x86-64 Linux suite contains 127 registered tests. All 127 pass with no expected
 failures when run in an amd64 Docker container on the current Darwin arm64
 host.
 
@@ -455,7 +455,7 @@ host.
 |---|---:|---|
 | `DualTxnWalTest.v3` | 34 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 54 | allocator, direct mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 55 | allocator, direct mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 `SingleTxnWal` and the platform wrapper classes have no dedicated tests. Immix
@@ -473,12 +473,13 @@ complete header may reopen even though the original persistence call failed.
 The file-backed tests exercise the actual `fdatasync` and page-aligned
 `msync(MS_SYNC)` code paths, including basic failure propagation, committed-WAL
 recovery, graceful close/remount, forked writers that call `exit_group`, and a
-writer deterministically stopped at either the split transaction's
+writer deterministically stopped at either a split/exact-fit transaction's
 commit-before-apply boundary or after allocator after-image application before
 the parent sends `SIGKILL`. The applied-after-image cases cover complete split
 and exact-fit allocation transactions plus a free transaction that coalesces
-both neighbors. The commit-before-apply case stops inside the test file backend
-after the real `fdatasync` and recovers the complete multi-entry split record.
+both neighbors. The commit-before-apply cases stop inside the test file backend
+after the real `fdatasync` and recover the complete multi-entry split and
+exact-fit records.
 They validate memory-order links, free-list links, used/list state, and chunk
 headers where applicable after remount. These tests do not yet
 clear the kernel page cache, reset a VM, interrupt power, trace syscall

@@ -86,7 +86,7 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
 
 ## Verification status
 
-The implementation-specific x86-64 Linux suite contains 126 tests across four
+The implementation-specific x86-64 Linux suite contains 127 tests across four
 files, all passing as of the 2026-08-06 extension. Coverage is strongest for normal
 phase-B commit/recovery, the intended one-boundary induction property, and the
 core shadow-backed crash matrix. The active WAL tests now restore live memory
