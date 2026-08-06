@@ -81,11 +81,11 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ### Tests
 
-**Audited 2026-07-31 and extended 2026-08-06:** the four implementation-specific x86-64 Linux test files contain **109 registered tests**. All 109 pass with no expected failures when the x86-64 Linux unit binary is run in an amd64 Docker container on the current Darwin arm64 host.
+**Audited 2026-07-31 and extended 2026-08-06:** the four implementation-specific x86-64 Linux test files contain **110 registered tests**. All 110 pass with no expected failures when the x86-64 Linux unit binary is run in an amd64 Docker container on the current Darwin arm64 host.
 
 - `DualTxnWalTest.v3` — **34 tests** for the active two-slot WAL: format/geometry, fresh-header persistence failures, slot alternation, empty commits, crash recovery against separate live/durable byte images, corrupt/torn records, replay ordering, overwrite guard, oversize/poisoned commits, commit/apply/recovery/flush/final-data-close/slot-scrub recovery-required enforcement, fail-before/copy-then-fail/partial-copy shadow outcomes, the normative unacknowledged-record replay, the phase-B one-boundary induction property, explicit flush, and clean/unrecovered close paths
 - `RegionTransactionTest.v3` — **16 tests** for `RegionTransaction` over the active `DualTxnWal`: cache read/write and fallthrough, write-behind apply/clear, phase-B persistence call counts, piggybacked durability, explicit flush, clean no-op, overwrite/alignment behavior, oversize-commit rejection, and commit/apply/flush recovery-required propagation
-- `TxnPWRegionTest.v3` — **37 tests** across allocator (`pwregion:`), Immix metadata (`pwregion_immix:`), overflow propagation (`pwregion_overflow:`), injected recovery-required propagation (`pwregion_recovery:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, descriptor-driven line geometry and chunk-to-line-mark linkage, `DualTxnWal` recovery/checksum rejection, abrupt writer exit after the file-backed WAL commit boundary, mmap/PMEM state and lifecycle, and file-backed persistence
+- `TxnPWRegionTest.v3` — **38 tests** across allocator (`pwregion:`), Immix metadata (`pwregion_immix:`), overflow propagation (`pwregion_overflow:`), injected recovery-required propagation (`pwregion_recovery:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, descriptor-driven line geometry and chunk-to-line-mark linkage, `DualTxnWal` recovery/checksum rejection, abrupt writer exits before and after allocator after-image application, mmap/PMEM state and lifecycle, and file-backed persistence
 - `MultiTxnWalTest.v3` — **22 tests** for the retained comparison WAL: superblocks, recovery, record validation, failure outcomes, epoch/gap handling, wrap-around/checkpoint reserve, crash-mid-log recovery, failed-persist scrub/rollback, and checkpoint policy
 - `SingleTxnWal` has **no dedicated tests**; it remains compiled as a reference implementation only
 - The PMEM-labelled test is structural only: `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping and bypasses `PmemMmapBackend.create()`, `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`
@@ -95,10 +95,12 @@ bytes from a separate durable shadow, so unpersisted bytes disappear; counting
 tests still use no-op persistence to pin API boundary counts. This establishes
 the WAL protocol under the `BackendRegion` contract, not the correctness of a
 backend's syscall or instruction translation. The file-backed tests exercise
-real `fdatasync`/`msync` paths and graceful remount, but a remount in the same
-kernel can still observe page-cache contents and does not establish abrupt-crash
-or power-loss durability. Progressively stronger integration tests remain in
-Next Steps #3 and `docs/persistent-backends.md`.
+real `fdatasync`/`msync`, graceful remount, and child writers that exit without
+cleanup on both sides of after-image application. The verifier still remounts
+under the same kernel and can observe page-cache contents, so this is
+process-crash consistency evidence rather than host-crash or power-loss proof.
+Progressively stronger integration tests remain in Next Steps #3 and
+`docs/persistent-backends.md`.
 
 ---
 
@@ -194,8 +196,8 @@ Priority 0 — active WAL failure/crash semantics:
 
 Priority 1 — allocator and backend integration:
 
-- [ ] Add abrupt-process tests for the file backend. Run the writer in a child process, terminate with `_exit`/`SIGKILL` at WAL protocol boundaries without `deallocate()`/`close()`, then reopen and verify in a separate process. Trace or intercept `fdatasync`/`msync` to check ordering and inject errors. This establishes independence from graceful shutdown and exercises the real syscall translation, but must be described as process-crash consistency rather than host power-loss proof. First slice complete: `pwregion_bd:abrupt_writer_recovers_committed_wal` forks a writer, exits it with `exit_group` immediately after a committed record (before after-image application or cleanup), and verifies replay from a fresh parent-process mapping. Remaining work covers the other protocol windows, `SIGKILL`, syscall ordering, and injected syscall failures.
-- [ ] Recover complete multi-entry allocator transactions, not only a manually injected one-byte `BlockEntry.used` update. Cover allocation split/exact-fit and free left/right coalescing at the commit→crash→recover and apply→crash→recover windows, then validate all memory-order and free-list links.
+- [ ] Add abrupt-process tests for the file backend. Run the writer in a child process, terminate with `_exit`/`SIGKILL` at WAL protocol boundaries without `deallocate()`/`close()`, then reopen and verify in a separate process. Trace or intercept `fdatasync`/`msync` to check ordering and inject errors. This establishes independence from graceful shutdown and exercises the real syscall translation, but must be described as process-crash consistency rather than host power-loss proof. Two slices complete: `pwregion_bd:abrupt_writer_recovers_committed_wal` exits after a committed record but before after-image application, while `pwregion_bd:abrupt_split_alloc_recovers_transaction` exits after a normal allocator commit has applied its deferred after-images; both remount from a fresh parent-process mapping without graceful child cleanup. Remaining work covers later protocol windows, `SIGKILL`, syscall ordering, and injected syscall failures.
+- [ ] Recover complete multi-entry allocator transactions, not only a manually injected one-byte `BlockEntry.used` update. Cover allocation split/exact-fit and free left/right coalescing at the commit→crash→recover and apply→crash→recover windows, then validate all memory-order and free-list links. First matrix slice complete: `pwregion_bd:abrupt_split_alloc_recovers_transaction` covers a split allocation at the apply→crash→recover window and checks the allocated/remainder memory-order links, large-free-list links, used/list state, and chunk header directly.
 - [ ] Cover `freeChunk()` commit-failure propagation, recovery-required behavior after a failed allocation leaves the shared transaction dirty, and invalid inputs (`allocChunk(0)`, oversized requests, null/double/foreign frees).
 - [ ] Add structural/property tests over mixed allocate/free/remount sequences so allocator list invariants are checked directly instead of inferred only from whether a later allocation succeeds.
 - [ ] Add metadata/Immix coverage (`MetaDataDesc`, line-mark lookup/reset and persistence policy) and instantiate each `X86_64PW*` / `X86_64ImmixPW*` wrapper.

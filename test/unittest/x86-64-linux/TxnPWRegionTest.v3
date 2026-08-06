@@ -675,6 +675,7 @@ def BX = [
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
 	BT("abrupt_writer_recovers_committed_wal", test_bd_abrupt_writer_recovers_committed_wal),
+	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
 ];
@@ -731,6 +732,25 @@ class BlockDevicePWRegionTester(t: Tester) {
 			1u64,
 			1u8)) return 4;
 		if (wal.commit() == 0u64) return 5;
+		return 0;
+	}
+
+	// Run a complete allocator transaction in a forked child. allocChunk(1)
+	// takes the large-free split path on a fresh region, so its one WAL record
+	// contains all of the block-order, free-list, used-bit, and chunk-header
+	// after-images. A dirty file backend after commit confirms those after-images
+	// were applied but are still waiting for the next piggybacked boundary.
+	def allocateSplitAbruptly() -> int {
+		region = openRegion(false);
+		if (region.backendRegion == null || region.txn == null) return 2;
+
+		def chunk = region.allocChunk(1u32);
+		if (chunk.isNull()) return 3;
+		if (region.requiresRecovery()) return 4;
+		if (region.txn.isDirty()) return 5;
+		if (!region.blockTableHandle[2u64].getUsed()) return 6;
+		if (!FileMmapRegion.?(region.backendRegion)) return 7;
+		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 8;
 		return 0;
 	}
 
@@ -894,6 +914,74 @@ def test_bd_abrupt_writer_recovers_committed_wal(tc: BlockDevicePWRegionTester) 
 
 	def recovered = tc.remount();
 	tc.t.assertz(true, recovered.blockTableHandle[2u64].getUsed());
+
+	tc.cleanup();
+}
+
+// Exercise the other side of the phase-B crash window through the allocator's
+// real transaction path: the record is durable and every after-image has been
+// applied to the mapping, but those after-images have not ridden the next
+// commit boundary. Abrupt exit must leave a replayable multi-entry record, and
+// remount must reconstruct a structurally consistent split allocation without
+// relying on DualTxnWal.close().
+def test_bd_abrupt_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateSplitAbruptly();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waited = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(pid, waited);
+	tc.t.assert_eq(0, waitStatus[0]);
+	if (waited != pid || waitStatus[0] != 0) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	def logEntry = recovered.blockTableHandle[1u64];
+	def allocated = recovered.blockTableHandle[2u64];
+	def remainder = recovered.blockTableHandle[3u64];
+	def metadata = recovered.blockTableHandle[7u64];
+	def chunk = recovered.blockEntryToChunk(allocated);
+
+	// Memory-order chain: log block -> allocated block -> remainder -> metadata.
+	tc.t.assertz(true, allocated.getUsed());
+	tc.t.assert_eq(ListKind.NONE.code, allocated.getListNum());
+	tc.t.assert_eq(logEntry.addr, allocated.getPrev().addr);
+	tc.t.assert_eq(remainder.addr, allocated.getNext().addr);
+	tc.t.assertz(true, allocated.getListPrev().isNull());
+	tc.t.assertz(true, allocated.getListNext().isNull());
+
+	tc.t.assertz(false, remainder.getUsed());
+	tc.t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum());
+	tc.t.assert_eq(allocated.addr, remainder.getPrev().addr);
+	tc.t.assert_eq(metadata.addr, remainder.getNext().addr);
+	tc.t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev().addr);
+	tc.t.assertz(true, remainder.getListNext().isNull());
+	tc.t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext().addr);
+	tc.t.assert_eq(remainder.addr, metadata.getPrev().addr);
+
+	// The same transaction also initialized the allocated chunk header.
+	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
+	tc.t.assert_eq(4096u64, chunk.getLimit());
+	tc.t.assert_eq(4096u64, chunk.getChunkLimit());
+	tc.t.assert_eq(0u64, chunk.getLinemarks());
+	tc.t.assertz(false, recovered.requiresRecovery());
+	tc.t.assertz(false, recovered.txn.isDirty());
 
 	tc.cleanup();
 }

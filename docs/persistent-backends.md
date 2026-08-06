@@ -447,21 +447,21 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-06: the implementation-specific
-x86-64 Linux suite contains 106 registered tests. The original 102 all passed
-with no expected failures. The four recovery-propagation regressions added on
-2026-08-06 compile in the Linux unit target but were not executable on the
-current Darwin arm64 host.
+x86-64 Linux suite contains 110 registered tests. All 110 pass with no expected
+failures when run in an amd64 Docker container on the current Darwin arm64
+host.
 
 | Test file | Tests | What it covers |
 |---|---:|---|
 | `DualTxnWalTest.v3` | 34 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 34 | allocator, overflow and recovery-required propagation, mmap/PMEM backend state, file-backed remount and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 38 | allocator, Immix line geometry/linkage, overflow and recovery-required propagation, mmap/PMEM backend state, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 22 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
-`SingleTxnWal`, Immix metadata behavior, and the platform wrapper classes have
-no dedicated tests. As of 2026-07-31, the direct `DualTxnWalTest` crash cases
-use `ShadowDurableRegion`: a newly mounted WAL sees a live image restored from
+`SingleTxnWal` and the platform wrapper classes have no dedicated tests. Immix
+coverage currently checks descriptor-driven line geometry and chunk-to-line-
+mark linkage. As of 2026-07-31, the direct `DualTxnWalTest` crash cases use
+`ShadowDurableRegion`: a newly mounted WAL sees a live image restored from
 separate durable bytes, so unpersisted writes disappear. The core phase-B
 commit/apply/N+1, replay, flush, close, corruption, fail-before and torn-record
 windows now have byte-level protocol-model evidence. The fault matrix also
@@ -472,11 +472,15 @@ complete header may reopen even though the original persistence call failed.
 
 The file-backed tests exercise the actual `fdatasync` and page-aligned
 `msync(MS_SYNC)` code paths, including basic failure propagation, committed-WAL
-recovery and graceful close/remount. They do not terminate the process at a WAL
-boundary, clear the kernel page cache, reset a VM, or interrupt power. A same-
-kernel remount can observe cached data that has not been shown to survive a
-system crash. Full gaps and priorities are maintained in `docs/ROADMAP.md`
-Next Steps #3.
+recovery, graceful close/remount, and forked writers that call `exit_group`
+without cleanup immediately before or after allocator after-image application.
+The applied-after-image case covers a complete split-allocation transaction and
+validates its memory-order links, free-list links, used/list state, and chunk
+header after remount. These tests do not yet use `SIGKILL`, clear the kernel
+page cache, reset a VM, interrupt power, trace syscall ordering, or inject
+syscall failures. A same-kernel remount can observe cached data that has not
+been shown to survive a system crash. Full gaps and priorities are maintained
+in `docs/ROADMAP.md` Next Steps #3.
 
 The PMEM-labelled unit coverage is structural only:
 `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping
