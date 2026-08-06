@@ -381,12 +381,11 @@ These are zero-allocation wrappers around raw memory addresses:
 
 **File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `ImmixPWRegion`)
 
-`ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. Line size is currently hardcoded at 256 bytes.
+`ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. Line size is currently hardcoded at 256 bytes.
 
 - `resetAllLineMarks()` — clears all line marks at the start of a GC cycle.
 
 > **TODO:** Line size should come from the metadata descriptor rather than being hardcoded.
-> **TODO:** The line-mark field is not yet linked to the chunk during `createChunk()`.
 
 ---
 

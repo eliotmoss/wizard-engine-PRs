@@ -201,6 +201,48 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 
 
 // =============================================================================
+// Immix line-mark linkage
+// =============================================================================
+
+def IRT = UnitTests.registerT("pwregion_immix:", _, ImmixPWRegionTester.new, _);
+def IRX = [
+	IRT("chunk_links_first_line_mark", test_immix_chunk_links_first_line_mark),
+	()
+];
+
+class ImmixPWRegionTester(t: Tester) {
+	var descBytes: Array<byte>;
+	var descs: Array<Ref<MetaDataDesc>>;
+	var region: ImmixPWRegion;
+
+	new() {
+		descBytes = Array<byte>.new(MetaDataDesc.size);
+		def desc = Ref<MetaDataDesc>.at(descBytes, 0);
+		desc.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		desc.fixedBytes = 0;
+		desc.unitSize = u32.!(ImmixPWRegions.ImmixLineSize);
+		desc.bytesPerUnit = u32.!(LineMark.size);
+
+		descs = Array<Ref<MetaDataDesc>>.new(1);
+		descs[0] = desc;
+		region = ImmixPWRegion.new(Backends.getVolatile(), 8u64, descs, 4096u64, true);
+	}
+}
+
+// createChunk() must link to the mark covering the chunk's actual region
+// offset, not merely to the start of the global line-mark table.
+def test_immix_chunk_links_first_line_mark(tc: ImmixPWRegionTester) {
+	def chunk = tc.region.allocChunk(1u32);
+	def lineIndex = tc.region.offsetInRegion(chunk.addr) / u64.!(ImmixPWRegions.ImmixLineSize);
+	def expectedOffset = tc.region.lineMarks[lineIndex].addr - tc.region.regionStart;
+
+	tc.t.assertz(false, chunk.isNull());
+	tc.t.assertz(false, expectedOffset == 0);
+	tc.t.assert_eq(expectedOffset, chunk.getLinemarks());
+}
+
+
+// =============================================================================
 // Commit-failure propagation test (small slots force WAL overflow)
 // =============================================================================
 

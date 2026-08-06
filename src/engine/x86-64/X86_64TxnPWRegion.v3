@@ -47,7 +47,7 @@ layout ChunkHeader {
         +0      offset:         u64;    // offset in chunk for next allocation
         +8      limit:          u64;    // offset just beyond last available byte in chunk
         +16     chunk_limit:    u64;    // offset just beyond end of the chunk
-        +24     linemarks:      u64;    // offset to first link mark of the chunk
+        +24     linemarks:      u64;    // region-relative offset to first line mark of the chunk
         =32;                            // size of chunk header
 }
 
@@ -815,10 +815,12 @@ class PWRegion {
                 chunk.setOffsetCached(txn, u64.!(ChunkHeader.size));
                 chunk.setLimitCached(txn, u64.!(numBlocks) * blockSize);
                 chunk.setChunkLimitCached(txn, u64.!(numBlocks) * blockSize);
-
-                // TODO link mark field
+                linkChunkLineMarks(chunk);
                 return chunk;
         }
+
+        // Extension hook for allocators with per-chunk line metadata.
+        def linkChunkLineMarks(chunk: ChunkHandle) { }
 
         def allocChunk(numBlocks: u32) -> ChunkHandle {
                 if (requiresRecovery()) return blankChunkHandle;
@@ -1018,6 +1020,15 @@ class ImmixPWRegion extends PWRegion {
                         }
                 }
                 return LineMarkTableHandle(0, 0);
+        }
+
+        def linkChunkLineMarks(chunk: ChunkHandle) {
+                if (lineMarks.addr == 0 || lineMarks.size == 0) {
+                        chunk.setLinemarksCached(txn, 0);
+                        return;
+                }
+                def lineIndex = offsetInRegion(chunk.addr) / u64.!(ImmixPWRegions.ImmixLineSize);
+                chunk.setLinemarksCached(txn, lineMarks[lineIndex].addr - regionStart);
         }
 
         def resetAllLineMarks() {

@@ -81,11 +81,11 @@ Work log for the `pwregions` branch. See `docs/persistent-backends.md` for desig
 
 ### Tests
 
-**Audited 2026-07-31 and extended 2026-08-06:** the four implementation-specific x86-64 Linux test files contain **106 registered tests**. The original 102 passed with no expected failures; the four recovery-propagation regressions added on 2026-08-06 compile in the x86-64 Linux unit target, but were not executable on the current Darwin arm64 host.
+**Audited 2026-07-31 and extended 2026-08-06:** the four implementation-specific x86-64 Linux test files contain **107 registered tests**. All 107 pass with no expected failures when the x86-64 Linux unit binary is run in an amd64 Docker container on the current Darwin arm64 host.
 
 - `DualTxnWalTest.v3` — **34 tests** for the active two-slot WAL: format/geometry, fresh-header persistence failures, slot alternation, empty commits, crash recovery against separate live/durable byte images, corrupt/torn records, replay ordering, overwrite guard, oversize/poisoned commits, commit/apply/recovery/flush/final-data-close/slot-scrub recovery-required enforcement, fail-before/copy-then-fail/partial-copy shadow outcomes, the normative unacknowledged-record replay, the phase-B one-boundary induction property, explicit flush, and clean/unrecovered close paths
 - `RegionTransactionTest.v3` — **16 tests** for `RegionTransaction` over the active `DualTxnWal`: cache read/write and fallthrough, write-behind apply/clear, phase-B persistence call counts, piggybacked durability, explicit flush, clean no-op, overwrite/alignment behavior, oversize-commit rejection, and commit/apply/flush recovery-required propagation
-- `TxnPWRegionTest.v3` — **34 tests** across allocator (`pwregion:`), overflow propagation (`pwregion_overflow:`), injected recovery-required propagation (`pwregion_recovery:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, `DualTxnWal` recovery/checksum rejection, mmap/PMEM state and lifecycle, and file-backed persistence
+- `TxnPWRegionTest.v3` — **35 tests** across allocator (`pwregion:`), Immix metadata (`pwregion_immix:`), overflow propagation (`pwregion_overflow:`), injected recovery-required propagation (`pwregion_recovery:`), backend ownership/state (`txn_backend:`), and file-backed remount/recovery (`pwregion_bd:`): format, alloc/free/coalescing/exhaustion, chunk-to-line-mark linkage, `DualTxnWal` recovery/checksum rejection, mmap/PMEM state and lifecycle, and file-backed persistence
 - `MultiTxnWalTest.v3` — **22 tests** for the retained comparison WAL: superblocks, recovery, record validation, failure outcomes, epoch/gap handling, wrap-around/checkpoint reserve, crash-mid-log recovery, failed-persist scrub/rollback, and checkpoint policy
 - `SingleTxnWal` has **no dedicated tests**; it remains compiled as a reference implementation only
 - The PMEM-labelled test is structural only: `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping and bypasses `PmemMmapBackend.create()`, `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`
@@ -228,7 +228,7 @@ provides the same development interface with more invasive host setup.
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
 - [x] Add log-chunk offset to `PWRegionHeader` — new `logChunk` field (region-relative byte offset) written by `format()` and read by `mount()`, so recovery locates the log via the header instead of assuming block 1. Header grew 72 → 80 bytes; `mount()` keeps a defensive fallback to block 1 when the field reads as `0`. Covered by `TxnPWRegionTest.v3` (`format_header_fields` asserts the field; the remount/recovery tests exercise the header-driven read path).
 - [x] `RegionTransaction.clear()` — no longer reallocates the `HashMap`; empties it in place via `cache.remove()` over the `addrs` key set (both `HashMap.remove` and `Vector.clear` retain their backing storage), reusing the map and vector across commits. Covered by the existing `region_transaction:` and `pwregion:` unit tests (commit→clear cycle, remount/recovery).
-- Link line-mark field in `createChunk()` (`ImmixPWRegion`)
+- [x] Link the line-mark field in `createChunk()` (`ImmixPWRegion`) — allocation now derives the chunk's first line-mark index from its region offset, stores a remount-safe region-relative metadata offset through the WAL transaction, and is covered by `pwregion_immix:chunk_links_first_line_mark`.
 - `ImmixLineSize` should come from the metadata descriptor, not be hardcoded
 
 ---
@@ -239,7 +239,6 @@ provides the same development interface with more invasive host setup.
 |---|------|-------------|
 | 1 | `X86_64TxnBackend.v3:88-100` | `flushCacheLine`/`storeFence` are stubs — PMEM not truly durable |
 | 2 | `X86_64TxnBackend.v3:58` | Page size hardcoded as 4096 |
-| 3 | `X86_64TxnPWRegion.v3` | Line-mark field not linked in `createChunk()` |
 | 4 | `X86_64TxnPWRegion.v3` | `ImmixLineSize` hardcoded (should use metadata descriptor) |
 | 5 | `TxnBackend.v3:132` | `Backends.getMmap()` declared but not implemented |
 | 6 | `X86_64TxnPWRegion.v3` | `getHeader()` now copies the header into a fresh `Array<byte>` on every call (minor GC pressure) |
