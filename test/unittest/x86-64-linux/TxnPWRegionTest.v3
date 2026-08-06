@@ -762,6 +762,7 @@ def BX = [
 	BT("abrupt_writer_recovers_committed_wal", test_bd_abrupt_writer_recovers_committed_wal),
 	BT("abrupt_split_alloc_recovers_transaction", test_bd_abrupt_split_alloc_recovers_transaction),
 	BT("abrupt_exact_fit_alloc_recovers_transaction", test_bd_abrupt_exact_fit_alloc_recovers_transaction),
+	BT("abrupt_coalescing_free_recovers_transaction", test_bd_abrupt_coalescing_free_recovers_transaction),
 	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
 	()
@@ -859,6 +860,30 @@ class BlockDevicePWRegionTester(t: Tester) {
 		return 0;
 	}
 
+	// Allocate adjacent one-block chunks, free the first, then free the second.
+	// The final free coalesces left with the first chunk and right with the
+	// remaining large extent in one multi-entry allocator transaction.
+	def coalesceFreeAbruptly() -> int {
+		region = openRegion(false);
+		if (region.backendRegion == null || region.txn == null) return 2;
+
+		def first = region.allocChunk(1u32);
+		if (first.isNull()) return 3;
+		def second = region.allocChunk(1u32);
+		if (second.isNull()) return 4;
+		if (!region.freeChunk(first)) return 5;
+		if (!region.freeChunk(second)) return 6;
+		if (region.requiresRecovery()) return 7;
+		if (region.txn.isDirty()) return 8;
+
+		def coalesced = region.blockTableHandle[2u64];
+		if (coalesced.getUsed()) return 9;
+		if (coalesced.getListNum() != ListKind.LARGE_FREE.code) return 10;
+		if (!FileMmapRegion.?(region.backendRegion)) return 11;
+		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 12;
+		return 0;
+	}
+
 	def assertRecoveredSplitAllocation(recovered: PWRegion) {
 		def logEntry = recovered.blockTableHandle[1u64];
 		def allocated = recovered.blockTableHandle[2u64];
@@ -923,6 +948,43 @@ class BlockDevicePWRegionTester(t: Tester) {
 		t.assert_eq(5u64 * 4096u64, chunk.getLimit());
 		t.assert_eq(5u64 * 4096u64, chunk.getChunkLimit());
 		t.assert_eq(0u64, chunk.getLinemarks());
+		t.assertz(false, recovered.requiresRecovery());
+		t.assertz(false, recovered.txn.isDirty());
+	}
+
+	def assertRecoveredCoalescingFree(recovered: PWRegion) {
+		def logEntry = recovered.blockTableHandle[1u64];
+		def coalesced = recovered.blockTableHandle[2u64];
+		def freedRight = recovered.blockTableHandle[3u64];
+		def absorbedRemainder = recovered.blockTableHandle[4u64];
+		def metadata = recovered.blockTableHandle[7u64];
+		def endMarker = recovered.blockTableHandle[8u64];
+
+		// Both neighbors were absorbed: the memory-order chain contains one
+		// five-block free extent between the log and metadata entries.
+		t.assert_eq(coalesced.addr, logEntry.getNext().addr);
+		t.assertz(false, coalesced.getUsed());
+		t.assert_eq(ListKind.LARGE_FREE.code, coalesced.getListNum());
+		t.assert_eq(logEntry.addr, coalesced.getPrev().addr);
+		t.assert_eq(metadata.addr, coalesced.getNext().addr);
+		t.assert_eq(coalesced.addr, metadata.getPrev().addr);
+		t.assert_eq(endMarker.addr, metadata.getNext().addr);
+		t.assert_eq(metadata.addr, endMarker.getPrev().addr);
+
+		// The coalesced entry is the only free-list member. The freed-right and
+		// old-remainder entries are interior to its extent and no longer listed.
+		t.assertz(true, recovered.smallSentinel.getListNext().isNull());
+		t.assert_eq(coalesced.addr, recovered.largeSentinel.getListNext().addr);
+		t.assert_eq(recovered.largeSentinel.addr, coalesced.getListPrev().addr);
+		t.assertz(true, coalesced.getListNext().isNull());
+		t.assertz(false, freedRight.getUsed());
+		t.assert_eq(ListKind.NONE.code, freedRight.getListNum());
+		t.assertz(true, freedRight.getListPrev().isNull());
+		t.assertz(true, freedRight.getListNext().isNull());
+		t.assertz(false, absorbedRemainder.getUsed());
+		t.assert_eq(ListKind.NONE.code, absorbedRemainder.getListNum());
+		t.assertz(true, absorbedRemainder.getListPrev().isNull());
+		t.assertz(true, absorbedRemainder.getListNext().isNull());
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
@@ -1163,6 +1225,43 @@ def test_bd_abrupt_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegionT
 
 	def recovered = tc.remount();
 	tc.assertRecoveredExactFitAllocation(recovered);
+
+	tc.cleanup();
+}
+
+// Crash after a complete free transaction has applied after-images for both
+// left and right coalescing, but before those after-images ride a later commit
+// or clean-close boundary. Remount must replay the record and reconstruct the
+// original five-block free extent without child cleanup.
+def test_bd_abrupt_coalescing_free_recovers_transaction(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.coalesceFreeAbruptly();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waited = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(pid, waited);
+	tc.t.assert_eq(0, waitStatus[0]);
+	if (waited != pid || waitStatus[0] != 0) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredCoalescingFree(recovered);
 
 	tc.cleanup();
 }
