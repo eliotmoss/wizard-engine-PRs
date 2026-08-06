@@ -18,8 +18,13 @@ def X = [
 	T("format_free_list_nonempty", test_format_free_list_nonempty),
 	T("alloc_1_valid",             test_alloc_1_valid),
 	T("alloc_multi_valid",         test_alloc_multi_valid),
+	T("alloc_zero_rejected",       test_alloc_zero_rejected),
+	T("alloc_oversized_rejected",  test_alloc_oversized_rejected),
 	T("alloc_sets_used",           test_alloc_sets_used),
 	T("alloc_chunk_header",        test_alloc_chunk_header),
+	T("free_null_rejected",        test_free_null_rejected),
+	T("free_double_rejected",      test_free_double_rejected),
+	T("free_foreign_rejected",     test_free_foreign_rejected),
 	T("free_clears_used",          test_free_clears_used),
 	T("free_then_realloc",         test_free_then_realloc),
 	T("exhaust_free_blocks",       test_exhaust_free_blocks),
@@ -98,6 +103,24 @@ def test_alloc_multi_valid(tc: PWRegionTester) {
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 }
 
+// Zero is not a meaningful chunk size. Reject it before the split path so it
+// cannot create a zero-length chunk or rewrite the existing free-list entry.
+def test_alloc_zero_rejected(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(0u32);
+	tc.t.assertz(false, tc.allocSucceeded(chunk));
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	tc.t.assertz(true, tc.allocSucceeded(tc.region.allocChunk(5u32)));
+}
+
+// A request larger than all user data must report ordinary exhaustion without
+// buffering allocator mutations.
+def test_alloc_oversized_rejected(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(6u32);
+	tc.t.assertz(false, tc.allocSucceeded(chunk));
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	tc.t.assertz(true, tc.allocSucceeded(tc.region.allocChunk(5u32)));
+}
+
 // After allocChunk(1), the block entry's used flag must be true when read
 // directly from memory (allocChunk commits before returning).
 def test_alloc_sets_used(tc: PWRegionTester) {
@@ -120,6 +143,39 @@ def test_alloc_chunk_header(tc: PWRegionTester) {
 // =============================================================================
 // Free tests
 // =============================================================================
+
+// Null is the allocation-failure sentinel, not a valid chunk to free.
+def test_free_null_rejected(tc: PWRegionTester) {
+	tc.t.assertz(false, tc.region.freeChunk(tc.region.blankChunkHandle));
+	tc.t.assertz(false, tc.region.txn.isDirty());
+}
+
+// The first free succeeds and commits; the second must be rejected without
+// adding writes to the shared transaction.
+def test_free_double_rejected(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.region.freeChunk(chunk));
+	tc.t.assertz(false, tc.region.freeChunk(chunk));
+	tc.t.assertz(false, tc.region.txn.isDirty());
+}
+
+// A chunk allocated by another region must be rejected before its address is
+// translated into this region's block-table index.
+def test_free_foreign_rejected(tc: PWRegionTester) {
+	var foreignRegion = PWRegion.new(
+		Backends.getVolatile(),
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		true
+	);
+	var foreignChunk = foreignRegion.allocChunk(1u32);
+
+	tc.t.assertz(true, !foreignChunk.isNull());
+	tc.t.assertz(false, tc.region.freeChunk(foreignChunk));
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	tc.t.assertz(true, foreignRegion.chunkToBlockEntry(foreignChunk).getUsed());
+}
 
 // After alloc+free, the block entry must show used == false.
 def test_free_clears_used(tc: PWRegionTester) {

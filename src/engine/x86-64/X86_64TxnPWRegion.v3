@@ -824,6 +824,7 @@ class PWRegion {
 
         def allocChunk(numBlocks: u32) -> ChunkHandle {
                 if (requiresRecovery()) return blankChunkHandle;
+                if (numBlocks == 0) return blankChunkHandle;
                 if (numBlocks == 1) {
                         // Try the small free block list
                         var firstHandle = smallSentinel.getListNextCached(txn);
@@ -891,8 +892,18 @@ class PWRegion {
                 if (requiresRecovery()) return false;
                 if (chunk.isNull()) return false;
 
+                // Reject handles that cannot name the start of a block in this
+                // region before converting the address into a block-table index.
+                // In particular, subtraction in chunkToBlockEntry() would
+                // otherwise underflow for a handle owned by another region.
+                if (chunk.addr < regionStart) return false;
+                def chunkOffset = chunk.addr - regionStart;
+                if (chunkOffset >= numBlocks * blockSize) return false;
+                if (chunkOffset % blockSize != 0) return false;
+
                 var entry = chunkToBlockEntry(chunk);
                 if (entry.isNull()) return false;
+                if (entry.getListNumCached(txn) != ListKind.NONE.code) return false;
                 if (!entry.getUsedCached(txn)) return false;
 
                 entry.setUsedCached(txn, false);
