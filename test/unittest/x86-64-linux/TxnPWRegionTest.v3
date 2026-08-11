@@ -826,26 +826,32 @@ def BD_SIGKILL = 9;
 def BD_SIGSTOP = 19;
 def BD_WUNTRACED = 2;
 
-component FileCommitTraceOp {
+component FilePersistenceTraceOp {
 	def PREPARE_RANGE = 1;
 	def FDATASYNC_COMPLETE = 2;
 	def FDATASYNC_FAILED = 3;
+	def MSYNC_COMPLETE = 4;
+	def MSYNC_FAILED = 5;
 }
 
-// Records range preparation around a successful call through the production
-// FileMmapRegion fdatasync seam. This keeps the real mapping and syscall path
-// while making the phase-B ordering visible to the test.
-class FileCommitTraceRegion extends FileMmapRegion {
+// Records prepared ranges and the completed syscalls behind both production
+// FileMmapRegion persistence seams. This keeps the real mapping and syscall
+// paths while making fdatasync/msync ordering and failures visible to tests.
+class FilePersistenceTraceRegion extends FileMmapRegion {
 	var operations = Vector<int>.new();
 	var preparedOffsets = Vector<u64>.new();
 	var preparedSizes = Vector<u64>.new();
+	var mappedSyncOffsets = Vector<u64>.new();
+	var mappedSyncSizes = Vector<u64>.new();
 	var failNextDataSync = false;
+	var failNextMappedSync = false;
 	var dataSyncAttempts = 0;
+	var mappedSyncAttempts = 0;
 
 	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
 	def onRangePrepared(offset: u64, size: u64) {
-		operations.put(FileCommitTraceOp.PREPARE_RANGE);
+		operations.put(FilePersistenceTraceOp.PREPARE_RANGE);
 		preparedOffsets.put(offset);
 		preparedSizes.put(size);
 	}
@@ -863,8 +869,28 @@ class FileCommitTraceRegion extends FileMmapRegion {
 		}
 		operations.put(if(
 			success,
-			FileCommitTraceOp.FDATASYNC_COMPLETE,
-			FileCommitTraceOp.FDATASYNC_FAILED));
+			FilePersistenceTraceOp.FDATASYNC_COMPLETE,
+			FilePersistenceTraceOp.FDATASYNC_FAILED));
+		return success;
+	}
+
+	def syncMappedRange(offset: u64, size: u64) -> bool {
+		mappedSyncAttempts++;
+		mappedSyncOffsets.put(offset);
+		mappedSyncSizes.put(size);
+		var success = false;
+		if (failNextMappedSync) {
+			failNextMappedSync = false;
+			// Invoke the real syscall on an unmapped page. The intended aligned
+			// range remains recorded above, while Linux reports the sync failure.
+			success = Mmap.sync(Pointer.NULL, size, Mmap.MS_SYNC);
+		} else {
+			success = Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
+		}
+		operations.put(if(
+			success,
+			FilePersistenceTraceOp.MSYNC_COMPLETE,
+			FilePersistenceTraceOp.MSYNC_FAILED));
 		return success;
 	}
 
@@ -872,18 +898,21 @@ class FileCommitTraceRegion extends FileMmapRegion {
 		operations.clear();
 		preparedOffsets.clear();
 		preparedSizes.clear();
+		mappedSyncOffsets.clear();
+		mappedSyncSizes.clear();
 		dataSyncAttempts = 0;
+		mappedSyncAttempts = 0;
 	}
 }
 
-class FileCommitTraceBackend extends FileMmapBackend {
-	var tracedRegion: FileCommitTraceRegion;
+class FilePersistenceTraceBackend extends FileMmapBackend {
+	var tracedRegion: FilePersistenceTraceRegion;
 
 	new(path: string) super(path) { }
 
 	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
 		if (newMapping == null) return null;
-		tracedRegion = FileCommitTraceRegion.new(newMapping, fd);
+		tracedRegion = FilePersistenceTraceRegion.new(newMapping, fd);
 		return tracedRegion;
 	}
 }
@@ -935,8 +964,10 @@ def BX = [
 	BT("coalesce",              test_bd_coalesce),
 	BT("persist_and_remount",   test_bd_persist_and_remount),
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
+	BT("file_format_orders_page_aligned_msync", test_bd_file_format_orders_page_aligned_msync),
 	BT("file_commit_orders_fdatasync_before_after_images", test_bd_file_commit_orders_fdatasync_before_after_images),
 	BT("file_commit_fdatasync_failure_requires_reopen", test_bd_file_commit_fdatasync_failure_requires_reopen),
+	BT("file_close_msync_failure_requires_reopen", test_bd_file_close_msync_failure_requires_reopen),
 	BT("mixed_sequence_preserves_invariants", test_bd_mixed_sequence_preserves_invariants),
 	BT("seeded_mixed_histories_preserve_invariants", test_bd_seeded_mixed_histories_preserve_invariants),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
@@ -1565,13 +1596,59 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 	tc.cleanup();
 }
 
+// Fresh format issues two ordered WAL-header/slot scrubs before publishing the
+// complete region image. The file backend must translate each requested range
+// into the exact page-aligned msync span while preserving that protocol order.
+def test_bd_file_format_orders_page_aligned_msync(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
+	tc.region = PWRegion.new(
+		backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		true
+	);
+
+	def traced = backend.tracedRegion;
+	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
+		tc.t.fail("msync-traced file backend format failed");
+		tc.cleanup();
+		return;
+	}
+
+	tc.t.assert_eq(3, traced.operations.length);
+	tc.t.assert_eq(3, traced.mappedSyncAttempts);
+	tc.t.assert_eq(0, traced.dataSyncAttempts);
+	if (traced.operations.length != 3 || traced.mappedSyncOffsets.length != 3) {
+		tc.cleanup();
+		return;
+	}
+
+	for (i < 3) {
+		tc.t.assert_eq(FilePersistenceTraceOp.MSYNC_COMPLETE, traced.operations[i]);
+	}
+	// Both ordered WAL initialization ranges occupy block 1's single page.
+	tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[0]);
+	tc.t.assert_eq(4096u64, traced.mappedSyncSizes[0]);
+	tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[1]);
+	tc.t.assert_eq(4096u64, traced.mappedSyncSizes[1]);
+	// The final format publication covers the complete eight-block mapping.
+	tc.t.assert_eq(0u64, traced.mappedSyncOffsets[2]);
+	tc.t.assert_eq(8u64 * 4096u64, traced.mappedSyncSizes[2]);
+	tc.t.assertz(false, tc.region.requiresRecovery());
+	tc.assertAllocatorInvariants(tc.region);
+
+	tc.cleanup();
+}
+
 // A real file-backed phase-B commit must prepare its WAL record, complete the
 // fdatasync commit boundary, and only then prepare the allocator after-images
 // whose durability is deferred to the next boundary. The trace is cleared
 // after mount so it contains exactly one allocator transaction.
 def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRegionTester) {
 	tc.region.deallocate();
-	def backend = FileCommitTraceBackend.new(BD_PATH);
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
 	tc.region = PWRegion.new(
 		backend,
 		8u64,
@@ -1599,17 +1676,17 @@ def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRe
 	// The first prepared range is the complete checksummed record in block 1.
 	def logOffset = tc.region.offsetInRegion(tc.region.logChunk.addr);
 	def logEnd = logOffset + tc.region.blockSize;
-	tc.t.assert_eq(FileCommitTraceOp.PREPARE_RANGE, traced.operations[0]);
+	tc.t.assert_eq(FilePersistenceTraceOp.PREPARE_RANGE, traced.operations[0]);
 	tc.t.assertz(true, traced.preparedOffsets[0] >= logOffset);
 	tc.t.assertz(true, traced.preparedOffsets[0] + traced.preparedSizes[0] <= logEnd);
 
 	// This event is emitted only after the production fdatasync call succeeds.
-	tc.t.assert_eq(FileCommitTraceOp.FDATASYNC_COMPLETE, traced.operations[1]);
+	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_COMPLETE, traced.operations[1]);
 
 	// All remaining events are non-WAL allocator after-images. No second sync is
 	// issued, so FileMmapRegion retains them for the next piggybacked boundary.
 	for (i = 2; i < traced.operations.length; i++) {
-		tc.t.assert_eq(FileCommitTraceOp.PREPARE_RANGE, traced.operations[i]);
+		tc.t.assert_eq(FilePersistenceTraceOp.PREPARE_RANGE, traced.operations[i]);
 		def preparedIndex = i - 1;
 		def offset = traced.preparedOffsets[preparedIndex];
 		def size = traced.preparedSizes[preparedIndex];
@@ -1628,7 +1705,7 @@ def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRe
 // record; this characterizes the indeterminate outcome, not power durability.
 def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
 	tc.region.deallocate();
-	def backend = FileCommitTraceBackend.new(BD_PATH);
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
 	tc.region = PWRegion.new(
 		backend,
 		8u64,
@@ -1660,8 +1737,8 @@ def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegio
 
 	// Failure occurs after the complete WAL record is prepared and before any
 	// allocator after-image reaches the live mapping.
-	tc.t.assert_eq(FileCommitTraceOp.PREPARE_RANGE, traced.operations[0]);
-	tc.t.assert_eq(FileCommitTraceOp.FDATASYNC_FAILED, traced.operations[1]);
+	tc.t.assert_eq(FilePersistenceTraceOp.PREPARE_RANGE, traced.operations[0]);
+	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_FAILED, traced.operations[1]);
 	tc.t.assert_eq(1, traced.preparedOffsets.length);
 	def allocated = tc.region.blockTableHandle[2u64];
 	tc.t.assertz(false, allocated.getUsed());
@@ -1678,6 +1755,64 @@ def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegio
 	// MAP_SHARED makes the complete record visible to the fresh mapping even
 	// though the injected fdatasync failed; production recovery replays it and
 	// publishes the allocator after-images through the normal file backend.
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
+
+	tc.cleanup();
+}
+
+// Clean close first makes the deferred allocator after-images durable with
+// fdatasync, then scrubs its reclaimable WAL slot with page-aligned msync. Fail
+// that actual msync call on an unmapped page: the old WAL instance must latch,
+// while remount remains structurally correct whether the idempotent record is
+// still visible or its live scrub is observed through the shared page cache.
+def test_bd_file_close_msync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
+	tc.region = PWRegion.new(
+		backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		false
+	);
+
+	def traced = backend.tracedRegion;
+	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
+		tc.t.fail("msync-failure file backend mount failed");
+		tc.cleanup();
+		return;
+	}
+
+	def chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, chunk.isNull());
+	if (chunk.isNull()) {
+		tc.cleanup();
+		return;
+	}
+
+	traced.clearTrace();
+	traced.failNextMappedSync = true;
+	def closingTxn = tc.region.txn;
+	tc.region.deallocate();
+	tc.region = null;
+
+	tc.t.assertz(true, closingTxn.requiresRecovery());
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(1, traced.mappedSyncAttempts);
+	tc.t.assert_eq(2, traced.operations.length);
+	if (traced.operations.length != 2 || traced.mappedSyncOffsets.length != 1) {
+		tc.cleanup();
+		return;
+	}
+
+	// close() must complete final-data fdatasync before attempting the slot scrub.
+	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_COMPLETE, traced.operations[0]);
+	tc.t.assert_eq(FilePersistenceTraceOp.MSYNC_FAILED, traced.operations[1]);
+	tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[0]);
+	tc.t.assert_eq(4096u64, traced.mappedSyncSizes[0]);
+
 	def recovered = tc.remount();
 	tc.assertRecoveredSplitAllocation(recovered);
 	tc.assertAllocatorInvariants(recovered);

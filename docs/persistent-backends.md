@@ -447,8 +447,8 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-11: the implementation-specific
-x86-64 Linux suite contains 142 registered tests. The previous 140-test audit
-passed in an amd64 Docker container on a Darwin arm64 host; all 142 pass with
+x86-64 Linux suite contains 144 registered tests. The previous 140-test audit
+passed in an amd64 Docker container on a Darwin arm64 host; all 144 pass with
 no expected failures in the latest native x86-64 Linux run.
 
 | Test file | Tests | What it covers |
@@ -456,7 +456,7 @@ no expected failures in the latest native x86-64 Linux run.
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
 | `DualTxnWalTest.v3` | 38 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 61 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 63 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 23 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 The platform wrapper classes have no dedicated tests. Immix
@@ -486,11 +486,15 @@ WAL-record preparation before that boundary and allocator after-image
 preparation after it. The same seam injects one real `EBADF` result through
 `fdatasync(-1)`: the allocator propagates failure, latches recovery-required,
 blocks same-mount retry/flush, and replays the complete page-cache record after
-remount. These tests do not yet clear the kernel page cache, reset a VM,
-interrupt power, trace at the kernel syscall layer, or cover `msync` ordering
-and failure injection. A same-kernel remount can observe cached
-data that has not been shown to survive a system crash. Full gaps and priorities
-are maintained in `docs/ROADMAP.md` Next Steps #3.
+remount. The mapped-range seam additionally records the exact page-aligned
+`msync` spans: fresh format orders two WAL initialization syncs before the
+whole-region publication, while clean close completes final-data `fdatasync`
+before an injected failing slot-scrub `msync`. The latter latches its old WAL
+instance and remount preserves the allocated structure. These tests do not yet
+clear the kernel page cache, reset a VM, interrupt power, or trace at the kernel
+syscall layer beyond the explicit test seams. A same-kernel remount can observe
+cached data that has not been shown to survive a system crash. Full gaps and
+priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
 
 The PMEM-labelled unit coverage is structural only:
 `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping

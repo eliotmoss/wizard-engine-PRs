@@ -52,17 +52,6 @@ component MmapRegionUtils {
 		return mmapProt;
 	}
 
-	def pageAlignedSyncRange(region: FdMmapRegion, offset: u64, size: u64) -> bool {
-		if (!region.validRange(offset, size)) return false;
-		if (size == 0) return true;
-		// TODO: define this somewhere else as a constant
-		def pageSize = 4096u64;
-		def syncStart = offset - (offset % pageSize);
-		def rangeEnd = offset + size;
-		def syncEnd = ((rangeEnd + pageSize - 1u64) / pageSize) * pageSize;
-		return Mmap.sync(region.mapping.range.start + i64.view(syncStart), syncEnd - syncStart, Mmap.MS_SYNC);
-	}
-
 	def flushRange(region: FdMmapRegion, offset: u64, size: u64) -> bool {
 		if (!region.validRange(offset, size)) return false;
 		if (size == 0) return true;
@@ -120,7 +109,22 @@ class FileMmapRegion extends FdMmapRegion {
 
 	def persistRange(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
-		return MmapRegionUtils.pageAlignedSyncRange(this, offset, size);
+		if (!validRange(offset, size)) return false;
+		if (size == 0) return true;
+		// TODO: define this somewhere else as a constant
+		def pageSize = 4096u64;
+		def syncStart = offset - (offset % pageSize);
+		def rangeEnd = offset + size;
+		def syncEnd = ((rangeEnd + pageSize - 1u64) / pageSize) * pageSize;
+		return syncMappedRange(syncStart, syncEnd - syncStart);
+	}
+
+	// Like syncFileData(), keep the actual range-sync syscall behind a narrow
+	// seam. Inputs are validated, page-aligned offsets and sizes computed by
+	// persistRange(), so tests can observe the exact translation or inject a
+	// syscall failure without duplicating that logic.
+	def syncMappedRange(offset: u64, size: u64) -> bool {
+		return Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
 	}
 
 	def persistChanges() -> bool {
