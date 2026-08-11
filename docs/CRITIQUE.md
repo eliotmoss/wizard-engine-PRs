@@ -67,7 +67,7 @@ The cache is keyed by exact address — a write to `addr` at width 8 and a subse
 
 ## 7. ImmixPWRegion line marks are not durable
 
-`resetAllLineMarks()` writes directly to memory, bypassing the WAL. After a crash, the region remounts with whatever line marks were in memory at the time of the crash, which may not correspond to the live/dead state of objects. Whether this is safe depends on whether the GC is designed to rebuild line marks from a full heap scan on remount — that is not currently specified or implemented. Until it is, the Immix extension cannot be considered crash-consistent.
+`resetAllLineMarks()` writes directly to memory, bypassing the WAL. This is now an explicit, regression-tested policy: line marks are transient GC state and mark/reset operations issue no persistence boundary. After a crash, the region can still remount with line marks that do not correspond to the live/dead state of objects. The caller must rebuild them from a full heap scan, but that rebuild is not currently implemented. Until it is, the Immix extension cannot be considered crash-consistent.
 
 ---
 

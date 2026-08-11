@@ -145,7 +145,7 @@ The superseded protocols are retained for comparison, **not wired in** — `Sing
 - `MmapRegionUtils.flushCacheLine` / `storeFence` are no-op placeholders — need Virgil inline-asm or intrinsic support for CLWB/SFENCE (`X86_64TxnBackend.v3:88-100`)
 - WAL overflow in `SingleTxnWal.append` (the superseded reference WAL) silently drops entries when block 1 is full; the active `DualTxnWal` surfaces an oversized transaction via a failed `commit()` instead (per-transaction capacity ≈ half the log chunk minus headers)
 - `Backends.getMmap()` declared but not implemented
-- `ImmixPWRegion` line marks bypass the WAL and are not durable
+- `ImmixPWRegion` line marks are explicitly transient: mark/reset bypass the WAL and persistence boundaries, so callers must rebuild them after a crash
 - `RegionTransaction.clear()` allocates a new `HashMap` on every commit (GC pressure)
 - `RegionTransaction` is aligned-access only — mixed-width overlapping reads cause silent cache misses
 

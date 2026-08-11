@@ -1012,7 +1012,10 @@ class PWRegion {
 class ImmixPWRegion extends PWRegion {
         new(backend: TxnRegionBackend, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, blockSize: u64, forceFormat: bool)
                 super(backend, numBlocks, metaDataDescs, blockSize, forceFormat) {
-                lineMarks = getLineMarks();
+                // Backend creation can fail (for example, MAP_SYNC on a non-DAX
+                // filesystem). Leave the Immix view empty just as PWRegion leaves
+                // the failed mount unopened instead of dereferencing address 0.
+                if (backendRegion != null) lineMarks = getLineMarks();
         }
 
         // Line mark definitions
@@ -1028,7 +1031,10 @@ class ImmixPWRegion extends PWRegion {
                                 lineSize = u64.!(r.unitSize);
                                 var spaceSize = numBlocks * blockSize;
                                 numLineMarks = (spaceSize + lineSize - 1) / lineSize;
-                                var lmrng = this.rng[r.offset ..+ numLineMarks * u64.!(LineMark.size)];
+                                // fixedBytes is a descriptor-owned prefix; per-unit
+                                // line marks begin immediately after it.
+                                def lineMarksOffset = r.offset + u64.!(r.fixedBytes);
+                                var lmrng = this.rng[lineMarksOffset ..+ numLineMarks * u64.!(LineMark.size)];
                                 return LineMarkTableHandle(u64.view(Pointer.atElement(lmrng, 0) - Pointer.NULL), numLineMarks);
                         }
                 }
@@ -1045,6 +1051,8 @@ class ImmixPWRegion extends PWRegion {
         }
 
         def resetAllLineMarks() {
+                // Line marks are transient GC state. They deliberately bypass the
+                // allocator transaction/WAL and must be rebuilt after a crash.
                 for (index < numLineMarks) {
                         lineMarks[index].getRef().mark = ImmixPWRegions.ImmixLineMarkResetValue;
                 }

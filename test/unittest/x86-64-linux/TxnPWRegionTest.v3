@@ -262,37 +262,141 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 
 def IRT = UnitTests.registerT("pwregion_immix:", _, ImmixPWRegionTester.new, _);
 def IRX = [
+	IRT("metadata_descriptors_persisted", test_immix_metadata_descriptors_persisted),
 	IRT("descriptor_controls_line_size", test_immix_descriptor_controls_line_size),
+	IRT("line_mark_lookup_bounds", test_immix_line_mark_lookup_bounds),
 	IRT("chunk_links_first_line_mark", test_immix_chunk_links_first_line_mark),
+	IRT("reset_all_line_marks", test_immix_reset_all_line_marks),
+	IRT("line_marks_bypass_wal", test_immix_line_marks_bypass_wal),
+	IRT("metadata_remount_restores_line_table", test_immix_metadata_remount_restores_line_table),
 	()
 ];
+
+// Count persistence calls while retaining ordinary volatile byte storage. Immix
+// line marks are intentionally transient GC metadata, so their direct updates
+// must not accidentally enter the allocator WAL or persistence boundary.
+class ImmixTrackingBackend extends TxnRegionBackend {
+	var data: Array<byte>;
+	var region: ImmixTrackingRegion;
+
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		if (data == null || fresh) data = Array<byte>.new(int.!(size));
+		region = ImmixTrackingRegion.new(data[0 ..+ data.length]);
+		return region;
+	}
+
+	def isPersistent() -> bool {
+		return false;
+	}
+
+	def name() -> string {
+		return "immix-tracking";
+	}
+}
+
+class ImmixTrackingRegion extends BackendRegion {
+	var prepareChangedRangeCount = 0;
+	var persistRangeCount = 0;
+	var persistChangesCount = 0;
+
+	new(range: Range<byte>) super(range) { }
+
+	def destroy() { }
+
+	def prepareChangedRange(offset: u64, size: u64) -> bool {
+		prepareChangedRangeCount++;
+		return true;
+	}
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		persistRangeCount++;
+		return true;
+	}
+
+	def persistChanges() -> bool {
+		persistChangesCount++;
+		return true;
+	}
+}
 
 class ImmixPWRegionTester(t: Tester) {
 	var descBytes: Array<byte>;
 	var descs: Array<Ref<MetaDataDesc>>;
+	var backend: ImmixTrackingBackend;
 	var region: ImmixPWRegion;
 
 	new() {
-		descBytes = Array<byte>.new(MetaDataDesc.size);
-		def desc = Ref<MetaDataDesc>.at(descBytes, 0);
-		desc.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
-		desc.fixedBytes = 0;
-		desc.unitSize = 128u32;
-		desc.bytesPerUnit = u32.!(LineMark.size);
+		descBytes = Array<byte>.new(MetaDataDesc.size * 2);
+		def otherDesc = Ref<MetaDataDesc>.at(descBytes, 0);
+		otherDesc.kind = 0x4f_54_48_45_52u64; // "OTHER"
+		otherDesc.fixedBytes = 3u32;
+		otherDesc.unitSize = 1024u32;
+		otherDesc.bytesPerUnit = 2u32;
 
-		descs = Array<Ref<MetaDataDesc>>.new(1);
-		descs[0] = desc;
-		region = ImmixPWRegion.new(Backends.getVolatile(), 8u64, descs, 4096u64, true);
+		def lineDesc = Ref<MetaDataDesc>.at(descBytes, MetaDataDesc.size);
+		lineDesc.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		lineDesc.fixedBytes = 4u32;
+		lineDesc.unitSize = 128u32;
+		lineDesc.bytesPerUnit = u32.!(LineMark.size);
+
+		descs = Array<Ref<MetaDataDesc>>.new(2);
+		descs[0] = otherDesc;
+		descs[1] = lineDesc;
+		backend = ImmixTrackingBackend.new();
+		region = ImmixPWRegion.new(backend, 8u64, descs, 4096u64, true);
 	}
+}
+
+// Formatting copies every descriptor field into the on-region descriptor
+// table and assigns each metadata area its own region-relative offset.
+def test_immix_metadata_descriptors_persisted(tc: ImmixPWRegionTester) {
+	def hdr = tc.region.getHeader();
+	def otherDesc = tc.region.getMetaDataDesc(0u64);
+	def lineDesc = tc.region.getMetaDataDesc(1u64);
+
+	tc.t.assert_eq(2u64, hdr.numDescs);
+	tc.t.assertz(true, hdr.metaDataDescs < hdr.numBytes);
+	tc.t.assert_eq(0x4f_54_48_45_52u64, otherDesc.kind);
+	tc.t.assert_eq(3u32, otherDesc.fixedBytes);
+	tc.t.assert_eq(1024u32, otherDesc.unitSize);
+	tc.t.assert_eq(2u32, otherDesc.bytesPerUnit);
+	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkMetaKind, lineDesc.kind);
+	tc.t.assert_eq(4u32, lineDesc.fixedBytes);
+	tc.t.assert_eq(128u32, lineDesc.unitSize);
+	tc.t.assert_eq(u32.!(LineMark.size), lineDesc.bytesPerUnit);
+	tc.t.assertz(true, lineDesc.offset < otherDesc.offset);
+	tc.t.assertz(true, otherDesc.offset < hdr.metaDataDescs);
+
+	// Prove these are stored copies, not aliases of the caller's descriptors.
+	tc.descs[1].unitSize = 64u32;
+	tc.t.assert_eq(128u32, lineDesc.unitSize);
 }
 
 // The persisted metadata descriptor, rather than a global constant, controls
 // both the line-table geometry and chunk-to-line-mark indexing.
 def test_immix_descriptor_controls_line_size(tc: ImmixPWRegionTester) {
 	def expectedMarks = (8u64 * 4096u64 + 127u64) / 128u64;
+	def lineDesc = tc.region.getMetaDataDesc(1u64);
 
 	tc.t.assert_eq(128u64, tc.region.lineSize);
 	tc.t.assert_eq(expectedMarks, tc.region.numLineMarks);
+	tc.t.assert_eq(
+		lineDesc.offset + u64.!(lineDesc.fixedBytes),
+		tc.region.lineMarks.addr - tc.region.regionStart);
+}
+
+// The line-mark table supports its entire persisted range and returns the null
+// handle exactly at and beyond its upper bound.
+def test_immix_line_mark_lookup_bounds(tc: ImmixPWRegionTester) {
+	def first = tc.region.lineMarks[0u64];
+	def last = tc.region.lineMarks[tc.region.numLineMarks - 1u64];
+	def pastEnd = tc.region.lineMarks[tc.region.numLineMarks];
+
+	tc.t.assertz(false, first.addr == 0);
+	tc.t.assert_eq(
+		first.addr + (tc.region.numLineMarks - 1u64) * u64.!(LineMark.size),
+		last.addr);
+	tc.t.assert_eq(0u64, pastEnd.addr);
 }
 
 // createChunk() must link to the mark covering the chunk's actual region
@@ -305,6 +409,152 @@ def test_immix_chunk_links_first_line_mark(tc: ImmixPWRegionTester) {
 	tc.t.assertz(false, chunk.isNull());
 	tc.t.assertz(false, expectedOffset == 0);
 	tc.t.assert_eq(expectedOffset, chunk.getLinemarks());
+}
+
+// A GC-cycle reset clears every per-unit mark without overwriting the
+// descriptor's fixed metadata prefix.
+def test_immix_reset_all_line_marks(tc: ImmixPWRegionTester) {
+	def lineDesc = tc.region.getMetaDataDesc(1u64);
+	def prefix = PWRegionUtils.pointerFromU64(tc.region.regionStart + lineDesc.offset);
+	for (i < int.!(lineDesc.fixedBytes)) (prefix + i).store<u8>(0xa5u8);
+	for (i < tc.region.numLineMarks) {
+		tc.region.lineMarks[i].setMark(ImmixPWRegions.LINE_MARKED);
+	}
+
+	tc.region.resetAllLineMarks();
+
+	for (i < int.!(lineDesc.fixedBytes)) {
+		tc.t.assert_eq(0xa5u8, (prefix + i).load<u8>());
+	}
+	for (i < tc.region.numLineMarks) {
+		tc.t.assert_eq(ImmixPWRegions.LINE_FREE, tc.region.lineMarks[i].getMark());
+	}
+}
+
+// Line marks are transient tracing state, not allocator consistency metadata.
+// Mark/reset therefore stays outside RegionTransaction and all persistence APIs.
+def test_immix_line_marks_bypass_wal(tc: ImmixPWRegionTester) {
+	def tracked = tc.backend.region;
+	def prepareCount = tracked.prepareChangedRangeCount;
+	def persistRangeCount = tracked.persistRangeCount;
+	def persistChangesCount = tracked.persistChangesCount;
+
+	tc.region.lineMarks[3u64].setMark(ImmixPWRegions.LINE_MARKED);
+	tc.region.resetAllLineMarks();
+
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	tc.t.assert_eq(prepareCount, tracked.prepareChangedRangeCount);
+	tc.t.assert_eq(persistRangeCount, tracked.persistRangeCount);
+	tc.t.assert_eq(persistChangesCount, tracked.persistChangesCount);
+}
+
+// Mount reconstructs the line table solely from the copied on-region
+// descriptors; caller-owned formatting descriptors are not required again.
+def test_immix_metadata_remount_restores_line_table(tc: ImmixPWRegionTester) {
+	def formattedOffset = tc.region.lineMarks.addr - tc.region.regionStart;
+	tc.region.deallocate();
+
+	tc.region = ImmixPWRegion.new(
+		tc.backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		false);
+
+	def lineDesc = tc.region.getMetaDataDesc(1u64);
+	tc.t.assert_eq(2u64, tc.region.getHeader().numDescs);
+	tc.t.assert_eq(128u64, tc.region.lineSize);
+	tc.t.assert_eq(formattedOffset, tc.region.lineMarks.addr - tc.region.regionStart);
+	tc.t.assert_eq(lineDesc.offset + u64.!(lineDesc.fixedBytes), formattedOffset);
+}
+
+
+// =============================================================================
+// x86-64 platform wrapper coverage
+// =============================================================================
+
+def WRT = UnitTests.registerT("pwregion_wrappers:", _, PWRegionWrapperTester.new, _);
+def WRX = [
+	WRT("pw_mem_region", test_wrapper_pw_mem_region),
+	WRT("pw_nv_region", test_wrapper_pw_nv_region),
+	WRT("pw_block_device_region", test_wrapper_pw_block_device_region),
+	WRT("immix_pw_mem_region", test_wrapper_immix_pw_mem_region),
+	WRT("immix_pw_nv_region", test_wrapper_immix_pw_nv_region),
+	()
+];
+
+def WRAPPER_FILE_PATH = "/tmp/wiz_test_wrapper_file_region";
+def WRAPPER_PMEM_PATH = "/tmp/wiz_test_wrapper_pmem_region";
+def WRAPPER_IMMIX_PMEM_PATH = "/tmp/wiz_test_wrapper_immix_pmem_region";
+
+class PWRegionWrapperTester(t: Tester) {
+	def emptyDescs() -> Array<Ref<MetaDataDesc>> {
+		return Array<Ref<MetaDataDesc>>.new(0);
+	}
+
+	def lineDescs() -> Array<Ref<MetaDataDesc>> {
+		var descs = Array<Ref<MetaDataDesc>>.new(1);
+		descs[0] = MemRegions.lineMarkDescRef;
+		return descs;
+	}
+}
+
+def test_wrapper_pw_mem_region(tc: PWRegionWrapperTester) {
+	var region = X86_64PWMemRegion.new(8u64, tc.emptyDescs(), true);
+	tc.t.assertz(false, region.backendRegion == null);
+	tc.t.assertz(true, VolatileRegion.?(region.backendRegion));
+	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+	tc.t.assertz(false, region.allocChunk(1u32).isNull());
+	region.deallocate();
+}
+
+// Ordinary CI filesystems normally reject MAP_SYNC. The wrapper must still be
+// safe to instantiate and tear down; on a DAX-capable /tmp, also pin its type.
+def test_wrapper_pw_nv_region(tc: PWRegionWrapperTester) {
+	RegionFileIO.unlink(WRAPPER_PMEM_PATH);
+	var region = X86_64PWNVRegion.new(WRAPPER_PMEM_PATH, 8u64, tc.emptyDescs(), true);
+	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+	if (region.backendRegion != null) {
+		tc.t.assertz(true, PmemMmapRegion.?(region.backendRegion));
+	}
+	region.deallocate();
+	RegionFileIO.unlink(WRAPPER_PMEM_PATH);
+}
+
+def test_wrapper_pw_block_device_region(tc: PWRegionWrapperTester) {
+	RegionFileIO.unlink(WRAPPER_FILE_PATH);
+	var region = X86_64PWBlockDeviceRegion.new(WRAPPER_FILE_PATH, 8u64, tc.emptyDescs(), true);
+	tc.t.assertz(false, region.backendRegion == null);
+	tc.t.assertz(true, FileMmapRegion.?(region.backendRegion));
+	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+	tc.t.assertz(false, region.allocChunk(1u32).isNull());
+	region.deallocate();
+	RegionFileIO.unlink(WRAPPER_FILE_PATH);
+}
+
+def test_wrapper_immix_pw_mem_region(tc: PWRegionWrapperTester) {
+	var region = X86_64ImmixPWMemRegion.new(8u64, tc.lineDescs(), true);
+	tc.t.assertz(false, region.backendRegion == null);
+	tc.t.assertz(true, VolatileRegion.?(region.backendRegion));
+	tc.t.assert_eq(u64.!(ImmixPWRegions.DefaultImmixLineSize), region.lineSize);
+	tc.t.assertz(false, region.lineMarks.addr == 0);
+	region.deallocate();
+}
+
+def test_wrapper_immix_pw_nv_region(tc: PWRegionWrapperTester) {
+	RegionFileIO.unlink(WRAPPER_IMMIX_PMEM_PATH);
+	var region = X86_64ImmixPWNVRegion.new(
+		WRAPPER_IMMIX_PMEM_PATH, 8u64, tc.lineDescs(), true);
+	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+	if (region.backendRegion == null) {
+		tc.t.assert_eq(0u64, region.lineMarks.addr);
+		tc.t.assert_eq(0u64, region.numLineMarks);
+	} else {
+		tc.t.assertz(true, PmemMmapRegion.?(region.backendRegion));
+		tc.t.assertz(false, region.lineMarks.addr == 0);
+	}
+	region.deallocate();
+	RegionFileIO.unlink(WRAPPER_IMMIX_PMEM_PATH);
 }
 
 
