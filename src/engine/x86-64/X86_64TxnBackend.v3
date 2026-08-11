@@ -109,8 +109,14 @@ class FileMmapRegion extends FdMmapRegion {
 		if (mapping == null) return false;
 		if (!validRange(offset, size)) return false;
 		if (size != 0) hasDirtyChanges = true;
+		onRangePrepared(offset, size);
 		return true;
 	}
+
+	// Observation hook paired with syncFileData() below. The default backend is
+	// intentionally silent; integration tests override it to trace ordering
+	// without reimplementing dirty-state transitions.
+	def onRangePrepared(offset: u64, size: u64) { }
 
 	def persistRange(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
@@ -120,10 +126,17 @@ class FileMmapRegion extends FdMmapRegion {
 	def persistChanges() -> bool {
 		if (mapping == null || fd < 0) return false;
 		if (!hasDirtyChanges) return true;
-		if (!RegionFileIO.fdatasync(fd)) return false;
+		if (!syncFileData()) return false;
 
 		hasDirtyChanges = false;
 		return true;
+	}
+
+	// Keep the syscall behind a narrow virtual seam so backend integration tests
+	// can observe its ordering and inject failures without replacing the
+	// FileMmapRegion persistence state machine.
+	def syncFileData() -> bool {
+		return RegionFileIO.fdatasync(fd);
 	}
 
 	def cleanupBeforeDestroy() {
