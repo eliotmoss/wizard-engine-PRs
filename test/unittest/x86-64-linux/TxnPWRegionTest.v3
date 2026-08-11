@@ -1157,12 +1157,14 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 
 class FilePersistenceTraceBackend extends FileMmapBackend {
 	var tracedRegion: FilePersistenceTraceRegion;
+	var failFirstDataSync = false;
 
 	new(path: string) super(path) { }
 
 	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
 		if (newMapping == null) return null;
 		tracedRegion = FilePersistenceTraceRegion.new(newMapping, fd);
+		tracedRegion.failNextDataSync = failFirstDataSync;
 		return tracedRegion;
 	}
 }
@@ -1254,6 +1256,9 @@ def BX = [
 	BT("file_format_orders_page_aligned_msync", test_bd_file_format_orders_page_aligned_msync),
 	BT("file_commit_orders_fdatasync_before_after_images", test_bd_file_commit_orders_fdatasync_before_after_images),
 	BT("file_commit_fdatasync_failure_requires_reopen", test_bd_file_commit_fdatasync_failure_requires_reopen),
+	BT("file_recovery_fdatasync_failure_requires_reopen", test_bd_file_recovery_fdatasync_failure_requires_reopen),
+	BT("file_flush_fdatasync_failure_requires_reopen", test_bd_file_flush_fdatasync_failure_requires_reopen),
+	BT("file_close_fdatasync_failure_requires_reopen", test_bd_file_close_fdatasync_failure_requires_reopen),
 	BT("file_close_msync_failure_requires_reopen", test_bd_file_close_msync_failure_requires_reopen),
 	BT("mixed_sequence_preserves_invariants", test_bd_mixed_sequence_preserves_invariants),
 	BT("seeded_mixed_histories_preserve_invariants", test_bd_seeded_mixed_histories_preserve_invariants),
@@ -2185,6 +2190,193 @@ def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegio
 	// MAP_SHARED makes the complete record visible to the fresh mapping even
 	// though the injected fdatasync failed; production recovery replays it and
 	// publishes the allocator after-images through the normal file backend.
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
+
+	tc.cleanup();
+}
+
+// Fail the real fdatasync that publishes replayed allocator after-images. The
+// child leaves a complete split-allocation record without clean close; mount
+// replays it into the new mapping, then must latch when the recovery boundary
+// reports EBADF. A later mount replays the retained record again successfully.
+def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateSplitAbruptly();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	var waitStatus = Array<int>.new(1);
+	def waited = Linux.syscall(
+		LinuxConst.SYS_wait4,
+		(pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+	tc.t.assert_eq(pid, waited);
+	tc.t.assert_eq(0, waitStatus[0]);
+	if (waited != pid || waitStatus[0] != 0) {
+		tc.cleanup();
+		return;
+	}
+
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
+	backend.failFirstDataSync = true;
+	tc.region = PWRegion.new(
+		backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		false
+	);
+
+	def traced = backend.tracedRegion;
+	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
+		tc.t.fail("recovery-failure file backend mount failed");
+		tc.cleanup();
+		return;
+	}
+
+	tc.t.assertz(true, tc.region.requiresRecovery());
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	tc.t.assertz(true, tc.region.blockTableHandle[2u64].getUsed());
+	tc.t.assertz(true, traced.hasDirtyChanges);
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assertz(true, traced.operations.length >= 2);
+	if (traced.operations.length < 2) {
+		tc.cleanup();
+		return;
+	}
+
+	// Recovery prepares every redo after-image before its single publication
+	// boundary; no allocator operation may run after that boundary fails.
+	for (i < traced.operations.length - 1) {
+		tc.t.assert_eq(FilePersistenceTraceOp.PREPARE_RANGE, traced.operations[i]);
+	}
+	tc.t.assert_eq(
+		FilePersistenceTraceOp.FDATASYNC_FAILED,
+		traced.operations[traced.operations.length - 1]);
+	def operationCount = traced.operations.length;
+	tc.t.assertz(true, tc.region.allocChunk(1u32).isNull());
+	tc.t.assertz(false, tc.region.txn.flush());
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(operationCount, traced.operations.length);
+
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
+
+	tc.cleanup();
+}
+
+// Fail the explicit idle-time fdatasync after a successful allocation has
+// applied its after-images. The WAL record remains the durable source of truth,
+// the current mount cannot retry, and reopening replays the allocation.
+def test_bd_file_flush_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
+	tc.region = PWRegion.new(
+		backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		false
+	);
+
+	def traced = backend.tracedRegion;
+	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
+		tc.t.fail("flush-failure file backend mount failed");
+		tc.cleanup();
+		return;
+	}
+
+	def chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, chunk.isNull());
+	if (chunk.isNull()) {
+		tc.cleanup();
+		return;
+	}
+
+	traced.clearTrace();
+	traced.failNextDataSync = true;
+	tc.t.assertz(false, tc.region.txn.flush());
+	tc.t.assertz(true, tc.region.requiresRecovery());
+	tc.t.assertz(false, tc.region.txn.isDirty());
+	tc.t.assertz(true, traced.hasDirtyChanges);
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(1, traced.operations.length);
+	if (traced.operations.length != 1) {
+		tc.cleanup();
+		return;
+	}
+	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_FAILED, traced.operations[0]);
+
+	// The recovery-required latch prevents a retry or a new allocator commit
+	// from issuing another syscall on this mapping.
+	tc.t.assertz(false, tc.region.txn.flush());
+	tc.t.assertz(true, tc.region.allocChunk(1u32).isNull());
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(1, traced.operations.length);
+
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
+
+	tc.cleanup();
+}
+
+// Fail close() at its final-data fdatasync, before either reclaimable WAL slot
+// is scrubbed. The close path must latch and stop, preserving the complete
+// record for the next mount to replay.
+def test_bd_file_close_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	def backend = FilePersistenceTraceBackend.new(BD_PATH);
+	tc.region = PWRegion.new(
+		backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		false
+	);
+
+	def traced = backend.tracedRegion;
+	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
+		tc.t.fail("close-data-failure file backend mount failed");
+		tc.cleanup();
+		return;
+	}
+
+	def chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, chunk.isNull());
+	if (chunk.isNull()) {
+		tc.cleanup();
+		return;
+	}
+
+	traced.clearTrace();
+	traced.failNextDataSync = true;
+	def closingTxn = tc.region.txn;
+	tc.region.deallocate();
+	tc.region = null;
+
+	tc.t.assertz(true, closingTxn.requiresRecovery());
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(0, traced.mappedSyncAttempts);
+	tc.t.assert_eq(1, traced.operations.length);
+	if (traced.operations.length != 1) {
+		tc.cleanup();
+		return;
+	}
+	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_FAILED, traced.operations[0]);
+
 	def recovered = tc.remount();
 	tc.assertRecoveredSplitAllocation(recovered);
 	tc.assertAllocatorInvariants(recovered);
