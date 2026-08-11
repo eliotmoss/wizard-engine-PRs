@@ -345,15 +345,29 @@ class DualTxnWal {
                 if (recoveryRequired) return;
                 if (!openOk) return;
                 if (!persistAppliedData()) return;
-                for (slot < 2) {
-                        if (slotSeqs[slot] == 0u64 || slotSeqs[slot] > dataDurableSeq) continue;
-                        zeroBytes(slotAddr(slot), u64.!(TxnRecordHeader.size));
-                        if (!backendRegion.persistRange(slotAddr(slot) - regionStart, u64.!(TxnRecordHeader.size))) {
-                                recoveryRequired = true;
-                                return;
-                        }
-                        slotSeqs[slot] = 0u64;
+                // Reclaim oldest-first. If a crash or indeterminate persist
+                // interrupts the two scrubs, the surviving records must form a
+                // newest suffix. Reclaiming by slot index can erase seq N+1
+                // before seq N (even sequences occupy slot 0), allowing recovery
+                // to replay the older record over already-durable newer data.
+                if (slotSeqs[0] != 0u64 && slotSeqs[1] != 0u64 && slotSeqs[1] < slotSeqs[0]) {
+                        if (!scrubDurableSlot(1)) return;
+                        scrubDurableSlot(0);
+                } else {
+                        if (!scrubDurableSlot(0)) return;
+                        scrubDurableSlot(1);
                 }
+        }
+
+        private def scrubDurableSlot(slot: int) -> bool {
+                if (slotSeqs[slot] == 0u64 || slotSeqs[slot] > dataDurableSeq) return true;
+                zeroBytes(slotAddr(slot), u64.!(TxnRecordHeader.size));
+                if (!backendRegion.persistRange(slotAddr(slot) - regionStart, u64.!(TxnRecordHeader.size))) {
+                        recoveryRequired = true;
+                        return false;
+                }
+                slotSeqs[slot] = 0u64;
+                return true;
         }
 
         private def initializeHeader() {

@@ -36,6 +36,7 @@ def DWTX = [
 	DWT("close_scrubs_for_clean_remount", test_dual_close_scrubs_for_clean_remount),
 	DWT("close_data_persist_failure_requires_reopen", test_dual_close_data_persist_failure_requires_reopen),
 	DWT("close_scrub_persist_failure_requires_reopen", test_dual_close_scrub_persist_failure_requires_reopen),
+	DWT("close_indeterminate_first_scrub_preserves_latest_value", test_dual_close_indeterminate_first_scrub_preserves_latest_value),
 	DWT("close_keeps_unrecovered_records", test_dual_close_keeps_unrecovered_records),
 	DWT("shadow_crash_restores_durable_bytes", test_shadow_crash_restores_durable_bytes),
 	DWT("shadow_copy_then_fail_is_durable", test_shadow_copy_then_fail_is_durable),
@@ -962,6 +963,30 @@ def test_dual_close_scrub_persist_failure_requires_reopen(tc: DualTxnWalTester) 
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0x88u8, tc.data[200]);
 	tc.t.assert_eq(0x99u8, tc.data[201]);
+}
+
+// If close is interrupted after durably scrubbing only one of two records, the
+// surviving record must be the newer one. Otherwise recovery can replay an old
+// after-image over data that the final close boundary already made durable.
+// COPY_THEN_FAIL models the indeterminate result at exactly that first scrub.
+def test_dual_close_indeterminate_first_scrub_preserves_latest_value(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
+	tc.t.assert_eq(2u64, tc.commitAndApply(200u64, 0x22u64, 1u8));
+
+	tc.shadowRegion.nextPersistRangeOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
+	tc.wal.close();
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(2u64, tc.wal.dataDurableSeq);
+
+	tc.shadowRegion.crash();
+	var reopened = tc.reopen();
+	// Sequence 1 (slot 1) was reclaimed first; sequence 2 remains replayable.
+	tc.t.assert_eq(2u64, reopened.validateSlot(0));
+	tc.t.assert_eq(0u64, reopened.validateSlot(1));
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x22u8, tc.data[200]);
+	tc.shadowRegion.crash();
+	tc.t.assert_eq(0x22u8, tc.data[200]);
 }
 
 // close() must never scrub a slot whose data is not known durable: records

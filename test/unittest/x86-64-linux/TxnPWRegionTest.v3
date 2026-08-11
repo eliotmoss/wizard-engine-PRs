@@ -1205,6 +1205,39 @@ class CommitBoundaryStopFileMmapBackend extends FileMmapBackend {
 	}
 }
 
+// Stop after a real page-aligned msync completes while close() is reclaiming
+// WAL slots. Killing the child at that point exercises a durable prefix of the
+// ordered slot scrubs without allowing unmap, fd close, or later scrubs.
+class SlotScrubBoundaryStopFileMmapRegion extends FileMmapRegion {
+	def stopAtMappedSync: int;
+	var mappedSyncCount = 0;
+
+	new(mapping: Mapping, fd: int, stopAtMappedSync: int) super(mapping, fd) { }
+
+	def syncMappedRange(offset: u64, size: u64) -> bool {
+		if (mapping == null) return false;
+		if (!Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC)) return false;
+		mappedSyncCount++;
+
+		if (mappedSyncCount == stopAtMappedSync) {
+			def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+			Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGSTOP));
+		}
+		return mappedSyncCount != stopAtMappedSync;
+	}
+}
+
+class SlotScrubBoundaryStopFileMmapBackend extends FileMmapBackend {
+	def stopAtMappedSync: int;
+
+	new(path: string, stopAtMappedSync: int) super(path) { }
+
+	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+		if (newMapping == null) return null;
+		return SlotScrubBoundaryStopFileMmapRegion.new(newMapping, fd, stopAtMappedSync);
+	}
+}
+
 def BT = UnitTests.registerT("pwregion_bd:", _, BlockDevicePWRegionTester.new, _);
 def BX = [
 	BT("format_magic",          test_bd_format_magic),
@@ -1234,6 +1267,7 @@ def BX = [
 	BT("sigkill_coalescing_free_commit_boundary_recovers", test_bd_sigkill_coalescing_free_commit_boundary_recovers),
 	BT("sigkill_second_commit_piggybacks_previous_data", test_bd_sigkill_second_commit_piggybacks_previous_data),
 	BT("sigkill_explicit_flush_boundary_recovers", test_bd_sigkill_explicit_flush_boundary_recovers),
+	BT("sigkill_close_first_slot_scrub_preserves_latest_state", test_bd_sigkill_close_first_slot_scrub_preserves_latest_state),
 	BT("sigkill_split_alloc_recovers_transaction", test_bd_sigkill_split_alloc_recovers_transaction),
 	BT("sigkill_exact_fit_alloc_recovers_transaction", test_bd_sigkill_exact_fit_alloc_recovers_transaction),
 	BT("sigkill_coalescing_free_recovers_transaction", test_bd_sigkill_coalescing_free_recovers_transaction),
@@ -1630,6 +1664,35 @@ class BlockDevicePWRegionTester(t: Tester) {
 		// Reaching this return means the expected explicit-flush SIGSTOP did not
 		// hold the child at the second fdatasync boundary.
 		return 7;
+	}
+
+	// Apply two overlapping allocator transactions, enter clean close, and stop
+	// after its first real slot-scrub msync. The final fdatasync has already made
+	// both transactions' data durable; recovery must retain the newer record if
+	// the parent kills the child before the second scrub.
+	def allocateTwoAndCloseAtFirstSlotScrub() -> int {
+		region = PWRegion.new(
+			SlotScrubBoundaryStopFileMmapBackend.new(BD_PATH, 1),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			false
+		);
+		if (region.backendRegion == null || region.txn == null) return 2;
+		if (!SlotScrubBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+
+		def first = region.allocChunk(1u32);
+		if (first.isNull()) return 4;
+		def second = region.allocChunk(1u32);
+		if (second.isNull()) return 5;
+		if (!region.blockTableHandle[2u64].getUsed()) return 6;
+		if (!region.blockTableHandle[3u64].getUsed()) return 7;
+
+		region.deallocate();
+		region = null;
+		// Reaching this return means the expected first-scrub SIGSTOP did not
+		// hold the child inside close().
+		return 8;
 	}
 
 	// Run the exact-fit allocator path in a forked child. allocChunk(5) consumes
@@ -2692,6 +2755,38 @@ def test_bd_sigkill_explicit_flush_boundary_recovers(tc: BlockDevicePWRegionTest
 
 	def recovered = tc.remount();
 	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
+
+	tc.cleanup();
+}
+
+// Clean close must reclaim two valid slots oldest-first. Stop after the first
+// real msync and kill the child: remount should see the newer surviving record,
+// never replay transaction 1 over transaction 2's already-durable allocator
+// state. This is process-crash consistency evidence under the same kernel.
+def test_bd_sigkill_close_first_slot_scrub_preserves_latest_state(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	tc.region = null;
+
+	def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+	if (pid < 0) {
+		tc.t.fail("fork failed");
+		tc.cleanup();
+		return;
+	}
+	if (pid == 0) {
+		def childStatus = tc.allocateTwoAndCloseAtFirstSlotScrub();
+		Linux.syscall(LinuxConst.SYS_exit_group, childStatus);
+		return;
+	}
+
+	if (!tc.killStoppedChild(pid)) {
+		tc.cleanup();
+		return;
+	}
+
+	def recovered = tc.remount();
+	tc.assertRecoveredTwoSplitAllocations(recovered);
 	tc.assertAllocatorInvariants(recovered);
 
 	tc.cleanup();
