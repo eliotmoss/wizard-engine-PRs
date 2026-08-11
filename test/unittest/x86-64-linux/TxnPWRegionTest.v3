@@ -829,6 +829,7 @@ def BD_WUNTRACED = 2;
 component FileCommitTraceOp {
 	def PREPARE_RANGE = 1;
 	def FDATASYNC_COMPLETE = 2;
+	def FDATASYNC_FAILED = 3;
 }
 
 // Records range preparation around a successful call through the production
@@ -838,6 +839,8 @@ class FileCommitTraceRegion extends FileMmapRegion {
 	var operations = Vector<int>.new();
 	var preparedOffsets = Vector<u64>.new();
 	var preparedSizes = Vector<u64>.new();
+	var failNextDataSync = false;
+	var dataSyncAttempts = 0;
 
 	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
@@ -848,8 +851,20 @@ class FileCommitTraceRegion extends FileMmapRegion {
 	}
 
 	def syncFileData() -> bool {
-		def success = RegionFileIO.fdatasync(fd);
-		if (success) operations.put(FileCommitTraceOp.FDATASYNC_COMPLETE);
+		dataSyncAttempts++;
+		var success = false;
+		if (failNextDataSync) {
+			failNextDataSync = false;
+			// Exercise the real syscall error path without invalidating the
+			// mapping's owned descriptor, which is still needed for clean teardown.
+			success = RegionFileIO.fdatasync(-1);
+		} else {
+			success = RegionFileIO.fdatasync(fd);
+		}
+		operations.put(if(
+			success,
+			FileCommitTraceOp.FDATASYNC_COMPLETE,
+			FileCommitTraceOp.FDATASYNC_FAILED));
 		return success;
 	}
 
@@ -857,6 +872,7 @@ class FileCommitTraceRegion extends FileMmapRegion {
 		operations.clear();
 		preparedOffsets.clear();
 		preparedSizes.clear();
+		dataSyncAttempts = 0;
 	}
 }
 
@@ -920,6 +936,7 @@ def BX = [
 	BT("persist_and_remount",   test_bd_persist_and_remount),
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
 	BT("file_commit_orders_fdatasync_before_after_images", test_bd_file_commit_orders_fdatasync_before_after_images),
+	BT("file_commit_fdatasync_failure_requires_reopen", test_bd_file_commit_fdatasync_failure_requires_reopen),
 	BT("mixed_sequence_preserves_invariants", test_bd_mixed_sequence_preserves_invariants),
 	BT("seeded_mixed_histories_preserve_invariants", test_bd_seeded_mixed_histories_preserve_invariants),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
@@ -1600,6 +1617,70 @@ def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRe
 	}
 	tc.t.assert_eq(traced.operations.length - 1, traced.preparedOffsets.length);
 	tc.t.assertz(true, traced.hasDirtyChanges);
+
+	tc.cleanup();
+}
+
+// Inject EBADF at the production file-sync seam during a real mapped-file
+// allocator commit. The failed boundary is unacknowledged: the current mount
+// must retain its dirty cache, reject all further persistence work, and require
+// reopen. A same-kernel remount can observe and replay the complete page-cache
+// record; this characterizes the indeterminate outcome, not power durability.
+def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+	tc.region.deallocate();
+	def backend = FileCommitTraceBackend.new(BD_PATH);
+	tc.region = PWRegion.new(
+		backend,
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		false
+	);
+
+	def traced = backend.tracedRegion;
+	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
+		tc.t.fail("failure-injected file backend mount failed");
+		tc.cleanup();
+		return;
+	}
+
+	traced.clearTrace();
+	traced.failNextDataSync = true;
+	def failedChunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, failedChunk.isNull());
+	tc.t.assertz(true, tc.region.requiresRecovery());
+	tc.t.assertz(true, tc.region.txn.isDirty());
+	tc.t.assertz(true, traced.hasDirtyChanges);
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(2, traced.operations.length);
+	if (traced.operations.length != 2) {
+		tc.cleanup();
+		return;
+	}
+
+	// Failure occurs after the complete WAL record is prepared and before any
+	// allocator after-image reaches the live mapping.
+	tc.t.assert_eq(FileCommitTraceOp.PREPARE_RANGE, traced.operations[0]);
+	tc.t.assert_eq(FileCommitTraceOp.FDATASYNC_FAILED, traced.operations[1]);
+	tc.t.assert_eq(1, traced.preparedOffsets.length);
+	def allocated = tc.region.blockTableHandle[2u64];
+	tc.t.assertz(false, allocated.getUsed());
+	tc.t.assertz(true, allocated.getUsedCached(tc.region.txn));
+
+	// The latch prevents both another allocator transaction and an explicit
+	// flush from reaching the backend on this mount.
+	def operationCount = traced.operations.length;
+	tc.t.assertz(true, tc.region.allocChunk(1u32).isNull());
+	tc.t.assertz(false, tc.region.txn.flush());
+	tc.t.assert_eq(1, traced.dataSyncAttempts);
+	tc.t.assert_eq(operationCount, traced.operations.length);
+
+	// MAP_SHARED makes the complete record visible to the fresh mapping even
+	// though the injected fdatasync failed; production recovery replays it and
+	// publishes the allocator after-images through the normal file backend.
+	def recovered = tc.remount();
+	tc.assertRecoveredSplitAllocation(recovered);
+	tc.assertAllocatorInvariants(recovered);
 
 	tc.cleanup();
 }

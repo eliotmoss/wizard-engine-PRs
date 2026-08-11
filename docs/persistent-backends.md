@@ -447,8 +447,8 @@ PWRegion.mount()
 ## Testing
 
 Audited 2026-07-31 and extended 2026-08-11: the implementation-specific
-x86-64 Linux suite contains 141 registered tests. The previous 140-test audit
-passed in an amd64 Docker container on a Darwin arm64 host; all 141 pass with
+x86-64 Linux suite contains 142 registered tests. The previous 140-test audit
+passed in an amd64 Docker container on a Darwin arm64 host; all 142 pass with
 no expected failures in the latest native x86-64 Linux run.
 
 | Test file | Tests | What it covers |
@@ -456,7 +456,7 @@ no expected failures in the latest native x86-64 Linux run.
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
 | `DualTxnWalTest.v3` | 38 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 60 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 61 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, Immix line geometry/linkage, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, graceful and abrupt-process file-backed remount, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 23 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 The platform wrapper classes have no dedicated tests. Immix
@@ -483,9 +483,12 @@ They validate memory-order links, free-list links, used/list state, and chunk
 headers where applicable after remount. A separate integration test intercepts
 the production file-sync seam around a successful real `fdatasync` and pins
 WAL-record preparation before that boundary and allocator after-image
-preparation after it. These tests do not yet clear the kernel page cache, reset
-a VM, interrupt power, trace at the kernel syscall layer, cover `msync`
-ordering, or inject syscall failures. A same-kernel remount can observe cached
+preparation after it. The same seam injects one real `EBADF` result through
+`fdatasync(-1)`: the allocator propagates failure, latches recovery-required,
+blocks same-mount retry/flush, and replays the complete page-cache record after
+remount. These tests do not yet clear the kernel page cache, reset a VM,
+interrupt power, trace at the kernel syscall layer, or cover `msync` ordering
+and failure injection. A same-kernel remount can observe cached
 data that has not been shown to survive a system crash. Full gaps and priorities
 are maintained in `docs/ROADMAP.md` Next Steps #3.
 
