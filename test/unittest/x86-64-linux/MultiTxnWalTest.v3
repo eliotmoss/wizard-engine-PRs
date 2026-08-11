@@ -23,6 +23,11 @@ def MTWX = [
 	MTW("crash_mid_log_recovery", test_multi_crash_mid_log_recovery),
 	MTW("commit_after_recovery_survives", test_multi_commit_after_recovery_survives),
 	MTW("failed_persist_no_duplicate", test_multi_failed_persist_no_duplicate),
+	MTW("checkpoint_data_failure_retains_records", test_multi_checkpoint_data_failure_retains_records),
+	MTW("checkpoint_superblock_failure_retains_records", test_multi_checkpoint_superblock_failure_retains_records),
+	MTW("oversize_commit_preserves_ring", test_multi_oversize_commit_preserves_ring),
+	MTW("ring_full_without_applied_records_fails", test_multi_ring_full_without_applied_records_fails),
+	MTW("failed_scrub_requires_reopen", test_multi_failed_scrub_requires_reopen),
 	MTW("checkpoint_policy_thresholds", test_multi_checkpoint_policy_thresholds),
 	MTW("maybe_checkpoint_count", test_multi_maybe_checkpoint_count),
 	MTW("maybe_checkpoint_occupancy", test_multi_maybe_checkpoint_occupancy),
@@ -71,7 +76,9 @@ class FailingRegion extends BackendRegion {
 	var failNextPersistRange = false;
 	var failNextPersistChanges = false;
 	var persistRangeCalls = 0;
+	var persistChangesCalls = 0;
 	var failPersistRangeCall = 0;
+	var failPersistRangeCallsRemaining = 0;
 
 	new(range: Range<byte>) super(range) { }
 
@@ -84,6 +91,10 @@ class FailingRegion extends BackendRegion {
 	def persistRange(offset: u64, size: u64) -> bool {
 		persistRangeCalls++;
 		if (persistRangeCalls == failPersistRangeCall) return false;
+		if (failPersistRangeCallsRemaining > 0) {
+			failPersistRangeCallsRemaining--;
+			return false;
+		}
 		if (failNextPersistRange) {
 			failNextPersistRange = false;
 			return false;
@@ -92,6 +103,7 @@ class FailingRegion extends BackendRegion {
 	}
 
 	def persistChanges() -> bool {
+		persistChangesCalls++;
 		if (failNextPersistChanges) {
 			failNextPersistChanges = false;
 			return false;
@@ -507,6 +519,144 @@ def test_multi_failed_persist_no_duplicate(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(0x22u8, data[210]);              // retry's value, not 0x11
 	tc.t.assert_eq(0x33u8, data[211]);              // retry's extra entry
 	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
+}
+
+// A failed data boundary must not publish the replay floor or reclaim the WAL
+// records that still make the applied transaction recoverable. Retrying the
+// checkpoint after the transient failure can then publish and reclaim them.
+def test_multi_checkpoint_data_failure_retains_records(tc: MultiTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def region = FailingRegion.new(data[0 ..+ data.length]);
+	def wal = MultiTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+
+	wal.append(200u64, 0x55u64, 1u8);
+	def seq = wal.commit();
+	tc.t.assert_eq(1u64, seq);
+	wal.applyUpdate(200u64, 0x55u64, 1u8);
+	wal.noteApplied(seq);
+	def bytesBefore = wal.activeBytes;
+	def rangeCallsBefore = region.persistRangeCalls;
+
+	region.failNextPersistChanges = true;
+	tc.t.assertz(false, wal.checkpoint(seq));
+	tc.t.assert_eq(0u64, wal.durableAppliedSeq);
+	tc.t.assert_eq(1, wal.activeRecords.length);
+	tc.t.assert_eq(bytesBefore, wal.activeBytes);
+	tc.t.assert_eq(rangeCallsBefore, region.persistRangeCalls); // no superblock publication attempted
+
+	tc.t.assertz(true, wal.checkpoint(seq));
+	tc.t.assert_eq(1u64, wal.durableAppliedSeq);
+	tc.t.assert_eq(0, wal.activeRecords.length);
+	tc.t.assert_eq(0u64, wal.activeBytes);
+}
+
+// If the data boundary succeeds but the new superblock copy does not, the
+// in-memory replay floor and record ownership must remain unchanged. A retry
+// rewrites the same generation and only then reclaims the record.
+def test_multi_checkpoint_superblock_failure_retains_records(tc: MultiTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def region = FailingRegion.new(data[0 ..+ data.length]);
+	def wal = MultiTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+
+	wal.append(200u64, 0x66u64, 1u8);
+	def seq = wal.commit();
+	tc.t.assert_eq(1u64, seq);
+	wal.applyUpdate(200u64, 0x66u64, 1u8);
+	wal.noteApplied(seq);
+	def bytesBefore = wal.activeBytes;
+
+	region.failNextPersistRange = true;
+	tc.t.assertz(false, wal.checkpoint(seq));
+	tc.t.assert_eq(0u64, wal.durableAppliedSeq);
+	tc.t.assert_eq(2u64, wal.currentGeneration);
+	tc.t.assert_eq(1, wal.activeRecords.length);
+	tc.t.assert_eq(bytesBefore, wal.activeBytes);
+
+	tc.t.assertz(true, wal.checkpoint(seq));
+	tc.t.assert_eq(1u64, wal.durableAppliedSeq);
+	tc.t.assert_eq(3u64, wal.currentGeneration);
+	tc.t.assert_eq(0, wal.activeRecords.length);
+	tc.t.assert_eq(2, region.persistChangesCalls);
+}
+
+// A transaction larger than the whole ring fails before reserving or writing
+// a record. commit() clears that rejected transaction, leaving the ring and
+// sequence available for a later valid commit.
+def test_multi_oversize_commit_preserves_ring(tc: MultiTxnWalTester) {
+	for (i < 25) {
+		tc.t.assertz(true, tc.wal.append(200u64 + u64.view(i), u64.view(i), 1u8));
+	}
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assert_eq(0u64, tc.wal.headOffset);
+	tc.t.assert_eq(1u64, tc.wal.nextTxnSeq);
+	tc.t.assert_eq(0, tc.wal.activeRecords.length);
+	tc.t.assert_eq(0u64, tc.wal.activeBytes);
+
+	tc.t.assertz(true, tc.wal.append(300u64, 0x77u64, 1u8));
+	tc.t.assert_eq(1u64, tc.wal.commit());
+}
+
+// Four one-entry records occupy all usable reservation positions in this
+// 896-byte ring. With none marked applied, the lazy checkpoint has no safe
+// replay floor to publish, so the fifth commit must fail without evicting the
+// recoverable prefix.
+def test_multi_ring_full_without_applied_records_fails(tc: MultiTxnWalTester) {
+	for (i < 4) {
+		tc.t.assertz(true, tc.wal.append(200u64 + u64.view(i), u64.view(i + 1), 1u8));
+		tc.t.assert_eq(u64.view(i + 1), tc.wal.commit());
+	}
+	def headBefore = tc.wal.headOffset;
+	def bytesBefore = tc.wal.activeBytes;
+	tc.t.assertz(true, tc.wal.append(204u64, 0x55u64, 1u8));
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assert_eq(headBefore, tc.wal.headOffset);
+	tc.t.assert_eq(bytesBefore, tc.wal.activeBytes);
+	tc.t.assert_eq(4, tc.wal.activeRecords.length);
+	tc.t.assert_eq(5u64, tc.wal.nextTxnSeq);
+	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
+
+	def reopened = tc.reopen();
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	for (i < 4) tc.t.assert_eq(u8.view(i + 1), tc.data[200 + i]);
+	tc.t.assert_eq(4u64, reopened.durableAppliedSeq);
+}
+
+// If both the commit point and its compensating magic scrub fail, the durable
+// slot is indeterminate. The current instance must reject retry; a new WAL can
+// inspect the durable image and recover the earlier acknowledged prefix.
+def test_multi_failed_scrub_requires_reopen(tc: MultiTxnWalTester) {
+	def data = Array<byte>.new(4096);
+	for (i < data.length) data[i] = 0u8;
+	def base = u64.view(Pointer.atElement(data, 0));
+	def log = base + 1024u64;
+	def region = FailingRegion.new(data[0 ..+ data.length]);
+	def wal = MultiTxnWal.new(base, log, 1024u64, region, true);
+
+	wal.append(200u64, 0x55u64, 1u8);
+	tc.t.assert_eq(1u64, wal.commit());
+	def headBefore = wal.headOffset;
+	region.failPersistRangeCallsRemaining = 2; // fail record commit and header scrub
+	wal.append(210u64, 0x66u64, 1u8);
+	tc.t.assert_eq(0u64, wal.commit());
+	tc.t.assertz(true, wal.openOk);
+	tc.t.assertz(true, wal.requiresRecovery());
+	tc.t.assert_eq(headBefore, wal.headOffset);
+	tc.t.assert_eq(2u64, wal.nextTxnSeq);
+	tc.t.assert_eq(1, wal.activeRecords.length);
+
+	tc.t.assertz(false, wal.append(210u64, 0x77u64, 1u8));
+	tc.t.assert_eq(0u64, wal.commit());
+	tc.t.assertz(true, wal.recover() == MultiWalRecovery.PERSIST_FAILED);
+
+	def reopened = MultiTxnWal.new(base, log, 1024u64, region, false);
+	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x55u8, data[200]);
+	tc.t.assert_eq(0u8, data[210]);
+	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
 }
 
 // Per-backend threshold wiring: configureCheckpointPolicy() must map each

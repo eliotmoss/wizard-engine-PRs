@@ -94,6 +94,7 @@ class MultiTxnWal {
         def var checkpointFillPercent: u64 = MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE;
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
+        private var recoveryRequired = false;   // A failed compensating persist made the durable record indeterminate
         def var openOk = false;
 
         new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
@@ -123,6 +124,7 @@ class MultiTxnWal {
         // dropping one would allow commit() to acknowledge an incomplete redo
         // record and lose the omitted write after a crash.
         def append(offset: u64, value: u64, width: u8) -> bool {
+                if (recoveryRequired) return false;
                 if (!openOk || !validEntryFields(offset, width)) {
                         poisoned = true;
                         return false;
@@ -143,10 +145,14 @@ class MultiTxnWal {
                 poisoned = false;
         }
 
+        def requiresRecovery() -> bool {
+                return recoveryRequired;
+        }
+
         // --- Data application ---
 
         def applyUpdate(offset: u64, value: u64, width: u8) {
-                if (!openOk || !validEntryFields(offset, width)) return;
+                if (recoveryRequired || !openOk || !validEntryFields(offset, width)) return;
                 writeAfterImage(offset, value, width);
                 backendRegion.prepareChangedRange(offset, u64.view(width));
         }
@@ -163,7 +169,7 @@ class MultiTxnWal {
         // are chosen per backend in configureCheckpointPolicy(). Best-effort: a
         // failed checkpoint leaves data recoverable from the WAL.
         def maybeCheckpoint() -> bool {
-                if (!openOk) return false;
+                if (recoveryRequired || !openOk) return false;
                 def lag = appliedSeqVolatile - durableAppliedSeq;
                 if (lag == 0u64) return true;                                                   // nothing applied to publish
                 if (lag >= checkpointTxnThreshold) return checkpoint(appliedSeqVolatile);       // bound recovery replay length
@@ -190,7 +196,7 @@ class MultiTxnWal {
         }
 
         def checkpoint(targetSeq: u64) -> bool {
-                if (!openOk) return false;
+                if (recoveryRequired || !openOk) return false;
                 if (targetSeq > appliedSeqVolatile) return false;
                 if (targetSeq <= durableAppliedSeq) return true;
                 // Checkpoint ordering is the durable-data boundary: all after-images
@@ -208,7 +214,7 @@ class MultiTxnWal {
         }
 
         def appendCommittedRecord(entries: Vector<WalPendingEntry>) -> u64 {
-                if (!openOk || poisoned) return 0u64;
+                if (recoveryRequired || !openOk || poisoned) return 0u64;
                 def entryCount = u32.!(entries.length);
                 for (i < entries.length) {
                         def e = entries[i];
@@ -260,15 +266,18 @@ class MultiTxnWal {
                         // The fully-written record must not survive the failure: a
                         // retry reuses this txnSeq, and two valid records with the
                         // same sequence let recovery replay the failed attempt's
-                        // contents. Scrub the header magic (persisting the scrub
-                        // best-effort) and roll the head back so a retry overwrites
-                        // this same slot. The sequence number is deliberately NOT
-                        // burned: a skipped seq is a gap that recovery treats as the
-                        // end of the committed prefix, which would abandon later
+                        // contents. Scrub the header magic and roll the head back so
+                        // a retry overwrites this same slot. If the scrub itself
+                        // cannot be persisted, the durable record is indeterminate;
+                        // reject same-instance work and require a newly opened WAL to
+                        // recover it. The sequence number is deliberately NOT burned:
+                        // a skipped seq is a gap that recovery treats as the end of
+                        // the committed prefix, which would abandon later
                         // acknowledged transactions.
                         recordStoreU64(absStart, TxnRecordHeader.magic.offset, 0u64);
-                        backendRegion.persistRange(absStart - regionStart, u64.!(TxnRecordHeader.size));
+                        def scrubPersisted = backendRegion.persistRange(absStart - regionStart, u64.!(TxnRecordHeader.size));
                         headOffset = start;
+                        if (!scrubPersisted) recoveryRequired = true;
                         return 0u64;
                 }
 
@@ -341,6 +350,7 @@ class MultiTxnWal {
         // --- Recovery ---
 
         def recover() -> MultiWalRecovery {
+                if (recoveryRequired) return MultiWalRecovery.PERSIST_FAILED;
                 if (!openOk) return MultiWalRecovery.CORRUPT;
                 def candidates = scanCommittedRecords();
                 def selected = selectContiguousPrefix(candidates);
