@@ -229,13 +229,19 @@ provides the same development interface with more invasive host setup.
 **Real-hardware target confirmed (2026-08-12):** the ANU research server
 `magpie` is x86-64 and exposes two 799,063,146,496-byte `fsdax` namespaces as
 ext4 filesystems at `/mnt/pmem0.0` and `/mnt/pmem1.0`, both mounted
-`rw,relatime,dax=always`. An administrator-assigned writable scratch directory
+`rw,relatime,dax=always`. All reported cache levels use 64-byte coherency lines,
+the CPU advertises `clwb`, and both PMEM regions report the
+`memory_controller` persistence domain, matching the agreed ADR baseline.
+DIMM health/shutdown state remains unknown because the unprivileged account
+cannot open `/dev/nmem*`. An administrator-assigned writable scratch directory
 is pending; no namespace, filesystem, mount-root, or pre-existing-file changes
 are authorized. See `docs/pmem-emulation.md` for the recorded geometry and safe
 execution constraints.
 
 - [x] Document QEMU as the primary workflow, Linux `memmap` as the alternative, the fsdax regular-file requirement, unsupported alternatives, and the three validation stages (`docs/pmem-emulation.md`).
-- [ ] **Stage 0b — trace-driven PMEM crash model:** introduce an instrumentable persistent store/flush/fence seam, record actual `STORE`/`CLWB`/`SFENCE` ordering, exhaustively enumerate distinct durable images for bounded WAL scenarios, and feed each image into production recovery. Model background dirty-line eviction and asynchronous writeback, state the ADR/eADR and atomicity assumptions, deduplicate equivalent states, and retain seeded randomized exploration for longer histories. Design: `docs/pmem-crash-model.md`.
+- [ ] **Stage 0b — trace-driven PMEM crash model:** introduce an instrumentable persistent store/flush/fence seam, record actual `STORE`/`CLWB`/`SFENCE` ordering, exhaustively enumerate distinct durable images for bounded WAL scenarios, and feed each image into production recovery. Model background dirty-line eviction and asynchronous writeback, deduplicate equivalent states, and retain seeded randomized exploration for longer histories. Design: `docs/pmem-crash-model.md`.
+  - [x] Milestone 1 (2026-08-12): agree and document the baseline as single-writer x86-64, 64-byte cache lines, naturally aligned failure-atomic 1/2/4/8-byte stores, ADR, non-atomic cache-line writeback, asynchronous non-snapshot `CLWB`, completing `SFENCE`, eviction at every event boundary, one normal crash, and a separate recovery profile bounded to two crashes. Add a physical-target audit for cache geometry, CPU instructions, firmware persistence domain, fsdax/`MAP_SYNC`, health, and emitted instructions.
+  - [ ] Milestones 2–9: implement the operation seam, recorder, explorer, real-recovery checks, allocator invariants, crash-during-recovery scenarios, regular/seeded test tiers, and emitted-instruction validation.
 - [x] **Stage 1 — DAX/remount integration:** `PmemDaxIntegrationTest.v3` accepts an assigned writable directory on a prepared fsdax mount, atomically reserves a `0600` file under a unique UID/PID/suffix name with `O_CREAT|O_EXCL`, and removes only that owned file after the run. Its two cases require production `PmemMmapBackend.create()`/`MAP_SYNC`, format and allocate through `X86_64PWNVRegion`, verify clean close/remount, then leave a committed payload after-image unapplied and prove the production mount recovery path replays it. `make pmem-integration PWASM_PMEM_TEST_DIR=/mnt/pmem/assigned-directory` builds and runs the separate opt-in binary; these cases are not registered in the default unit or CI suites. The binary is compile-checked and its ordinary-filesystem rejection/cleanup path is covered locally; a prepared fsdax environment is required for a positive run.
 - [ ] **Stage 2 — guest crash/restart:** automate process termination at WAL boundaries and reopen the same file; add guest reset/QEMU restart experiments with the same NVDIMM backing file. Treat the results as software crash-consistency evidence, not physical durability proof.
 - [ ] **Stage 3 — real PMEM durability:** after the CLWB/SFENCE work in #4, repeat the integration and controlled crash/power-interruption campaign on physical PMEM. Only this stage can support a host power-loss durability claim.

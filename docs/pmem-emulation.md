@@ -167,6 +167,23 @@ metadata resides on the PMEM device; it does **not** mean device-DAX. The
 decisive field is `"mode":"fsdax"`, which is compatible with this project's
 regular-file backend.
 
+The persistence-profile audit recorded on 2026-08-12 is:
+
+| Check | Observed result | Status |
+|---|---|---|
+| Architecture | `x86_64` | Matches the baseline |
+| Cache coherency line | 64 bytes for L1 data, L1 instruction, L2 unified, and L3 unified caches | Matches the 64-byte production precondition |
+| Cache writeback instructions | CPU flags include `clflush`, `clflushopt`, and `clwb` | `CLWB` baseline supported |
+| Region persistence domain | `region0` and `region1` both report `memory_controller` | Matches the selected ADR model; this is not eADR |
+| DIMM health/shutdown state | `ndctl list -DH` could not open `/dev/nmem*`; every health state was therefore `unknown` | Pending an administrator-privileged query |
+| `MAP_SYNC` on an assigned test file | Not yet run | Pending an assigned writable directory |
+| Emitted `CLWB`/`SFENCE` instructions | Backend functions remain placeholders | Pending backend implementation and disassembly/tracing |
+
+The topology, cache geometry, and CPU flags are readable without elevated
+privileges. The health query requires an administrator to run
+`ndctl list -DH` or grant the necessary read access; `unknown` in the captured
+output is a permission-limited result, not evidence of unhealthy media.
+
 Use only a writable scratch directory explicitly assigned by the server
 administrator. Do not pass `/dev/pmem0`, `/dev/pmem1`, either mount root, or an
 existing region file to the test, and do not format, reconfigure, disable, or

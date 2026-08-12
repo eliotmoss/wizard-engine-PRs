@@ -127,26 +127,41 @@ survive as one atomic group.
 
 ---
 
-## Assumptions that must be explicit
+## Agreed baseline persistence profile
 
-"All possible outcomes" is meaningful only relative to a declared machine and
-persistence model. Before implementation, record decisions for:
+The initial model uses the following assumptions, agreed on 2026-08-12. "All
+possible outcomes" elsewhere in this document means all outcomes within this
+profile and the stated scenario/crash bounds, not every PMEM platform.
 
-- cache-line size;
-- aligned-store and persistence atomicity for 1/2/4/8-byte stores;
-- whether cache-line writeback itself may tear at the chosen persistence
-  domain;
-- x86 store ordering relevant to the trace;
-- ADR versus eADR, including whether CPU caches are in the persistence domain;
-- the completion guarantee supplied by `SFENCE` for preceding `CLWB`s;
-- whether eviction may occur after every store or only at recorded scheduling
-  points; and
-- the maximum number of crashes, including whether recovery may crash again.
+| Dimension | Baseline assumption |
+|---|---|
+| Architecture and writers | x86-64, one logical writer, ordinary temporal stores to write-back memory. Concurrent persistent writers, DMA/device writes, and non-temporal stores are out of scope. |
+| Cache line | 64 bytes. This is a production-platform precondition, matching the backend's cache-line iteration and the WAL's 64-byte alignment. |
+| Persistence domain | ADR: memory-controller write-pending queues are power-fail protected; CPU caches and store buffers are not. `CLWB` plus `SFENCE` is therefore required. eADR is not part of this baseline. |
+| Crash | A fail-safe power loss or system reset for which ADR works as advertised. A crash discards CPU caches, store buffers, and outstanding operations that have not reached ADR, while preserving everything that has reached ADR. Media faults, unsafe/dirty shutdowns in which ADR fails, and process-only crashes are separate failure classes. |
+| Scalar-store atomicity | Naturally aligned 1/2/4/8-byte stores are failure-atomic and cannot tear. Unaligned stores, stores wider than 8 bytes, and stores crossing a cache-line boundary are outside the supported contract. The recorder must reject such a trace; production persistent-store call sites must be audited or enforce alignment before evidence is claimed. |
+| Store order | The recorded single-writer x86 store order is authoritative. Stores to one cache line become durable in program order; different cache lines may become durable in different orders until constrained by writeback and fencing. |
+| Writeback atomicity | A 64-byte cache-line writeback is not assumed failure-atomic. It may leave a causally valid partial line at the granularity of the atomic stores above, while respecting same-line store order. The explorer must not reduce a record-range writeback to an all-or-nothing line or range copy. |
+| `CLWB` issue and completion | `CLWB` is asynchronous. A requested writeback may reach ADR immediately, after later trace events, or when a later fence requires it. It must include the same-line stores that precede the `CLWB`; because the instruction is not an immutable snapshot, completion may also include any causally reachable later line version present before completion. The explorer considers every such version. |
+| `SFENCE` | When `SFENCE` returns, every preceding `CLWB` on which the protocol relies has completed to the ADR domain. It orders the earlier stores/writebacks before later stores, but does not flush unrelated dirty lines. A store after a `CLWB` is not guaranteed durable merely because that earlier request completed. |
+| Background eviction | At every trace-event boundary, any dirty line may be written back without an explicit `CLWB`, with the same tearing and same-line ordering rules. State deduplication and partial-order reduction may remove equivalent schedules but not durable images. |
+| Crash cuts | Scalar `STORE` events and a returned `SFENCE` are atomic transitions. `CLWB` remains outstanding until completion. A crash while a fence is waiting is represented by a pre-return cut with any allowed subset of writebacks completed; a post-return cut contains every completion required by the fence. |
+| Crash bound | Normal-operation scenarios exhaustively explore one crash. A separate bounded recovery profile permits one additional crash during recovery, for a maximum of two crashes in those scenarios. Claims must state which profile was run. |
 
-The initial project model should target the persistence domain assumed by the
-production `CLWB` + `SFENCE` protocol. Alternative assumptions can be separate
-configurations; results from one configuration must not be presented as proof
-for another.
+An eADR configuration may be added later, but it is a distinct model: globally
+visible dirty cache lines are then inside the persistence domain and explicit
+cache-line writeback is not required for power-fail safety. Results from eADR,
+from process termination, or from a file-backed model must not be presented as
+evidence for the ADR baseline.
+
+The architectural basis for the profile is the
+[Intel 64 and IA-32 Software Developer's Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html);
+the [Intel Persistent Memory FAQ](https://www.intel.com/content/www/us/en/developer/articles/troubleshooting/persistent-memory-faq.html)
+summarizes the eight-byte power-fail atomicity and flush-plus-fence contract.
+
+Target-machine configuration and validation are documented separately in
+[PMEM Emulation](pmem-emulation.md), so this document remains focused on the
+abstract crash and persistence semantics.
 
 ---
 
@@ -291,7 +306,8 @@ second representation of the protocol.
 
 ## Implementation milestones
 
-1. Agree and document the PMEM/persistence-domain assumptions.
+1. **Completed 2026-08-12:** agree and document the PMEM/persistence-domain
+   assumptions above.
 2. Introduce the instrumentable persistent store/flush/fence interface.
 3. Add a deterministic trace recorder and a human-readable counterexample
    format.
