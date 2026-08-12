@@ -446,17 +446,17 @@ PWRegion.mount()
 
 ## Testing
 
-Audited 2026-07-31 and extended 2026-08-11: the implementation-specific
-x86-64 Linux suite contains 161 registered tests. The previous 140-test audit
-passed in an amd64 Docker container on a Darwin arm64 host; all 161 pass with
+Audited 2026-07-31 and extended 2026-08-12: the implementation-specific
+x86-64 Linux suite contains 167 registered tests. The previous 140-test audit
+passed in an amd64 Docker container on a Darwin arm64 host; all 167 pass with
 no expected failures in the latest native x86-64 Linux run.
 
 | Test file | Tests | What it covers |
 |---|---:|---|
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
-| `DualTxnWalTest.v3` | 38 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
+| `DualTxnWalTest.v3` | 39 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 75 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 
 The platform wrapper classes each have a dedicated construction test. Immix
@@ -502,12 +502,23 @@ syscall layer beyond the explicit test seams. A same-kernel remount can observe
 cached data that has not been shown to survive a system crash. Full gaps and
 priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
 
-The PMEM-labelled unit coverage is structural only:
+The default PMEM-labelled unit coverage is structural only:
 `txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping
 in `PmemMmapRegion`. It does not call `PmemMmapBackend.create()` and therefore
 does not exercise `MAP_SYNC`, filesystem DAX, an emulated `/dev/pmem0`, or a
-real PMEM device. The three-stage integration plan—DAX/remount, guest
-crash/restart, then real-hardware durability—is documented in
+real PMEM device. The separate opt-in `PmemDaxIntegrationTest.v3` closes that
+functional gap: it reserves a unique private file inside a caller-supplied
+fsdax scratch directory, then requires production `PmemMmapBackend.create()` /
+`MAP_SYNC`, clean allocator remount, and WAL replay.
+Run it with:
+
+```bash
+make pmem-integration PWASM_PMEM_TEST_DIR=/mnt/pmem/assigned-directory
+```
+
+The test is excluded from the default unit/CI binary and remains software
+integration evidence, not a cache-line or power-loss durability result. The
+remaining guest crash/restart and real-hardware stages are documented in
 `docs/pmem-emulation.md`.
 
 ### Correctness argument by layers
@@ -609,5 +620,4 @@ test/unit.sh
 | 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
-| 8 | `TxnPWRegionTest.v3` | PMEM coverage bypasses `PmemMmapBackend.create()` and `MAP_SYNC`; an opt-in fsdax integration test is still required. |
 | 9 | `docs/pmem-crash-model.md` | Add an instrumentable persistent-store/flush/fence seam and a bounded trace explorer for background eviction, asynchronous `CLWB`, `SFENCE`, and crash schedules. |

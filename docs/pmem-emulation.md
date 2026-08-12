@@ -150,6 +150,31 @@ Use the regular-file path `/mnt/pmem/wizard-region` with
 `PmemMmapBackend.create()` is the definitive project-level check that the
 file accepts `MAP_SYNC`.
 
+## Available real-PMEM host: magpie
+
+The ANU School of Computing research server `magpie` was inspected on
+2026-08-12 and is the current target for the opt-in Stage 1 run. Its observed
+configuration is:
+
+| Namespace | Mode | PFN map | Alignment | Block device | Filesystem mount |
+|---|---|---|---:|---|---|
+| `namespace0.0` | `fsdax` | `dev` | 2 MiB | `/dev/pmem0` | ext4 at `/mnt/pmem0.0`, `rw,relatime,dax=always` |
+| `namespace1.0` | `fsdax` | `dev` | 2 MiB | `/dev/pmem1` | ext4 at `/mnt/pmem1.0`, `rw,relatime,dax=always` |
+
+Both namespaces report 799,063,146,496 usable bytes and 512-byte sectors, and
+the host reports `x86_64`. Here `"map":"dev"` means that the namespace's PFN
+metadata resides on the PMEM device; it does **not** mean device-DAX. The
+decisive field is `"mode":"fsdax"`, which is compatible with this project's
+regular-file backend.
+
+Use only a writable scratch directory explicitly assigned by the server
+administrator. Do not pass `/dev/pmem0`, `/dev/pmem1`, either mount root, or an
+existing region file to the test, and do not format, reconfigure, disable, or
+unmount either namespace. The current test has a 4 MiB peak region file; up to
+1 GiB of scratch space provides headroom for planned multi-image crash tests
+and retained traces. A positive hardware run remains pending assignment of
+that directory.
+
 ## Alternative: reserve native Linux DRAM
 
 On an x86-64 Linux machine without NVDIMM hardware, the kernel parameter
@@ -241,24 +266,41 @@ separate validation layers.
 
 ### Stage 1 — DAX and recovery integration
 
-The first stage should prove that the intended Linux interface and the
-current backend are connected correctly:
+The opt-in `PmemDaxIntegrationTest.v3` proves that the intended Linux
+interface and the current backend are connected correctly:
 
-- the guest discovers the NVDIMM and exposes an fsdax block device;
+- the host exposes an fsdax block device;
 - a file on the mounted filesystem accepts `MAP_SYNC`;
 - `PmemMmapBackend.create()` formats and maps the requested region;
 - allocation and transaction commits work through `X86_64PWNVRegion`; and
 - a clean close and remount preserve allocator state; and
 - a controlled reopen with a committed record exercises WAL replay.
 
-This should become an opt-in x86-64 Linux integration test. It should not run
-in the default unit suite because it depends on a prepared DAX filesystem and
-privileged VM setup.
+Run it on the prepared x86-64 Linux machine with an assigned writable scratch
+directory on the fsdax mount:
+
+```bash
+make pmem-integration PWASM_PMEM_TEST_DIR=/mnt/pmem/assigned-directory
+```
+
+The target builds a separate `bin/pmemtest.x86-64-linux` binary. Its two tests
+are not registered in the default unit suite or run by CI. The runner never
+unlinks a caller-selected filename: it atomically reserves a new `0600` file in
+the supplied directory using `O_CREAT|O_EXCL`, adds the UID, PID, and a bounded
+collision suffix to its name, and removes only that file after a normal run.
+An interrupted runner may leave a clearly named `wizard-pmem-*.region` artifact
+for later manual cleanup, but a subsequent run will not overwrite it. A
+directory on an ordinary filesystem is expected to fail at
+`PmemMmapBackend.create()` because the backend has no non-`MAP_SYNC` fallback.
 
 The existing `txn_backend:pmem_region_tracks_pending_writeback` unit test does
 not provide this coverage. It wraps an anonymous `Mmap.reserve()` mapping
 directly in `PmemMmapRegion`, bypassing `PmemMmapBackend.create()`,
 `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`.
+
+This stage establishes functional DAX mapping, clean remount, and software WAL
+replay. Because `flushCacheLine()` and `storeFence()` are still placeholders,
+it does not establish cache-line persistence or host power-loss durability.
 
 ### Stage 2 — guest crash and restart testing
 
