@@ -734,6 +734,7 @@ def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
 def MT = UnitTests.registerT("txn_backend:", _, FileMmapBackendTester.new, _);
 def MX = [
 	MT("fresh_truncates_and_zero_fills", test_fresh_truncates_and_zero_fills),
+	MT("exclusive_create_rejects_existing_file", test_exclusive_create_rejects_existing_file),
 	MT("missing_attach_creates_zeroed_file", test_missing_attach_creates_zeroed_file),
 	MT("mapped_file_region_owns_state", test_mapped_file_region_owns_state),
 	MT("mapped_file_persist_changes_clears_dirty_flag", test_mapped_file_persist_changes_clears_dirty_flag),
@@ -768,6 +769,23 @@ class FileMmapBackendTester(t: Tester) {
 		}
 		RegionFileIO.unlink(BACKEND_PATH);
 	}
+}
+
+// Shared-machine integration runners reserve their generated path atomically.
+// A second reservation must fail rather than opening or truncating that file.
+def test_exclusive_create_rejects_existing_file(tc: FileMmapBackendTester) {
+	def first = RegionFileIO.createExclusive(BACKEND_PATH);
+	if (first < 0) {
+		tc.t.fail("initial exclusive file reservation failed");
+		tc.cleanup();
+		return;
+	}
+
+	def second = RegionFileIO.createExclusive(BACKEND_PATH);
+	tc.t.assertz(true, second < 0);
+	if (second >= 0) RegionFileIO.close(second);
+	RegionFileIO.close(first);
+	tc.cleanup();
 }
 
 // A fresh open must discard both stale contents and a stale larger extent.

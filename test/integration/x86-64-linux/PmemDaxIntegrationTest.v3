@@ -1,0 +1,122 @@
+// Opt-in integration tests for the production PMEM/DAX backend.
+//
+// The runner atomically reserves a private, unique file inside a caller-provided
+// writable directory on a prepared filesystem-DAX mount. PmemMmapBackend maps
+// it with MAP_SHARED_VALIDATE | MAP_SYNC, so successful construction proves
+// that the test did not silently fall back to an ordinary shared file mapping.
+// These tests exercise software remount/recovery behavior only; the
+// cache-writeback and fence helpers remain placeholders and this suite does not
+// claim host power-loss durability.
+
+def PMT = UnitTests.registerT("pmem_dax:", _, PmemDaxIntegrationTester.new, _);
+def PMX = [
+	PMT("backend_accepts_map_sync", test_pmem_backend_accepts_map_sync),
+	PMT("clean_remount_and_wal_replay", test_pmem_clean_remount_and_wal_replay),
+	()
+];
+
+class PmemDaxIntegrationTester(t: Tester) {
+	def numBlocks = 8u64;
+	def regionBytes = numBlocks * MemRegions.BlockSize;
+	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
+
+	def emptyDescs() -> Array<Ref<MetaDataDesc>> {
+		return Array<Ref<MetaDataDesc>>.new(0);
+	}
+
+}
+
+// A successful production-backend create is the project-level MAP_SYNC probe:
+// PmemMmapBackend has no fallback mapping mode when the kernel rejects MAP_SYNC.
+def test_pmem_backend_accepts_map_sync(tc: PmemDaxIntegrationTester) {
+	def backend = PmemMmapBackend.new(PmemDaxTestConfig.path);
+	var region = backend.create(tc.regionBytes, tc.prot, true);
+
+	if (region == null) {
+		tc.t.fail("PmemMmapBackend.create failed; path must be a regular file on an fsdax mount");
+		return;
+	}
+
+	tc.t.assertz(true, PmemMmapRegion.?(region));
+	tc.t.assert_eq(int.!(tc.regionBytes), region.range.length);
+	region.destroy();
+}
+
+// Format and allocate through X86_64PWNVRegion, verify a clean remount, then
+// commit a payload after-image directly to the production DualTxnWal without
+// applying it. Destroying only the mapping simulates a controlled reopen with
+// the committed record still present; the final PWRegion mount must replay it.
+def test_pmem_clean_remount_and_wal_replay(tc: PmemDaxIntegrationTester) {
+	var formatted = X86_64PWNVRegion.new(
+		PmemDaxTestConfig.path, tc.numBlocks, tc.emptyDescs(), true);
+	if (formatted.backendRegion == null || formatted.txn == null) {
+		tc.t.fail("fresh X86_64PWNVRegion format failed on the fsdax path");
+		formatted.deallocate();
+		return;
+	}
+
+	tc.t.assertz(true, PmemMmapRegion.?(formatted.backendRegion));
+	def chunk = formatted.allocChunk(1u32);
+	if (chunk.isNull()) {
+		tc.t.fail("PMEM-backed allocation failed");
+		formatted.deallocate();
+		return;
+	}
+	def allocatedBlock = formatted.blockIndexOf(formatted.chunkToBlockEntry(chunk));
+	def payloadOffset = formatted.offsetInRegion(chunk.addr) + u64.!(ChunkHeader.size);
+	formatted.deallocate();
+
+	var cleanMount = X86_64PWNVRegion.new(
+		PmemDaxTestConfig.path, tc.numBlocks, tc.emptyDescs(), false);
+	if (cleanMount.backendRegion == null || cleanMount.txn == null) {
+		tc.t.fail("clean PMEM remount failed");
+		cleanMount.deallocate();
+		return;
+	}
+	tc.t.assertz(true, cleanMount.blockTableHandle[allocatedBlock].getUsed());
+	tc.t.assertz(false, cleanMount.requiresRecovery());
+	cleanMount.deallocate();
+
+	def backend = PmemMmapBackend.new(PmemDaxTestConfig.path);
+	var raw = backend.create(tc.regionBytes, tc.prot, false);
+	if (raw == null) {
+		tc.t.fail("raw PMEM remap for WAL injection failed");
+		return;
+	}
+
+	def regionStart = u64.view(Pointer.atElement(raw.range, 0));
+	def wal = DualTxnWal.new(
+		regionStart,
+		regionStart + MemRegions.BlockSize,
+		MemRegions.BlockSize,
+		raw,
+		false
+	);
+	tc.t.assert_eq(0u8,
+		PWRegionUtils.pointerFromU64(regionStart + payloadOffset).load<u8>());
+	if (!wal.openOk || !wal.append(payloadOffset, 0xa5u64, 1u8) || wal.commit() == 0u64) {
+		tc.t.fail("could not commit the PMEM WAL recovery record");
+		raw.destroy();
+		return;
+	}
+	tc.t.assert_eq(0u8,
+		PWRegionUtils.pointerFromU64(regionStart + payloadOffset).load<u8>());
+
+	// Deliberately bypass wal.close(): it would flush data and scrub the record.
+	raw.destroy();
+	raw = null;
+
+	var recovered = X86_64PWNVRegion.new(
+		PmemDaxTestConfig.path, tc.numBlocks, tc.emptyDescs(), false);
+	if (recovered.backendRegion == null || recovered.txn == null) {
+		tc.t.fail("PMEM remount for WAL recovery failed");
+		recovered.deallocate();
+		return;
+	}
+
+	tc.t.assert_eq(0xa5u8,
+		PWRegionUtils.pointerFromU64(recovered.regionStart + payloadOffset).load<u8>());
+	tc.t.assertz(true, recovered.blockTableHandle[allocatedBlock].getUsed());
+	tc.t.assertz(false, recovered.requiresRecovery());
+	recovered.deallocate();
+}

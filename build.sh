@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|unittest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|objdump|unittest|pmemtest> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -51,6 +51,7 @@ TARGET_V3="src/engine/v3/*.v3"
 TARGET_X86_64="src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL_LIB/asm/x86-64/*.v3"
 UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_LIB/test/*.v3"
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
+PMEMTEST_X86_64_LINUX="test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3 $VIRGIL_LIB/test/*.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
 WASM_MODE="src/WasmMode.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
@@ -147,6 +148,11 @@ elif [ "$PROGRAM" = "unittest" ]; then
     if [[ "$TARGET" = "x86-64-linux" || "$TARGET" = "x86_64_linux" ]]; then
         SOURCES="$SOURCES $UNITTEST_X86_64_LINUX $MODULES $WASI $WASI_X86_64_LINUX"
     fi
+elif [ "$PROGRAM" = "pmemtest" ]; then
+    if [[ "$TARGET" != "x86-64-linux" && "$TARGET" != "x86_64_linux" ]]; then
+        exit_usage
+    fi
+    SOURCES="$ENGINE $PMEMTEST_X86_64_LINUX"
 elif [ "$PROGRAM" = "objdump" ]; then
     SOURCES="$ENGINE src/objdump.main.v3"
 else

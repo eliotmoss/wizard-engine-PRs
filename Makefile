@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -29,6 +29,7 @@ WALI_X86_64_LINUX=src/modules/wali/x86-64-linux/*.v3
 OBJDUMP=$(ENGINE) src/objdump.main.v3
 UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
+PMEMTEST_X86_64_LINUX=test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -67,6 +68,18 @@ bin/objdump.x86-linux: $(OBJDUMP) build.sh
 # x86-64-linux targets
 bin/unittest.x86-64-linux: $(UNITTEST) $(UNITTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh unittest x86-64-linux
+
+# Opt-in: PWASM_PMEM_TEST_DIR must name an assigned writable directory on an
+# fsdax mount. The runner exclusively creates and removes its own unique file.
+pmem-integration: bin/pmemtest.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pmemtest.x86-64-linux "$(PWASM_PMEM_TEST_DIR)"
+
+bin/pmemtest.x86-64-linux: $(ENGINE) $(PMEMTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pmemtest x86-64-linux
 
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT) build.sh
 	./build.sh spectest x86-64-linux

@@ -1,0 +1,71 @@
+// Entrypoint for the opt-in filesystem-DAX integration tests. This is kept
+// separate from unittest.main.v3 so DAX-dependent tests are never registered
+// in the default unit-test binary.
+
+component PmemDaxTestConfig {
+	def var directory: string;
+	def var path: string;
+
+	// Reserve a private, uniquely named file inside the caller-assigned scratch
+	// directory. O_EXCL prevents accidental replacement of an existing file;
+	// the bounded suffix retry also tolerates a stale artifact from an earlier
+	// killed run after Linux eventually reuses its PID.
+	def reservePath(dir: string) -> bool {
+		directory = dir;
+		def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+		def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+		for (attempt < 100) {
+			path = StringBuilder.new()
+				.puts(directory)
+				.puts("/wizard-pmem-u")
+				.putd(uid)
+				.puts("-p")
+				.putd(pid)
+				.puts("-")
+				.putd(attempt)
+				.puts(".region")
+				.toString();
+			def fd = RegionFileIO.createExclusive(path);
+			if (fd >= 0) {
+				RegionFileIO.close(fd);
+				return true;
+			}
+			if (fd != -LinuxConst.EEXIST) {
+				path = null;
+				return false;
+			}
+		}
+		path = null;
+		return false;
+	}
+
+	def cleanup() -> bool {
+		if (path != null) {
+			def removed = RegionFileIO.unlink(path);
+			path = null;
+			return removed;
+		}
+		return true;
+	}
+}
+
+def main(args: Array<string>) -> int {
+	if (args.length != 1 || args[0] == null || args[0].length == 0) {
+		System.puts("Usage: pmemtest.x86-64-linux <assigned-writable-fsdax-directory>\n");
+		return 2;
+	}
+	if (!PmemDaxTestConfig.reservePath(args[0])) {
+		System.puts("Could not reserve a unique test file in the supplied directory.\n");
+		return 2;
+	}
+	System.puts("Using temporary PMEM region: ");
+	System.puts(PmemDaxTestConfig.path);
+	System.ln();
+	args[0] = null;
+	def status = UnitTests.run(args);
+	if (!PmemDaxTestConfig.cleanup()) {
+		System.puts("Could not remove the temporary PMEM region printed above.\n");
+		if (status == 0) return 2;
+	}
+	return status;
+}

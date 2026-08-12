@@ -270,6 +270,7 @@ class FileMmapBackend extends TxnRegionBackend {
 
 component RegionFileIO {
 	def FILE_MODE = 420;	// 0644 octal
+	def PRIVATE_FILE_MODE = 384;	// 0600 octal
 
 	// Build a null-terminated C string for the given path.
 	private def toCPath(path: string) -> Array<byte> {
@@ -295,6 +296,18 @@ component RegionFileIO {
 		var pathBuf = toCPath(path);
 		var r = Linux.syscall(LinuxConst.SYS_open,
 			(Pointer.atElement(pathBuf, 0), LinuxConst.O_RDWR | LinuxConst.O_CREAT | LinuxConst.O_TRUNC, FILE_MODE));
+		return int.!(r.0);
+	}
+
+	// Atomically reserve a new private file without following or replacing an
+	// existing name. Used by shared-machine integration runners before they hand
+	// a generated path to a backend whose fresh-format contract includes O_TRUNC.
+	def createExclusive(path: string) -> int {
+		var pathBuf = toCPath(path);
+		var r = Linux.syscall(LinuxConst.SYS_open,
+			(Pointer.atElement(pathBuf, 0),
+			 LinuxConst.O_RDWR | LinuxConst.O_CREAT | LinuxConst.O_EXCL,
+			 PRIVATE_FILE_MODE));
 		return int.!(r.0);
 	}
 
@@ -326,11 +339,11 @@ component RegionFileIO {
 	// toCPath(). Routing this through toCPath() (a third caller) shifts Virgil's
 	// inlining/stackmap layout enough to trip a latent precise-GC bug that crashes
 	// unrelated interpreter GC tests (e.g. int:force_gc1). Keep this inline.
-	def unlink(path: string) {
+	def unlink(path: string) -> bool {
 		var pathBuf = Array<byte>.new(path.length + 1);
 		for (i < path.length) pathBuf[i] = path[i];
 		pathBuf[path.length] = 0;
-		Linux.syscall(LinuxConst.SYS_unlink, Pointer.atElement(pathBuf, 0));
+		return Linux.syscall(LinuxConst.SYS_unlink, Pointer.atElement(pathBuf, 0)).0 == 0;
 	}
 }
 
