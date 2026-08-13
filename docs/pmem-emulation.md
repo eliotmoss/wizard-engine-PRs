@@ -266,8 +266,10 @@ model must also allow dirty cache lines to be written back without `CLWB`, a
 to survive before a fence, and an `SFENCE` to complete the earlier writebacks
 on which the protocol relies.
 
-The proposed implementation records the production ordering of persistent
-`STORE`, `CLWB`, and `SFENCE` actions, explores every distinct durable image
+The first code milestone now records the production `DualTxnWal` ordering of
+persistent `STORE`, `CLWB`, and `SFENCE` actions through a per-region operation
+provider. It covers record construction, after-image apply/replay, slot scrub,
+and PMEM range/fence translation on ordinary memory. The remaining work explores every distinct durable image
 for short bounded scenarios, and invokes the real WAL/allocator recovery code
 against each image. An ordinary file or byte array is sufficient because the
 simulator—not DAX or the host page cache—defines durability. Exhaustive short
@@ -277,9 +279,11 @@ for longer allocator histories. See
 hardware assumptions, state-space reductions, recovery integration, and
 evidence limits.
 
-Stage 0b still cannot prove that the compiler and native backend emit the
-intended instructions. Instruction tracing and DAX/hardware integration remain
-separate validation layers.
+The current recorder does not model durable bytes, eviction, asynchronous
+writeback completion, crash cuts, or recovery schedules. Stage 0b also cannot
+prove that the compiler and native backend emit the intended instructions.
+Instruction tracing and DAX/hardware integration remain separate validation
+layers.
 
 ### Stage 1 — DAX and recovery integration
 

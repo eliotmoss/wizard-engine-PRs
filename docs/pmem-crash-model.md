@@ -167,10 +167,8 @@ abstract crash and persistence semantics.
 
 ## Instrumentation seam
 
-The backend currently learns about persistent writes only after direct pointer
-stores have happened. That is sufficient for range preparation but cannot
-produce the store-level trace required here. Persistent accesses should be
-routed through a narrow interface such as:
+Milestone 2 implements a per-region `PersistentOperations` provider with this
+interface:
 
 ```text
 storeU8(offset, value)
@@ -181,15 +179,50 @@ clwb(cacheLine)
 sfence()
 ```
 
-The production implementation performs the real store or native instruction.
-The recorder implementation mutates the live image and appends an event. The
-same WAL and allocator code must drive both implementations so the recorded
-trace corresponds to the production ordering.
+`BackendRegion` owns the provider, so dependency injection is explicit and
+there is no global trace state. `DualTxnWal` obtains that exact provider from
+its backend region. `PmemMmapRegion` uses the same object while translating
+`prepareChangedRange()` and persistence boundaries, which gives one total
+order across all three event kinds.
 
-`DualTxnWal` already centralizes most record loads/stores and after-image
-writes, which is a useful starting point. Formatting and allocator handle
-writes must also be audited so every store to the persistent region is visible
-to scenarios that exercise those paths.
+`X86_64PersistentOperations` is the production implementation. Scalar methods
+perform the same `Pointer.store` operations as before; x86-64 supplies the
+little-endian byte order. `clwb(cacheLine)` and `sfence()` reach
+`MmapRegionUtils.flushCacheLine()` and `storeFence()`. Those native hooks are
+still placeholders, so this seam is not evidence of physical PMEM durability.
+
+`RecordingPersistentOperations` works on an ordinary byte range. It executes
+the same checked scalar stores against the live image, then appends a typed
+event with a monotonically increasing sequence number. It records region-
+relative, 64-byte-aligned cache-line starts and every fence requested by the
+PMEM backend. `clear()`/`reset()` empties the event vector and restarts sequence
+numbering at one. Its stable per-event rendering is:
+
+```text
+STORE(seq=N, offset=O, width=W, value=0xV)
+CLWB(seq=N, cacheLine=L)
+SFENCE(seq=N)
+```
+
+The structured representation is `PersistentTraceEvent(seq, kind, offset,
+width, value)`: `STORE` uses all fields, `CLWB` uses `offset` as the cache-line
+start with zero width/value, and `SFENCE` uses only `seq`. Tests inspect these
+fields rather than parsing the rendering.
+
+The active `DualTxnWal` now routes fresh header creation, byte-wise record and
+slot zeroing, every record/header/entry/trailer/checksum store, after-image
+application, recovery replay, and durable-slot scrubbing through this provider.
+Loads remain direct and uninstrumented. Naturally aligned supported stores are
+checked before recording, so an invalid internal layout store fails immediately
+instead of entering a trace.
+
+The seam is not yet region-wide. `PWRegion.format()` still directly constructs
+the region header, sentinels, block table, and metadata descriptors before its
+whole-region `persistRange`. Non-cached allocator handle setters, retained
+`SingleTxnWal`/`MultiTxnWal`, and intentionally transient Immix line marks also
+remain outside it. Normal allocator transactions use `RegionTransaction` and
+therefore reach the instrumented active `DualTxnWal` for both their records and
+their applied after-images.
 
 Tracing only `prepareChangedRange()` is not enough: it occurs after the stores,
 aggregates ranges, and cannot represent a partially constructed record that
@@ -308,9 +341,14 @@ second representation of the protocol.
 
 1. **Completed 2026-08-12:** agree and document the PMEM/persistence-domain
    assumptions above.
-2. Introduce the instrumentable persistent store/flush/fence interface.
-3. Add a deterministic trace recorder and a human-readable counterexample
-   format.
+2. **Completed 2026-08-13:** introduce the per-region instrumentable persistent
+   store/flush/fence interface, its x86-64 production provider, and the typed
+   in-memory provider used to pin active-WAL ordering. All active `DualTxnWal`
+   persistent stores and PMEM writeback/fence requests share this seam.
+3. Integrate recorded events into deterministic counterexample artifacts and
+   scenario capture. The in-memory recorder and stable per-event rendering
+   exist, but no explorer/counterexample artifact or durable-state trace format
+   exists yet, so this milestone remains pending.
 4. Implement cache-line state, background eviction, asynchronous writeback,
    fence completion, crash-image generation, and state deduplication.
 5. Feed every generated image into real WAL recovery and assert the core

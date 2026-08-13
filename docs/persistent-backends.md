@@ -33,6 +33,7 @@ All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live u
 ```
 BackendRegion (abstract class)
     range: Range<byte>                       // the mapped bytes
+    persistentOperations()                   // per-region scalar/CLWB/SFENCE provider
     destroy()                                // release storage
     prepareChangedRange(offset, size)        // mark region dirty (write-behind)
     persistChanges()                         // flush all pending dirty ranges
@@ -43,6 +44,14 @@ TxnRegionBackend (abstract class)           // factory for BackendRegion instanc
     isPersistent() -> bool
     name() -> string
 ```
+
+The narrow `PersistentOperations` interface provides naturally aligned
+`storeU8`/`storeU16`/`storeU32`/`storeU64`, region-relative `clwb`, and
+`sfence`. A single provider belongs to each region, allowing active-WAL stores
+and PMEM writeback/fence requests to share one observable order. The production
+x86-64 provider performs ordinary native scalar stores and reaches the existing
+writeback/fence hooks. A recording provider mutates the same live byte image and
+retains typed `STORE`/`CLWB`/`SFENCE` events for deterministic tests.
 
 `BackendProt` mirrors Linux `PROT_*` flags: `NONE(0) READ(1) WRITE(2) EXEC(4)`.
 
@@ -62,7 +71,7 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
   └── PmemMmapRegion   (PMEM durability via clflush + sfence)
 ```
 
-**Note:** `MmapRegionUtils.flushCacheLine()` and `storeFence()` are currently stubs — they require Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE` that are not yet emitted. See [Open items](#open-items).
+**Note:** `MmapRegionUtils.flushCacheLine()` and `storeFence()` are currently stubs — the production operation provider reaches them, but they still require Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE` that are not yet emitted. See [Open items](#open-items).
 
 ### Backend factories
 
@@ -119,7 +128,7 @@ setup, safety constraints, and the staged validation plan.
 
 **Comparison files:** `src/engine/x86-64/X86_64MultiTxnWal.v3`, `src/engine/x86-64/X86_64SingleTxnWal.v3`
 
-`DualTxnWal` is the WAL wired into `PWRegion` and `RegionTransaction`. It keeps at most two committed transactions in fixed slots selected by `txnSeq % 2`. Redo entries are absolute, idempotent after-images, so recovery validates both slots and replays them in ascending sequence order without a superblock, epoch, replay floor, ring, or checkpoint policy.
+`DualTxnWal` is the WAL wired into `PWRegion` and `RegionTransaction`. It keeps at most two committed transactions in fixed slots selected by `txnSeq % 2`. Redo entries are absolute, idempotent after-images, so recovery validates both slots and replays them in ascending sequence order without a superblock, epoch, replay floor, ring, or checkpoint policy. Fresh construction, record zeroing and fields, checksum publication, after-image application/replay, and slot scrubbing all store through the backend region's `PersistentOperations` provider.
 
 `MultiTxnWal` remains compiled and has dedicated comparison tests, but it is no longer on the allocator commit path. `SingleTxnWal` remains a reference implementation with baseline commit, recovery, checksum, boundary-count, and silent-overflow comparison tests. See `docs/wal-comparison.md` for the design comparison and `docs/checkpoint-policy.md` for the retained ring-WAL policy record.
 
@@ -446,18 +455,26 @@ PWRegion.mount()
 
 ## Testing
 
-Audited 2026-07-31 and extended 2026-08-12: the implementation-specific
-x86-64 Linux suite contains 167 registered tests. The previous 140-test audit
-passed in an amd64 Docker container on a Darwin arm64 host; all 167 pass with
-no expected failures in the latest native x86-64 Linux run.
+Audited 2026-07-31 and extended 2026-08-13: the implementation-specific
+x86-64 Linux suite contains 173 registered tests across six files. All 173 pass
+with no unexpected failures in the current native x86-64 Linux run; the full
+unit binary contains 1,884 tests including portable and spec-parser coverage.
 
 | Test file | Tests | What it covers |
 |---|---:|---|
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
-| `DualTxnWalTest.v3` | 39 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
+| `DualTxnWalTest.v3` | 40 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
+| `PersistentOperationsTest.v3` | 5 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
 | `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
+
+The trace recorder deliberately has no durable image, background eviction,
+asynchronous writeback completion, crash cuts, or schedule exploration yet.
+Its scope is to prove that real active-WAL execution emits the expected ordered
+operations. `PWRegion.format()` and its direct header/block-table/descriptor
+stores, non-cached allocator setters, retained comparison WALs, and transient
+Immix line marks remain outside the store seam pending a later audit.
 
 The platform wrapper classes each have a dedicated construction test. Immix
 coverage checks copied and remounted descriptors, descriptor-prefix-aware line
@@ -620,4 +637,4 @@ test/unit.sh
 | 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
-| 9 | `docs/pmem-crash-model.md` | Add an instrumentable persistent-store/flush/fence seam and a bounded trace explorer for background eviction, asynchronous `CLWB`, `SFENCE`, and crash schedules. |
+| 9 | `docs/pmem-crash-model.md` | Extend the completed persistent-operation seam and typed recorder with durable images plus a bounded explorer for background eviction, asynchronous `CLWB`, `SFENCE`, and crash schedules. |
