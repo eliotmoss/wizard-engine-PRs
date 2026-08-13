@@ -1,0 +1,309 @@
+// Persistent-operation seam and trace-recorder tests. These use ordinary
+// anonymous memory; no DAX mapping or PMEM hardware is required.
+
+def POT = UnitTests.registerT("persistent_ops:", _, PersistentOperationsTester.new, _);
+def POTX = [
+	POT("scalar_stores_are_typed_little_endian", test_persistent_scalar_stores_are_typed_little_endian),
+	POT("pmem_range_translation", test_persistent_pmem_range_translation),
+	POT("dual_wal_phase_b_trace", test_persistent_dual_wal_phase_b_trace),
+	POT("dual_wal_two_transaction_trace", test_persistent_dual_wal_two_transaction_trace),
+	POT("dual_wal_recovery_trace", test_persistent_dual_wal_recovery_trace),
+	()
+];
+
+class PersistentOperationsTester(t: Tester) {
+	var data = Array<byte>.new(4096);
+	var recorder = RecordingPersistentOperations.new(data[0 ..+ data.length]);
+
+	def assertSequences(events: Vector<PersistentTraceEvent>) {
+		for (i < events.length) t.assert_eq(u64.!(i + 1), events[i].seq);
+	}
+
+	def assertStore(event: PersistentTraceEvent, seq: u64,
+		offset: u64, width: u8, value: u64) {
+		t.assertz(true, event.kind == PersistentEventKind.STORE);
+		t.assert_eq(seq, event.seq);
+		t.assert_eq(offset, event.offset);
+		t.assert_eq(width, event.width);
+		t.assert_eq(value, event.value);
+	}
+
+	def makePmemRegion() -> PmemMmapRegion {
+		def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = PmemMmapRegion.new(mapping, -1);
+		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		return region;
+	}
+
+	def recorderOf(region: PmemMmapRegion) -> RecordingPersistentOperations {
+		return RecordingPersistentOperations.!(region.persistentOperations());
+	}
+}
+
+// The recording provider executes the same native scalar stores as production,
+// then records the normalized value and width. The byte assertions pin x86-64
+// little-endian behavior rather than relying only on typed loads.
+def test_persistent_scalar_stores_are_typed_little_endian(tc: PersistentOperationsTester) {
+	tc.recorder.storeU8(1u64, 0xA5u8);
+	tc.recorder.storeU16(2u64, 0xB1C2u16);
+	tc.recorder.storeU32(4u64, 0xD3E4_F506_u32);
+	tc.recorder.storeU64(8u64, 0x1728_394A_5B6C_7D8E_u64);
+
+	tc.assertStore(tc.recorder.events[0], 1u64, 1u64, 1u8, 0xA5u64);
+	tc.assertStore(tc.recorder.events[1], 2u64, 2u64, 2u8, 0xB1C2u64);
+	tc.assertStore(tc.recorder.events[2], 3u64, 4u64, 4u8, 0x0000_0000_D3E4_F506_u64);
+	tc.assertStore(tc.recorder.events[3], 4u64, 8u64, 8u8, 0x1728_394A_5B6C_7D8E_u64);
+	tc.assertSequences(tc.recorder.events);
+
+	tc.t.assert_eq(0xA5u8, tc.data[1]);
+	tc.t.assert_eq(0xC2u8, tc.data[2]);
+	tc.t.assert_eq(0xB1u8, tc.data[3]);
+	tc.t.assert_eq(0x06u8, tc.data[4]);
+	tc.t.assert_eq(0xF5u8, tc.data[5]);
+	tc.t.assert_eq(0xE4u8, tc.data[6]);
+	tc.t.assert_eq(0xD3u8, tc.data[7]);
+	def expected64 = [0x8Eu8, 0x7Du8, 0x6Cu8, 0x5Bu8,
+		0x4Au8, 0x39u8, 0x28u8, 0x17u8];
+	for (i < expected64.length) tc.t.assert_eq(expected64[i], tc.data[8 + i]);
+
+	tc.recorder.clear();
+	tc.t.assert_eq(0, tc.recorder.events.length);
+	tc.recorder.storeU8(0u64, 0x11u8);
+	tc.t.assert_eq(1u64, tc.recorder.events[0].seq);
+	tc.recorder.reset();
+	tc.t.assert_eq(0, tc.recorder.events.length);
+}
+
+// PMEM preparation translates byte ranges to every touched 64-byte line in
+// ascending order. A fence appears only when a writeback is pending.
+def test_persistent_pmem_range_translation(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("pmem trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+
+	tc.t.assertz(true, region.prepareChangedRange(4096u64, 0u64));
+	tc.t.assert_eq(0, recorder.events.length);
+	tc.t.assertz(true, region.persistChanges());
+	tc.t.assert_eq(0, recorder.events.length);
+
+	tc.t.assertz(true, region.prepareChangedRange(73u64, 1u64));
+	tc.t.assert_eq(1, recorder.events.length);
+	tc.t.assertz(true, recorder.events[0].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(64u64, recorder.events[0].offset);
+	tc.t.assertz(true, region.persistChanges());
+	tc.t.assert_eq(2, recorder.events.length);
+	tc.t.assertz(true, recorder.events[1].kind == PersistentEventKind.SFENCE);
+
+	recorder.clear();
+	tc.t.assertz(true, region.prepareChangedRange(63u64, 130u64));
+	def expectedLines = [0u64, 64u64, 128u64, 192u64];
+	tc.t.assert_eq(expectedLines.length, recorder.events.length);
+	for (i < expectedLines.length) {
+		tc.t.assertz(true, recorder.events[i].kind == PersistentEventKind.CLWB);
+		tc.t.assert_eq(expectedLines[i], recorder.events[i].offset);
+	}
+	tc.assertSequences(recorder.events);
+	tc.t.assertz(true, region.persistChanges());
+	tc.t.assertz(true, recorder.events[4].kind == PersistentEventKind.SFENCE);
+	tc.t.assert_eq(5u64, recorder.events[4].seq);
+	def eventCount = recorder.events.length;
+	tc.t.assertz(true, region.persistChanges());
+	tc.t.assert_eq(eventCount, recorder.events.length);
+
+	// Synchronous range persistence uses the same line translation followed by
+	// its own fence, without creating pending work for persistChanges().
+	recorder.clear();
+	tc.t.assertz(true, region.persistRange(511u64, 2u64));
+	tc.t.assert_eq(3, recorder.events.length);
+	tc.t.assertz(true, recorder.events[0].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(448u64, recorder.events[0].offset);
+	tc.t.assertz(true, recorder.events[1].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(512u64, recorder.events[1].offset);
+	tc.t.assertz(true, recorder.events[2].kind == PersistentEventKind.SFENCE);
+	def afterPersistRange = recorder.events.length;
+	tc.t.assertz(true, region.persistChanges());
+	tc.t.assert_eq(afterPersistRange, recorder.events.length);
+	region.destroy();
+}
+
+// One real DualTxnWal commit produces byte-visible record construction,
+// record-line writebacks, the commit fence, then the write-behind after-image
+// store and its line writeback. Explicit flush supplies the completing fence.
+def test_persistent_dual_wal_phase_b_trace(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("phase-B trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	recorder.clear();
+
+	def value = 0x8877_6655_4433_2211_u64;
+	tc.t.assertz(true, wal.append(200u64, value, 8u8));
+	tc.t.assert_eq(1u64, wal.commit());
+	tc.assertSequences(recorder.events);
+
+	var firstClwb = -1;
+	for (i < recorder.events.length) {
+		if (firstClwb < 0 && recorder.events[i].kind == PersistentEventKind.CLWB) firstClwb = i;
+	}
+	tc.t.assertz(true, firstClwb > 0);
+	def recordStart = 1536u64; // odd txnSeq -> slot 1
+	def recordLen = 192u64;
+	// zeroBytes() remains byte-visible rather than becoming an atomic record
+	// event. Build that long expected prefix programmatically.
+	for (i < int.!(recordLen)) {
+		tc.assertStore(recorder.events[i], u64.!(i + 1),
+			recordStart + u64.!(i), 1u8, 0u64);
+	}
+	var field = int.!(recordLen);
+	tc.assertStore(recorder.events[field++], u64.!(field), recordStart,
+		8u8, DualTxnWalConstants.RECORD_MAGIC);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.version.offset), 2u8,
+		u64.!(DualTxnWalConstants.RECORD_VERSION));
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.headerSize.offset), 2u8,
+		u64.!(TxnRecordHeader.size));
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.entrySize.offset), 2u8,
+		u64.!(LogEntry.size));
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.recordLen.offset), 4u8, recordLen);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.entryCount.offset), 4u8, 1u64);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.logEpoch.offset), 8u8, 0u64);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		recordStart + u64.view(TxnRecordHeader.txnSeq.offset), 8u8, 1u64);
+	def entryStart = recordStart + u64.!(TxnRecordHeader.size);
+	tc.assertStore(recorder.events[field++], u64.!(field), entryStart,
+		8u8, 200u64);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		entryStart + u64.view(LogEntry.value.offset), 8u8, value);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		entryStart + u64.view(LogEntry.width.offset), 1u8, 8u64);
+	def trailerStart = entryStart + u64.!(LogEntry.size);
+	tc.assertStore(recorder.events[field++], u64.!(field), trailerStart,
+		8u8, DualTxnWalConstants.TRAILER_MAGIC);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		trailerStart + u64.view(TxnCommitTrailer.recordLen.offset), 4u8, recordLen);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		trailerStart + u64.view(TxnCommitTrailer.entryCount.offset), 4u8, 1u64);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		trailerStart + u64.view(TxnCommitTrailer.logEpoch.offset), 8u8, 0u64);
+	tc.assertStore(recorder.events[field++], u64.!(field),
+		trailerStart + u64.view(TxnCommitTrailer.txnSeq.offset), 8u8, 1u64);
+	def checksumOffset = trailerStart + u64.view(TxnCommitTrailer.checksum.offset);
+	tc.assertStore(recorder.events[field++], u64.!(field), checksumOffset,
+		8u8, 0u64);
+	def publishedChecksum = Pointer.atElement(region.range, int.!(checksumOffset)).load<u64>();
+	tc.assertStore(recorder.events[field++], u64.!(field), checksumOffset,
+		8u8, publishedChecksum);
+	tc.t.assert_eq(field, firstClwb);
+	def expectedRecordLines = [1536u64, 1600u64, 1664u64];
+	for (i < expectedRecordLines.length) {
+		def event = recorder.events[firstClwb + i];
+		tc.t.assertz(true, event.kind == PersistentEventKind.CLWB);
+		tc.t.assert_eq(expectedRecordLines[i], event.offset);
+	}
+	def commitFence = firstClwb + expectedRecordLines.length;
+	tc.t.assert_eq(commitFence + 1, recorder.events.length);
+	tc.t.assertz(true, recorder.events[commitFence].kind == PersistentEventKind.SFENCE);
+
+	tc.t.assertz(true, wal.applyUpdate(200u64, value, 8u8));
+	tc.t.assert_eq(commitFence + 3, recorder.events.length);
+	tc.assertStore(recorder.events[commitFence + 1],
+		recorder.events[commitFence].seq + 1u64, 200u64, 8u8, value);
+	tc.t.assertz(true, recorder.events[commitFence + 2].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(192u64, recorder.events[commitFence + 2].offset);
+	def beforeFlush = recorder.events.length;
+	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assert_eq(beforeFlush + 1, recorder.events.length);
+	tc.t.assertz(true, recorder.events[beforeFlush].kind == PersistentEventKind.SFENCE);
+	tc.assertSequences(recorder.events);
+	region.destroy();
+}
+
+// Transaction N's after-image CLWB remains outstanding until transaction N+1
+// commits. Its event precedes N+1's record construction and commit fence, and
+// each commit still contributes exactly one boundary.
+def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("two-transaction trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	recorder.clear();
+
+	wal.append(200u64, 0x11u64, 1u8);
+	tc.t.assert_eq(1u64, wal.commit());
+	wal.applyUpdate(200u64, 0x11u64, 1u8);
+	def afterFirst = recorder.events.length;
+	tc.t.assertz(true, recorder.events[afterFirst - 1].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(192u64, recorder.events[afterFirst - 1].offset);
+
+	wal.append(201u64, 0x22u64, 1u8);
+	tc.t.assert_eq(2u64, wal.commit());
+	var fenceCount = 0;
+	var secondFence = -1;
+	for (i < recorder.events.length) {
+		if (recorder.events[i].kind == PersistentEventKind.SFENCE) {
+			fenceCount++;
+			if (fenceCount == 2) secondFence = i;
+		}
+	}
+	tc.t.assert_eq(2, fenceCount);
+	tc.t.assertz(true, secondFence > afterFirst);
+	var eventIndex = afterFirst;
+	while (eventIndex < secondFence) {
+		tc.t.assertz(true, recorder.events[eventIndex].kind != PersistentEventKind.SFENCE);
+		eventIndex++;
+	}
+	wal.applyUpdate(201u64, 0x22u64, 1u8);
+	var afterApplyFenceCount = 0;
+	for (i < recorder.events.length) {
+		if (recorder.events[i].kind == PersistentEventKind.SFENCE) afterApplyFenceCount++;
+	}
+	tc.t.assert_eq(2, afterApplyFenceCount); // applying transaction 2 adds no boundary
+	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistentEventKind.CLWB);
+	tc.assertSequences(recorder.events);
+	region.destroy();
+}
+
+// Reopen and invoke the production recovery implementation against the same
+// recorded record. Replay uses the identical store seam and its completing
+// writeback/fence are visible in the same total order.
+def test_persistent_dual_wal_recovery_trace(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("recovery trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	wal.append(200u64, 0xA5u64, 1u8);
+	tc.t.assert_eq(1u64, wal.commit());
+	recorder.clear();
+
+	def reopened = DualTxnWal.new(base, base + 1024u64, 1024u64, region, false);
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(3, recorder.events.length);
+	tc.assertStore(recorder.events[0], 1u64, 200u64, 1u8, 0xA5u64);
+	tc.t.assertz(true, recorder.events[1].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(192u64, recorder.events[1].offset);
+	tc.t.assertz(true, recorder.events[2].kind == PersistentEventKind.SFENCE);
+	tc.assertSequences(recorder.events);
+	tc.t.assert_eq(0xA5u8, region.range[200]);
+	region.destroy();
+}

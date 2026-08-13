@@ -1,0 +1,123 @@
+// Production and recording implementations of the persistent-operation seam.
+// Both mutate the same live byte image with ordinary Pointer.store operations;
+// the recorder additionally retains typed STORE/CLWB/SFENCE events in one
+// monotonically sequenced stream. Durability and crash scheduling deliberately
+// remain outside this milestone.
+
+enum PersistentEventKind {
+	STORE,
+	CLWB,
+	SFENCE
+}
+
+type PersistentTraceEvent(seq: u64, kind: PersistentEventKind,
+	offset: u64, width: u8, value: u64) #unboxed {
+	def render(buf: StringBuilder) -> StringBuilder {
+		match (kind) {
+			STORE => buf.put3("STORE(seq=%d, offset=%d, width=%d, value=0x",
+				seq, offset, u64.view(width)).putx(value).puts(")");
+			CLWB => buf.put2("CLWB(seq=%d, cacheLine=%d)", seq, offset);
+			SFENCE => buf.put1("SFENCE(seq=%d)", seq);
+		}
+		return buf;
+	}
+}
+
+class X86_64PersistentOperations extends PersistentOperations {
+	def range: Range<byte>;
+
+	new(range) { }
+
+	def storeU8(offset: u64, value: u8) {
+		checkedPointer(offset, 1u64).store<u8>(value);
+	}
+
+	def storeU16(offset: u64, value: u16) {
+		checkedPointer(offset, 2u64).store<u16>(value);
+	}
+
+	def storeU32(offset: u64, value: u32) {
+		checkedPointer(offset, 4u64).store<u32>(value);
+	}
+
+	def storeU64(offset: u64, value: u64) {
+		checkedPointer(offset, 8u64).store<u64>(value);
+	}
+
+	def clwb(cacheLine: u64) {
+		if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+			cacheLine >= u64.!(range.length)) {
+			System.error("PersistentOperationError", "invalid cache-line writeback offset");
+		}
+		MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+	}
+
+	def sfence() {
+		MmapRegionUtils.storeFence();
+	}
+
+	def checkedPointer(offset: u64, width: u64) -> Pointer {
+		def size = u64.!(range.length);
+		if (offset % width != 0u64 || offset > size || width > size - offset) {
+			System.error("PersistentOperationError", "unaligned or out-of-range persistent scalar store");
+		}
+		return Pointer.atElement(range, int.!(offset));
+	}
+}
+
+class RecordingPersistentOperations extends X86_64PersistentOperations {
+	def events = Vector<PersistentTraceEvent>.new();
+	private var nextSeq = 1u64;
+
+	new(range: Range<byte>) super(range) { }
+
+	def storeU8(offset: u64, value: u8) {
+		checkedPointer(offset, 1u64).store<u8>(value);
+		recordStore(offset, 1u8, u64.view(value) & 0xFF_u64);
+	}
+
+	def storeU16(offset: u64, value: u16) {
+		checkedPointer(offset, 2u64).store<u16>(value);
+		recordStore(offset, 2u8, u64.view(value) & 0xFFFF_u64);
+	}
+
+	def storeU32(offset: u64, value: u32) {
+		checkedPointer(offset, 4u64).store<u32>(value);
+		recordStore(offset, 4u8, u64.view(value) & 0xFFFF_FFFF_u64);
+	}
+
+	def storeU64(offset: u64, value: u64) {
+		checkedPointer(offset, 8u64).store<u64>(value);
+		recordStore(offset, 8u8, value);
+	}
+
+	def clwb(cacheLine: u64) {
+		// Reuse the production provider's validation, but recording must not issue
+		// a native instruction: the trace itself is the deterministic result.
+		if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+			cacheLine >= u64.!(range.length)) {
+			System.error("PersistentOperationError", "invalid cache-line writeback offset");
+		}
+		events.put(PersistentTraceEvent(nextSeq++, PersistentEventKind.CLWB,
+			cacheLine, 0u8, 0u64));
+	}
+
+	def sfence() {
+		events.put(PersistentTraceEvent(nextSeq++, PersistentEventKind.SFENCE,
+			0u64, 0u8, 0u64));
+	}
+
+	def clear() {
+		events.clear();
+		nextSeq = 1u64;
+	}
+
+	def reset() {
+		clear();
+	}
+
+	private def recordStore(offset: u64, width: u8, value: u64) {
+		events.put(PersistentTraceEvent(nextSeq++, PersistentEventKind.STORE,
+			offset, width, value));
+	}
+}

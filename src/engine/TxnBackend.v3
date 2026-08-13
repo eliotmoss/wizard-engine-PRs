@@ -22,11 +22,34 @@ enum CheckpointCost {
 	EXPENSIVE
 }
 
+// Narrow seam for persistent scalar stores and PMEM ordering operations.
+// Offsets are always relative to the beginning of the owning BackendRegion.
+// Implementations must preserve naturally aligned little-endian 1/2/4/8-byte
+// stores. A BackendRegion owns one provider so stores, cache-line writebacks,
+// and fences can be observed in one total order without global tracing state.
+class PersistentOperations {
+	def storeU8(offset: u64, value: u8);
+	def storeU16(offset: u64, value: u16);
+	def storeU32(offset: u64, value: u32);
+	def storeU64(offset: u64, value: u64);
+	def clwb(cacheLine: u64);
+	def sfence();
+}
+
 // A memory region created by a backend
 class BackendRegion {
 	def range: Range<byte>;  // The actual bytes of the region
+	private var persistentOperationProvider: PersistentOperations;
 
 	new(range) { }
+
+	def persistentOperations() -> PersistentOperations {
+		return persistentOperationProvider;
+	}
+
+	def setPersistentOperations(provider: PersistentOperations) {
+		persistentOperationProvider = provider;
+	}
 
 	// Destroy this region and release any resources it owns.
 	def destroy();

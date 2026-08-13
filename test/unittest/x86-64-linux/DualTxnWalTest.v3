@@ -15,6 +15,7 @@ def DWTX = [
 	DWT("commit_alternates_slots", test_dual_commit_alternates_slots),
 	DWT("commit_crash_recover", test_dual_commit_crash_recover),
 	DWT("mixed_width_signed_values_recover", test_dual_mixed_width_signed_values_recover),
+	DWT("scalar_entry_alignment", test_dual_scalar_entry_alignment),
 	DWT("invalid_entry_ranges_rejected", test_dual_invalid_entry_ranges_rejected),
 	DWT("clean_empty_recover", test_dual_clean_empty_recover),
 	DWT("torn_record_rejected", test_dual_torn_record_rejected),
@@ -441,6 +442,31 @@ def test_dual_mixed_width_signed_values_recover(tc: DualTxnWalTester) {
 	tc.t.assert_eq(i16.view(u16.view(value16)), addr16.load<i16>());
 	tc.t.assert_eq(u32.view(value32), addr32.load<u32>());
 	tc.t.assert_eq(i64.view(value64), addr64.load<i64>());
+}
+
+// The PMEM crash model admits only naturally aligned 1/2/4/8-byte stores.
+// Aligned stores at the end of a cache line are legal and cannot cross it;
+// unaligned stores are definite validation failures before persistence.
+def test_dual_scalar_entry_alignment(tc: DualTxnWalTester) {
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	def invalidOffsets = [201u64, 202u64, 204u64];
+	def invalidWidths = [2u8, 4u8, 8u8];
+	for (i < invalidOffsets.length) {
+		tc.t.assertz(false, tc.wal.append(invalidOffsets[i], 0xAAu64, invalidWidths[i]));
+		tc.t.assert_eq(0u64, tc.wal.commit());
+		tc.t.assertz(false, tc.wal.requiresRecovery());
+		tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	}
+
+	// These stores end exactly at a 64-byte boundary. Their natural alignment
+	// makes line crossing impossible for every supported width.
+	tc.t.assertz(true, tc.wal.append(63u64, 0x11u64, 1u8));
+	tc.t.assertz(true, tc.wal.append(62u64, 0x2233u64, 2u8));
+	tc.t.assertz(true, tc.wal.append(60u64, 0x4455_6677u64, 4u8));
+	tc.t.assertz(true, tc.wal.append(56u64, 0x8899_AABB_CCDD_EEFF_u64, 8u8));
+	tc.t.assert_eq(1u64, tc.wal.commit());
+	tc.t.assert_eq(persistChangesCount + 1, tc.shadowRegion.persistChangesCount);
+	tc.t.assertz(false, tc.wal.requiresRecovery());
 }
 
 // Appends must reject entries that escape the backend or overlap any part of

@@ -64,6 +64,7 @@ class DualTxnWal {
         def logChunkAddr: u64;
         def var logChunkSize: u64;
         def backendRegion: BackendRegion;
+	private var persistentOperations: PersistentOperations;
 
         def var logChunkOffset: u64;
         def var slotBytes: u64;
@@ -86,6 +87,11 @@ class DualTxnWal {
                         Trace.OUT.puts("dual-transaction WAL requires a backend region").ln();
                         return;
                 }
+		persistentOperations = backendRegion.persistentOperations();
+		if (persistentOperations == null) {
+			persistentOperations = X86_64PersistentOperations.new(backendRegion.range);
+			backendRegion.setPersistentOperations(persistentOperations);
+		}
                 if (slotBytes < alignedRecordLen(0u32)) {
                         Trace.OUT.put1("log chunk too small for dual-transaction WAL slots (%d bytes)", blockSize).ln();
                         return;
@@ -488,9 +494,14 @@ class DualTxnWal {
                 if (width != 1u8 && width != 2u8 && width != 4u8 && width != 8u8) return false;
                 if (backendRegion == null) return false;
                 def size = u64.view(width);
+		if (offset % size != 0u64) return false;
                 def regionSize = u64.!(backendRegion.range.length);
                 if (offset > regionSize || size > regionSize - offset) return false;
                 def end = offset + size;
+		// Natural alignment makes this impossible for 1/2/4/8-byte stores in
+		// the 64-byte-line model, but keep the supported contract explicit.
+		if (offset / DualTxnWalConstants.ALIGNMENT !=
+			(end - 1u64) / DualTxnWalConstants.ALIGNMENT) return false;
                 def walStart = logChunkOffset;
                 def walEnd = logChunkOffset + logChunkSize;
                 if (offset < walEnd && walStart < end) return false;
@@ -498,12 +509,11 @@ class DualTxnWal {
         }
 
         private def writeAfterImage(offset: u64, value: u64, width: u8) {
-                def addr = PWRegionUtils.pointerFromU64(regionStart + offset);
                 match (width) {
-                        1 => addr.store<u8>(u8.view(value));
-                        2 => addr.store<u16>(u16.view(value));
-                        4 => addr.store<u32>(u32.view(value));
-                        8 => addr.store<u64>(value);
+			1 => persistentOperations.storeU8(offset, u8.view(value));
+			2 => persistentOperations.storeU16(offset, u16.view(value));
+			4 => persistentOperations.storeU32(offset, u32.view(value));
+			8 => persistentOperations.storeU64(offset, value);
                         _ => ;
                 }
         }
@@ -540,7 +550,7 @@ class DualTxnWal {
                 var ptr = start;
                 def end = start + len;
                 while (ptr < end) {
-                        PWRegionUtils.pointerFromU64(ptr).store<u8>(0u8);
+			persistentOperations.storeU8(ptr - regionStart, 0u8);
                         ptr++;
                 }
         }
@@ -570,11 +580,11 @@ class DualTxnWal {
         }
 
         private def headerStoreU64(offset: int, value: u64) {
-                PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).store<u64>(value);
+		persistentOperations.storeU64(logChunkOffset + u64.view(offset), value);
         }
 
         private def headerStoreU32(offset: int, value: u32) {
-                PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).store<u32>(value);
+		persistentOperations.storeU32(logChunkOffset + u64.view(offset), value);
         }
 
         private def recordLoadU64(addr: u64, offset: int) -> u64 {
@@ -594,18 +604,18 @@ class DualTxnWal {
         }
 
         private def recordStoreU64(addr: u64, offset: int, value: u64) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u64>(value);
+		persistentOperations.storeU64(addr - regionStart + u64.view(offset), value);
         }
 
         private def recordStoreU32(addr: u64, offset: int, value: u32) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u32>(value);
+		persistentOperations.storeU32(addr - regionStart + u64.view(offset), value);
         }
 
         private def recordStoreU16(addr: u64, offset: int, value: u16) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u16>(value);
+		persistentOperations.storeU16(addr - regionStart + u64.view(offset), value);
         }
 
         private def recordStoreU8(addr: u64, offset: int, value: u8) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u8>(value);
+		persistentOperations.storeU8(addr - regionStart + u64.view(offset), value);
         }
 }

@@ -5,7 +5,9 @@ class FdMmapRegion extends BackendRegion {
 	def var fd: int;
 
 	new(mapping: Mapping, fd: int)
-		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size()))) { }
+		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size()))) {
+		setPersistentOperations(X86_64PersistentOperations.new(range));
+	}
 
 	def validRange(offset: u64, size: u64) -> bool {
 		def regionSize = u64.!(range.length);
@@ -44,6 +46,8 @@ class FdMmapRegion extends BackendRegion {
 }
 
 component MmapRegionUtils {
+	def CACHE_LINE_SIZE = 64u64;
+
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
 		if ((prot & BackendProt.READ.mask) != 0) mmapProt |= Mmap.PROT_READ;
@@ -58,23 +62,19 @@ component MmapRegionUtils {
 		// Flush cache lines to PMEM
 		// CLWB (Cache Line Write Back) is the preferred instruction
 		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
-		var start = Pointer.atElement(region.range, 0) + i64.view(offset);
-		var end = start + i64.view(size);
-		def cacheLineSize = 64u64; // x86-64 cache line size
+		def end = offset + size;
+		var cacheLine = offset - (offset % CACHE_LINE_SIZE);
 
-		// Flush each cache line
-		var addr = u64.view(start);
-		def endAddr = u64.view(end);
-		addr = addr - (addr % cacheLineSize);
-		while (addr < endAddr) {
-			flushCacheLine(PWRegionUtils.pointerFromU64(addr));
-			addr = addr + cacheLineSize;
+		// Flush each cache line in ascending region-relative order.
+		while (cacheLine < end) {
+			region.persistentOperations().clwb(cacheLine);
+			cacheLine += CACHE_LINE_SIZE;
 		}
 		return true;
 	}
 
 	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
-	private def flushCacheLine(addr: Pointer) {
+	def flushCacheLine(addr: Pointer) {
 		// TODO: This needs compiler support for inline assembly
 		// Ideally: __builtin_ia32_clwb(addr) or asm volatile("clwb (%0)" :: "r"(addr))
 		// For now, this is a placeholder that would need to be implemented
@@ -168,7 +168,7 @@ class PmemMmapRegion extends FdMmapRegion {
 	def persistChanges() -> bool {
 		if (mapping == null) return false;
 		if (!hasPendingWriteback) return true;
-		MmapRegionUtils.storeFence();
+		persistentOperations().sfence();
 		hasPendingWriteback = false;
 		return true;
 	}
@@ -178,7 +178,7 @@ class PmemMmapRegion extends FdMmapRegion {
 		if (!validRange(offset, size)) return false;
 		if (size == 0) return true;
 		if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
-		MmapRegionUtils.storeFence();
+		persistentOperations().sfence();
 		return true;
 	}
 
