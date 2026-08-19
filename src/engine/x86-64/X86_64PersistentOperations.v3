@@ -121,3 +121,22 @@ class RecordingPersistentOperations extends X86_64PersistentOperations {
 			offset, width, value));
 	}
 }
+
+component X86_64PersistentOps {
+	// Resolve a region's provider, installing the production one on first use.
+	// Every writer to a region must share ONE provider object: PmemMmapRegion's
+	// writeback/fence path reads back through BackendRegion.persistentOperations(),
+	// so a second, uninstalled provider would yield a trace that is interleaved
+	// but not totally ordered with the CLWB/SFENCE stream. VolatileRegion cannot
+	// install one itself -- it lives in the all-targets src/engine/, which cannot
+	// name this x86-64-only implementation.
+	def ensureFor(region: BackendRegion) -> PersistentOperations {
+		if (region == null) return null;
+		var ops = region.persistentOperations();
+		if (ops == null) {
+			ops = X86_64PersistentOperations.new(region.range);
+			region.setPersistentOperations(ops);
+		}
+		return ops;
+	}
+}
