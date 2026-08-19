@@ -260,6 +260,77 @@ was written back by ordinary cache eviction before its explicit flush.
 
 ---
 
+## Scenario capture and artifacts
+
+The recorder's event vector is live and grows for as long as the region is in
+use, so it is not itself a scenario. `PersistentTrace`
+(`src/engine/x86-64/X86_64PersistentTrace.v3`) is the frozen form:
+`RecordingPersistentOperations.snapshot(name)` copies the events recorded so far
+into an immutable, named artifact with the region size, and
+`PersistentTraces.capture(recorder, name, run)` clears the recorder first so a
+captured scenario contains exactly its own events, with sequence numbers
+restarting at one, even on a region that was already written to.
+
+A trace supports the four operations the explorer needs:
+
+- `prefix(n)` is the **crash cut**: the trace as it stood after exactly `n`
+  events. Cuts clamp at both ends, so a walk over `0..length()` needs no
+  special cases, and a cut is itself a trace — it validates, digests, and
+  renders on its own.
+- `validate()` checks the trace against the baseline profile above and returns
+  the first defect with its event index: a non-ascending sequence number, a
+  store whose width is not 1/2/4/8, one that leaves the region, one that spans
+  two cache lines, one that is not naturally aligned, or a writeback that is
+  unaligned or out of region. A trace that fails this check must not be
+  explored, because its stores can tear in ways the model does not represent.
+  Natural alignment already implies single-line containment at these widths, so
+  containment is checked first and the tearing rule stays independently
+  reachable rather than becoming dead code.
+- `digest()` is a content hash over the region geometry and every event field,
+  used to deduplicate schedules that produced an identical trace. It
+  deliberately excludes the scenario name: the digest identifies behaviour, not
+  the label the run was recorded under.
+- `touchedLines()` returns the distinct 64-byte lines written, ascending. This
+  is the set of lines the explorer must hold dirty/version state for, so it
+  bounds the per-cut state space. A `CLWB` of a line nothing wrote contributes
+  no state.
+
+Both artifact renderings are stable, so a failing exploration can be stored and
+diffed instead of re-derived from a run that may not repeat. A trace renders as
+a header with the geometry and event census, a fixed-width 16-digit digest, one
+line per event, and a matching footer:
+
+```text
+--- pmem-trace demo
+region-bytes=256 cache-line=64 events=3 stores=1 clwbs=1 fences=1 lines=1 digest=0x...
+STORE(seq=1, offset=8, width=8, value=0xDEADBEEF)
+CLWB(seq=2, cacheLine=0)
+SFENCE(seq=3)
+--- end pmem-trace demo
+```
+
+`PersistentCounterexample` wraps that with the scenario name, the property that
+failed, a detail line, and the crash cut, and renders the cut trace inside:
+
+```text
+=== pmem-counterexample two_slot_commit
+property: acknowledged transaction survives
+detail: slot 1 record valid but after-image absent
+crash-after-event: 2 of 3
+--- pmem-trace demo
+...
+--- end pmem-trace demo
+=== end pmem-counterexample two_slot_commit
+```
+
+The durable image is not part of the artifact yet: nothing models durable bytes
+until milestone 4, so a counterexample currently carries the schedule prefix
+that produced the failure, not the bytes it produced. `validate()` is also the
+single definition of the scalar-atomicity baseline — the store-audit tests over
+`PWRegion` check the frozen trace through it rather than restating the rules.
+
+---
+
 ## Trace exploration and real recovery
 
 A trace can be recorded once up to the first crash because persistence does not
@@ -378,10 +449,14 @@ second representation of the protocol.
    **Store audit completed 2026-08-14:** `PWRegion.format()` and the non-cached
    allocator handle setters now route through the same provider, so a recorded
    trace is a complete description of the active path's persistent writes.
-3. Integrate recorded events into deterministic counterexample artifacts and
-   scenario capture. The in-memory recorder and stable per-event rendering
-   exist, but no explorer/counterexample artifact or durable-state trace format
-   exists yet, so this milestone remains pending.
+3. **Completed 2026-08-19:** integrate recorded events into deterministic
+   counterexample artifacts and scenario capture. `PersistentTrace` freezes a
+   named snapshot, cuts it at a crash point, validates it against the baseline
+   profile, digests it for deduplication, and renders it; the recorder feeds it
+   via `snapshot()`/`PersistentTraces.capture()`, and
+   `PersistentCounterexample` is the stored form of a failing exploration. No
+   explorer emits those counterexamples yet, and they do not yet carry a
+   durable image, because nothing models durable bytes before milestone 4.
 4. Implement cache-line state, background eviction, asynchronous writeback,
    fence completion, crash-image generation, and state deduplication.
 5. Feed every generated image into real WAL recovery and assert the core
