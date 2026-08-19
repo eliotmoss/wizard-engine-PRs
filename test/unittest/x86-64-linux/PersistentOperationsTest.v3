@@ -8,8 +8,54 @@ def POTX = [
 	POT("dual_wal_phase_b_trace", test_persistent_dual_wal_phase_b_trace),
 	POT("dual_wal_two_transaction_trace", test_persistent_dual_wal_two_transaction_trace),
 	POT("dual_wal_recovery_trace", test_persistent_dual_wal_recovery_trace),
+	POT("pwregion_format_trace", test_persistent_pwregion_format_trace),
+	POT("pwregion_format_descriptor_trace", test_persistent_pwregion_format_descriptor_trace),
+	POT("pwregion_alloc_applies_after_commit_boundary", test_persistent_pwregion_alloc_applies_after_commit_boundary),
+	POT("immix_line_marks_emit_no_events", test_persistent_immix_line_marks_emit_no_events),
 	()
 ];
+
+// Geometry of the traced region used by the PWRegion format tests.
+component TracePWRegions {
+	def BLOCKS = 8u64;
+	def BLOCK_SIZE = 4096u64;
+	def SIZE = 32768u64;                    // BLOCKS * BLOCK_SIZE
+	def LOG_CHUNK_START = 4096u64;          // block 1
+	def LOG_CHUNK_END = 8192u64;
+	def BLOCK_TABLE_ENTRIES = 9u64;         // numBlocks + 1
+	def BLOCK_TABLE_START = 32408u64;       // SIZE - BLOCK_TABLE_ENTRIES * BlockEntry.size
+	def SENTINEL_START = 80u64;             // PWRegionHeader.size
+	def SENTINEL_COUNT = 8u64;              // BlockLists.MAX_LISTS
+}
+
+// Installs the trace recorder on the region *before* PWRegion ever sees it.
+// This is precisely why PWRegion must read its provider from the region rather
+// than construct one unconditionally: the recorder has to already be the
+// region's single provider when format() issues its very first store.
+class TracePWRegionBackend extends TxnRegionBackend {
+	var region: PmemMmapRegion;
+
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def mapping = Mmap.reserve(size, MmapRegionUtils.convertProt(prot));
+		if (mapping == null) return null;
+		region = PmemMmapRegion.new(mapping, -1);
+		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		return region;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "trace-pmem";
+	}
+
+	def recorder() -> RecordingPersistentOperations {
+		if (region == null) return null;
+		return RecordingPersistentOperations.!(region.persistentOperations());
+	}
+}
 
 class PersistentOperationsTester(t: Tester) {
 	var data = Array<byte>.new(4096);
@@ -38,6 +84,96 @@ class PersistentOperationsTester(t: Tester) {
 
 	def recorderOf(region: PmemMmapRegion) -> RecordingPersistentOperations {
 		return RecordingPersistentOperations.!(region.persistentOperations());
+	}
+
+	// Every recorded store must satisfy the crash model's scalar-atomicity
+	// baseline (docs/pmem-crash-model.md): a naturally aligned 1/2/4/8-byte
+	// store that lies inside the region and never spans two cache lines. A
+	// store violating this could tear in a way the explorer does not model.
+	def assertStoreContract(events: Vector<PersistentTraceEvent>, regionSize: u64) {
+		for (i < events.length) {
+			def e = events[i];
+			if (e.kind != PersistentEventKind.STORE) continue;
+			def width = u64.view(e.width);
+			t.assertz(true, width == 1 || width == 2 || width == 4 || width == 8);
+			t.assertz(true, e.offset % width == 0);
+			t.assertz(true, e.offset <= regionSize && width <= regionSize - e.offset);
+			t.assertz(true, e.offset / 64u64 == (e.offset + width - 1u64) / 64u64);
+		}
+	}
+
+	// Mark every byte covered by a recorded store, so a format trace can be
+	// checked for complete structural coverage instead of event-by-event.
+	def storeCoverage(events: Vector<PersistentTraceEvent>, regionSize: u64) -> Array<bool> {
+		def covered = Array<bool>.new(int.!(regionSize));
+		for (i < events.length) {
+			def e = events[i];
+			if (e.kind != PersistentEventKind.STORE) continue;
+			for (b < int.view(e.width)) covered[int.!(e.offset) + b] = true;
+		}
+		return covered;
+	}
+
+	def assertCovered(covered: Array<bool>, start: u64, len: u64, expected: bool) {
+		for (i < int.!(len)) t.assertz(expected, covered[int.!(start) + i]);
+	}
+
+	// Both the sentinels and the block table are arrays of BlockEntry. Every
+	// field is written by clearBlockEntry(); bytes +3..+8 are layout padding.
+	def assertBlockEntriesCovered(covered: Array<bool>, start: u64, count: u64) {
+		for (i < int.!(count)) {
+			def base = start + u64.!(i) * u64.!(BlockEntry.size);
+			assertCovered(covered, base, 3u64, true);           // listNum + used
+			assertCovered(covered, base + 3u64, 5u64, false);   // padding gap
+			assertCovered(covered, base + 8u64, 32u64, true);   // prev/next/listPrev/listNext
+		}
+	}
+
+	def noDescs() -> Array<Ref<MetaDataDesc>> {
+		return Array<Ref<MetaDataDesc>>.new(0);
+	}
+
+	// Two descriptors with distinct, non-default field values, so a swapped or
+	// wrongly-sized descriptor store cannot pass unnoticed.
+	def twoDescs() -> Array<Ref<MetaDataDesc>> {
+		def bytes = Array<byte>.new(MetaDataDesc.size * 2);
+		def other = Ref<MetaDataDesc>.at(bytes, 0);
+		other.kind = 0x4f_54_48_45_52u64; // "OTHER"
+		other.fixedBytes = 3u32;
+		other.unitSize = 1024u32;
+		other.bytesPerUnit = 2u32;
+
+		def line = Ref<MetaDataDesc>.at(bytes, MetaDataDesc.size);
+		line.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		line.fixedBytes = 4u32;
+		line.unitSize = 128u32;
+		line.bytesPerUnit = u32.!(LineMark.size);
+
+		def descs = Array<Ref<MetaDataDesc>>.new(2);
+		descs[0] = other;
+		descs[1] = line;
+		return descs;
+	}
+
+	def lineDescs() -> Array<Ref<MetaDataDesc>> {
+		def bytes = Array<byte>.new(MetaDataDesc.size);
+		def line = Ref<MetaDataDesc>.at(bytes, 0);
+		line.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		line.fixedBytes = 0u32;
+		line.unitSize = ImmixPWRegions.DefaultImmixLineSize;
+		line.bytesPerUnit = u32.!(LineMark.size);
+
+		def descs = Array<Ref<MetaDataDesc>>.new(1);
+		descs[0] = line;
+		return descs;
+	}
+
+	def indexOfStore(events: Vector<PersistentTraceEvent>, offset: u64) -> int {
+		for (i < events.length) {
+			def e = events[i];
+			if (e.kind == PersistentEventKind.STORE && e.offset == offset) return i;
+		}
+		return -1;
 	}
 }
 
@@ -278,6 +414,198 @@ def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTeste
 	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistentEventKind.CLWB);
 	tc.assertSequences(recorder.events);
 	region.destroy();
+}
+
+// The store audit's core regression: PWRegion.format() builds the entire region
+// image through the seam, so a recorded trace is a complete description of what
+// was written. Asserted structurally -- the trace is several hundred events, and
+// pinning each one would break on any benign layout change.
+def test_persistent_pwregion_format_trace(tc: PersistentOperationsTester) {
+	def backend = TracePWRegionBackend.new();
+	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
+		TracePWRegions.BLOCK_SIZE, true);
+	if (backend.region == null) {
+		tc.t.fail("format trace mapping allocation failed");
+		return;
+	}
+	tc.t.assertz(true, region.backendRegion != null);
+	def events = backend.recorder().events;
+	def size = TracePWRegions.SIZE;
+
+	tc.assertSequences(events);
+	tc.assertStoreContract(events, size);
+
+	// Structural coverage: every field format() is responsible for is written,
+	// and the two known holes stay holes.
+	def covered = tc.storeCoverage(events, size);
+	tc.assertCovered(covered, 0u64, 40u64, true);           // blockTable..numDescs
+	// PWRegionHeader.metaData (+40) is deliberately never written by format();
+	// it keeps its zero-initialized value. Asserted so the hole is documented
+	// rather than silently absorbed by a weaker check.
+	tc.assertCovered(covered, 40u64, 8u64, false);
+	tc.assertCovered(covered, 48u64, 32u64, true);          // metaDataDescs..logChunk
+	tc.assertBlockEntriesCovered(covered, TracePWRegions.SENTINEL_START,
+		TracePWRegions.SENTINEL_COUNT);
+	tc.assertBlockEntriesCovered(covered, TracePWRegions.BLOCK_TABLE_START,
+		TracePWRegions.BLOCK_TABLE_ENTRIES);
+
+	// One total order: the WAL's own fresh-header stores are interleaved into
+	// PWRegion's linkage stores, bounded by the logChunk field store that
+	// precedes ensureWal() and the magic store that ends format().
+	def logChunkField = tc.indexOfStore(events, u64.view(PWRegionHeader.logChunk.offset));
+	def magicField = tc.indexOfStore(events, u64.view(PWRegionHeader.magic.offset));
+	tc.t.assertz(true, logChunkField >= 0);
+	tc.t.assertz(true, magicField > logChunkField);
+	var sawLogChunkStore = false;
+	for (i < events.length) {
+		def e = events[i];
+		if (e.kind != PersistentEventKind.STORE) continue;
+		if (e.offset < TracePWRegions.LOG_CHUNK_START) continue;
+		if (e.offset >= TracePWRegions.LOG_CHUNK_END) continue;
+		sawLogChunkStore = true;
+		tc.t.assertz(true, i > logChunkField && i < magicField);
+	}
+	tc.t.assertz(true, sawLogChunkStore);
+
+	// Publication: format() ends by flushing the whole region under one fence.
+	// The magic store is the last store, and nothing is written after the
+	// publication run begins.
+	def lines = int.!(size / 64u64);
+	def fenceIndex = events.length - 1;
+	def runStart = fenceIndex - lines;
+	tc.t.assertz(true, events[fenceIndex].kind == PersistentEventKind.SFENCE);
+	for (i < lines) {
+		def e = events[runStart + i];
+		tc.t.assertz(true, e.kind == PersistentEventKind.CLWB);
+		tc.t.assert_eq(u64.!(i) * 64u64, e.offset);
+	}
+	tc.t.assert_eq(runStart - 1, magicField);
+	region.deallocate();
+}
+
+// Descriptor fields are the only place the allocator needs a 4-byte store, so
+// this pins the u32/u64 width split that a Ref<> field assignment used to hide.
+def test_persistent_pwregion_format_descriptor_trace(tc: PersistentOperationsTester) {
+	def backend = TracePWRegionBackend.new();
+	def descs = tc.twoDescs();
+	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, descs,
+		TracePWRegions.BLOCK_SIZE, true);
+	if (backend.region == null) {
+		tc.t.fail("descriptor trace mapping allocation failed");
+		return;
+	}
+	def events = backend.recorder().events;
+	tc.assertStoreContract(events, TracePWRegions.SIZE);
+
+	def hdr = region.getHeader();
+	tc.t.assert_eq(2u64, hdr.numDescs);
+	def descsOffset = hdr.metaDataDescs;
+
+	for (d < 2) {
+		def base = descsOffset + u64.!(d) * u64.!(MetaDataDesc.size);
+		def source = descs[d];
+		// Exactly five stores land in this descriptor, in field order.
+		def found = Vector<PersistentTraceEvent>.new();
+		for (i < events.length) {
+			def e = events[i];
+			if (e.kind != PersistentEventKind.STORE) continue;
+			if (e.offset < base) continue;
+			if (e.offset >= base + u64.!(MetaDataDesc.size)) continue;
+			found.put(e);
+		}
+		tc.t.assert_eq(5, found.length);
+		tc.assertStore(found[0], found[0].seq,
+			base + u64.view(MetaDataDesc.kind.offset), 8u8, source.kind);
+		tc.assertStore(found[1], found[1].seq,
+			base + u64.view(MetaDataDesc.fixedBytes.offset), 4u8, u64.!(source.fixedBytes));
+		tc.assertStore(found[2], found[2].seq,
+			base + u64.view(MetaDataDesc.unitSize.offset), 4u8, u64.!(source.unitSize));
+		tc.assertStore(found[3], found[3].seq,
+			base + u64.view(MetaDataDesc.bytesPerUnit.offset), 4u8, u64.!(source.bytesPerUnit));
+		tc.assertStore(found[4], found[4].seq,
+			base + u64.view(MetaDataDesc.offset.offset), 8u8,
+			region.getMetaDataDesc(u64.!(d)).offset);
+	}
+
+	// The 4-byte layout gap at +20 is never stored.
+	def covered = tc.storeCoverage(events, TracePWRegions.SIZE);
+	for (d < 2) {
+		def base = descsOffset + u64.!(d) * u64.!(MetaDataDesc.size);
+		tc.assertCovered(covered, base + 20u64, 4u64, false);
+	}
+	region.deallocate();
+}
+
+// Once the region is mounted, allocator mutations must reach the region only as
+// WAL after-images applied *after* the commit boundary. With every store now
+// observable, that ordering is directly checkable rather than inferred.
+def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentOperationsTester) {
+	def backend = TracePWRegionBackend.new();
+	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
+		TracePWRegions.BLOCK_SIZE, true);
+	if (backend.region == null) {
+		tc.t.fail("alloc trace mapping allocation failed");
+		return;
+	}
+	def recorder = backend.recorder();
+	recorder.clear();
+
+	def chunk = region.allocChunk(1u32);
+	tc.t.assertz(false, chunk.isNull());
+	def events = recorder.events;
+	tc.assertSequences(events);
+	tc.assertStoreContract(events, TracePWRegions.SIZE);
+
+	// The commit point is the first fence of the transaction.
+	var commitFence = -1;
+	for (i < events.length) {
+		if (commitFence < 0 && events[i].kind == PersistentEventKind.SFENCE) commitFence = i;
+	}
+	tc.t.assertz(true, commitFence > 0);
+
+	var sawRecordStore = false;
+	var sawAfterImage = false;
+	for (i < events.length) {
+		def e = events[i];
+		if (e.kind != PersistentEventKind.STORE) continue;
+		def inLog = e.offset >= TracePWRegions.LOG_CHUNK_START
+			&& e.offset < TracePWRegions.LOG_CHUNK_END;
+		if (inLog) {
+			// Record construction precedes the commit boundary.
+			sawRecordStore = true;
+			tc.t.assertz(true, i < commitFence);
+		} else {
+			// Region data is only written after its redo record is durable.
+			sawAfterImage = true;
+			tc.t.assertz(true, i > commitFence);
+			// The region header is written by format() alone.
+			tc.t.assertz(true, e.offset >= TracePWRegions.SENTINEL_START);
+		}
+	}
+	tc.t.assertz(true, sawRecordStore);
+	tc.t.assertz(true, sawAfterImage);
+	region.deallocate();
+}
+
+// Immix line marks are deliberately transient: they bypass the WAL and the
+// persistence boundaries, so they must not appear in a persistence trace at
+// all. After the store audit they are the only remaining direct stores in the
+// allocator, so this documents that end state as intentional.
+def test_persistent_immix_line_marks_emit_no_events(tc: PersistentOperationsTester) {
+	def backend = TracePWRegionBackend.new();
+	def region = ImmixPWRegion.new(backend, TracePWRegions.BLOCKS, tc.lineDescs(),
+		TracePWRegions.BLOCK_SIZE, true);
+	if (backend.region == null) {
+		tc.t.fail("line-mark trace mapping allocation failed");
+		return;
+	}
+	tc.t.assertz(true, region.backendRegion != null);
+	def recorder = backend.recorder();
+	recorder.clear();
+
+	region.resetAllLineMarks();
+	tc.t.assert_eq(0, recorder.events.length);
+	region.deallocate();
 }
 
 // Reopen and invoke the production recovery implementation against the same
