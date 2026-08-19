@@ -1,0 +1,209 @@
+// Schedule enumeration over a recorded trace: which durable images a crash at
+// one cut can leave behind.
+//
+// Second slice of milestone 4 in docs/pmem-crash-model.md. PersistentCrashMachine
+// defines the transitions; this layer searches them. A state is the machine's
+// trace position plus the two per-line prefix lengths, so equivalent schedules
+// -- the same writebacks completed in a different order, or at a different
+// event boundary -- collapse to one state, and the durable bytes are only
+// materialized for the states that are actually reported.
+//
+// Two searches are provided and are required to agree:
+//
+//   - the full search branches on every permitted writeback at every event
+//     boundary, which is the model stated in the document and is exponential;
+//   - the reduced search replays the trace with no voluntary writeback at all
+//     and then enumerates the per-line prefixes reachable from the resulting
+//     state.
+//
+// The reduction is sound and complete under the baseline profile because a
+// durable prefix only grows, a fence's obligation is fixed by the CLWBs that
+// precede it and not by which voluntary writebacks happened first, and
+// background eviction may complete any pending prefix at the crash boundary
+// itself. So the images reachable at a cut are exactly the per-line prefixes at
+// or above the fence-forced floor. `persistent_explore:reduction_agrees_with_full_search`
+// checks that claim executably at every cut of several traces rather than
+// leaving it as an argument.
+//
+// Still out of scope: feeding an image into real recovery (milestone 5) and
+// attaching one to PersistentCounterexample.
+
+// The distinct durable images a crash at one cut can produce, plus how much of
+// the state space was actually searched. {truncated} is never silent: a budget
+// that stopped the search is reported and rendered.
+class PersistentExploration(trace: PersistentTrace, crashAfter: int,
+	images: Array<PersistentDurableImage>, statesVisited: int, truncated: bool) {
+
+	def imageCount() -> int {
+		return images.length;
+	}
+
+	def digests() -> Array<u64> {
+		def out = Array<u64>.new(images.length);
+		for (i < images.length) out[i] = images[i].digest();
+		return out;
+	}
+
+	def containsDigest(digest: u64) -> bool {
+		for (i < images.length) if (images[i].digest() == digest) return true;
+		return false;
+	}
+
+	def containsImage(image: PersistentDurableImage) -> bool {
+		if (image == null) return false;
+		return containsDigest(image.digest());
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put2("--- pmem-exploration %s crash-after=%d", trace.name, crashAfter);
+		buf.put1(" of %d", trace.length()).ln();
+		buf.put2("states=%d images=%d truncated=", statesVisited, images.length);
+		buf.puts(if(truncated, "true", "false")).ln();
+		def d = digests();
+		for (i < d.length) buf.puts("image digest=0x").putx_64(d[i]).ln();
+		buf.put1("--- end pmem-exploration %s", trace.name).ln();
+		return buf;
+	}
+
+	def toArtifact() -> string {
+		return render(StringBuilder.new()).toString();
+	}
+}
+
+component PersistentExplorer {
+	// States a search may enqueue before it reports itself truncated.
+	def DEFAULT_BUDGET = 8192;
+
+	// Full search: branch on every permitted writeback at every event boundary,
+	// deduplicating states. This is the model as stated, and is the reference
+	// the reduced search is checked against.
+	def crashImages(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
+		budget: int) -> PersistentExploration {
+
+		def m = PersistentCrashMachine.new(trace, initial);
+		def cut = clampCut(trace, crashAfter);
+		def frontier = Vector<PersistentMachineState>.new();
+		def seen = HashMap<u64, Vector<PersistentMachineState>>.new(hashState, u64.==);
+		def images = Vector<PersistentDurableImage>.new();
+		def imageDigests = Vector<u64>.new();
+		var truncated = false;
+
+		enqueue(frontier, seen, m.snapshot());
+		var head = 0;
+		while (head < frontier.length) {
+			def state = frontier[head];
+			head++;
+			m.restore(state);
+			if (m.position() == cut) recordImage(images, imageDigests, m.crash());
+
+			// A dirty line may complete any prefix of its pending stores here,
+			// whether or not a CLWB asked for it: the torn-line and background
+			// eviction rules are the same branch.
+			for (i < m.lineCount()) {
+				def durable = m.durableInLine(i);
+				def pending = m.storesInLine(i) - durable;
+				for (k < pending) {
+					m.restore(state);
+					m.writebackAt(i, durable + k + 1);
+					enqueue(frontier, seen, m.snapshot());
+				}
+			}
+			if (m.position() < cut) {
+				m.restore(state);
+				m.step();
+				enqueue(frontier, seen, m.snapshot());
+			}
+			if (frontier.length > budgetOf(budget)) {
+				truncated = true;
+				break;
+			}
+		}
+		return PersistentExploration.new(trace, cut, images.extract(), frontier.length, truncated);
+	}
+
+	// Reduced search: replay to the cut with no voluntary writeback, which
+	// leaves each line at its fence-forced floor, then enumerate the per-line
+	// prefixes at or above that floor. Same image set, without the intermediate
+	// schedule states.
+	def reducedCrashImages(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
+		budget: int) -> PersistentExploration {
+
+		def m = PersistentCrashMachine.new(trace, initial);
+		def cut = clampCut(trace, crashAfter);
+		m.runTo(cut);
+		def floor = m.snapshot();
+
+		def lines = m.lineCount();
+		def counts = Array<int>.new(lines);
+		def limits = Array<int>.new(lines);
+		for (i < lines) {
+			counts[i] = floor.durableCounts[i];
+			limits[i] = m.storesInLine(i);
+		}
+
+		def images = Vector<PersistentDurableImage>.new();
+		def imageDigests = Vector<u64>.new();
+		var truncated = false;
+		var more = true;
+		var states = 0;
+		while (more) {
+			if (states >= budgetOf(budget)) {
+				truncated = true;
+				break;
+			}
+			states++;
+			m.restore(PersistentMachineState.new(cut, Arrays.dup(counts), floor.requiredCounts));
+			recordImage(images, imageDigests, m.crash());
+
+			// Odometer over the per-line prefix lengths, least significant line first.
+			more = false;
+			for (i < lines) {
+				if (counts[i] < limits[i]) {
+					counts[i]++;
+					more = true;
+					break;
+				}
+				counts[i] = floor.durableCounts[i];
+			}
+		}
+		return PersistentExploration.new(trace, cut, images.extract(), states, truncated);
+	}
+
+	private def budgetOf(budget: int) -> int {
+		return if(budget > 0, budget, DEFAULT_BUDGET);
+	}
+
+	private def clampCut(trace: PersistentTrace, crashAfter: int) -> int {
+		if (crashAfter < 0) return 0;
+		if (crashAfter > trace.length()) return trace.length();
+		return crashAfter;
+	}
+
+	private def recordImage(images: Vector<PersistentDurableImage>, digests: Vector<u64>,
+		image: PersistentDurableImage) {
+		def d = image.digest();
+		for (i < digests.length) if (digests[i] == d) return;
+		digests.put(d);
+		images.put(image);
+	}
+
+	// Enqueue a state unless an equal one was already reached. The hash is only
+	// a bucket key; states are compared field by field, so a collision costs a
+	// comparison rather than a dropped schedule.
+	private def enqueue(frontier: Vector<PersistentMachineState>,
+		seen: HashMap<u64, Vector<PersistentMachineState>>,
+		state: PersistentMachineState) {
+
+		def key = state.hash();
+		var bucket = seen[key];
+		if (bucket == null) {
+			bucket = Vector<PersistentMachineState>.new();
+			seen[key] = bucket;
+		}
+		for (i < bucket.length) if (bucket[i].sameState(state)) return;
+		bucket.put(state);
+		frontier.put(state);
+	}
+
+	private def hashState(key: u64) => i32.view(key ^ (key >> 32));
+}

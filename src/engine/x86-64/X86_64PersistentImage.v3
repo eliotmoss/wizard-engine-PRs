@@ -89,12 +89,45 @@ class PersistentLineState(line: u64) {
 	var requiredCount = 0;
 }
 
+// A machine state: the trace position and, per line, how many of its stores are
+// durable and how many an outstanding writeback request owes the next fence.
+// The durable image is a function of this, so an exploration deduplicates on
+// states and materializes bytes only for the ones it reports.
+class PersistentMachineState(pos: int, durableCounts: Array<int>, requiredCounts: Array<int>) {
+
+	def sameState(that: PersistentMachineState) -> bool {
+		if (that == null || that.pos != pos) return false;
+		if (that.durableCounts.length != durableCounts.length) return false;
+		for (i < durableCounts.length) {
+			if (durableCounts[i] != that.durableCounts[i]) return false;
+			if (requiredCounts[i] != that.requiredCounts[i]) return false;
+		}
+		return true;
+	}
+
+	def hash() -> u64 {
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		h = mix(h, u64.!(pos));
+		for (i < durableCounts.length) {
+			h = mix(h, u64.!(durableCounts[i]));
+			h = mix(h, u64.!(requiredCounts[i]));
+		}
+		return h;
+	}
+
+	private def mix(h: u64, v: u64) -> u64 {
+		def r = (h << 7) | (h >> 57);
+		return (r ^ v) * 0x1000_0000_01B3_u64;
+	}
+}
+
 // Replays a trace against cache-line state and yields the durable image a crash
 // at the current position would leave. Event execution is fixed by the trace;
 // every durability choice is a separate call, which is exactly the branching
 // point the explorer will enumerate.
 class PersistentCrashMachine {
 	def trace: PersistentTrace;
+	private var initialBytes: Array<byte>;
 	private var durable: Array<byte>;
 	private var lineStates: Array<PersistentLineState>;
 	private var pos = 0;
@@ -102,7 +135,8 @@ class PersistentCrashMachine {
 	// {initial} is the region's durable content before the scenario ran; null
 	// means a zeroed region.
 	new(trace, initial: Array<byte>) {
-		durable = PersistentImages.startingImage(trace.regionBytes, initial);
+		initialBytes = PersistentImages.startingImage(trace.regionBytes, initial);
+		durable = Arrays.dup(initialBytes);
 		def touched = trace.touchedLines();
 		lineStates = Array<PersistentLineState>.new(touched.length);
 		for (i < touched.length) lineStates[i] = PersistentLineState.new(touched[i]);
@@ -195,6 +229,60 @@ class PersistentCrashMachine {
 	// event boundary.
 	def evictAll() {
 		for (i < lineStates.length) drainTo(lineStates[i], lineStates[i].stores.length);
+	}
+
+	// Index-based view of the same state, for an explorer that branches over
+	// every line at every step and should not pay a lookup per branch.
+	def lineCount() -> int {
+		return lineStates.length;
+	}
+
+	def lineAt(index: int) -> u64 {
+		return lineStates[index].line;
+	}
+
+	def storesInLine(index: int) -> int {
+		return lineStates[index].stores.length;
+	}
+
+	def durableInLine(index: int) -> int {
+		return lineStates[index].durableCount;
+	}
+
+	def requiredInLine(index: int) -> int {
+		return lineStates[index].requiredCount;
+	}
+
+	def writebackAt(index: int, count: int) -> int {
+		return drainTo(lineStates[index], count);
+	}
+
+	// The machine's whole state: trace position plus the two per-line prefix
+	// lengths. The durable image is a function of these, so an exploration can
+	// enumerate states and materialize bytes only when it needs them.
+	def snapshot() -> PersistentMachineState {
+		def durableCounts = Array<int>.new(lineStates.length);
+		def requiredCounts = Array<int>.new(lineStates.length);
+		for (i < lineStates.length) {
+			durableCounts[i] = lineStates[i].durableCount;
+			requiredCounts[i] = lineStates[i].requiredCount;
+		}
+		return PersistentMachineState.new(pos, durableCounts, requiredCounts);
+	}
+
+	// Return to a previously snapshotted state. The durable image is rebuilt
+	// from the pre-scenario bytes, since a writeback cannot be undone in place.
+	def restore(state: PersistentMachineState) {
+		pos = 0;
+		for (i < lineStates.length) lineStates[i].stores.clear();
+		while (pos < state.pos) step();
+		Arrays.copyInto(initialBytes, durable, 0);
+		for (i < lineStates.length) {
+			def st = lineStates[i];
+			st.durableCount = 0;
+			st.requiredCount = state.requiredCounts[i];
+			drainTo(st, state.durableCounts[i]);
+		}
 	}
 
 	// The durable image a crash at the current position leaves behind: caches,

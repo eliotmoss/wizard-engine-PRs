@@ -1,0 +1,320 @@
+// Schedule-enumeration tests (second slice of milestone 4 in
+// docs/pmem-crash-model.md). These pin which durable images a crash at one cut
+// can produce, that equivalent schedules deduplicate to one state, that a
+// budget is reported rather than silently applied, and that the reduced search
+// agrees with the full one at every cut.
+
+def PET = UnitTests.registerT("persistent_explore:", _, PersistentExplorerTester.new, _);
+def PETX = [
+	PET("single_store_has_two_images", test_explore_single_store_has_two_images),
+	PET("fence_forces_one_image", test_explore_fence_forces_one_image),
+	PET("independent_lines_multiply", test_explore_independent_lines_multiply),
+	PET("torn_prefixes_enumerated", test_explore_torn_prefixes_enumerated),
+	PET("fence_floor_limits_later_stores", test_explore_fence_floor_limits_later_stores),
+	PET("brackets_lazy_and_eager", test_explore_brackets_lazy_and_eager),
+	PET("reduction_agrees_with_full_search", test_explore_reduction_agrees_with_full_search),
+	PET("budget_truncates_and_reports", test_explore_budget_truncates_and_reports),
+	PET("real_wal_images_at_boundaries", test_explore_real_wal_images_at_boundaries),
+	()
+];
+
+class PersistentExplorerTester(t: Tester) {
+	def A = 0x1111_2222_3333_4444_u64;
+	def B = 0x5555_6666_7777_8888_u64;
+	def C = 0x9999_AAAA_BBBB_CCCC_u64;
+
+	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistentTraceEvent {
+		return PersistentTraceEvent(seq, PersistentEventKind.STORE, offset, width, value);
+	}
+
+	def clwb(seq: u64, cacheLine: u64) -> PersistentTraceEvent {
+		return PersistentTraceEvent(seq, PersistentEventKind.CLWB, cacheLine, 0u8, 0u64);
+	}
+
+	def fence(seq: u64) -> PersistentTraceEvent {
+		return PersistentTraceEvent(seq, PersistentEventKind.SFENCE, 0u64, 0u8, 0u64);
+	}
+
+	def trace(name: string, events: Array<PersistentTraceEvent>) -> PersistentTrace {
+		def result = PersistentTrace.new(name, 256u64, events);
+		def check = result.validate();
+		if (!check.ok()) {
+			t.fail(check.render(StringBuilder.new().puts("test trace is not modelable: ")).toString());
+		}
+		return result;
+	}
+
+	def explore(tr: PersistentTrace, cut: int) -> PersistentExploration {
+		return PersistentExplorer.crashImages(tr, null, cut, 0);
+	}
+
+	def reduced(tr: PersistentTrace, cut: int) -> PersistentExploration {
+		return PersistentExplorer.reducedCrashImages(tr, null, cut, 0);
+	}
+
+	// Same set of durable images, regardless of the order they were found in.
+	def assertSameImages(expected: PersistentExploration, got: PersistentExploration) {
+		t.asserti(expected.imageCount(), got.imageCount());
+		def d = expected.digests();
+		for (i < d.length) t.assertz(true, got.containsDigest(d[i]));
+	}
+
+	def countOf(text: string, needle: string) -> int {
+		if (needle.length == 0 || needle.length > text.length) return 0;
+		var found = 0;
+		for (i < text.length - needle.length + 1) {
+			var hit = true;
+			for (j < needle.length) if (text[i + j] != needle[j]) hit = false;
+			if (hit) found++;
+		}
+		return found;
+	}
+
+	def makePmemRegion() -> PmemMmapRegion {
+		def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = PmemMmapRegion.new(mapping, -1);
+		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		return region;
+	}
+}
+
+// One unflushed store is one bit of freedom: the crash either caught the
+// eviction or it did not.
+def test_explore_single_store_has_two_images(tc: PersistentExplorerTester) {
+	def tr = tc.trace("one_store", [tc.store(1u64, 8u64, 8u8, tc.A)]);
+
+	def before = tc.explore(tr, 0);
+	tc.t.asserti(1, before.imageCount());
+	tc.t.assertz(false, before.truncated);
+
+	def after = tc.explore(tr, 1);
+	tc.t.asserti(2, after.imageCount());
+	tc.t.assertz(true, after.containsImage(PersistentImages.lazyCrash(tr, null, 1)));
+	tc.t.assertz(true, after.containsImage(PersistentImages.eagerCrash(tr, null, 1)));
+	// Three states: nothing done, the store executed, the store written back.
+	tc.t.asserti(3, after.statesVisited);
+}
+
+// A completed fence removes the freedom it covers: after it, the store is
+// durable on every schedule, so the cut has exactly one image. This is what
+// makes the WAL's commit point a commit point.
+def test_explore_fence_forces_one_image(tc: PersistentExplorerTester) {
+	def tr = tc.trace("fenced", [
+		tc.store(1u64, 8u64, 8u8, tc.A),
+		tc.clwb(2u64, 0u64),
+		tc.fence(3u64)
+	]);
+
+	def atFence = tc.explore(tr, 3);
+	tc.t.asserti(1, atFence.imageCount());
+	tc.t.assert_eq(tc.A, atFence.images[0].read(8u64, 8));
+
+	// Before the fence returns, both outcomes are still reachable.
+	tc.t.asserti(2, tc.explore(tr, 2).imageCount());
+}
+
+// Different cache lines are independent, so their freedom multiplies rather
+// than being decided together by one all-or-nothing flush.
+def test_explore_independent_lines_multiply(tc: PersistentExplorerTester) {
+	def tr = tc.trace("two_lines", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.store(2u64, 128u64, 8u8, tc.B)
+	]);
+
+	def all = tc.explore(tr, 2);
+	tc.t.asserti(4, all.imageCount());
+	tc.t.assertz(false, all.truncated);
+
+	var withFirst = 0;
+	var withSecond = 0;
+	for (i < all.images.length) {
+		if (all.images[i].read(0u64, 8) == tc.A) withFirst++;
+		if (all.images[i].read(128u64, 8) == tc.B) withSecond++;
+	}
+	tc.t.asserti(2, withFirst);
+	tc.t.asserti(2, withSecond);
+}
+
+// A line's writeback may stop after any of its stores, so three stores on one
+// line give four images -- the partially constructed WAL record states the
+// model must not collapse away.
+def test_explore_torn_prefixes_enumerated(tc: PersistentExplorerTester) {
+	def tr = tc.trace("one_line_three_stores", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.store(2u64, 8u64, 8u8, tc.B),
+		tc.store(3u64, 16u64, 8u8, tc.C)
+	]);
+
+	def all = tc.explore(tr, 3);
+	tc.t.asserti(4, all.imageCount());
+	// Program order holds in every image: a later store is never durable while
+	// an earlier one on the same line is missing.
+	for (i < all.images.length) {
+		def img = all.images[i];
+		if (img.read(8u64, 8) != 0u64) tc.t.assert_eq(tc.A, img.read(0u64, 8));
+		if (img.read(16u64, 8) != 0u64) tc.t.assert_eq(tc.B, img.read(8u64, 8));
+	}
+}
+
+// A fence sets a floor, not a ceiling: stores made after the CLWB on the same
+// line stay free, so the cut keeps exactly the freedom the protocol left open.
+def test_explore_fence_floor_limits_later_stores(tc: PersistentExplorerTester) {
+	def tr = tc.trace("floor", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.clwb(2u64, 0u64),
+		tc.fence(3u64),
+		tc.store(4u64, 8u64, 8u8, tc.B)
+	]);
+
+	def all = tc.explore(tr, 4);
+	tc.t.asserti(2, all.imageCount());
+	for (i < all.images.length) tc.t.assert_eq(tc.A, all.images[i].read(0u64, 8));
+	tc.t.assertz(true, all.containsImage(PersistentImages.lazyCrash(tr, null, 4)));
+	tc.t.assertz(true, all.containsImage(PersistentImages.eagerCrash(tr, null, 4)));
+}
+
+// The two canonical schedules are the extremes of the search, so an exploration
+// that lost either of them has lost the weakest and strongest images recovery
+// must cope with.
+def test_explore_brackets_lazy_and_eager(tc: PersistentExplorerTester) {
+	def tr = tc.trace("mixed", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.clwb(2u64, 0u64),
+		tc.store(3u64, 128u64, 4u8, 0x1234_5678_u64),
+		tc.fence(4u64),
+		tc.store(5u64, 8u64, 2u8, 0xABCDu64)
+	]);
+
+	for (cut < tr.length() + 1) {
+		def all = tc.explore(tr, cut);
+		tc.t.assertz(false, all.truncated);
+		tc.t.assertz(true, all.containsImage(PersistentImages.lazyCrash(tr, null, cut)));
+		tc.t.assertz(true, all.containsImage(PersistentImages.eagerCrash(tr, null, cut)));
+	}
+}
+
+// The reduction claim, checked rather than argued: replaying with no voluntary
+// writeback and then enumerating per-line prefixes above the fence-forced floor
+// reaches exactly the images the full branching search reaches.
+def test_explore_reduction_agrees_with_full_search(tc: PersistentExplorerTester) {
+	def traces = [
+		tc.trace("r_one_line", [
+			tc.store(1u64, 0u64, 8u8, tc.A),
+			tc.store(2u64, 8u64, 8u8, tc.B),
+			tc.clwb(3u64, 0u64),
+			tc.fence(4u64),
+			tc.store(5u64, 16u64, 8u8, tc.C)
+		]),
+		tc.trace("r_two_lines", [
+			tc.store(1u64, 0u64, 8u8, tc.A),
+			tc.store(2u64, 64u64, 8u8, tc.B),
+			tc.clwb(3u64, 64u64),
+			tc.fence(4u64),
+			tc.store(5u64, 72u64, 4u8, 0x2222_3333_u64),
+			tc.clwb(6u64, 0u64),
+			tc.fence(7u64)
+		]),
+		tc.trace("r_overwrite", [
+			tc.store(1u64, 32u64, 8u8, tc.A),
+			tc.store(2u64, 32u64, 8u8, tc.B),
+			tc.clwb(3u64, 0u64),
+			tc.fence(4u64)
+		])
+	];
+
+	for (i < traces.length) {
+		def tr = traces[i];
+		for (cut < tr.length() + 1) {
+			def full = tc.explore(tr, cut);
+			tc.t.assertz(false, full.truncated);
+			def small = tc.reduced(tr, cut);
+			tc.t.assertz(false, small.truncated);
+			tc.assertSameImages(full, small);
+		}
+	}
+}
+
+// A search that ran out of budget must say so: a truncated exploration is not
+// evidence that no other image exists.
+def test_explore_budget_truncates_and_reports(tc: PersistentExplorerTester) {
+	def tr = tc.trace("budgeted", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.store(2u64, 8u64, 8u8, tc.B),
+		tc.store(3u64, 64u64, 8u8, tc.C),
+		tc.store(4u64, 128u64, 8u8, tc.A)
+	]);
+
+	def complete = tc.explore(tr, 4);
+	tc.t.assertz(false, complete.truncated);
+	// Three lines, one holding two stores: 3 * 2 * 2 prefix combinations.
+	tc.t.asserti(12, complete.imageCount());
+
+	def capped = PersistentExplorer.crashImages(tr, null, 4, 4);
+	tc.t.assertz(true, capped.truncated);
+	tc.t.assertz(true, capped.imageCount() <= complete.imageCount());
+
+	def cappedReduced = PersistentExplorer.reducedCrashImages(tr, null, 4, 2);
+	tc.t.assertz(true, cappedReduced.truncated);
+	tc.t.asserti(2, cappedReduced.imageCount());
+
+	// The rendering carries the flag, so a stored artifact cannot be mistaken
+	// for an exhaustive result.
+	def artifact = capped.toArtifact();
+	tc.t.assertz(true, Strings.startsWith(artifact, "--- pmem-exploration budgeted crash-after=4 of 4\n"));
+	tc.t.asserti(1, tc.countOf(artifact, "truncated=true"));
+	tc.t.asserti(capped.imageCount(), tc.countOf(artifact, "image digest=0x"));
+	tc.t.asserti(1, tc.countOf(artifact, "--- end pmem-exploration budgeted"));
+	tc.t.asserti(1, tc.countOf(complete.toArtifact(), "truncated=false"));
+}
+
+// The model applied to a recorded production trace: at the commit point the
+// record is durable on every schedule while the after-image has not been
+// written yet, and once the scenario has flushed and fenced every line it
+// touched the cut has exactly one image.
+def test_explore_real_wal_images_at_boundaries(tc: PersistentExplorerTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("trace mapping allocation failed");
+		return;
+	}
+	def recorder = RecordingPersistentOperations.!(region.persistentOperations());
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+
+	def value = 0x8877_6655_4433_2211_u64;
+	recorder.clear();
+	tc.t.assertz(true, wal.append(200u64, value, 8u8));
+	tc.t.assert_eq(1u64, wal.commit());
+	tc.t.assertz(true, wal.applyUpdate(200u64, value, 8u8));
+	tc.t.assertz(true, wal.persistAppliedData());
+	def tr = recorder.snapshot("dual_wal_commit_apply_flush");
+	tc.t.assertz(true, tr.validate().ok());
+
+	// Everything touched has been flushed and fenced, so no freedom is left.
+	def atEnd = PersistentExplorer.reducedCrashImages(tr, null, tr.length(), 0);
+	tc.t.assertz(false, atEnd.truncated);
+	tc.t.asserti(1, atEnd.imageCount());
+	tc.t.assert_eq(value, atEnd.images[0].read(200u64, 8));
+	tc.t.assertz(true, atEnd.containsImage(PersistentImages.lazyCrash(tr, null, tr.length())));
+
+	// At the commit point the record is durable on every schedule; the
+	// after-image has not been stored yet, so no image can contain it.
+	def commitFence = tr.length() - 3;
+	def atCommit = PersistentExplorer.reducedCrashImages(tr, null, commitFence, 0);
+	tc.t.assertz(false, atCommit.truncated);
+	tc.t.asserti(1, atCommit.imageCount());
+	tc.t.assertz(false, 0u64 == atCommit.images[0].read(1536u64, 8));
+	tc.t.assert_eq(0u64, atCommit.images[0].read(200u64, 8));
+
+	// One event later the after-image exists but is unflushed: two images, and
+	// the record survives in both.
+	def applied = PersistentExplorer.reducedCrashImages(tr, null, commitFence + 1, 0);
+	tc.t.asserti(2, applied.imageCount());
+	for (i < applied.images.length) {
+		tc.t.assertz(false, 0u64 == applied.images[i].read(1536u64, 8));
+	}
+	tc.t.assertz(true, applied.containsImage(PersistentImages.lazyCrash(tr, null, commitFence + 1)));
+	tc.t.assertz(true, applied.containsImage(PersistentImages.eagerCrash(tr, null, commitFence + 1)));
+	region.destroy();
+}

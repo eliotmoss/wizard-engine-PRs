@@ -387,6 +387,59 @@ therefore still carry the schedule prefix rather than the bytes it produced.
 
 ---
 
+## Enumerating schedules
+
+`src/engine/x86-64/X86_64PersistentExplorer.v3` searches the machine's
+transitions for the durable images one crash cut can produce.
+
+A search state is the machine's trace position plus the two per-line prefix
+lengths — nothing else. Durable bytes are a function of that state, so
+equivalent schedules (the same writebacks completed in a different order, or at
+a different event boundary) collapse to one state, and an image is materialized
+only for a state that is actually reported. States are bucketed by a hash and
+then compared field by field, so a hash collision costs a comparison rather
+than a dropped schedule.
+
+`crashImages()` is the full search: from every state it branches on each line's
+permitted writeback prefixes — the torn-line and background-eviction rules are
+the same branch — and on executing the next trace event, until the cut. Every
+visited state at the cut contributes its image, including states reached by
+evictions after the last event and before the crash. It is exponential, so it
+takes a state budget; exceeding it sets `truncated`, which the result and its
+rendering both carry. A truncated exploration is not evidence that no other
+image exists.
+
+`reducedCrashImages()` is the same answer without the intermediate schedule
+states: replay to the cut with no voluntary writeback, which leaves each line at
+its fence-forced floor, then enumerate the per-line prefixes at or above that
+floor. The reduction is sound and complete under the baseline profile because
+
+- a durable prefix only ever grows;
+- a fence's obligation is fixed by the `CLWB`s preceding it, not by which
+  voluntary writebacks happened first; and
+- background eviction may complete any pending prefix at the crash boundary
+  itself, so no earlier voluntary writeback reaches an image that the boundary
+  cannot.
+
+The reachable images at a cut are therefore exactly the product of the per-line
+prefix ranges above the floor. That is an argument, so
+`persistent_explore:reduction_agrees_with_full_search` checks it executably
+instead: at every cut of three traces, the two searches must produce the same
+image set.
+
+This is also where the model's shape becomes visible. A completed fence removes
+freedom: after the WAL's commit boundary the record is durable on every
+schedule, so that cut has exactly one image, while the cut one event later — the
+after-image applied but not yet flushed — has two. Independent lines multiply
+rather than being decided together, and program order within a line holds in
+every image, so a partially constructed record is a state the search produces
+rather than one it collapses away.
+
+Not yet: handing an image to real recovery (milestone 5), and attaching one to
+`PersistentCounterexample`.
+
+---
+
 ## Trace exploration and real recovery
 
 A trace can be recorded once up to the first crash because persistence does not
@@ -517,8 +570,11 @@ second representation of the protocol.
    writeback completion, fence obligations, background eviction, and crash-image
    generation, in `PersistentCrashMachine`/`PersistentDurableImage`, with the
    lazy/eager extremal schedules and an image digest for deduplication (see
-   "Durable images and cache-line state" above). **Remaining:** enumerating the
-   schedules between the two extremes and deduplicating the states they reach.
+   "Durable images and cache-line state" above). **Second slice completed
+   2026-08-19:** the full branching search with state deduplication and a
+   reported budget, and an equivalent reduced search justified by the
+   monotonicity of durable prefixes and checked against the full search at every
+   cut (see "Enumerating schedules" above).
 5. Feed every generated image into real WAL recovery and assert the core
    acknowledgement properties.
 6. Add direct allocator invariant walkers and the initial scenario matrix.
