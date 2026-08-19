@@ -107,7 +107,8 @@ PWRegion (block allocator)
 
 | File | Role |
 |------|------|
-| `src/engine/TxnBackend.v3` | Abstract `BackendRegion` / `TxnRegionBackend` interfaces; `VolatileBackend` |
+| `src/engine/TxnBackend.v3` | Abstract `BackendRegion` / `TxnRegionBackend` interfaces; `VolatileBackend`; the `PersistentOperations` store/flush/fence seam |
+| `X86_64PersistentOperations.v3` | Production + trace-recording `PersistentOperations` providers; `X86_64PersistentOps.ensureFor()` installs one provider per region. Every persistent store on the active path (`PWRegion.format()`, `DirectRegionWriter`, `DualTxnWal`) goes through it, giving one total `STORE`/`CLWB`/`SFENCE` order |
 | `X86_64TxnBackend.v3` | `FileMmapRegion`, `PmemMmapRegion`, `FdMmapRegion`; `RegionFileIO`; `X86_64Backends` factory |
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, `ImmixPWRegion` |
 | `X86_64SingleTxnWal.v3` | Single-transaction in-region WAL — superseded, **not wired in**; kept as a reference implementation (see `docs/wal-comparison.md`) |
@@ -145,7 +146,7 @@ The superseded protocols are retained for comparison, **not wired in** — `Sing
 - `MmapRegionUtils.flushCacheLine` / `storeFence` are no-op placeholders — need Virgil inline-asm or intrinsic support for CLWB/SFENCE (`X86_64TxnBackend.v3:88-100`)
 - WAL overflow in `SingleTxnWal.append` (the superseded reference WAL) silently drops entries when block 1 is full; the active `DualTxnWal` surfaces an oversized transaction via a failed `commit()` instead (per-transaction capacity ≈ half the log chunk minus headers)
 - `Backends.getMmap()` declared but not implemented
-- `ImmixPWRegion` line marks are explicitly transient: mark/reset bypass the WAL and persistence boundaries, so callers must rebuild them after a crash
+- `ImmixPWRegion` line marks are explicitly transient: mark/reset bypass the WAL and persistence boundaries, so callers must rebuild them after a crash. They are also the only remaining direct stores in the allocator — every other persistent store on the active path goes through the `PersistentOperations` seam
 - `RegionTransaction.clear()` allocates a new `HashMap` on every commit (GC pressure)
 - `RegionTransaction` is aligned-access only — mixed-width overlapping reads cause silent cache misses
 

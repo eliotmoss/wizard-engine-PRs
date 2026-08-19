@@ -180,10 +180,14 @@ sfence()
 ```
 
 `BackendRegion` owns the provider, so dependency injection is explicit and
-there is no global trace state. `DualTxnWal` obtains that exact provider from
-its backend region. `PmemMmapRegion` uses the same object while translating
-`prepareChangedRange()` and persistence boundaries, which gives one total
-order across all three event kinds.
+there is no global trace state. `DualTxnWal` and `PWRegion` both obtain that
+exact provider from the backend region through
+`X86_64PersistentOps.ensureFor()`. `PmemMmapRegion` uses the same object while
+translating `prepareChangedRange()` and persistence boundaries, which gives one
+total order across all three event kinds. Sharing a single provider object per
+region is what makes that order total: a second, uninstalled provider would
+produce events interleaved with, but not ordered against, the writeback and
+fence stream.
 
 `X86_64PersistentOperations` is the production implementation. Scalar methods
 perform the same `Pointer.store` operations as before; x86-64 supplies the
@@ -216,13 +220,39 @@ Loads remain direct and uninstrumented. Naturally aligned supported stores are
 checked before recording, so an invalid internal layout store fails immediately
 instead of entering a trace.
 
-The seam is not yet region-wide. `PWRegion.format()` still directly constructs
-the region header, sentinels, block table, and metadata descriptors before its
-whole-region `persistRange`. Non-cached allocator handle setters, retained
-`SingleTxnWal`/`MultiTxnWal`, and intentionally transient Immix line marks also
-remain outside it. Normal allocator transactions use `RegionTransaction` and
-therefore reach the instrumented active `DualTxnWal` for both their records and
-their applied after-images.
+The seam now covers the whole active path. `PWRegion.format()` writes the region
+header, sentinels, block table, and metadata descriptors through a
+`DirectRegionWriter` — a non-transactional writer over the same provider —
+before its whole-region `persistRange`, and the non-cached `BlockEntryHandle`
+and `ChunkHandle` setters take that writer as an explicit parameter. The
+provider is resolved once in the `PWRegion` constructor via
+`X86_64PersistentOps.ensureFor()`, which installs the production provider on
+regions that lack one (notably `VolatileRegion`) so that one object serves the
+whole region; `DualTxnWal` uses the same helper. Normal allocator transactions
+continue through `RegionTransaction` to the instrumented `DualTxnWal` for both
+their records and their applied after-images.
+
+Two categories remain outside the seam, both deliberately:
+
+- **Immix line marks** (`LineMarkHandle.setMark`, `resetAllLineMarks`) are
+  explicitly transient. They bypass the WAL and the persistence boundaries by
+  design and must be rebuilt after a crash, so they are not persistent state
+  the explorer should model. They are now the only direct stores left in the
+  allocator, and `persistent_ops:immix_line_marks_emit_no_events` pins that.
+- **`SingleTxnWal` and `MultiTxnWal`** are retained comparison implementations
+  that are not wired into the commit path, so their stores can never appear in
+  a trace of a running region.
+
+Keeping the direct writer and `RegionTransaction` as separate types with
+distinct setter names (`setUsed(w, …)` versus `setUsedCached(txn, …)`) is a
+safety property, not just style: an allocator mutation that accidentally
+bypassed the WAL would fail to compile rather than silently escape the log.
+
+`PWRegion` validates its geometry before formatting, because the provider
+rejects a misaligned or out-of-range store by aborting the process rather than
+returning an error. A block size that is not a multiple of 8 (which would
+misalign the block table) and a region too small to hold the header, log chunk,
+metadata and one free block are both refused up front.
 
 Tracing only `prepareChangedRange()` is not enough: it occurs after the stores,
 aggregates ranges, and cannot represent a partially constructed record that
@@ -345,6 +375,9 @@ second representation of the protocol.
    store/flush/fence interface, its x86-64 production provider, and the typed
    in-memory provider used to pin active-WAL ordering. All active `DualTxnWal`
    persistent stores and PMEM writeback/fence requests share this seam.
+   **Store audit completed 2026-08-14:** `PWRegion.format()` and the non-cached
+   allocator handle setters now route through the same provider, so a recorded
+   trace is a complete description of the active path's persistent writes.
 3. Integrate recorded events into deterministic counterexample artifacts and
    scenario capture. The in-memory recorder and stable per-event rendering
    exist, but no explorer/counterexample artifact or durable-state trace format
