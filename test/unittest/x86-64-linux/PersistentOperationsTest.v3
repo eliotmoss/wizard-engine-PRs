@@ -90,15 +90,12 @@ class PersistentOperationsTester(t: Tester) {
 	// baseline (docs/pmem-crash-model.md): a naturally aligned 1/2/4/8-byte
 	// store that lies inside the region and never spans two cache lines. A
 	// store violating this could tear in a way the explorer does not model.
+	// PersistentTrace.validate() is the single definition of that baseline, so
+	// this checks the frozen trace rather than restating the rules.
 	def assertStoreContract(events: Vector<PersistentTraceEvent>, regionSize: u64) {
-		for (i < events.length) {
-			def e = events[i];
-			if (e.kind != PersistentEventKind.STORE) continue;
-			def width = u64.view(e.width);
-			t.assertz(true, width == 1 || width == 2 || width == 4 || width == 8);
-			t.assertz(true, e.offset % width == 0);
-			t.assertz(true, e.offset <= regionSize && width <= regionSize - e.offset);
-			t.assertz(true, e.offset / 64u64 == (e.offset + width - 1u64) / 64u64);
+		def check = PersistentTrace.new("store-contract", regionSize, events.copy()).validate();
+		if (!check.ok()) {
+			t.fail(check.render(StringBuilder.new().puts("store contract violated: ")).toString());
 		}
 	}
 

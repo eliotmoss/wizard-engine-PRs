@@ -1,0 +1,376 @@
+// Trace-capture and counterexample-artifact tests (milestone 3 of
+// docs/pmem-crash-model.md). These pin the frozen-snapshot semantics, the
+// crash-cut prefix, the model-conformance validator, the content digest used
+// for schedule deduplication, and the two stable artifact renderings. No DAX
+// mapping or PMEM hardware is required.
+
+def PTT = UnitTests.registerT("persistent_trace:", _, PersistentTraceTester.new, _);
+def PTTX = [
+	PTT("snapshot_freezes_recorder", test_trace_snapshot_freezes_recorder),
+	PTT("capture_resets_and_names_scenario", test_trace_capture_resets_and_names_scenario),
+	PTT("artifact_rendering_is_stable", test_trace_artifact_rendering_is_stable),
+	PTT("digest_identifies_content", test_trace_digest_identifies_content),
+	PTT("prefix_cuts_at_crash_point", test_trace_prefix_cuts_at_crash_point),
+	PTT("touched_lines_bound_state_space", test_trace_touched_lines_bound_state_space),
+	PTT("validate_accepts_recorded_wal_commit", test_trace_validate_accepts_recorded_wal_commit),
+	PTT("validate_rejects_unmodelable_events", test_trace_validate_rejects_unmodelable_events),
+	PTT("counterexample_artifact_renders", test_trace_counterexample_artifact_renders),
+	()
+];
+
+class PersistentTraceTester(t: Tester) {
+	def data = Array<byte>.new(4096);
+	def recorder = RecordingPersistentOperations.new(data[0 ..+ data.length]);
+
+	// Body of the captured scenario used by capture_resets_and_names_scenario;
+	// a named delegate keeps the capture helper's contract (clear, run, freeze)
+	// visible at the call site.
+	def scenarioBody() {
+		recorder.storeU32(64u64, 0x0102_0304_u32);
+		recorder.clwb(64u64);
+		recorder.sfence();
+	}
+
+	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistentTraceEvent {
+		return PersistentTraceEvent(seq, PersistentEventKind.STORE, offset, width, value);
+	}
+
+	def clwb(seq: u64, cacheLine: u64) -> PersistentTraceEvent {
+		return PersistentTraceEvent(seq, PersistentEventKind.CLWB, cacheLine, 0u8, 0u64);
+	}
+
+	def fence(seq: u64) -> PersistentTraceEvent {
+		return PersistentTraceEvent(seq, PersistentEventKind.SFENCE, 0u64, 0u8, 0u64);
+	}
+
+	// The three-event trace used by the rendering and digest tests.
+	def demoTrace(name: string) -> PersistentTrace {
+		def events = [
+			store(1u64, 8u64, 8u8, 0x0000_DEAD_BEEF_u64),
+			clwb(2u64, 0u64),
+			fence(3u64)
+		];
+		return PersistentTrace.new(name, 256u64, events);
+	}
+
+	def assertDefect(trace: PersistentTrace, defect: PersistentTraceDefect, index: int) {
+		def check = trace.validate();
+		t.assertz(false, check.ok());
+		t.assertz(true, check.defect == defect);
+		t.asserti(index, check.index);
+	}
+
+	def assertLines(expected: Array<u64>, got: Array<u64>) {
+		t.asserti(expected.length, got.length);
+		if (expected.length != got.length) return;
+		for (i < expected.length) t.assert_eq(expected[i], got[i]);
+	}
+
+	def makePmemRegion() -> PmemMmapRegion {
+		def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = PmemMmapRegion.new(mapping, -1);
+		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		return region;
+	}
+
+	def recorderOf(region: PmemMmapRegion) -> RecordingPersistentOperations {
+		return RecordingPersistentOperations.!(region.persistentOperations());
+	}
+}
+
+// A snapshot is a copy, not a view: the recorder can keep running, be cleared,
+// and be re-run without mutating an artifact already taken. Without this, an
+// explorer that recorded one scenario per region would silently compare
+// artifacts that had all drifted to the latest events.
+def test_trace_snapshot_freezes_recorder(tc: PersistentTraceTester) {
+	tc.recorder.storeU8(0u64, 0x11u8);
+	tc.recorder.storeU16(2u64, 0x2233u16);
+	def early = tc.recorder.snapshot("early");
+
+	tc.recorder.sfence();
+	def late = tc.recorder.snapshot("late");
+
+	tc.t.asserti(2, early.length());
+	tc.t.asserti(3, late.length());
+	tc.t.assert_string("early", early.name);
+	tc.t.assert_string("late", late.name);
+	tc.t.assert_eq(4096u64, early.regionBytes);
+	tc.t.asserti(2, early.count(PersistentEventKind.STORE));
+	tc.t.asserti(0, early.count(PersistentEventKind.SFENCE));
+	tc.t.asserti(1, late.count(PersistentEventKind.SFENCE));
+
+	// Clearing and re-recording must not reach back into either snapshot.
+	tc.recorder.clear();
+	tc.recorder.storeU64(8u64, 0x99u64);
+	tc.t.asserti(2, early.length());
+	tc.t.asserti(3, late.length());
+	tc.t.assert_eq(2u64, early.events[1].offset);
+	tc.t.assert_eq(2u8, early.events[1].width);
+	tc.t.assert_eq(0x2233u64, early.events[1].value);
+	tc.t.assertz(true, late.validate().ok());
+}
+
+// capture() is the reproducibility contract: the recorder is reset first, so an
+// artifact contains exactly its own scenario and its sequence numbers restart
+// at one even when the region was already written to.
+def test_trace_capture_resets_and_names_scenario(tc: PersistentTraceTester) {
+	tc.recorder.storeU8(0u64, 0x77u8);
+	tc.recorder.storeU8(1u64, 0x88u8);
+
+	def trace = PersistentTraces.capture(tc.recorder, "scenario", tc.scenarioBody);
+
+	tc.t.asserti(3, trace.length());
+	tc.t.assert_string("scenario", trace.name);
+	tc.t.assert_eq(1u64, trace.events[0].seq);
+	tc.t.assert_eq(3u64, trace.events[2].seq);
+	tc.t.assertz(true, trace.events[0].kind == PersistentEventKind.STORE);
+	tc.t.assert_eq(64u64, trace.events[0].offset);
+	tc.t.assertz(true, trace.events[1].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, trace.events[2].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, trace.validate().ok());
+
+	// The stores still happened against live bytes; only the events were reset.
+	tc.t.assert_eq(0x77u8, tc.data[0]);
+	tc.t.assert_eq(0x04u8, tc.data[64]);
+	tc.t.asserti(3, tc.recorder.events.length);
+}
+
+// The artifact rendering is the stored form of a counterexample, so its exact
+// shape is part of the contract: a header with the geometry and event census, a
+// fixed-width content digest, one line per event, and a matching footer.
+def test_trace_artifact_rendering_is_stable(tc: PersistentTraceTester) {
+	def trace = tc.demoTrace("demo");
+	def expected = StringBuilder.new()
+		.puts("--- pmem-trace demo\n")
+		.puts("region-bytes=256 cache-line=64 events=3 stores=1 clwbs=1 fences=1 lines=1 digest=0x")
+		.putx_64(trace.digest()).ln()
+		.puts("STORE(seq=1, offset=8, width=8, value=0xDEADBEEF)\n")
+		.puts("CLWB(seq=2, cacheLine=0)\n")
+		.puts("SFENCE(seq=3)\n")
+		.puts("--- end pmem-trace demo\n")
+		.toString();
+	tc.t.assert_string(expected, trace.toArtifact());
+
+	// Rendering must be a pure function of the trace.
+	tc.t.assert_string(trace.toArtifact(), trace.toArtifact());
+
+	// The digest field is a fixed-width 16-digit uppercase hex number, so
+	// artifacts stay column-stable and greppable across runs.
+	def digest = StringBuilder.new().putx_64(trace.digest()).toString();
+	tc.t.asserti(16, digest.length);
+	for (i < digest.length) {
+		def c = digest[i];
+		tc.t.assertz(true, (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'));
+	}
+}
+
+// The digest identifies behavior, so equivalent schedules deduplicate to one
+// artifact while any change in geometry or in any event field does not.
+def test_trace_digest_identifies_content(tc: PersistentTraceTester) {
+	def base = tc.demoTrace("demo");
+	def sameEventsOtherName = tc.demoTrace("other-name");
+	tc.t.assert_eq(base.digest(), sameEventsOtherName.digest());
+
+	def otherGeometry = PersistentTrace.new("demo", 512u64, base.events);
+	tc.t.assert_ne(base.digest(), otherGeometry.digest());
+
+	def changedValue = PersistentTrace.new("demo", 256u64,
+		[tc.store(1u64, 8u64, 8u8, 0x0000_DEAD_BEEE_u64), tc.clwb(2u64, 0u64), tc.fence(3u64)]);
+	tc.t.assert_ne(base.digest(), changedValue.digest());
+
+	def changedOffset = PersistentTrace.new("demo", 256u64,
+		[tc.store(1u64, 16u64, 8u8, 0x0000_DEAD_BEEF_u64), tc.clwb(2u64, 0u64), tc.fence(3u64)]);
+	tc.t.assert_ne(base.digest(), changedOffset.digest());
+
+	def changedWidth = PersistentTrace.new("demo", 256u64,
+		[tc.store(1u64, 8u64, 4u8, 0x0000_DEAD_BEEF_u64), tc.clwb(2u64, 0u64), tc.fence(3u64)]);
+	tc.t.assert_ne(base.digest(), changedWidth.digest());
+
+	// Same fields, different kinds and different order: a fence swapped with a
+	// writeback is a different persistence schedule, not a duplicate.
+	def reordered = PersistentTrace.new("demo", 256u64,
+		[tc.store(1u64, 8u64, 8u8, 0x0000_DEAD_BEEF_u64), tc.fence(2u64), tc.clwb(3u64, 0u64)]);
+	tc.t.assert_ne(base.digest(), reordered.digest());
+
+	def shifted = PersistentTrace.new("demo", 256u64,
+		[tc.store(2u64, 8u64, 8u8, 0x0000_DEAD_BEEF_u64), tc.clwb(3u64, 0u64), tc.fence(4u64)]);
+	tc.t.assert_ne(base.digest(), shifted.digest());
+}
+
+// prefix() is the crash cut the explorer branches on. Cuts clamp at both ends
+// so a walk over 0..length() needs no special cases, and a cut trace is a
+// first-class trace: it validates, renders, and digests as its own artifact.
+def test_trace_prefix_cuts_at_crash_point(tc: PersistentTraceTester) {
+	def full = tc.demoTrace("demo");
+
+	def empty = full.prefix(0);
+	tc.t.asserti(0, empty.length());
+	tc.t.assertz(true, empty.validate().ok());
+	tc.t.asserti(0, empty.touchedLines().length);
+	tc.t.assert_string("demo", empty.name);
+	tc.t.assert_eq(256u64, empty.regionBytes);
+
+	def cut = full.prefix(2);
+	tc.t.asserti(2, cut.length());
+	tc.t.assert_eq(1u64, cut.events[0].seq);
+	tc.t.assert_eq(2u64, cut.events[1].seq);
+	tc.t.asserti(1, cut.count(PersistentEventKind.STORE));
+	tc.t.asserti(1, cut.count(PersistentEventKind.CLWB));
+	tc.t.asserti(0, cut.count(PersistentEventKind.SFENCE));
+	tc.t.assertz(true, cut.validate().ok());
+
+	// Distinct cuts are distinct artifacts.
+	tc.t.assert_ne(full.digest(), cut.digest());
+	tc.t.assert_ne(cut.digest(), empty.digest());
+
+	// Clamping, in both directions.
+	tc.t.asserti(3, full.prefix(3).length());
+	tc.t.asserti(3, full.prefix(99).length());
+	tc.t.assert_eq(full.digest(), full.prefix(99).digest());
+	tc.t.asserti(0, full.prefix(-1).length());
+
+	// The cut is a copy: the original trace keeps its full length.
+	tc.t.asserti(3, full.length());
+}
+
+// touchedLines() bounds the explorer's per-line state: ascending, deduplicated,
+// stores only. A writeback of a line nothing wrote is not state to track.
+def test_trace_touched_lines_bound_state_space(tc: PersistentTraceTester) {
+	def trace = PersistentTrace.new("lines", 4096u64, [
+		tc.store(1u64, 192u64, 8u8, 0x1u64),
+		tc.store(2u64, 8u64, 8u8, 0x2u64),
+		tc.store(3u64, 63u64, 1u8, 0x3u64),   // still line 0
+		tc.store(4u64, 128u64, 4u8, 0x4u64),
+		tc.store(5u64, 200u64, 1u8, 0x5u64),  // still line 192
+		tc.clwb(6u64, 1024u64),               // never stored to
+		tc.fence(7u64)
+	]);
+	tc.assertLines([0u64, 128u64, 192u64], trace.touchedLines());
+	tc.t.assertz(true, trace.validate().ok());
+}
+
+// A trace of the real WAL commit path must be modelable end to end: every
+// recorded store obeys the scalar-atomicity baseline, and the lines it touches
+// are exactly the record's three lines plus the after-image's line.
+def test_trace_validate_accepts_recorded_wal_commit(tc: PersistentTraceTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+
+	def value = 0x8877_6655_4433_2211_u64;
+	recorder.clear();
+	tc.t.assertz(true, wal.append(200u64, value, 8u8));
+	tc.t.assert_eq(1u64, wal.commit());
+	tc.t.assertz(true, wal.applyUpdate(200u64, value, 8u8));
+	tc.t.assertz(true, wal.persistAppliedData());
+	def trace = recorder.snapshot("dual_wal_commit_apply_flush");
+
+	def check = trace.validate();
+	if (!check.ok()) {
+		tc.t.fail(check.render(StringBuilder.new().puts("recorded WAL trace is not modelable: ")).toString());
+	}
+	tc.t.assert_eq(4096u64, trace.regionBytes);
+	// Two boundaries: the commit point and the explicit flush.
+	tc.t.asserti(2, trace.count(PersistentEventKind.SFENCE));
+	// Slot 1 spans lines 1536/1600/1664; the after-image at offset 200 is line 192.
+	tc.assertLines([192u64, 1536u64, 1600u64, 1664u64], trace.touchedLines());
+	tc.t.assert_eq(u64.!(trace.length()), trace.events[trace.length() - 1].seq);
+
+	// Every cut of a modelable trace is itself modelable, so the explorer can
+	// crash anywhere in this scenario without first re-validating.
+	for (i < trace.length() + 1) tc.t.assertz(true, trace.prefix(i).validate().ok());
+	region.destroy();
+}
+
+// A trace the model cannot represent must be rejected at capture time rather
+// than explored and reported as evidence. Each case names the first defect and
+// the event it occurred at.
+def test_trace_validate_rejects_unmodelable_events(tc: PersistentTraceTester) {
+	def good = tc.store(1u64, 0u64, 8u8, 0u64);
+
+	tc.assertDefect(PersistentTrace.new("seq", 256u64,
+		[good, tc.store(1u64, 8u64, 8u8, 0u64)]),
+		PersistentTraceDefect.NON_ASCENDING_SEQ, 1);
+
+	tc.assertDefect(PersistentTrace.new("width", 256u64,
+		[good, tc.store(2u64, 16u64, 3u8, 0u64)]),
+		PersistentTraceDefect.UNSUPPORTED_WIDTH, 1);
+
+	tc.assertDefect(PersistentTrace.new("range", 256u64,
+		[good, tc.store(2u64, 256u64, 8u8, 0u64)]),
+		PersistentTraceDefect.STORE_OUT_OF_RANGE, 1);
+
+	// Overflow-safe rejection: offset + width would wrap.
+	tc.assertDefect(PersistentTrace.new("overflow", 256u64,
+		[good, tc.store(2u64, 0xFFFF_FFFF_FFFF_FFF8_u64, 8u8, 0u64)]),
+		PersistentTraceDefect.STORE_OUT_OF_RANGE, 1);
+
+	// An 8-byte store starting at 60 would tear across two cache lines.
+	tc.assertDefect(PersistentTrace.new("crossing", 256u64,
+		[good, tc.clwb(2u64, 0u64), tc.store(3u64, 60u64, 8u8, 0u64)]),
+		PersistentTraceDefect.STORE_CROSSES_LINE, 2);
+
+	// Unaligned but line-contained: a distinct defect from crossing.
+	tc.assertDefect(PersistentTrace.new("aligned", 256u64,
+		[good, tc.store(2u64, 4u64, 8u8, 0u64)]),
+		PersistentTraceDefect.UNALIGNED_STORE, 1);
+
+	tc.assertDefect(PersistentTrace.new("clwb_align", 256u64,
+		[good, tc.clwb(2u64, 32u64)]),
+		PersistentTraceDefect.CLWB_UNALIGNED, 1);
+
+	tc.assertDefect(PersistentTrace.new("clwb_range", 256u64,
+		[good, tc.clwb(2u64, 256u64)]),
+		PersistentTraceDefect.CLWB_OUT_OF_RANGE, 1);
+
+	// The empty and all-good traces are usable, and a passing check reports no
+	// event index.
+	def ok = PersistentTrace.new("ok", 256u64, [good, tc.clwb(2u64, 0u64), tc.fence(3u64)]);
+	def check = ok.validate();
+	tc.t.assertz(true, check.ok());
+	tc.t.asserti(-1, check.index);
+	tc.t.assert_string("ok", check.render(StringBuilder.new()).toString());
+	tc.t.assert_string("store is not naturally aligned at event 1",
+		PersistentTraceCheck(PersistentTraceDefect.UNALIGNED_STORE, 1)
+			.render(StringBuilder.new()).toString());
+}
+
+// The counterexample artifact carries the failed property, the crash cut, and
+// the events that had executed by then -- everything needed to replay a failing
+// exploration without re-running it.
+def test_trace_counterexample_artifact_renders(tc: PersistentTraceTester) {
+	def trace = tc.demoTrace("demo");
+	def cx = PersistentCounterexample.new("two_slot_commit",
+		"acknowledged transaction survives",
+		"slot 1 record valid but after-image absent", trace, 2);
+
+	def cut = cx.cutTrace();
+	tc.t.asserti(2, cut.length());
+	tc.t.assert_eq(trace.prefix(2).digest(), cut.digest());
+
+	def expected = StringBuilder.new()
+		.puts("=== pmem-counterexample two_slot_commit\n")
+		.puts("property: acknowledged transaction survives\n")
+		.puts("detail: slot 1 record valid but after-image absent\n")
+		.puts("crash-after-event: 2 of 3\n")
+		.puts("--- pmem-trace demo\n")
+		.puts("region-bytes=256 cache-line=64 events=2 stores=1 clwbs=1 fences=0 lines=1 digest=0x")
+		.putx_64(cut.digest()).ln()
+		.puts("STORE(seq=1, offset=8, width=8, value=0xDEADBEEF)\n")
+		.puts("CLWB(seq=2, cacheLine=0)\n")
+		.puts("--- end pmem-trace demo\n")
+		.puts("=== end pmem-counterexample two_slot_commit\n")
+		.toString();
+	tc.t.assert_string(expected, cx.toArtifact());
+
+	// A crash cut past the end of the trace still renders the whole trace.
+	def whole = PersistentCounterexample.new("two_slot_commit", "p", "d", trace, 99);
+	tc.t.asserti(3, whole.cutTrace().length());
+	tc.t.assert_eq(trace.digest(), whole.cutTrace().digest());
+}
