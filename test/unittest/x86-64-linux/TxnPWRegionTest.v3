@@ -30,6 +30,8 @@ def X = [
 	T("exhaust_free_blocks",       test_exhaust_free_blocks),
 	T("coalesce_right",            test_coalesce_right),
 	T("commit_clears_transaction", test_commit_clears_transaction),
+	T("unaligned_block_size_rejected", test_unaligned_block_size_rejected),
+	T("undersized_region_rejected", test_undersized_region_rejected),
 	()
 ];
 
@@ -253,6 +255,41 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 	tc.t.assertz(false, tc.region.txn.isDirty());
 	tc.region.allocChunk(1u32);
 	tc.t.assertz(false, tc.region.txn.isDirty());
+}
+
+// format() writes the block table and descriptors through the persistent-operation
+// seam, which contracts naturally aligned stores and aborts the process on a
+// misaligned one. A block size that is not a multiple of 8 would misalign the
+// block table, so it must be refused at construction instead of reaching the
+// provider. Rejection uses the existing failure contract: a null backend region.
+def test_unaligned_block_size_rejected(tc: PWRegionTester) {
+	def region = PWRegion.new(
+		Backends.getVolatile(),
+		8u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4095u64,
+		true
+	);
+	tc.t.assertz(true, region.backendRegion == null);
+	tc.t.assertz(true, region.txn == null);
+}
+
+// The header, WAL log chunk, metadata blocks and at least one free block must
+// all fit. Below that, format()'s unsigned userDataBlocks computation would
+// underflow and its linkage stores would target a null block-table entry.
+// Rejected before the region is stamped, so nothing advertises itself as valid.
+def test_undersized_region_rejected(tc: PWRegionTester) {
+	def region = PWRegion.new(
+		Backends.getVolatile(),
+		2u64,
+		Array<Ref<MetaDataDesc>>.new(0),
+		4096u64,
+		true
+	);
+	// Geometry is legal, so construction proceeds; format() bails before
+	// stamping the magic, leaving the region unmountable rather than corrupt.
+	tc.t.assertz(true, region.backendRegion != null);
+	tc.t.assertz(false, region.getHeader().magic == PWRegions.MAGIC);
 }
 
 

@@ -210,28 +210,28 @@ type BlockEntryHandle(addr: u64) #unboxed {
                 return toHandle(cache.readI64(addr + u64.view(BlockEntry.listNext.offset)));
         }
 
-        def setListNum(v: i16) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNum.offset)).store<i16>(v);
+        def setListNum(w: DirectRegionWriter, v: i16) {
+                w.writeI16(addr + u64.view(BlockEntry.listNum.offset), v);
         }
 
-        def setUsed(v: bool) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.used.offset)).store<u8>(if(v, 1u8, 0u8));
+        def setUsed(w: DirectRegionWriter, v: bool) {
+                w.writeU8(addr + u64.view(BlockEntry.used.offset), if(v, 1u8, 0u8));
         }
 
-        def setPrev(v: BlockEntryHandle) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.prev.offset)).store<i64>(toOffset(v));
+        def setPrev(w: DirectRegionWriter, v: BlockEntryHandle) {
+                w.writeI64(addr + u64.view(BlockEntry.prev.offset), toOffset(v));
         }
 
-        def setNext(v: BlockEntryHandle) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.next.offset)).store<i64>(toOffset(v));
+        def setNext(w: DirectRegionWriter, v: BlockEntryHandle) {
+                w.writeI64(addr + u64.view(BlockEntry.next.offset), toOffset(v));
         }
 
-        def setListPrev(v: BlockEntryHandle) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listPrev.offset)).store<i64>(toOffset(v));
+        def setListPrev(w: DirectRegionWriter, v: BlockEntryHandle) {
+                w.writeI64(addr + u64.view(BlockEntry.listPrev.offset), toOffset(v));
         }
 
-        def setListNext(v: BlockEntryHandle) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNext.offset)).store<i64>(toOffset(v));
+        def setListNext(w: DirectRegionWriter, v: BlockEntryHandle) {
+                w.writeI64(addr + u64.view(BlockEntry.listNext.offset), toOffset(v));
         }
 
         def setListNumCached(cache: RegionTransaction, v: i16) {
@@ -285,20 +285,20 @@ type ChunkHandle(addr: u64) #unboxed {
                 return getRef().linemarks;
         }
 
-        def setOffset(v: u64) {
-                getRef().offset = v;
+        def setOffset(w: DirectRegionWriter, v: u64) {
+                w.writeU64(addr + u64.view(ChunkHeader.offset.offset), v);
         }
 
-        def setLimit(v: u64) {
-                getRef().limit = v;
+        def setLimit(w: DirectRegionWriter, v: u64) {
+                w.writeU64(addr + u64.view(ChunkHeader.limit.offset), v);
         }
 
-        def setChunkLimit(v: u64) {
-                getRef().chunk_limit = v;
+        def setChunkLimit(w: DirectRegionWriter, v: u64) {
+                w.writeU64(addr + u64.view(ChunkHeader.chunk_limit.offset), v);
         }
 
-        def setLinemarks(v: u64) {
-                getRef().linemarks = v;
+        def setLinemarks(w: DirectRegionWriter, v: u64) {
+                w.writeU64(addr + u64.view(ChunkHeader.linemarks.offset), v);
         }
 
         def setOffsetCached(cache: RegionTransaction, v: u64) {
@@ -351,6 +351,55 @@ type LogEntryHandle(addr: u64) { }
 
 // Wrapper ADT to store the cached value and its width (size)
 type CachedUpdate(value: u64, size: u8) #unboxed { }
+
+// Direct, non-transactional writes to the persistent image through the traced
+// PersistentOperations seam. Legal only where no WAL transaction protects the
+// bytes: format() builds the whole region before the WAL exists and publishes
+// it with a single persistRange(). Steady-state allocator mutations must use
+// RegionTransaction (the *Cached setters) instead.
+//
+// The method names deliberately mirror RegionTransaction's write* family so a
+// direct setter and its *Cached twin read as line-for-line counterparts, and
+// so that bypassing the WAL by accident stays visible at the call site.
+//
+// Addresses are absolute; the seam takes region-relative offsets, so the
+// translation lives here rather than at every call site.
+class DirectRegionWriter {
+        private def ops: PersistentOperations;
+        def regionStart: u64;
+
+        new(ops, regionStart) { }
+
+        // Write BlockEntry.used (u1/bool stored as u8)
+        def writeU8(addr: u64, val: u8) {
+                ops.storeU8(addr - regionStart, val);
+        }
+
+        // Write BlockEntry.listNum
+        def writeI16(addr: u64, val: i16) {
+                ops.storeU16(addr - regionStart, u16.view(val));
+        }
+
+        // Write ChunkHeader.offset, limit
+        def writeU64(addr: u64, val: u64) {
+                ops.storeU64(addr - regionStart, val);
+        }
+
+        // Write BlockEntry.prev, next, listPrev, listNext
+        def writeI64(addr: u64, val: i64) {
+                ops.storeU64(addr - regionStart, u64.view(val));
+        }
+
+        // Region-relative forms, for header and descriptor fields whose offsets
+        // already are (mirrors DualTxnWal's headerStore*/recordStore* split).
+        def writeOffsetU32(offset: u64, val: u32) {
+                ops.storeU32(offset, val);
+        }
+
+        def writeOffsetU64(offset: u64, val: u64) {
+                ops.storeU64(offset, val);
+        }
+}
 
 // A transaction facade over the write-behind cache and redo log.
 // This component buffers writes in DRAM, then commits them through DualTxnWal.
@@ -509,6 +558,7 @@ class PWRegion {
         private var wal: DualTxnWal;
         def var regionStart: u64;
         def var txn: RegionTransaction;
+        private var writer: DirectRegionWriter;
 
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
@@ -520,7 +570,39 @@ class PWRegion {
                 }
                 rng = backendRegion.range;
                 regionStart = u64.view(Pointer.atElement(rng, 0));
+                if (!validGeometry(blockSize)) {
+                        Trace.OUT.put2("PWRegion geometry unsupported: %d blocks of %d bytes",
+                                numBlocks, blockSize).ln();
+                        backendRegion.destroy();
+                        backendRegion = null;
+                        return;
+                }
+                // Resolve before init(): format() writes the header, sentinels,
+                // block table and descriptors through this writer well before
+                // ensureWal() constructs the WAL and its own provider reference.
+                writer = DirectRegionWriter.new(X86_64PersistentOps.ensureFor(backendRegion), regionStart);
                 init(blockSize, forceFormat);
+        }
+
+        // The persistent-operation seam contracts naturally aligned 1/2/4/8-byte
+        // stores and rejects anything else by aborting (System.error), so a
+        // geometry that would misalign a formatted structure must be refused
+        // here rather than reaching the provider. Every structure format()
+        // writes -- the 8-aligned header, 40-byte block entries anchored at the
+        // region end, and 32-byte descriptors -- is naturally aligned exactly
+        // when the region size is a multiple of 8, since 40 % 8 == 0 and
+        // 32 % 8 == 0.
+        private def validGeometry(blockSize: u64) -> bool {
+                if (numBlocks == 0 || blockSize == 0) return false;
+                if (blockSize % 8 != 0) return false;
+                def size = numBlocks * blockSize;
+                // '>' not '!=': an mmap backing store may round the mapping up.
+                if (size > u64.!(rng.length)) return false;
+                def fixed = u64.!(PWRegionHeader.size)
+                        + u64.!(BlockLists.MAX_LISTS) * u64.!(BlockEntry.size)
+                        + (numBlocks + 1) * u64.!(BlockEntry.size)
+                        + u64.!(metaDataDescs.length * MetaDataDesc.size);
+                return fixed <= size;
         }
 
         private def sanitizeOffset(offset: u64) {
@@ -632,17 +714,17 @@ class PWRegion {
 
         // Reset all fields of a block entry to their default (empty) state
         private def clearBlockEntry(entry: BlockEntryHandle) {
-                entry.setListNum(0);
-                entry.setUsed(false);
-                entry.setPrev(NULL_BLOCK_ENTRY);
-                entry.setNext(NULL_BLOCK_ENTRY);
-                entry.setListPrev(NULL_BLOCK_ENTRY);
-                entry.setListNext(NULL_BLOCK_ENTRY);
+                entry.setListNum(writer, 0);
+                entry.setUsed(writer, false);
+                entry.setPrev(writer, NULL_BLOCK_ENTRY);
+                entry.setNext(writer, NULL_BLOCK_ENTRY);
+                entry.setListPrev(writer, NULL_BLOCK_ENTRY);
+                entry.setListNext(writer, NULL_BLOCK_ENTRY);
         }
 
         // Initialize list sentinels just after the region header
         private def headerSetU64(offset: int, value: u64) {
-                (PWRegionUtils.pointerFromU64(regionStart) + offset).store<u64>(value);
+                writer.writeOffsetU64(u64.view(offset), value);
         }
 
         private def formatSentinels() {
@@ -674,7 +756,10 @@ class PWRegion {
         // Allocate metadata descriptor and metadata space from the end of the region
         private def formatMetaData(size: u64, currentRegionEnd: u64) -> u64 {
                 def metaDataDescsSize = u64.!(metaDataDescs.length * MetaDataDesc.size);
-                var end = currentRegionEnd - metaDataDescsSize;
+                // {end} walks downward as each descriptor's metadata is carved off,
+                // so the descriptor table's own base must be captured separately.
+                def descsOffset = currentRegionEnd - metaDataDescsSize;
+                var end = descsOffset;
                 sanitizeOffset(end);
                 headerSetU64(PWRegionHeader.metaDataDescs.offset, end);
                 headerSetU64(PWRegionHeader.numDescs.offset, u64.!(metaDataDescs.length));
@@ -687,12 +772,17 @@ class PWRegion {
                         end -= metaDataSize;
                         sanitizeOffset(end);
 
-                        var newDesc = getMetaDataDesc(u64.!(i));
-                        newDesc.kind = desc.kind;
-                        newDesc.fixedBytes = desc.fixedBytes;
-                        newDesc.unitSize = desc.unitSize;
-                        newDesc.bytesPerUnit = desc.bytesPerUnit;
-                        newDesc.offset = end;
+                        // Written field-by-field through the seam rather than through
+                        // a Ref<MetaDataDesc>, so every descriptor store appears in the
+                        // trace. Note the widths differ: kind/offset are u64, the three
+                        // sizing fields are u32. Bytes +20..+23 are layout padding and
+                        // stay at their zero-initialized value.
+                        def descOffset = descsOffset + u64.!(i * MetaDataDesc.size);
+                        writer.writeOffsetU64(descOffset + u64.view(MetaDataDesc.kind.offset), desc.kind);
+                        writer.writeOffsetU32(descOffset + u64.view(MetaDataDesc.fixedBytes.offset), desc.fixedBytes);
+                        writer.writeOffsetU32(descOffset + u64.view(MetaDataDesc.unitSize.offset), desc.unitSize);
+                        writer.writeOffsetU32(descOffset + u64.view(MetaDataDesc.bytesPerUnit.offset), desc.bytesPerUnit);
+                        writer.writeOffsetU64(descOffset + u64.view(MetaDataDesc.offset.offset), end);
                 }
                 return end;
         }
@@ -713,6 +803,17 @@ class PWRegion {
 
                 var metaDataBytes = u64.!(rng.length) - currentRegionEnd;
                 var metaDataBlocks = (metaDataBytes + (blockSize - 1)) / blockSize;
+                // Block 0 (header), block 1 (WAL log chunk), at least one free block,
+                // and the metadata blocks must all fit. Without this check the
+                // unsigned subtraction below underflows, blockTableHandle[] returns
+                // NULL_BLOCK_ENTRY, and the linkage stores below target address 0.
+                // Returning here leaves the magic unstamped, so a later mount() sees
+                // the mismatch and reformats rather than trusting a partial image.
+                if (numBlocks < metaDataBlocks + 3u64) {
+                        Trace.OUT.put2("region too small to format: %d blocks of %d bytes",
+                                numBlocks, blockSize).ln();
+                        return;
+                }
                 var userDataBlocks = numBlocks - (metaDataBlocks + 1);
 
                 // Set up block list linkage
@@ -726,17 +827,17 @@ class PWRegion {
 
                 // Block 0: region header (METADATA, used)
                 sanitizeAddress(headerBlockHandle.addr);
-                headerBlockHandle.setListNum(ListKind.METADATA.code);
-                headerBlockHandle.setUsed(true);
-                headerBlockHandle.setNext(logBlockHandle);
+                headerBlockHandle.setListNum(writer, ListKind.METADATA.code);
+                headerBlockHandle.setUsed(writer, true);
+                headerBlockHandle.setNext(writer, logBlockHandle);
                 sanitizeOffset(blockTableOffset + u64.!(BlockEntry.size));
 
                 // Block 1: WAL log chunk (METADATA, used)
                 sanitizeAddress(logBlockHandle.addr);
-                logBlockHandle.setListNum(ListKind.METADATA.code);
-                logBlockHandle.setUsed(true);
-                logBlockHandle.setPrev(headerBlockHandle);
-                logBlockHandle.setNext(firstFreeBlockHandle);
+                logBlockHandle.setListNum(writer, ListKind.METADATA.code);
+                logBlockHandle.setUsed(writer, true);
+                logBlockHandle.setPrev(writer, headerBlockHandle);
+                logBlockHandle.setNext(writer, firstFreeBlockHandle);
                 sanitizeOffset(blockTableOffset + 2u64 * u64.!(BlockEntry.size));
 
                 logChunk = blockEntryToChunk(logBlockHandle);
@@ -745,40 +846,40 @@ class PWRegion {
 
                 // Block 2: first free block (LARGE_FREE)
                 sanitizeAddress(firstFreeBlockHandle.addr);
-                firstFreeBlockHandle.setListNum(ListKind.LARGE_FREE.code);
-                firstFreeBlockHandle.setNext(metaHandle);
-                firstFreeBlockHandle.setPrev(logBlockHandle);
-                firstFreeBlockHandle.setListPrev(largeSentinel);
-                firstFreeBlockHandle.setListNext(NULL_BLOCK_ENTRY);
+                firstFreeBlockHandle.setListNum(writer, ListKind.LARGE_FREE.code);
+                firstFreeBlockHandle.setNext(writer, metaHandle);
+                firstFreeBlockHandle.setPrev(writer, logBlockHandle);
+                firstFreeBlockHandle.setListPrev(writer, largeSentinel);
+                firstFreeBlockHandle.setListNext(writer, NULL_BLOCK_ENTRY);
                 sanitizeOffset(blockTableOffset + (userDataBlocks + 1) * u64.!(BlockEntry.size));
                 sanitizeOffset(blockTableOffset);
                 sanitizeOffset(sentinelOffset + u64.!(ListKind.LARGE_FREE.code * i64.!(BlockEntry.size)));
 
                 // Sentinels: small starts empty, large points to firstFreeBlock
                 sanitizeAddress(smallSentinel.addr);
-                smallSentinel.setListNext(NULL_BLOCK_ENTRY);
+                smallSentinel.setListNext(writer, NULL_BLOCK_ENTRY);
                 sanitizeOffset(blockTableOffset);
 
                 sanitizeAddress(largeSentinel.addr);
-                largeSentinel.setListNext(firstFreeBlockHandle);
+                largeSentinel.setListNext(writer, firstFreeBlockHandle);
                 sanitizeOffset(blockTableOffset + u64.!(BlockEntry.size));
 
                 // Metadata block (METADATA, used)
                 sanitizeAddress(metaHandle.addr);
-                metaHandle.setListNum(ListKind.METADATA.code);
-                metaHandle.setUsed(true);
-                metaHandle.setNext(lastHandle);
-                metaHandle.setPrev(firstFreeBlockHandle);
-                metaHandle.setListPrev(NULL_BLOCK_ENTRY);
-                metaHandle.setListNext(NULL_BLOCK_ENTRY);
+                metaHandle.setListNum(writer, ListKind.METADATA.code);
+                metaHandle.setUsed(writer, true);
+                metaHandle.setNext(writer, lastHandle);
+                metaHandle.setPrev(writer, firstFreeBlockHandle);
+                metaHandle.setListPrev(writer, NULL_BLOCK_ENTRY);
+                metaHandle.setListNext(writer, NULL_BLOCK_ENTRY);
                 sanitizeOffset(blockTableOffset + numBlocks * u64.!(BlockEntry.size));
                 sanitizeOffset(blockTableOffset + u64.!(BlockEntry.size));
 
                 // End-of-region marker (NONE, used)
                 sanitizeAddress(lastHandle.addr);
-                lastHandle.setListNum(ListKind.NONE.code);
-                lastHandle.setUsed(true);
-                lastHandle.setPrev(metaHandle);
+                lastHandle.setListNum(writer, ListKind.NONE.code);
+                lastHandle.setUsed(writer, true);
+                lastHandle.setPrev(writer, metaHandle);
                 sanitizeOffset(blockTableOffset + (userDataBlocks + 1) * u64.!(BlockEntry.size));
 
                 headerSetU64(PWRegionHeader.magic.offset, PWRegions.MAGIC);
@@ -989,6 +1090,10 @@ class PWRegion {
                         wal.close();
                         wal = null;
                 }
+                // The writer's provider holds a range over memory that destroy()
+                // is about to unmap; drop it so a stale direct store fails
+                // deterministically instead of writing into unmapped pages.
+                writer = null;
                 if (backendRegion != null) {
                         backendRegion.destroy();
                         backendRegion = null;
