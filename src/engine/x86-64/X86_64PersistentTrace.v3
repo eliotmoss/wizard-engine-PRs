@@ -1,0 +1,229 @@
+// Deterministic capture of recorded persistent-operation traces.
+//
+// Milestone 3 of docs/pmem-crash-model.md. RecordingPersistentOperations
+// produces a live, growing event stream; this layer freezes it into an
+// immutable scenario artifact that can be:
+//
+//   - validated against the crash model's scalar-atomicity baseline, so a
+//     trace the explorer cannot faithfully model is rejected at capture time
+//     rather than silently under-approximated;
+//   - cut at a crash point (prefix), the transition the explorer branches on;
+//   - hashed, so equivalent schedules deduplicate to one artifact; and
+//   - rendered in a stable textual form, so a failing exploration produces a
+//     counterexample that can be stored, diffed, and replayed.
+//
+// Durable images, cache-line state, eviction, and writeback completion are
+// deliberately still out of scope; they arrive with milestones 4 and 5.
+
+// Why a recorded trace cannot be used as a crash-model input.
+enum PersistentTraceDefect(text: string) {
+	NONE("none"),
+	NON_ASCENDING_SEQ("sequence number does not ascend"),
+	UNSUPPORTED_WIDTH("store width is not 1/2/4/8 bytes"),
+	UNALIGNED_STORE("store is not naturally aligned"),
+	STORE_OUT_OF_RANGE("store leaves the region"),
+	STORE_CROSSES_LINE("store spans two cache lines"),
+	CLWB_UNALIGNED("writeback offset is not cache-line aligned"),
+	CLWB_OUT_OF_RANGE("writeback line is outside the region")
+}
+
+// Result of validating a trace: the first defect found and the event index at
+// which it was found (-1 when the trace is usable).
+type PersistentTraceCheck(defect: PersistentTraceDefect, index: int) #unboxed {
+	def ok() -> bool {
+		return defect == PersistentTraceDefect.NONE;
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		if (defect == PersistentTraceDefect.NONE) return buf.puts("ok");
+		return buf.put2("%s at event %d", defect.text, index);
+	}
+}
+
+// An immutable, named snapshot of one recorded scenario.
+class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTraceEvent>) {
+
+	def length() -> int {
+		return events.length;
+	}
+
+	def count(kind: PersistentEventKind) -> int {
+		var n = 0;
+		for (i < events.length) if (events[i].kind == kind) n++;
+		return n;
+	}
+
+	// The trace as it stood after exactly {count} events -- i.e. a crash cut
+	// immediately after that event. Out-of-range cuts clamp, so an explorer can
+	// walk 0..length() without special-casing the ends.
+	def prefix(count: int) -> PersistentTrace {
+		var n = count;
+		if (n < 0) n = 0;
+		if (n > events.length) n = events.length;
+		def cut = Array<PersistentTraceEvent>.new(n);
+		for (i < n) cut[i] = events[i];
+		return PersistentTrace.new(name, regionBytes, cut);
+	}
+
+	// Check the trace against the agreed persistence profile. A store that is
+	// unaligned, oversized, out of region, or spanning two cache lines can tear
+	// in ways the model does not represent, so such a trace must not be
+	// explored and reported as evidence.
+	def validate() -> PersistentTraceCheck {
+		var lastSeq = 0u64;
+		for (i < events.length) {
+			def e = events[i];
+			if (e.seq <= lastSeq) {
+				return PersistentTraceCheck(PersistentTraceDefect.NON_ASCENDING_SEQ, i);
+			}
+			lastSeq = e.seq;
+			match (e.kind) {
+				STORE => {
+					def width = u64.view(e.width);
+					if (width != 1 && width != 2 && width != 4 && width != 8) {
+						return PersistentTraceCheck(PersistentTraceDefect.UNSUPPORTED_WIDTH, i);
+					}
+					// Range before containment, so the sum below cannot overflow.
+					if (e.offset > regionBytes || width > regionBytes - e.offset) {
+						return PersistentTraceCheck(PersistentTraceDefect.STORE_OUT_OF_RANGE, i);
+					}
+					// Containment before alignment: natural alignment already implies
+					// single-line containment for these widths, so checking it first is
+					// what keeps the tearing rule an independently reachable defect.
+					def line = MmapRegionUtils.CACHE_LINE_SIZE;
+					if (e.offset / line != (e.offset + width - 1u64) / line) {
+						return PersistentTraceCheck(PersistentTraceDefect.STORE_CROSSES_LINE, i);
+					}
+					if (e.offset % width != 0) {
+						return PersistentTraceCheck(PersistentTraceDefect.UNALIGNED_STORE, i);
+					}
+				}
+				CLWB => {
+					if (e.offset % MmapRegionUtils.CACHE_LINE_SIZE != 0u64) {
+						return PersistentTraceCheck(PersistentTraceDefect.CLWB_UNALIGNED, i);
+					}
+					if (e.offset >= regionBytes) {
+						return PersistentTraceCheck(PersistentTraceDefect.CLWB_OUT_OF_RANGE, i);
+					}
+				}
+				SFENCE => ;
+			}
+		}
+		return PersistentTraceCheck(PersistentTraceDefect.NONE, -1);
+	}
+
+	// Distinct 64-byte cache lines written by this trace, ascending. This is the
+	// set of lines the explorer must track dirty/version state for, so it bounds
+	// the per-crash-cut state space.
+	def touchedLines() -> Array<u64> {
+		def lines = Vector<u64>.new();
+		for (i < events.length) {
+			def e = events[i];
+			if (e.kind != PersistentEventKind.STORE) continue;
+			def line = e.offset - e.offset % MmapRegionUtils.CACHE_LINE_SIZE;
+			var pos = 0;
+			while (pos < lines.length && lines[pos] < line) pos++;
+			if (pos < lines.length && lines[pos] == line) continue;
+			lines.put(line);
+			var j = lines.length - 1;
+			while (j > pos) {
+				lines[j] = lines[j - 1];
+				j--;
+			}
+			lines[pos] = line;
+		}
+		return lines.extract();
+	}
+
+	// Content hash over the region geometry and every event field. Two captures
+	// that produced the same events are the same trace, so {name} is
+	// deliberately excluded: the digest identifies behavior, not the label the
+	// scenario was recorded under.
+	def digest() -> u64 {
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		h = mix(h, regionBytes);
+		h = mix(h, u64.!(events.length));
+		for (i < events.length) {
+			def e = events[i];
+			h = mix(h, e.seq);
+			h = mix(h, kindCode(e.kind));
+			h = mix(h, e.offset);
+			h = mix(h, u64.view(e.width));
+			h = mix(h, e.value);
+		}
+		return h;
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put1("--- pmem-trace %s", name).ln();
+		buf.put3("region-bytes=%d cache-line=%d events=%d ",
+			regionBytes, MmapRegionUtils.CACHE_LINE_SIZE, events.length);
+		buf.put3("stores=%d clwbs=%d fences=%d ",
+			count(PersistentEventKind.STORE),
+			count(PersistentEventKind.CLWB),
+			count(PersistentEventKind.SFENCE));
+		buf.put1("lines=%d digest=0x", touchedLines().length).putx_64(digest()).ln();
+		for (i < events.length) events[i].render(buf).ln();
+		buf.put1("--- end pmem-trace %s", name).ln();
+		return buf;
+	}
+
+	def toArtifact() -> string {
+		return render(StringBuilder.new()).toString();
+	}
+
+	private def kindCode(kind: PersistentEventKind) -> u64 {
+		var code = 0u64;
+		match (kind) {
+			STORE => code = 1u64;
+			CLWB => code = 2u64;
+			SFENCE => code = 3u64;
+		}
+		return code;
+	}
+
+	private def mix(h: u64, v: u64) -> u64 {
+		def r = (h << 7) | (h >> 57);
+		return (r ^ v) * 0x1000_0000_01B3_u64;
+	}
+}
+
+// A crash-model counterexample: the scenario that was recorded, the crash cut
+// at which a property failed, and enough of the trace to reproduce it. Its
+// rendering is stable so a failing exploration can be stored and diffed rather
+// than re-derived from a run that may not repeat.
+class PersistentCounterexample(scenario: string, property: string, detail: string,
+	trace: PersistentTrace, crashAfter: int) {
+
+	// The events that had executed when the crash was injected.
+	def cutTrace() -> PersistentTrace {
+		return trace.prefix(crashAfter);
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put1("=== pmem-counterexample %s", scenario).ln();
+		buf.put1("property: %s", property).ln();
+		buf.put1("detail: %s", detail).ln();
+		buf.put2("crash-after-event: %d of %d", crashAfter, trace.length()).ln();
+		cutTrace().render(buf);
+		buf.put1("=== end pmem-counterexample %s", scenario).ln();
+		return buf;
+	}
+
+	def toArtifact() -> string {
+		return render(StringBuilder.new()).toString();
+	}
+}
+
+component PersistentTraces {
+	// Record one named scenario from a clean recorder and freeze the result.
+	// Capturing through this helper is what makes a scenario reproducible: the
+	// recorder is reset first, so the artifact contains that scenario's events
+	// and nothing left over from earlier work on the same region.
+	def capture(recorder: RecordingPersistentOperations, name: string,
+		run: void -> void) -> PersistentTrace {
+		recorder.clear();
+		run();
+		return recorder.snapshot(name);
+	}
+}

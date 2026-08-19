@@ -107,6 +107,12 @@ class RecordingPersistentOperations extends X86_64PersistentOperations {
 			0u64, 0u8, 0u64));
 	}
 
+	// Freeze the events recorded so far into an immutable, named artifact. The
+	// recorder may keep running afterwards; the snapshot does not change.
+	def snapshot(name: string) -> PersistentTrace {
+		return PersistentTrace.new(name, u64.!(range.length), events.copy());
+	}
+
 	def clear() {
 		events.clear();
 		nextSeq = 1u64;
