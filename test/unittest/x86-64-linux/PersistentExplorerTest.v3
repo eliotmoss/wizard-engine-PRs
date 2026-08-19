@@ -15,6 +15,10 @@ def PETX = [
 	PET("reduction_agrees_with_full_search", test_explore_reduction_agrees_with_full_search),
 	PET("budget_truncates_and_reports", test_explore_budget_truncates_and_reports),
 	PET("real_wal_images_at_boundaries", test_explore_real_wal_images_at_boundaries),
+	PET("property_holds_over_every_image", test_explore_property_holds_over_every_image),
+	PET("property_failure_becomes_counterexample", test_explore_property_failure_becomes_counterexample),
+	PET("all_cuts_reports_earliest_failure", test_explore_all_cuts_reports_earliest_failure),
+	PET("truncated_search_is_not_evidence", test_explore_truncated_search_is_not_evidence),
 	()
 ];
 
@@ -68,6 +72,22 @@ class PersistentExplorerTester(t: Tester) {
 			if (hit) found++;
 		}
 		return found;
+	}
+
+	// Program order within a line: the second store can only be durable if the
+	// first one is. Holds on every image the model produces.
+	def orderedProperty(image: PersistentDurableImage) -> string {
+		if (image.read(8u64, 8) != 0u64 && image.read(0u64, 8) != A) {
+			return "second store durable without the first";
+		}
+		return null;
+	}
+
+	// Deliberately too strong: an unflushed store is not durable on every
+	// schedule, so this fails on exactly the images that dropped it.
+	def durableProperty(image: PersistentDurableImage) -> string {
+		if (image.read(0u64, 8) != A) return "first store absent";
+		return null;
 	}
 
 	def makePmemRegion() -> PmemMmapRegion {
@@ -317,4 +337,107 @@ def test_explore_real_wal_images_at_boundaries(tc: PersistentExplorerTester) {
 	tc.t.assertz(true, applied.containsImage(PersistentImages.lazyCrash(tr, null, commitFence + 1)));
 	tc.t.assertz(true, applied.containsImage(PersistentImages.eagerCrash(tr, null, commitFence + 1)));
 	region.destroy();
+}
+
+
+// A property that holds is reported as holding over every image the cut permits
+// -- and only counts as evidence when the search that produced them was
+// complete.
+def test_explore_property_holds_over_every_image(tc: PersistentExplorerTester) {
+	def tr = tc.trace("ordered", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.store(2u64, 8u64, 8u8, tc.B)
+	]);
+	def property = PersistentImageProperty.new("same-line stores persist in order",
+		0u64, 16, tc.orderedProperty);
+
+	def result = PersistentExplorer.checkImages(tr, null, 2, 0, property);
+	tc.t.assertz(true, result.ok());
+	tc.t.assertz(true, result.exhaustive());
+	tc.t.asserti(3, result.imagesChecked);
+	tc.t.asserti(3, result.exploration.imageCount());
+	// With no counterexample the artifact is the exploration summary.
+	tc.t.asserti(1, tc.countOf(result.toArtifact(), "truncated=false"));
+
+	def sweep = PersistentExplorer.checkAllCuts(tr, null, 0, property);
+	tc.t.assertz(true, sweep.exhaustive());
+	// Cuts 0, 1 and 2 permit 1, 2 and 3 images.
+	tc.t.asserti(6, sweep.imagesChecked);
+}
+
+// A failing property becomes a stored counterexample: the failing durable
+// bytes, the schedule prefix that produced them, and a window of the region
+// worth reading.
+def test_explore_property_failure_becomes_counterexample(tc: PersistentExplorerTester) {
+	def tr = tc.trace("unflushed", [tc.store(1u64, 0u64, 8u8, tc.A)]);
+	def property = PersistentImageProperty.new("first store survives", 0u64, 16,
+		tc.durableProperty);
+
+	def result = PersistentExplorer.checkImages(tr, null, 1, 0, property);
+	tc.t.assertz(false, result.ok());
+	tc.t.assertz(false, result.exhaustive());
+	tc.t.assertz(false, result.truncated);
+
+	def cx = result.counterexample;
+	tc.t.assert_string("unflushed", cx.scenario);
+	tc.t.assert_string("first store survives", cx.property);
+	tc.t.assert_string("first store absent", cx.detail);
+	tc.t.asserti(1, cx.crashAfter);
+	// The image it carries is the one that dropped the store: the lazy schedule.
+	tc.t.assert_eq(PersistentImages.lazyCrash(tr, null, 1).digest(), cx.durableImage().digest());
+	tc.t.assertz(false, PersistentImages.eagerCrash(tr, null, 1).digest() == cx.durableImage().digest());
+
+	def artifact = cx.toArtifact();
+	tc.t.asserti(1, tc.countOf(artifact, "detail: first store absent"));
+	tc.t.asserti(1, tc.countOf(artifact, "durable-image: bytes=256 digest=0x"));
+	tc.t.asserti(1, tc.countOf(artifact, "durable-window: offset=0 length=16"));
+	tc.t.asserti(1, tc.countOf(artifact, "00000000: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"));
+	tc.t.asserti(1, tc.countOf(artifact, "--- pmem-trace unflushed"));
+}
+
+// Sweeping every cut reports the earliest one at which the property can fail,
+// which is the cut worth reading: later failures are usually the same hole.
+def test_explore_all_cuts_reports_earliest_failure(tc: PersistentExplorerTester) {
+	def tr = tc.trace("late_failure", [
+		tc.store(1u64, 64u64, 8u8, tc.B),
+		tc.store(2u64, 0u64, 8u8, tc.A),
+		tc.clwb(3u64, 0u64),
+		tc.fence(4u64)
+	]);
+	def property = PersistentImageProperty.new("first store survives", 0u64, 8,
+		tc.durableProperty);
+
+	def sweep = PersistentExplorer.checkAllCuts(tr, null, 0, property);
+	tc.t.assertz(false, sweep.ok());
+	// Cuts 0 and 1 have no store at offset 0 at all, so they fail first.
+	tc.t.asserti(0, sweep.counterexample.crashAfter);
+	tc.t.asserti(0, sweep.counterexample.cutTrace().length());
+
+	// Once the fence has completed, the store is durable on every schedule, so
+	// the same property holds at that cut.
+	def atFence = PersistentExplorer.checkImages(tr, null, 4, 0, property);
+	tc.t.assertz(true, atFence.exhaustive());
+	tc.t.asserti(2, atFence.exploration.imageCount());
+}
+
+// A budget that stopped the search is not a proof: the result says so even when
+// every image it did check passed.
+def test_explore_truncated_search_is_not_evidence(tc: PersistentExplorerTester) {
+	def tr = tc.trace("budgeted_check", [
+		tc.store(1u64, 0u64, 8u8, tc.A),
+		tc.store(2u64, 8u64, 8u8, tc.B),
+		tc.store(3u64, 64u64, 8u8, tc.C)
+	]);
+	def property = PersistentImageProperty.new("same-line stores persist in order",
+		0u64, 16, tc.orderedProperty);
+
+	def capped = PersistentExplorer.checkImages(tr, null, 3, 2, property);
+	tc.t.assertz(true, capped.ok());
+	tc.t.assertz(true, capped.truncated);
+	tc.t.assertz(false, capped.exhaustive());
+	tc.t.asserti(2, capped.imagesChecked);
+
+	def complete = PersistentExplorer.checkImages(tr, null, 3, 0, property);
+	tc.t.assertz(true, complete.exhaustive());
+	tc.t.asserti(6, complete.imagesChecked);
 }

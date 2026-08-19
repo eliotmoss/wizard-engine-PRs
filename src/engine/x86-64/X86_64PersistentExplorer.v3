@@ -25,8 +25,10 @@
 // checks that claim executably at every cut of several traces rather than
 // leaving it as an argument.
 //
-// Still out of scope: feeding an image into real recovery (milestone 5) and
-// attaching one to PersistentCounterexample.
+// A property over the images is checked here too: checkImages() runs one over
+// every image a cut can leave and turns the first failure into a stored
+// PersistentCounterexample carrying those durable bytes. Milestone 5's real
+// recovery run is one such property; nothing about this layer assumes it.
 
 // The distinct durable images a crash at one cut can produce, plus how much of
 // the state space was actually searched. {truncated} is never silent: a budget
@@ -63,6 +65,42 @@ class PersistentExploration(trace: PersistentTrace, crashAfter: int,
 		for (i < d.length) buf.puts("image digest=0x").putx_64(d[i]).ln();
 		buf.put1("--- end pmem-exploration %s", trace.name).ln();
 		return buf;
+	}
+
+	def toArtifact() -> string {
+		return render(StringBuilder.new()).toString();
+	}
+}
+
+
+// A property of the durable image a crash left behind. {check} returns null
+// when the property holds and a detail string describing the failure when it
+// does not, so a counterexample says what went wrong rather than only that
+// something did. {windowOffset}/{windowLength} name the bytes worth printing in
+// the artifact -- a record slot, an after-image -- since dumping a whole region
+// helps nobody.
+class PersistentImageProperty(name: string, windowOffset: u64, windowLength: int,
+	check: PersistentDurableImage -> string) { }
+
+// Outcome of checking a property over the images a cut (or every cut) permits.
+// {truncated} matters as much as {counterexample}: a search that ran out of
+// budget and found nothing has not shown that nothing is there.
+class PersistentCheckResult(exploration: PersistentExploration,
+	counterexample: PersistentCounterexample, imagesChecked: int, truncated: bool) {
+
+	def ok() -> bool {
+		return counterexample == null;
+	}
+
+	// The property held on every image AND the search that produced them was
+	// complete. Only this pair is evidence.
+	def exhaustive() -> bool {
+		return counterexample == null && !truncated;
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		if (counterexample != null) return counterexample.render(buf);
+		return exploration.render(buf);
 	}
 
 	def toArtifact() -> string {
@@ -167,6 +205,50 @@ component PersistentExplorer {
 			}
 		}
 		return PersistentExploration.new(trace, cut, images.extract(), states, truncated);
+	}
+
+
+	// Run {property} over every durable image the cut permits, in enumeration
+	// order, and stop at the first failure. The counterexample carries the
+	// failing bytes and the schedule prefix that produced them.
+	def checkImages(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
+		budget: int, property: PersistentImageProperty) -> PersistentCheckResult {
+
+		def exploration = reducedCrashImages(trace, initial, crashAfter, budget);
+		for (i < exploration.images.length) {
+			def image = exploration.images[i];
+			def detail = property.check(image);
+			if (detail != null) {
+				def cx = PersistentCounterexample.new(trace.name, property.name, detail,
+					trace, exploration.crashAfter)
+					.withImage(image, property.windowOffset, property.windowLength);
+				return PersistentCheckResult.new(exploration, cx, i + 1, exploration.truncated);
+			}
+		}
+		return PersistentCheckResult.new(exploration, null, exploration.images.length,
+			exploration.truncated);
+	}
+
+	// The same check at every crash cut, earliest first, since the earliest
+	// failing cut is the one worth reading. Truncation anywhere in the sweep is
+	// carried into the result.
+	def checkAllCuts(trace: PersistentTrace, initial: Array<byte>, budget: int,
+		property: PersistentImageProperty) -> PersistentCheckResult {
+
+		var checked = 0;
+		var truncated = false;
+		var last: PersistentExploration;
+		for (cut < trace.length() + 1) {
+			def result = checkImages(trace, initial, cut, budget, property);
+			checked += result.imagesChecked;
+			if (result.truncated) truncated = true;
+			last = result.exploration;
+			if (!result.ok()) {
+				return PersistentCheckResult.new(result.exploration, result.counterexample,
+					checked, truncated);
+			}
+		}
+		return PersistentCheckResult.new(last, null, checked, truncated);
 	}
 
 	private def budgetOf(budget: int) -> int {

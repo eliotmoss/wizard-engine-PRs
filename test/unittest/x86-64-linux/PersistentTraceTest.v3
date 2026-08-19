@@ -15,6 +15,7 @@ def PTTX = [
 	PTT("validate_accepts_recorded_wal_commit", test_trace_validate_accepts_recorded_wal_commit),
 	PTT("validate_rejects_unmodelable_events", test_trace_validate_rejects_unmodelable_events),
 	PTT("counterexample_artifact_renders", test_trace_counterexample_artifact_renders),
+	PTT("counterexample_carries_durable_image", test_trace_counterexample_carries_durable_image),
 	()
 ];
 
@@ -64,6 +65,17 @@ class PersistentTraceTester(t: Tester) {
 		t.asserti(expected.length, got.length);
 		if (expected.length != got.length) return;
 		for (i < expected.length) t.assert_eq(expected[i], got[i]);
+	}
+
+	def countOf(text: string, needle: string) -> int {
+		if (needle.length == 0 || needle.length > text.length) return 0;
+		var found = 0;
+		for (i < text.length - needle.length + 1) {
+			var hit = true;
+			for (j < needle.length) if (text[i + j] != needle[j]) hit = false;
+			if (hit) found++;
+		}
+		return found;
 	}
 
 	def makePmemRegion() -> PmemMmapRegion {
@@ -373,4 +385,54 @@ def test_trace_counterexample_artifact_renders(tc: PersistentTraceTester) {
 	def whole = PersistentCounterexample.new("two_slot_commit", "p", "d", trace, 99);
 	tc.t.asserti(3, whole.cutTrace().length());
 	tc.t.assert_eq(trace.digest(), whole.cutTrace().digest());
+}
+
+
+// A counterexample from an exploration carries the bytes the crash left, not
+// only the schedule that produced them. The window is aligned down to 16 bytes
+// and clamped to the image, so artifacts stay column-stable and a window near
+// the end of the region cannot run off it.
+def test_trace_counterexample_carries_durable_image(tc: PersistentTraceTester) {
+	def trace = tc.demoTrace("demo");
+	def image = PersistentImages.eagerCrash(trace, null, 1);
+	def cx = PersistentCounterexample.new("two_slot_commit",
+		"acknowledged transaction survives",
+		"after-image absent", trace, 1).withImage(image, 0u64, 16);
+
+	tc.t.assert_eq(image.digest(), cx.durableImage().digest());
+
+	def cut = cx.cutTrace();
+	def expected = StringBuilder.new()
+		.puts("=== pmem-counterexample two_slot_commit\n")
+		.puts("property: acknowledged transaction survives\n")
+		.puts("detail: after-image absent\n")
+		.puts("crash-after-event: 1 of 3\n")
+		.puts("durable-image: bytes=256 digest=0x").putx_64(image.digest()).ln()
+		.puts("durable-window: offset=0 length=16\n")
+		.puts("00000000: 00 00 00 00 00 00 00 00 EF BE AD DE 00 00 00 00\n")
+		.puts("--- pmem-trace demo\n")
+		.puts("region-bytes=256 cache-line=64 events=1 stores=1 clwbs=0 fences=0 lines=1 digest=0x")
+		.putx_64(cut.digest()).ln()
+		.puts("STORE(seq=1, offset=8, width=8, value=0xDEADBEEF)\n")
+		.puts("--- end pmem-trace demo\n")
+		.puts("=== end pmem-counterexample two_slot_commit\n")
+		.toString();
+	tc.t.assert_string(expected, cx.toArtifact());
+
+	// A window near the end of the region is aligned down and clamped, not run
+	// off the end.
+	def tail = PersistentCounterexample.new("s", "p", "d", trace, 1)
+		.withImage(image, 250u64, 16).toArtifact();
+	tc.t.asserti(1, tc.countOf(tail, "durable-window: offset=250 length=16\n"));
+	tc.t.asserti(1, tc.countOf(tail, "000000F0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00\n"));
+
+	// A zero-length window still names the bytes the counterexample carries; a
+	// counterexample with no image at all renders exactly as it did before
+	// durable images existed (pinned by counterexample_artifact_renders).
+	def noWindow = PersistentCounterexample.new("s", "p", "d", trace, 1)
+		.withImage(image, 0u64, 0).toArtifact();
+	tc.t.asserti(1, tc.countOf(noWindow, "durable-image: bytes=256 digest=0x"));
+	tc.t.asserti(0, tc.countOf(noWindow, "durable-window:"));
+	tc.t.asserti(0, tc.countOf(PersistentCounterexample.new("s", "p", "d", trace, 1).toArtifact(),
+		"durable-image:"));
 }

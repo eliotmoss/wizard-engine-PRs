@@ -72,6 +72,30 @@ class PersistentDurableImage(bytes: Array<byte>) {
 		return -1;
 	}
 
+	// A 16-byte-per-line hex window over the durable bytes, for a stored
+	// counterexample. The window is aligned down to a line so the columns stay
+	// stable across artifacts, and clamped to the image.
+	def renderRange(buf: StringBuilder, offset: u64, length: int) -> StringBuilder {
+		if (length <= 0 || bytes.length == 0) return buf;
+		def size = u64.!(bytes.length);
+		var start = offset;
+		if (start > size) start = size;
+		var end = start + u64.!(length);
+		if (end > size) end = size;
+		var pos = start - start % 16u64;
+		while (pos < end) {
+			buf.putx_32(u32.view(pos)).puts(":");
+			for (i < 16) {
+				def at = pos + u64.!(i);
+				if (at >= size) break;
+				buf.puts(" ").putx_8(u32.view(bytes[int.!(at)]));
+			}
+			buf.ln();
+			pos += 16u64;
+		}
+		return buf;
+	}
+
 	private def mix(h: u64, v: u64) -> u64 {
 		def r = (h << 7) | (h >> 57);
 		return (r ^ v) * 0x1000_0000_01B3_u64;

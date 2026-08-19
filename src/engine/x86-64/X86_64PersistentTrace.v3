@@ -195,6 +195,25 @@ class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTr
 class PersistentCounterexample(scenario: string, property: string, detail: string,
 	trace: PersistentTrace, crashAfter: int) {
 
+	private var image: PersistentDurableImage;
+	private var windowOffset = 0u64;
+	private var windowLength = 0;
+
+	// Attach the durable bytes the crash left behind, plus the window of them
+	// worth printing (a record slot, an after-image). Without this the artifact
+	// carries only the schedule prefix, which is all a counterexample could
+	// carry before durable images were modelled.
+	def withImage(durable: PersistentDurableImage, offset: u64, length: int) -> PersistentCounterexample {
+		image = durable;
+		windowOffset = offset;
+		windowLength = length;
+		return this;
+	}
+
+	def durableImage() -> PersistentDurableImage {
+		return image;
+	}
+
 	// The events that had executed when the crash was injected.
 	def cutTrace() -> PersistentTrace {
 		return trace.prefix(crashAfter);
@@ -205,6 +224,13 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 		buf.put1("property: %s", property).ln();
 		buf.put1("detail: %s", detail).ln();
 		buf.put2("crash-after-event: %d of %d", crashAfter, trace.length()).ln();
+		if (image != null) {
+			buf.put1("durable-image: bytes=%d digest=0x", image.size()).putx_64(image.digest()).ln();
+			if (windowLength > 0) {
+				buf.put2("durable-window: offset=%d length=%d", windowOffset, windowLength).ln();
+				image.renderRange(buf, windowOffset, windowLength);
+			}
+		}
 		cutTrace().render(buf);
 		buf.put1("=== end pmem-counterexample %s", scenario).ln();
 		return buf;

@@ -323,11 +323,22 @@ crash-after-event: 2 of 3
 === end pmem-counterexample two_slot_commit
 ```
 
-The durable image is not part of the artifact yet: nothing models durable bytes
-until milestone 4, so a counterexample currently carries the schedule prefix
-that produced the failure, not the bytes it produced. `validate()` is also the
-single definition of the scalar-atomicity baseline — the store-audit tests over
-`PWRegion` check the frozen trace through it rather than restating the rules.
+`withImage()` attaches the durable bytes a crash left behind, so a stored
+counterexample carries both the schedule prefix and the state it produced. The
+artifact then names the image (`durable-image: bytes=N digest=0x…`) and prints a
+window of it, aligned down to 16 bytes and clamped to the region, since dumping
+a whole region helps nobody:
+
+```text
+durable-image: bytes=256 digest=0x...
+durable-window: offset=0 length=16
+00000000: 00 00 00 00 00 00 00 00 EF BE AD DE 00 00 00 00
+```
+
+A counterexample with no image renders exactly as it did before durable images
+existed. `validate()` is also the single definition of the scalar-atomicity
+baseline — the store-audit tests over `PWRegion` check the frozen trace through
+it rather than restating the rules.
 
 ---
 
@@ -435,8 +446,19 @@ rather than being decided together, and program order within a line holds in
 every image, so a partially constructed record is a state the search produces
 rather than one it collapses away.
 
-Not yet: handing an image to real recovery (milestone 5), and attaching one to
-`PersistentCounterexample`.
+`checkImages()` runs a `PersistentImageProperty` over every image a cut permits
+and turns the first failure into a stored `PersistentCounterexample` carrying
+those bytes; `checkAllCuts()` sweeps every cut and reports the earliest failing
+one. A property returns `null` when it holds and a detail string when it does
+not, so the artifact says what went wrong rather than only that something did,
+and it names the window of the region worth printing. `PersistentCheckResult`
+keeps truncation beside the verdict: `exhaustive()` requires both that the
+property held on every image and that the search which produced them completed,
+because a budget-limited search that found nothing has not shown that nothing is
+there.
+
+Milestone 5's real recovery run is one such property. Nothing in this layer
+assumes it: the property is an arbitrary function of the durable bytes.
 
 ---
 
@@ -574,7 +596,10 @@ second representation of the protocol.
    2026-08-19:** the full branching search with state deduplication and a
    reported budget, and an equivalent reduced search justified by the
    monotonicity of durable prefixes and checked against the full search at every
-   cut (see "Enumerating schedules" above).
+   cut (see "Enumerating schedules" above). **Completed 2026-08-20:**
+   counterexamples carry the durable image and a clamped byte window, and
+   `checkImages()`/`checkAllCuts()` turn a property over images into a stored
+   counterexample with truncation reported beside the verdict.
 5. Feed every generated image into real WAL recovery and assert the core
    acknowledgement properties.
 6. Add direct allocator invariant walkers and the initial scenario matrix.
