@@ -1,0 +1,277 @@
+// Durable bytes for the PMEM crash model: cache-line state, asynchronous
+// writeback completion, background eviction, and the crash images they produce.
+//
+// First slice of milestone 4 in docs/pmem-crash-model.md. A PersistentTrace is
+// the frozen record of what a scenario stored, flushed and fenced; this layer
+// is what those events mean for durability. The machine replays a trace against
+// volatile per-line state and exposes each writeback decision as an explicit
+// primitive, so the later enumerating explorer chooses schedules without
+// re-deriving the transition rules -- and so a hand-written test can pin one
+// schedule directly.
+//
+// Modelled here, per the agreed baseline profile:
+//
+//   - a STORE changes live state only; it never becomes durable on its own;
+//   - a cache-line writeback is NOT failure-atomic: it may make durable any
+//     prefix of that line's not-yet-durable stores, in program order;
+//   - CLWB is asynchronous and is not a snapshot -- it obliges only the stores
+//     that preceded it, and a completion may carry later same-line stores too;
+//   - SFENCE completes the writebacks its preceding CLWBs requested, and
+//     nothing else; and
+//   - any dirty line may be written back at any event boundary with no CLWB
+//     at all (background eviction).
+//
+// Still out of scope: enumerating every permitted schedule, deduplicating the
+// resulting states, and feeding images into real recovery (milestones 4-5).
+
+// An immutable durable byte image: what a crash at some cut left behind.
+class PersistentDurableImage(bytes: Array<byte>) {
+
+	def size() -> int {
+		return bytes.length;
+	}
+
+	// Little-endian scalar read, matching the byte order the recorded stores
+	// were encoded with. Tests assert against this rather than raw bytes.
+	def read(offset: u64, width: int) -> u64 {
+		def size = u64.!(bytes.length);
+		if (width < 0 || offset > size || u64.!(width) > size - offset) {
+			System.error("PersistentImageError", "durable read leaves the image");
+		}
+		var v = 0u64;
+		var i = width;
+		while (i > 0) {
+			i--;
+			v = (v << 8) | u64.view(bytes[int.!(offset) + i]);
+		}
+		return v;
+	}
+
+	// Content hash of the durable bytes, used to deduplicate the states an
+	// exploration reaches by different schedules.
+	def digest() -> u64 {
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		h = mix(h, u64.!(bytes.length));
+		for (i < bytes.length) h = mix(h, u64.view(bytes[i]));
+		return h;
+	}
+
+	def sameBytes(that: PersistentDurableImage) -> bool {
+		if (that == null || that.bytes.length != bytes.length) return false;
+		for (i < bytes.length) if (bytes[i] != that.bytes[i]) return false;
+		return true;
+	}
+
+	// Index of the first differing byte, or -1 when the images are equal. This
+	// is what a counterexample needs to say *where* two schedules diverged.
+	def firstDifference(that: PersistentDurableImage) -> int {
+		if (that == null) return 0;
+		def n = if(bytes.length < that.bytes.length, bytes.length, that.bytes.length);
+		for (i < n) if (bytes[i] != that.bytes[i]) return i;
+		if (bytes.length != that.bytes.length) return n;
+		return -1;
+	}
+
+	private def mix(h: u64, v: u64) -> u64 {
+		def r = (h << 7) | (h >> 57);
+		return (r ^ v) * 0x1000_0000_01B3_u64;
+	}
+}
+
+// Volatile state of one 64-byte cache line: the stores that have landed in it,
+// how many of them have reached the persistence domain, and how many a pending
+// writeback request obliges the next fence to complete. Both counts index the
+// line's store list from the start, so a completed writeback never has to be
+// subtracted out of an outstanding request.
+class PersistentLineState(line: u64) {
+	def stores = Vector<PersistentTraceEvent>.new();
+	var durableCount = 0;
+	var requiredCount = 0;
+}
+
+// Replays a trace against cache-line state and yields the durable image a crash
+// at the current position would leave. Event execution is fixed by the trace;
+// every durability choice is a separate call, which is exactly the branching
+// point the explorer will enumerate.
+class PersistentCrashMachine {
+	def trace: PersistentTrace;
+	private var durable: Array<byte>;
+	private var lineStates: Array<PersistentLineState>;
+	private var pos = 0;
+
+	// {initial} is the region's durable content before the scenario ran; null
+	// means a zeroed region.
+	new(trace, initial: Array<byte>) {
+		durable = PersistentImages.startingImage(trace.regionBytes, initial);
+		def touched = trace.touchedLines();
+		lineStates = Array<PersistentLineState>.new(touched.length);
+		for (i < touched.length) lineStates[i] = PersistentLineState.new(touched[i]);
+	}
+
+	def length() -> int {
+		return trace.length();
+	}
+
+	def position() -> int {
+		return pos;
+	}
+
+	// The lines this trace writes, ascending -- the only lines that can hold
+	// volatile state, so the only ones an explorer must branch on.
+	def lines() -> Array<u64> {
+		def out = Array<u64>.new(lineStates.length);
+		for (i < lineStates.length) out[i] = lineStates[i].line;
+		return out;
+	}
+
+	// Stores in {line} that have not reached the persistence domain.
+	def pendingStores(line: u64) -> int {
+		def st = lookup(line);
+		if (st == null) return 0;
+		return st.stores.length - st.durableCount;
+	}
+
+	// Stores in {line} that an outstanding CLWB obliges the next fence to
+	// complete. Zero once nothing is owed, including for a CLWB issued on a line
+	// with nothing dirty in it.
+	def requestedWriteback(line: u64) -> int {
+		def st = lookup(line);
+		if (st == null) return 0;
+		def owed = st.requiredCount - st.durableCount;
+		return if(owed > 0, owed, 0);
+	}
+
+	// Execute the next trace event. Returns false at the end of the trace.
+	def step() -> bool {
+		if (pos >= trace.length()) return false;
+		def e = trace.events[pos];
+		pos++;
+		match (e.kind) {
+			STORE => {
+				def st = lookup(lineOf(e.offset));
+				if (st != null) st.stores.put(e);
+			}
+			CLWB => {
+				// A writeback request covers the stores issued before it. A CLWB of a
+				// line nothing wrote owes nothing, which is why it carries no state.
+				def st = lookup(e.offset);
+				if (st != null && st.stores.length > st.requiredCount) {
+					st.requiredCount = st.stores.length;
+				}
+			}
+			SFENCE => {
+				for (i < lineStates.length) drainTo(lineStates[i], lineStates[i].requiredCount);
+			}
+		}
+		return true;
+	}
+
+	// Execute events up to the crash cut {count}, clamped like PersistentTrace
+	// prefixes so a walk over 0..length() needs no special cases. Never rewinds.
+	def runTo(count: int) {
+		var target = count;
+		if (target > trace.length()) target = trace.length();
+		while (pos < target) step();
+	}
+
+	// Complete a writeback of {line} up to a total of {count} of its stores,
+	// clamped to what is actually pending. A count between the durable and
+	// pending ends is a torn line: partial at scalar-store granularity, in
+	// program order. Returns the new durable prefix length.
+	def writeback(line: u64, count: int) -> int {
+		def st = lookup(line);
+		if (st == null) return 0;
+		return drainTo(st, count);
+	}
+
+	// Background eviction of one line: everything dirty in it becomes durable.
+	def evictLine(line: u64) -> int {
+		def st = lookup(line);
+		if (st == null) return 0;
+		return drainTo(st, st.stores.length);
+	}
+
+	// Background eviction of every dirty line, the maximal outcome at this
+	// event boundary.
+	def evictAll() {
+		for (i < lineStates.length) drainTo(lineStates[i], lineStates[i].stores.length);
+	}
+
+	// The durable image a crash at the current position leaves behind: caches,
+	// store buffers, and outstanding writebacks are discarded.
+	def crash() -> PersistentDurableImage {
+		return PersistentDurableImage.new(Arrays.dup(durable));
+	}
+
+	private def drainTo(st: PersistentLineState, count: int) -> int {
+		var target = count;
+		if (target > st.stores.length) target = st.stores.length;
+		while (st.durableCount < target) {
+			applyStore(st.stores[st.durableCount]);
+			st.durableCount++;
+		}
+		return st.durableCount;
+	}
+
+	private def applyStore(e: PersistentTraceEvent) {
+		def offset = int.!(e.offset);
+		def width = int.view(e.width);
+		var v = e.value;
+		for (i < width) {
+			durable[offset + i] = byte.view(u8.view(v));
+			v = v >> 8;
+		}
+	}
+
+	private def lineOf(offset: u64) -> u64 {
+		return offset - offset % MmapRegionUtils.CACHE_LINE_SIZE;
+	}
+
+	// The line list is short (it is the trace's touched set) and ascending.
+	private def lookup(line: u64) -> PersistentLineState {
+		var lo = 0;
+		var hi = lineStates.length - 1;
+		while (lo <= hi) {
+			def mid = (lo + hi) / 2;
+			def at = lineStates[mid].line;
+			if (at == line) return lineStates[mid];
+			if (at < line) lo = mid + 1;
+			else hi = mid - 1;
+		}
+		return null;
+	}
+}
+
+component PersistentImages {
+	// The durable image a scenario starts from: {initial} truncated or
+	// zero-extended to the trace's region size, or all zeroes when null.
+	def startingImage(regionBytes: u64, initial: Array<byte>) -> Array<byte> {
+		def image = Array<byte>.new(int.!(regionBytes));
+		if (initial == null) return image;
+		def n = if(initial.length < image.length, initial.length, image.length);
+		for (i < n) image[i] = initial[i];
+		return image;
+	}
+
+	// Minimal outcome at a crash cut: no background eviction and no early
+	// writeback completion, so only what a fence obliged is durable. This is the
+	// weakest image recovery must still cope with.
+	def lazyCrash(trace: PersistentTrace, initial: Array<byte>, crashAfter: int) -> PersistentDurableImage {
+		def m = PersistentCrashMachine.new(trace, initial);
+		m.runTo(crashAfter);
+		return m.crash();
+	}
+
+	// Maximal outcome at a crash cut: every dirty line is evicted at every event
+	// boundary, so every store issued before the crash survives.
+	def eagerCrash(trace: PersistentTrace, initial: Array<byte>, crashAfter: int) -> PersistentDurableImage {
+		def m = PersistentCrashMachine.new(trace, initial);
+		var target = crashAfter;
+		if (target > trace.length()) target = trace.length();
+		while (m.position() < target) {
+			m.step();
+			m.evictAll();
+		}
+		return m.crash();
+	}
+}

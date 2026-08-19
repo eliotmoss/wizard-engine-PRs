@@ -110,6 +110,7 @@ PWRegion (block allocator)
 | `src/engine/TxnBackend.v3` | Abstract `BackendRegion` / `TxnRegionBackend` interfaces; `VolatileBackend`; the `PersistentOperations` store/flush/fence seam |
 | `X86_64PersistentOperations.v3` | Production + trace-recording `PersistentOperations` providers; `X86_64PersistentOps.ensureFor()` installs one provider per region. Every persistent store on the active path (`PWRegion.format()`, `DirectRegionWriter`, `DualTxnWal`) goes through it, giving one total `STORE`/`CLWB`/`SFENCE` order |
 | `X86_64PersistentTrace.v3` | Frozen scenario artifacts over the recorder: `PersistentTrace` (immutable snapshot, crash-cut `prefix()`, baseline `validate()`, content `digest()`, `touchedLines()`, stable rendering), `PersistentCounterexample`, `PersistentTraces.capture()` |
+| `X86_64PersistentImage.v3` | Durable-byte model over a trace: `PersistentCrashMachine` (per-line store lists, asynchronous writeback completion, fence obligations, background eviction, `crash()`), `PersistentDurableImage` (little-endian `read()`, `digest()`, `sameBytes()`), `PersistentImages.lazyCrash()`/`eagerCrash()` extremal schedules |
 | `X86_64TxnBackend.v3` | `FileMmapRegion`, `PmemMmapRegion`, `FdMmapRegion`; `RegionFileIO`; `X86_64Backends` factory |
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, `ImmixPWRegion` |
 | `X86_64SingleTxnWal.v3` | Single-transaction in-region WAL — superseded, **not wired in**; kept as a reference implementation (see `docs/wal-comparison.md`) |
@@ -121,6 +122,7 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/DualTxnWalTest.v3` | `DualTxnWal` unit tests (commit/recovery/guard/failure paths) |
 | `test/unittest/x86-64-linux/PersistentOperationsTest.v3` | `PersistentOperations` seam tests (typed store/CLWB/SFENCE ordering, store audit over `PWRegion`) |
 | `test/unittest/x86-64-linux/PersistentTraceTest.v3` | Trace capture/validation/digest and artifact-rendering tests |
+| `test/unittest/x86-64-linux/PersistentImageTest.v3` | Durable-image model tests (volatility, torn writeback, fence completion, eviction, real-WAL trace image) |
 | `test/unittest/x86-64-linux/MultiTxnWalTest.v3` | `MultiTxnWal` unit tests (comparison implementation) |
 
 ### On-region layout

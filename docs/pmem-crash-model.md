@@ -331,6 +331,62 @@ single definition of the scalar-atomicity baseline — the store-audit tests ove
 
 ---
 
+## Durable images and cache-line state
+
+`PersistentTrace` says what a scenario stored, flushed and fenced;
+`src/engine/x86-64/X86_64PersistentImage.v3` says what that means for
+durability. It is the transition system the explorer will search, implemented
+and testable before any search exists.
+
+`PersistentCrashMachine` replays a validated trace against volatile per-line
+state. Each touched line (exactly `touchedLines()`, so a `CLWB` of a line
+nothing wrote carries no state) holds its stores in program order plus two
+indices into that list: how many have reached the persistence domain, and how
+many an outstanding writeback request obliges the next fence to complete.
+Because both are absolute prefix lengths, a completed writeback never has to be
+subtracted out of a pending request.
+
+Trace events drive the machine; every durability decision is a separate call,
+which is precisely the branching point a schedule enumerator needs:
+
+```text
+step()                     execute the next trace event
+  STORE                      append to its line; nothing becomes durable
+  CLWB                       raise the line's requirement to the stores issued so far
+  SFENCE                     complete every outstanding requirement, and nothing else
+writeback(line, count)     complete a prefix of a line's pending stores (torn line)
+evictLine(line)            background eviction of one line
+evictAll()                 background eviction at this event boundary
+crash()                    the durable image; caches and outstanding work are discarded
+```
+
+A writeback to a count strictly between the durable and pending ends is the
+non-atomic 64-byte line: partial, at scalar-store granularity, in program
+order. A store issued after a `CLWB` and before the fence stays volatile even
+though its line is dirty, while `evictAll()` may still make it durable — the
+asymmetry the piggybacked commit boundary relies on.
+
+`PersistentDurableImage` is the resulting immutable byte image, with a
+little-endian `read()` for assertions, a `digest()` for state deduplication, and
+`sameBytes()`/`firstDifference()` for comparing two schedules' outcomes. A
+machine starts from the region's prior durable content, so a scenario can be
+explored on an already-formatted region rather than only on a blank one.
+
+`PersistentImages.lazyCrash()` and `eagerCrash()` are the two extremal
+schedules — nothing durable but what a fence obliged, and every dirty line
+evicted at every boundary. They bracket every image the model permits at a cut,
+and where they agree the cut has exactly one image: after a scenario has
+flushed and fenced every line it touched, the schedule no longer matters.
+`persistent_image:real_wal_after_image_needs_its_flush` pins that on a recorded
+production `DualTxnWal` commit/apply/flush trace.
+
+Still absent, and the remainder of milestone 4: enumerating the permitted
+schedules between those two extremes, deduplicating the states they reach, and
+handing the images to real recovery (milestone 5). Counterexample artifacts
+therefore still carry the schedule prefix rather than the bytes it produced.
+
+---
+
 ## Trace exploration and real recovery
 
 A trace can be recorded once up to the first crash because persistence does not
@@ -457,8 +513,12 @@ second representation of the protocol.
    `PersistentCounterexample` is the stored form of a failing exploration. No
    explorer emits those counterexamples yet, and they do not yet carry a
    durable image, because nothing models durable bytes before milestone 4.
-4. Implement cache-line state, background eviction, asynchronous writeback,
-   fence completion, crash-image generation, and state deduplication.
+4. **First slice completed 2026-08-19:** cache-line state, asynchronous
+   writeback completion, fence obligations, background eviction, and crash-image
+   generation, in `PersistentCrashMachine`/`PersistentDurableImage`, with the
+   lazy/eager extremal schedules and an image digest for deduplication (see
+   "Durable images and cache-line state" above). **Remaining:** enumerating the
+   schedules between the two extremes and deduplicating the states they reach.
 5. Feed every generated image into real WAL recovery and assert the core
    acknowledgement properties.
 6. Add direct allocator invariant walkers and the initial scenario matrix.
