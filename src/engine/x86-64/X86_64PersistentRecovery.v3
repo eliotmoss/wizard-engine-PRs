@@ -7,10 +7,26 @@
 // inside the checker could only prove that a correct model of an incorrect
 // program agrees with itself.
 //
-// The run is self-contained: the image is copied into a fresh mapping, a WAL
-// is opened over it WITHOUT fresh initialization (this is a remount, not a
+// The run is self-contained: the image is copied into a fresh region, a WAL is
+// opened over it WITHOUT fresh initialization (this is a remount, not a
 // format), recover() runs, and the resulting bytes are frozen back into an
-// image before the mapping is released.
+// image before the region is released.
+//
+// Mounting an image is done through PersistentImageMounts, which offers the two
+// containers deliberately rather than by accident:
+//
+//   - openArray() is an ordinary byte-array region. Its persistence boundaries
+//     succeed without reaching the writeback/fence hooks, which is exactly right
+//     when only recovery's effect on bytes matters -- the simulator, not the
+//     backend, already decided which bytes survived. It costs no syscalls, which
+//     matters when a budgeted sweep mounts thousands of images.
+//   - openMapped() is a PmemMmapRegion, so its boundaries translate into
+//     cache-line writebacks and fences on the region's provider. With a
+//     recording provider installed, recovery's own stores, CLWBs and fences are
+//     captured as a trace, which is the input to a bounded second crash DURING
+//     recovery (milestone 7). Recording through the production PMEM region
+//     rather than a copy of its translation is what keeps that trace evidence
+//     about the real seam.
 
 // What production recovery did with one durable image, and the bytes it left.
 class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
@@ -26,28 +42,107 @@ class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
 	}
 }
 
-component PersistentRecoveries {
-	// Mount {image} and run the production two-slot WAL recovery over it.
-	// Returns null only when the host could not provide a mapping.
-	def runDualWal(image: PersistentDurableImage, logChunkOffset: u64,
-		logChunkSize: u64) -> PersistentRecoveryRun {
+// One durable image, mounted as a region. {recorder} is non-null only for a
+// mount that records what the code under test does to it.
+class PersistentImageMount(region: BackendRegion, recorder: RecordingPersistentOperations) {
 
-		def size = u64.!(image.size());
-		def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+	// The bytes as they stand now, frozen into an image.
+	def freeze() -> PersistentDurableImage {
+		def after = Array<byte>.new(region.range.length);
+		for (i < after.length) after[i] = region.range[i];
+		return PersistentDurableImage.new(after);
+	}
+
+	def regionStart() -> u64 {
+		return u64.view(Pointer.atElement(region.range, 0));
+	}
+
+	def close() {
+		region.destroy();
+	}
+}
+
+component PersistentImageMounts {
+	// Byte-array container: no syscalls, and persistence boundaries succeed
+	// without reaching the writeback/fence hooks. Use this when only the effect
+	// of the mounted code on the bytes matters.
+	def openArray(image: PersistentDurableImage) -> PersistentImageMount {
+		def data = Array<byte>.new(image.size());
+		for (i < data.length) data[i] = image.bytes[i];
+		return PersistentImageMount.new(VolatileRegion.new(data[0 ..+ data.length]), null);
+	}
+
+	// Mapped PMEM container, whose boundaries translate into writebacks and
+	// fences on the region's provider. With {record} set, those -- and every
+	// persistent store -- are captured, so the mounted run can itself be
+	// explored for a further crash. Returns null if the host refused a mapping.
+	def openMapped(image: PersistentDurableImage, record: bool) -> PersistentImageMount {
+		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
 		def region = PmemMmapRegion.new(mapping, -1);
 		for (i < image.size()) region.range[i] = image.bytes[i];
+		var recorder: RecordingPersistentOperations;
+		if (record) {
+			recorder = RecordingPersistentOperations.new(region.range);
+			region.setPersistentOperations(recorder);
+		}
+		return PersistentImageMount.new(region, recorder);
+	}
+}
 
-		def base = u64.view(Pointer.atElement(region.range, 0));
-		def wal = DualTxnWal.new(base, base + logChunkOffset, logChunkSize, region, false);
-		def result = wal.recover();
+// A recovery run together with the trace of what recovery itself made durable.
+// The trace's starting durable image is the image recovery was handed, so
+// exploring it is exploring a second crash during recovery.
+class PersistentRecoveryRecording(run: PersistentRecoveryRun, trace: PersistentTrace) { }
 
-		def after = Array<byte>.new(image.size());
-		for (i < after.length) after[i] = region.range[i];
-		def run = PersistentRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
-			wal.lastCommittedSeq, wal.dataDurableSeq, PersistentDurableImage.new(after));
-		region.destroy();
+component PersistentRecoveries {
+	// Mount {image} and run the production two-slot WAL recovery over it.
+	// Returns null only when the host could not provide a region.
+	def runDualWal(image: PersistentDurableImage, logChunkOffset: u64,
+		logChunkSize: u64) -> PersistentRecoveryRun {
+
+		def mount = PersistentImageMounts.openMapped(image, false);
+		if (mount == null) return null;
+		def run = recoverOn(mount, logChunkOffset, logChunkSize);
+		mount.close();
 		return run;
+	}
+
+	// The same run, recorded: every store, cache-line writeback and fence
+	// recovery performs is captured, so a crash DURING recovery can be explored
+	// with the same machinery as a crash during normal operation.
+	def recordDualWalRecovery(image: PersistentDurableImage, logChunkOffset: u64,
+		logChunkSize: u64, name: string) -> PersistentRecoveryRecording {
+
+		def mount = PersistentImageMounts.openMapped(image, true);
+		if (mount == null) return null;
+		def run = recoverOn(mount, logChunkOffset, logChunkSize);
+		def trace = mount.recorder.snapshot(name);
+		mount.close();
+		return PersistentRecoveryRecording.new(run, trace);
+	}
+
+	private def recoverOn(mount: PersistentImageMount, logChunkOffset: u64,
+		logChunkSize: u64) -> PersistentRecoveryRun {
+
+		def base = mount.regionStart();
+		def wal = DualTxnWal.new(base, base + logChunkOffset, logChunkSize, mount.region, false);
+		def result = wal.recover();
+		return PersistentRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
+			wal.lastCommittedSeq, wal.dataDurableSeq, mount.freeze());
+	}
+
+	// Every durable image a SECOND crash, during recovery from {image}, can
+	// leave must still satisfy {property}: the log record has not been scrubbed,
+	// and replay is idempotent, so a remount must reach the same state.
+	// Bounded to two crashes in total, matching the recovery profile in
+	// docs/pmem-crash-model.md.
+	def checkCrashDuringRecovery(image: PersistentDurableImage, logChunkOffset: u64,
+		logChunkSize: u64, budget: int, property: PersistentImageProperty) -> PersistentCheckResult {
+
+		def recording = recordDualWalRecovery(image, logChunkOffset, logChunkSize, "dual_wal_recovery");
+		if (recording == null) return null;
+		return PersistentExplorer.checkAllCuts(recording.trace, image.bytes, budget, property);
 	}
 }
 
@@ -118,9 +213,9 @@ class PersistentImageBackend(image: PersistentDurableImage) extends TxnRegionBac
 
 	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
 		if (u64.!(image.size()) < size) return null;
-		def data = Array<byte>.new(image.size());
-		for (i < data.length) data[i] = image.bytes[i];
-		return VolatileRegion.new(data[0 ..+ data.length]);
+		// The array container: a sweep mounts thousands of images and only the
+		// bytes recovery leaves behind are examined. See PersistentImageMounts.
+		return PersistentImageMounts.openArray(image).region;
 	}
 
 	def isPersistent() -> bool {

@@ -11,6 +11,8 @@ def PRTX = [
 	PRT("torn_record_images_never_invent_state", test_recovery_torn_record_images_never_invent_state),
 	PRT("recovery_is_idempotent", test_recovery_recovery_is_idempotent),
 	PRT("unmet_property_yields_image_counterexample", test_recovery_unmet_property_yields_image_counterexample),
+	PRT("recovery_records_its_own_trace", test_recovery_recovery_records_its_own_trace),
+	PRT("crash_during_recovery_still_recovers", test_recovery_crash_during_recovery_still_recovers),
 	()
 ];
 
@@ -185,4 +187,67 @@ def test_recovery_unmet_property_yields_image_counterexample(tc: PersistentRecov
 	tc.t.asserti(1, tc.countOf(artifact, "durable-window: offset=200 length=16"));
 	tc.t.asserti(1, tc.countOf(artifact, "acknowledged after-image absent after recovery"));
 	tc.t.asserti(1, tc.countOf(artifact, "--- pmem-trace dual_wal_commit"));
+}
+
+
+// Recovery is itself a persistent scenario: mounted through a recording PMEM
+// region, its stores, cache-line writebacks and fences are captured in one
+// trace. That trace, started from the image recovery was handed, is what a
+// second crash is explored over.
+def test_recovery_recovery_records_its_own_trace(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def recording = PersistentRecoveries.recordDualWalRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
+		"dual_wal_recovery");
+	if (recording == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+
+	tc.t.assertz(true, recording.run.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(tc.VALUE, recording.run.recovered.read(tc.OFFSET, 8));
+
+	def trace = recording.trace;
+	tc.t.assertz(true, trace.validate().ok());
+	tc.t.assert_eq(tc.REGION_BYTES, trace.regionBytes);
+	// Replay stores the after-image and publishes it with one boundary.
+	tc.t.assertz(true, trace.count(PersistentEventKind.STORE) > 0);
+	tc.t.assertz(true, trace.count(PersistentEventKind.SFENCE) > 0);
+	// The after-image's line is among the lines replay touched.
+	def line = tc.OFFSET - tc.OFFSET % 64u64;
+	var touched = false;
+	def lines = trace.touchedLines();
+	for (i < lines.length) if (lines[i] == line) touched = true;
+	tc.t.assertz(true, touched);
+
+	// A run that recorded nothing would make the second-crash exploration
+	// vacuous, so the trace must actually contain the replay.
+	tc.t.assertz(true, trace.length() > 1);
+}
+
+// The bounded two-crash profile: crash once at the commit boundary, then crash
+// again anywhere during recovery. Every image that second crash can leave must
+// still recover the acknowledged after-image -- recovery never scrubbed the
+// record, and replay is idempotent, so a remount reaches the same state.
+def test_recovery_crash_during_recovery_still_recovers(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def result = PersistentRecoveries.checkCrashDuringRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
+		16, tc.survivesProperty());
+	if (result == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	// Replay writes one after-image and publishes it, so the second-crash state
+	// space is small enough to sweep exhaustively -- unlike the mid-record cuts
+	// of a commit.
+	tc.t.assertz(true, result.exhaustive());
+	tc.t.assertz(true, result.imagesChecked > 1);
 }

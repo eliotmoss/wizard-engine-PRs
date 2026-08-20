@@ -494,10 +494,10 @@ is still required later to test `MAP_SYNC` and the native backend translation.
 
 `src/engine/x86-64/X86_64PersistentRecovery.v3` closes the loop: it mounts an
 enumerated durable image and runs the production `DualTxnWal` recovery path over
-it. `PersistentRecoveries.runDualWal()` copies the image into a fresh mapping,
-opens a WAL over it *without* fresh initialization (this is a remount, not a
-format), calls `recover()`, and freezes the resulting bytes back into an image
-before releasing the mapping. The run reports what recovery said — its
+it. `PersistentRecoveries.runDualWal()` copies the image into a fresh region, opens
+a WAL over it *without* fresh initialization (this is a remount, not a format),
+calls `recover()`, and freezes the resulting bytes back into an image before
+releasing the region. The run reports what recovery said — its
 `DualWalRecovery` outcome, whether it latched recovery-required, and the
 sequence numbers it adopted — alongside the bytes it produced.
 
@@ -575,6 +575,44 @@ remain reviewable:
 
 The current hand-written shadow and abrupt-process tests provide expected
 outcomes and invariants for many of these scenarios.
+
+---
+
+### Which container an image is mounted in
+
+`PersistentImageMounts` offers two, and the choice is a modelling decision
+rather than an implementation detail:
+
+| Mount | Container | Boundaries | Use |
+|---|---|---|---|
+| `openArray()` | byte array | succeed without reaching the writeback/fence hooks | only recovery's effect on the bytes matters; costs no syscalls, which is what makes a sweep over thousands of images affordable |
+| `openMapped(record)` | `PmemMmapRegion` | translate into cache-line writebacks and fences on the region's provider | the mounted run must itself be modelled; with `record` set, its stores, `CLWB`s and fences are captured as a trace |
+
+The array mount is sound for a recovery whose *result* is being checked: the
+simulator, not the backend, already decided which bytes survived the crash, and
+recovery's own persistence boundaries are what the next section models. It
+cannot express a persistence failure or a crash during recovery, which is
+exactly what the mapped, recording mount is for.
+
+## Crash during recovery
+
+`recordDualWalRecovery()` mounts an image through the recording PMEM container
+and runs production recovery on it, returning both the outcome and the trace of
+what recovery made durable. That trace, started from the image recovery was
+handed, is a persistent scenario like any other — so a second crash is explored
+with the same machinery, and `checkCrashDuringRecovery()` is the two-crash
+profile: crash once wherever the first exploration says, then crash anywhere
+during the recovery that follows.
+
+Recording through the production `PmemMmapRegion` rather than a copy of its
+translation is what keeps this evidence about the real seam.
+
+For the canonical case — a commit-boundary crash — replay writes one after-image
+and publishes it with one boundary, so the second-crash state space is small
+enough to sweep exhaustively, unlike the mid-record cuts of a commit itself. The
+acknowledged after-image must survive every one of those images: recovery does
+not scrub the record it replayed, and replay is idempotent, so a remount reaches
+the same state.
 
 ---
 
@@ -704,7 +742,11 @@ second representation of the protocol.
    (`PersistentImageBackend`, `PersistentAllocatorProperty`), driven by recorded
    split-allocation and coalescing-free transactions (see "Allocator scenarios"
    above). **Remaining:** the rest of the initial scenario matrix.
-7. Add bounded crash-during-recovery exploration.
+7. **First slice completed 2026-08-20:** bounded crash-during-recovery
+   exploration — `recordDualWalRecovery()` captures recovery's own stores,
+   writebacks and fences, and `checkCrashDuringRecovery()` explores a second
+   crash over that trace (see "Crash during recovery" above). **Remaining:**
+   allocator scenarios and recovery-persistence failures under the same profile.
 8. Retain exhaustive short tests in the regular suite; run longer seeded
    exploration separately.
 9. Independently validate that the production PMEM implementation emits the
