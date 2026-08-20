@@ -490,6 +490,52 @@ is still required later to test `MAP_SYNC` and the native backend translation.
 
 ---
 
+## Running real recovery over an image
+
+`src/engine/x86-64/X86_64PersistentRecovery.v3` closes the loop: it mounts an
+enumerated durable image and runs the production `DualTxnWal` recovery path over
+it. `PersistentRecoveries.runDualWal()` copies the image into a fresh mapping,
+opens a WAL over it *without* fresh initialization (this is a remount, not a
+format), calls `recover()`, and freezes the resulting bytes back into an image
+before releasing the mapping. The run reports what recovery said — its
+`DualWalRecovery` outcome, whether it latched recovery-required, and the
+sequence numbers it adopted — alongside the bytes it produced.
+
+`PersistentWalRecoveryProperty` expresses the acknowledgement contract as a
+property the explorer can check over every image a cut permits:
+
+- every image must mount and recover without reporting `PERSIST_FAILED` or
+  leaving the mount recovery-required;
+- recovery must be idempotent — recovering the bytes recovery just produced must
+  not change the after-image again;
+- for a cut at or after the commit boundary, the acknowledged after-image
+  **must** be present afterwards; and
+- for an earlier cut it may be absent or may replay, but it must never recover
+  as a value that was never committed, which is what a torn record accepted as
+  valid would look like.
+
+A scenario starts from the region as it already stood: the trace records only
+the commit, and the bytes left by the formatted, WAL-initialized mount are the
+model's starting durable image. Capturing the fresh initialization inside the
+trace instead would add its byte-wise zeroing of the whole log chunk to the
+state space for no modelling benefit — those bytes were durable before the
+scenario began.
+
+### What this run bounds
+
+A real commit constructs its record byte by byte across three cache lines, so a
+mid-record cut permits on the order of 10^5 images (the product of the per-line
+prefix ranges) — far more than a unit test should mount and recover. The
+committed-boundary cut is the cheap one: every line the record touched has been
+flushed and fenced, so it has exactly one image, and
+`persistent_recovery:commit_boundary_survives_every_schedule` checks the
+must-survive half of the contract exhaustively there. The sweep over every cut
+runs under an explicit per-cut budget and asserts that it reports itself as
+**not** exhaustive, so it stands as evidence over the images it checked and
+nothing more. The unbounded sweep belongs in milestone 8's separate tier.
+
+---
+
 ## Properties to check
 
 Each completed recovery run should check, as applicable:
@@ -600,8 +646,11 @@ second representation of the protocol.
    counterexamples carry the durable image and a clamped byte window, and
    `checkImages()`/`checkAllCuts()` turn a property over images into a stored
    counterexample with truncation reported beside the verdict.
-5. Feed every generated image into real WAL recovery and assert the core
-   acknowledgement properties.
+5. **First slice completed 2026-08-20:** mount an enumerated image and run the
+   production `DualTxnWal` recovery over it, with the acknowledgement contract
+   (survival, no invented state, no latch, idempotence) as a checkable property
+   (see "Running real recovery over an image" above). **Remaining:** allocator
+   scenarios beyond a single WAL commit, and the wider scenario matrix.
 6. Add direct allocator invariant walkers and the initial scenario matrix.
 7. Add bounded crash-during-recovery exploration.
 8. Retain exhaustive short tests in the regular suite; run longer seeded

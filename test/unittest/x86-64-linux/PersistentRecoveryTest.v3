@@ -1,0 +1,188 @@
+// Production-recovery-over-enumerated-image tests (milestone 5 of
+// docs/pmem-crash-model.md). Every durable image a recorded DualTxnWal commit
+// can leave behind is mounted and handed to the real recovery path, and the
+// acknowledgement contract is checked against what recovery actually produced.
+// No DAX mapping or PMEM hardware is required.
+
+def PRT = UnitTests.registerT("persistent_recovery:", _, PersistentRecoveryTester.new, _);
+def PRTX = [
+	PRT("recovers_acknowledged_commit_image", test_recovery_recovers_acknowledged_commit_image),
+	PRT("commit_boundary_survives_every_schedule", test_recovery_commit_boundary_survives_every_schedule),
+	PRT("torn_record_images_never_invent_state", test_recovery_torn_record_images_never_invent_state),
+	PRT("recovery_is_idempotent", test_recovery_recovery_is_idempotent),
+	PRT("unmet_property_yields_image_counterexample", test_recovery_unmet_property_yields_image_counterexample),
+	()
+];
+
+class PersistentRecoveryTester(t: Tester) {
+	def VALUE = 0x8877_6655_4433_2211_u64;
+	def OFFSET = 200u64;
+	def LOG_OFFSET = 1024u64;
+	def LOG_SIZE = 1024u64;
+	def REGION_BYTES = 4096u64;
+
+	// The region bytes that were already durable when the scenario began: the
+	// mount is formatted and its WAL header persisted before the commit runs, so
+	// the crash model starts from those bytes rather than from zeroes.
+	var mounted: Array<byte>;
+	var trace: PersistentTrace;
+
+	// Record one real commit -- append, commit, no apply -- through the
+	// production WAL on a trace-recording PMEM region.
+	def recordCommit() -> bool {
+		def mapping = Mmap.reserve(REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return false;
+		def region = PmemMmapRegion.new(mapping, -1);
+		def recorder = RecordingPersistentOperations.new(region.range);
+		region.setPersistentOperations(recorder);
+
+		def base = u64.view(Pointer.atElement(region.range, 0));
+		def wal = DualTxnWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, true);
+		mounted = Array<byte>.new(region.range.length);
+		for (i < mounted.length) mounted[i] = region.range[i];
+
+		recorder.clear();
+		var ok = wal.append(OFFSET, VALUE, 8u8);
+		ok = ok && wal.commit() == 1u64;
+		trace = recorder.snapshot("dual_wal_commit");
+		ok = ok && trace.validate().ok();
+		region.destroy();
+		return ok;
+	}
+
+	def survivesProperty() -> PersistentImageProperty {
+		return PersistentWalRecoveryProperty.new(LOG_OFFSET, LOG_SIZE, OFFSET, 8, VALUE, true)
+			.property("acknowledged transaction survives recovery");
+	}
+
+	def noInventedStateProperty() -> PersistentImageProperty {
+		return PersistentWalRecoveryProperty.new(LOG_OFFSET, LOG_SIZE, OFFSET, 8, VALUE, false)
+			.property("recovery never invents an uncommitted value");
+	}
+
+	def countOf(text: string, needle: string) -> int {
+		if (needle.length == 0 || needle.length > text.length) return 0;
+		var found = 0;
+		for (i < text.length - needle.length + 1) {
+			var hit = true;
+			for (j < needle.length) if (text[i + j] != needle[j]) hit = false;
+			if (hit) found++;
+		}
+		return found;
+	}
+}
+
+// The end-to-end path: enumerate the image a crash right after the commit
+// boundary leaves, mount it, and let the production WAL recover it. The
+// after-image was never applied before the crash, so only replay can restore it.
+def test_recovery_recovers_acknowledged_commit_image(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	// The crash caught the record, not the data: offset 200 is untouched.
+	tc.t.assert_eq(0u64, image.read(tc.OFFSET, 8));
+
+	def run = PersistentRecoveries.runDualWal(image, tc.LOG_OFFSET, tc.LOG_SIZE);
+	if (run == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+	tc.t.assertz(true, run.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(false, run.requiresRecovery);
+	tc.t.assert_eq(tc.VALUE, run.recovered.read(tc.OFFSET, 8));
+	tc.t.assert_eq(2u64, run.nextTxnSeq);
+	tc.t.assert_eq(1u64, run.dataDurableSeq);
+}
+
+// The commit point, checked against production recovery rather than asserted:
+// once the boundary has returned, every image the model permits must recover
+// the acknowledged after-image.
+def test_recovery_commit_boundary_survives_every_schedule(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def result = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+		tc.survivesProperty());
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.exhaustive());
+	// Every line the record touched was flushed and fenced, so the boundary
+	// leaves exactly one image -- that is what makes it a commit point.
+	tc.t.asserti(1, result.exploration.imageCount());
+	tc.t.asserti(1, result.imagesChecked);
+}
+
+// The other half of the contract, over every crash cut: an unacknowledged
+// transaction may be absent or may replay, but a partially written record must
+// never recover as a value that was never committed.
+//
+// A real commit writes a record byte by byte across three cache lines, so the
+// mid-record cuts permit far more images than a unit test should mount. This
+// run is therefore deliberately bounded, and the bound is asserted rather than
+// hidden: the result reports itself as not exhaustive, so it is evidence over
+// the images it checked and nothing more. Milestone 8's separate tier is where
+// the unbounded sweep belongs.
+def test_recovery_torn_record_images_never_invent_state(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 24,
+		tc.noInventedStateProperty());
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.truncated);
+	tc.t.assertz(false, result.exhaustive());
+	// Every cut contributed at least one image, and the mid-record cuts
+	// contributed many more than one.
+	tc.t.assertz(true, result.imagesChecked > tc.trace.length());
+}
+
+// Recovery must be replayable: mounting the bytes recovery produced and
+// recovering again changes nothing. A second crash during recovery therefore
+// costs correctness nothing.
+def test_recovery_recovery_is_idempotent(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def first = PersistentRecoveries.runDualWal(
+		PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length()),
+		tc.LOG_OFFSET, tc.LOG_SIZE);
+	if (first == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+	def second = PersistentRecoveries.runDualWal(first.recovered, tc.LOG_OFFSET, tc.LOG_SIZE);
+	tc.t.assert_eq(tc.VALUE, second.recovered.read(tc.OFFSET, 8));
+	tc.t.assert_eq(first.nextTxnSeq, second.nextTxnSeq);
+	tc.t.assertz(false, second.requiresRecovery);
+	// The record is still on-region, so the replay happens again and lands on
+	// the same bytes.
+	tc.t.assertz(true, first.recovered.sameBytes(second.recovered));
+}
+
+// A property that does not hold produces a usable artifact: the durable bytes
+// that broke it, the crash cut that produced them, and what recovery reported.
+// Requiring survival before the commit boundary is exactly such a property.
+def test_recovery_unmet_property_yields_image_counterexample(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def result = PersistentExplorer.checkImages(tc.trace, tc.mounted, 1, 0, tc.survivesProperty());
+	tc.t.assertz(false, result.ok());
+	tc.t.assertz(false, result.exhaustive());
+
+	def cx = result.counterexample;
+	tc.t.assert_string("dual_wal_commit", cx.scenario);
+	tc.t.asserti(1, cx.crashAfter);
+	tc.t.assert_eq(0u64, cx.durableImage().read(tc.OFFSET, 8));
+
+	def artifact = cx.toArtifact();
+	tc.t.asserti(1, tc.countOf(artifact, "durable-image: bytes=4096 digest=0x"));
+	tc.t.asserti(1, tc.countOf(artifact, "durable-window: offset=200 length=16"));
+	tc.t.asserti(1, tc.countOf(artifact, "acknowledged after-image absent after recovery"));
+	tc.t.asserti(1, tc.countOf(artifact, "--- pmem-trace dual_wal_commit"));
+}

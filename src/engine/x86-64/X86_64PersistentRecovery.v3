@@ -1,0 +1,112 @@
+// Production recovery over an enumerated durable image.
+//
+// Milestone 5 of docs/pmem-crash-model.md. The explorer produces the byte
+// images a crash can leave; this layer mounts one and runs the real
+// DualTxnWal recovery path over it, so a property is checked against the
+// program rather than against a second model of it. Reimplementing recovery
+// inside the checker could only prove that a correct model of an incorrect
+// program agrees with itself.
+//
+// The run is self-contained: the image is copied into a fresh mapping, a WAL
+// is opened over it WITHOUT fresh initialization (this is a remount, not a
+// format), recover() runs, and the resulting bytes are frozen back into an
+// image before the mapping is released.
+
+// What production recovery did with one durable image, and the bytes it left.
+class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
+	nextTxnSeq: u64, lastCommittedSeq: u64, dataDurableSeq: u64,
+	recovered: PersistentDurableImage) {
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put1("recovery=%s", recovery.name);
+		buf.put1(" requiresRecovery=%z", requiresRecovery);
+		buf.put3(" nextTxnSeq=%d lastCommittedSeq=%d dataDurableSeq=%d",
+			nextTxnSeq, lastCommittedSeq, dataDurableSeq);
+		return buf;
+	}
+}
+
+component PersistentRecoveries {
+	// Mount {image} and run the production two-slot WAL recovery over it.
+	// Returns null only when the host could not provide a mapping.
+	def runDualWal(image: PersistentDurableImage, logChunkOffset: u64,
+		logChunkSize: u64) -> PersistentRecoveryRun {
+
+		def size = u64.!(image.size());
+		def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = PmemMmapRegion.new(mapping, -1);
+		for (i < image.size()) region.range[i] = image.bytes[i];
+
+		def base = u64.view(Pointer.atElement(region.range, 0));
+		def wal = DualTxnWal.new(base, base + logChunkOffset, logChunkSize, region, false);
+		def result = wal.recover();
+
+		def after = Array<byte>.new(image.size());
+		for (i < after.length) after[i] = region.range[i];
+		def run = PersistentRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
+			wal.lastCommittedSeq, wal.dataDurableSeq, PersistentDurableImage.new(after));
+		region.destroy();
+		return run;
+	}
+}
+
+// The acknowledgement contract, as a property the explorer can check over every
+// image a crash cut permits.
+//
+// Every image must mount and recover without leaving the mount unusable, and
+// recovery must be idempotent -- recovering the bytes recovery just produced
+// must not change the after-image again.
+//
+// {mustSurvive} distinguishes the two halves of the contract:
+//
+//   - true: the transaction was acknowledged before this cut, so its
+//     after-image MUST be present after recovery on every schedule;
+//   - false: it was not acknowledged, so it may be absent or may replay if a
+//     complete valid record reached durability -- but it must never produce a
+//     value that was never committed, which is what a torn record replayed as
+//     valid would look like.
+class PersistentWalRecoveryProperty(logChunkOffset: u64, logChunkSize: u64,
+	offset: u64, width: int, value: u64, mustSurvive: bool) {
+
+	def check(image: PersistentDurableImage) -> string {
+		def run = PersistentRecoveries.runDualWal(image, logChunkOffset, logChunkSize);
+		if (run == null) return "could not map a region for the durable image";
+		if (run.recovery == DualWalRecovery.PERSIST_FAILED) {
+			return detail("recovery reported PERSIST_FAILED", run);
+		}
+		if (run.requiresRecovery) {
+			return detail("recovery left the mount recovery-required", run);
+		}
+
+		def got = run.recovered.read(offset, width);
+		if (mustSurvive) {
+			if (got != value) return detail("acknowledged after-image absent after recovery", run);
+		} else if (got != 0u64 && got != value) {
+			return detail("recovery produced a value that was never committed", run);
+		}
+
+		// Recovery is idempotent: replaying the image recovery just produced
+		// must not change the after-image or fail.
+		def again = PersistentRecoveries.runDualWal(run.recovered, logChunkOffset, logChunkSize);
+		if (again == null) return "could not map a region for the recovered image";
+		if (again.recovery == DualWalRecovery.PERSIST_FAILED || again.requiresRecovery) {
+			return detail("second recovery over the recovered image failed", again);
+		}
+		if (again.recovered.read(offset, width) != got) {
+			return detail("recovery is not idempotent", again);
+		}
+		return null;
+	}
+
+	def property(name: string) -> PersistentImageProperty {
+		return PersistentImageProperty.new(name, offset, 16, check);
+	}
+
+	private def detail(text: string, run: PersistentRecoveryRun) -> string {
+		def buf = StringBuilder.new().put1("%s: ", text);
+		run.render(buf);
+		buf.puts(" durable=0x").putx_64(run.recovered.read(offset, width));
+		return buf.toString();
+	}
+}
