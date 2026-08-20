@@ -15,6 +15,9 @@ def PRTX = [
 	PRT("crash_during_recovery_still_recovers", test_recovery_crash_during_recovery_still_recovers),
 	PRT("failed_replay_persist_latches_and_reopens", test_recovery_failed_replay_persist_latches_and_reopens),
 	PRT("failed_replay_persist_never_loses_a_record", test_recovery_failed_replay_persist_never_loses_a_record),
+	PRT("three_commits_reclaim_the_oldest_slot", test_recovery_three_commits_reclaim_the_oldest_slot),
+	PRT("overwrite_guard_keeps_acknowledged_data", test_recovery_overwrite_guard_keeps_acknowledged_data),
+	PRT("crash_during_three_commit_recovery_recovers", test_recovery_crash_during_three_commit_recovery_recovers),
 	()
 ];
 
@@ -25,11 +28,22 @@ class PersistentRecoveryTester(t: Tester) {
 	def LOG_SIZE = 1024u64;
 	def REGION_BYTES = 4096u64;
 
+	// The second and third transactions of the multi-transaction scenario. Each
+	// after-image sits on its own cache line, so whether one of them is durable
+	// says nothing about the others: a shared line would make the model's
+	// per-line prefix rule do the work the WAL is supposed to be doing.
+	def VALUE_B = 0x1122_3344_5566_7788_u64;
+	def VALUE_C = 0x0f0e_0d0c_0b0a_0908_u64;
+	def OFFSET_B = 264u64;
+	def OFFSET_C = 328u64;
+
 	// The region bytes that were already durable when the scenario began: the
 	// mount is formatted and its WAL header persisted before the commit runs, so
 	// the crash model starts from those bytes rather than from zeroes.
 	var mounted: Array<byte>;
 	var trace: PersistentTrace;
+	var slotOffsets = Array<u64>.new(2);	// region-relative address of each record slot
+	var thirdCommitStart: int;		// event index at which the third transaction begins
 
 	// Record one real commit -- append, commit, no apply -- through the
 	// production WAL on a trace-recording PMEM region.
@@ -52,6 +66,64 @@ class PersistentRecoveryTester(t: Tester) {
 		ok = ok && trace.validate().ok();
 		region.destroy();
 		return ok;
+	}
+
+	// Record three back-to-back transactions through the production WAL, each
+	// applied write-behind after its commit as the WAL's contract requires. The
+	// third commits into slot 1 -- 3 % 2 == 1 -- which is the slot holding
+	// transaction 1's record, so writing it destroys the only log copy of that
+	// transaction. Two transactions can never reach that state, which is why
+	// the overwrite guard needs a third one to be exercised at all.
+	def recordThreeCommits() -> bool {
+		def mapping = Mmap.reserve(REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return false;
+		def region = PmemMmapRegion.new(mapping, -1);
+		def recorder = RecordingPersistentOperations.new(region.range);
+		region.setPersistentOperations(recorder);
+
+		def base = u64.view(Pointer.atElement(region.range, 0));
+		def wal = DualTxnWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, true);
+		for (i < 2) slotOffsets[i] = wal.slotAddr(i) - base;
+		mounted = Array<byte>.new(region.range.length);
+		for (i < mounted.length) mounted[i] = region.range[i];
+
+		recorder.clear();
+		var ok = commitOne(wal, OFFSET, VALUE, 1u64);
+		ok = ok && commitOne(wal, OFFSET_B, VALUE_B, 2u64);
+		// Everything recorded so far is the history the third transaction
+		// overwrites; its own cuts start here.
+		thirdCommitStart = recorder.events.length;
+		ok = ok && commitOne(wal, OFFSET_C, VALUE_C, 3u64);
+		trace = recorder.snapshot("dual_wal_three_commits");
+		ok = ok && trace.validate().ok();
+		region.destroy();
+		return ok;
+	}
+
+	// One transaction as RegionTransaction drives it: buffer the after-image,
+	// commit it, then apply it write-behind. The apply's persist is deferred to
+	// the next commit's boundary, which is what makes the piggybacked boundary
+	// -- and the durability the overwrite guard relies on -- part of the trace.
+	private def commitOne(wal: DualTxnWal, offset: u64, value: u64, expectSeq: u64) -> bool {
+		if (!wal.append(offset, value, 8u8)) return false;
+		if (wal.commit() != expectSeq) return false;
+		return wal.applyUpdate(offset, value, 8u8);
+	}
+
+	// The whole recorded history, with each transaction's after-image required
+	// to survive or not according to {acknowledged}: an unacknowledged
+	// transaction may be absent, but must never recover as a value that was
+	// never committed.
+	def historyProperty(name: string, ackA: bool, ackB: bool, ackC: bool) -> PersistentImageProperty {
+		return PersistentWalHistoryProperty.new(LOG_OFFSET, LOG_SIZE, [
+			PersistentWalAfterImage.new(OFFSET, 8, VALUE, ackA),
+			PersistentWalAfterImage.new(OFFSET_B, 8, VALUE_B, ackB),
+			PersistentWalAfterImage.new(OFFSET_C, 8, VALUE_C, ackC)
+		]).property(name, slotOffsets[1], 64);
+	}
+
+	def slotSeq(image: PersistentDurableImage, slot: int) -> u64 {
+		return image.read(slotOffsets[slot] + u64.view(TxnRecordHeader.txnSeq.offset), 8);
 	}
 
 	def survivesProperty() -> PersistentImageProperty {
@@ -308,4 +380,121 @@ def test_recovery_failed_replay_persist_never_loses_a_record(tc: PersistentRecov
 		acknowledged);
 	if (!atBoundary.ok()) tc.t.fail(atBoundary.toArtifact());
 	tc.t.assertz(true, atBoundary.exhaustive());
+}
+
+
+// The third transaction commits into the slot the first one occupies, so its
+// record is destroyed while the WAL is still running. What makes that safe is
+// that transaction 1's after-image is durable DATA by then -- it rode the
+// second commit's boundary -- so the log copy is redundant before it goes.
+def test_recovery_three_commits_reclaim_the_oldest_slot(tc: PersistentRecoveryTester) {
+	if (!tc.recordThreeCommits()) {
+		tc.t.fail("could not record three production WAL commits");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+
+	// Slot 1 now holds transaction 3; transaction 1's record is gone.
+	tc.t.assert_eq(3u64, tc.slotSeq(image, 1));
+	tc.t.assert_eq(2u64, tc.slotSeq(image, 0));
+
+	// The first two after-images are durable data: their boundaries have been
+	// and gone. The third one's has not, so only its record can restore it --
+	// which is what the reclaimed slot is now being used for.
+	tc.t.assert_eq(tc.VALUE, image.read(tc.OFFSET, 8));
+	tc.t.assert_eq(tc.VALUE_B, image.read(tc.OFFSET_B, 8));
+	tc.t.assert_eq(0u64, image.read(tc.OFFSET_C, 8));
+
+	def run = PersistentRecoveries.runDualWal(image, tc.LOG_OFFSET, tc.LOG_SIZE);
+	if (run == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+	tc.t.assertz(true, run.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(false, run.requiresRecovery);
+	tc.t.assert_eq(4u64, run.nextTxnSeq);
+	tc.t.assert_eq(tc.VALUE, run.recovered.read(tc.OFFSET, 8));
+	tc.t.assert_eq(tc.VALUE_B, run.recovered.read(tc.OFFSET_B, 8));
+	tc.t.assert_eq(tc.VALUE_C, run.recovered.read(tc.OFFSET_C, 8));
+}
+
+// The overwrite guard's claim, checked against production recovery over the
+// crash schedules of the transaction that does the overwriting. From the third
+// commit's first event onward, transactions 1 and 2 are acknowledged, so every
+// image those cuts permit must recover both -- however much of the new record
+// reached the region, and even at the cuts where slot 1 has been zeroed and
+// transaction 1 exists nowhere in the log at all.
+def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecoveryTester) {
+	if (!tc.recordThreeCommits()) {
+		tc.t.fail("could not record three production WAL commits");
+		return;
+	}
+	// A range starting at the third commit, because the claim starts there: at
+	// the earlier cuts transaction 2 is not yet acknowledged and transaction 1
+	// may not be either.
+	def result = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.thirdCommitStart,
+		tc.trace.length(), 8,
+		tc.historyProperty("reclaiming a slot never loses an acknowledged transaction",
+			true, true, false));
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	// The mid-record cuts contribute more than one image each, so this is a
+	// sweep rather than a walk down the trace. The record is written byte by
+	// byte across several cache lines, so the bound is real and reported rather
+	// than hidden: this is evidence over the images it checked and nothing more.
+	tc.t.assertz(true, result.imagesChecked > tc.trace.length() - tc.thirdCommitStart + 1);
+	tc.t.assertz(true, result.truncated);
+	tc.t.assertz(false, result.exhaustive());
+
+	// The sweep would notice a transaction going missing: requiring the third
+	// one to survive at the cut where its commit has not yet begun fails. A
+	// property that holds because it asks nothing is not evidence.
+	def unmet = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.thirdCommitStart, 0,
+		tc.historyProperty("an unacknowledged transaction is not required to survive",
+			true, true, true));
+	tc.t.assertz(false, unmet.ok());
+
+	// At the third commit point all three are acknowledged. Every line the new
+	// record touched was flushed and fenced, so the only freedom left is the
+	// third after-image's own line, applied write-behind and not yet persisted:
+	// two images, both of which must recover all three transactions.
+	def atBoundary = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+		tc.historyProperty("a reclaiming commit acknowledges all three transactions",
+			true, true, true));
+	if (!atBoundary.ok()) tc.t.fail(atBoundary.toArtifact());
+	tc.t.assertz(true, atBoundary.exhaustive());
+	tc.t.asserti(2, atBoundary.exploration.imageCount());
+
+	// The whole trace, with nothing required to survive: no cut may recover a
+	// value that was never committed, including the cuts that catch a slot
+	// half-overwritten.
+	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 4,
+		tc.historyProperty("a reclaimed slot never invents a transaction",
+			false, false, false));
+	if (!sweep.ok()) tc.t.fail(sweep.toArtifact());
+	tc.t.assertz(true, sweep.truncated);
+}
+
+// The two-crash profile over the reclaiming history: crash at the third commit
+// point, then crash again anywhere during the mount that recovers it. Recovery
+// replays both surviving records, and every image that second crash can leave
+// must still produce all three after-images.
+def test_recovery_crash_during_three_commit_recovery_recovers(tc: PersistentRecoveryTester) {
+	if (!tc.recordThreeCommits()) {
+		tc.t.fail("could not record three production WAL commits");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def result = PersistentRecoveries.checkCrashDuringRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
+		16, tc.historyProperty("a reclaiming history survives a crash during its recovery",
+			true, true, true));
+	if (result == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	// Replay writes two after-images and publishes them with one boundary, so
+	// the second-crash state space is small enough to sweep exhaustively even
+	// with three transactions of history behind it.
+	tc.t.assertz(true, result.exhaustive());
+	tc.t.assertz(true, result.imagesChecked > 1);
 }

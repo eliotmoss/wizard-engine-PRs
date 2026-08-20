@@ -534,6 +534,40 @@ runs under an explicit per-cut budget and asserts that it reports itself as
 **not** exhaustive, so it stands as evidence over the images it checked and
 nothing more. The unbounded sweep belongs in milestone 8's separate tier.
 
+### Histories, and the slot that gets reclaimed
+
+One commit exercises the contract only where the record still exists. With two
+record slots, transaction N+2 commits into transaction N's slot, so the log copy
+that proved N is destroyed while the WAL is still running. The only reason that
+is safe is that N's after-image became durable *data* at transaction N+1's
+boundary — which is what the overwrite guard in `appendCommittedRecord()`
+verifies before it zeroes the slot. Two transactions can never reach that state,
+so the scenario needs a third.
+
+`PersistentWalHistoryProperty` is the same acknowledgement contract stated over
+several after-images at once, each one marked acknowledged or not
+(`PersistentWalAfterImage`). It mounts each image once for the whole history
+rather than once per after-image, which is what makes it affordable in a sweep.
+
+The claim is a suffix claim: transactions 1 and 2 are acknowledged only from the
+third commit's first event onward, so `PersistentExplorer.checkCutRange()`
+checks exactly those cuts instead of weakening the property to one that every
+cut of the whole history can satisfy. Over that range — including the cuts that
+catch slot 1 zeroed, where transaction 1 exists nowhere in the log at all —
+production recovery must still produce both after-images.
+`persistent_recovery:overwrite_guard_keeps_acknowledged_data` runs that sweep
+under a reported budget, checks that the same property *fails* when the
+unacknowledged third transaction is also required to survive — a property that
+holds because it asks nothing is not evidence — and checks the third commit
+point exhaustively. That cut is cheap for the same reason every commit point is:
+each line the new record touched was flushed and fenced, leaving only the third
+after-image's own line, applied write-behind and not yet persisted. Two images,
+and both must recover all three transactions.
+
+The two-crash profile runs over the same history in
+`persistent_recovery:crash_during_three_commit_recovery_recovers`: crash at the
+third commit point, then crash again anywhere during the mount that recovers it.
+
 ---
 
 ## Properties to check
@@ -779,8 +813,13 @@ second representation of the protocol.
    crash over that trace, the same profile for an allocator mount
    (`recordPWRegionRecovery()`), and recovery-persistence failure injection
    (`InjectedFailureRegion`, `PersistentRecoveryFailureProperty`) — see "Crash
-   during recovery" above. **Remaining:** failure injection during an allocator
-   mount, and multi-transaction scenarios.
+   during recovery" above. **Later slices completed 2026-08-20:** failure
+   injection during an allocator mount (`runPWRegionWithFailure()`,
+   `PersistentAllocatorFailureProperty`), a two-transaction allocator scenario,
+   and the three-transaction history whose third commit reclaims the first
+   transaction's slot (`PersistentWalHistoryProperty`, `checkCutRange()`; see
+   "Histories, and the slot that gets reclaimed" above). **Remaining:** the
+   explicit-flush and clean-close scrub scenarios.
 8. Retain exhaustive short tests in the regular suite; run longer seeded
    exploration separately.
 9. Independently validate that the production PMEM implementation emits the

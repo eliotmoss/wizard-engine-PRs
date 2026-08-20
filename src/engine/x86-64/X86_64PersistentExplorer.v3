@@ -235,10 +235,28 @@ component PersistentExplorer {
 	def checkAllCuts(trace: PersistentTrace, initial: Array<byte>, budget: int,
 		property: PersistentImageProperty) -> PersistentCheckResult {
 
+		return checkCutRange(trace, initial, 0, trace.length(), budget, property);
+	}
+
+	// The same check over the cuts in [{fromCut}, {toCut}], earliest first.
+	// A property is often only claimed from a point in the history onward --
+	// a transaction becomes acknowledged partway through a multi-transaction
+	// scenario, and only from there must its after-image survive every schedule
+	// -- and checking exactly those cuts states the claim where it applies
+	// instead of weakening it to one the whole trace can satisfy. Both ends
+	// clamp into the trace; an inverted range collapses to the single cut
+	// {toCut} names.
+	def checkCutRange(trace: PersistentTrace, initial: Array<byte>, fromCut: int, toCut: int,
+		budget: int, property: PersistentImageProperty) -> PersistentCheckResult {
+
+		def end = clampCut(trace, toCut);
+		var first = clampCut(trace, fromCut);
+		if (first > end) first = end;
+
 		var checked = 0;
 		var truncated = false;
 		var last: PersistentExploration;
-		for (cut < trace.length() + 1) {
+		for (cut = first; cut <= end; cut++) {
 			def result = checkImages(trace, initial, cut, budget, property);
 			checked += result.imagesChecked;
 			if (result.truncated) truncated = true;

@@ -19,6 +19,7 @@ def PETX = [
 	PET("property_failure_becomes_counterexample", test_explore_property_failure_becomes_counterexample),
 	PET("all_cuts_reports_earliest_failure", test_explore_all_cuts_reports_earliest_failure),
 	PET("truncated_search_is_not_evidence", test_explore_truncated_search_is_not_evidence),
+	PET("cut_range_checks_only_its_cuts", test_explore_cut_range_checks_only_its_cuts),
 	()
 ];
 
@@ -440,4 +441,37 @@ def test_explore_truncated_search_is_not_evidence(tc: PersistentExplorerTester) 
 	def complete = PersistentExplorer.checkImages(tr, null, 3, 0, property);
 	tc.t.assertz(true, complete.exhaustive());
 	tc.t.asserti(6, complete.imagesChecked);
+}
+
+
+// A property is often only claimed from a point in a scenario onward, so a
+// range must check the cuts it was given and no others: the property that fails
+// at the start of this trace holds from the fence on, and asking for that
+// suffix must not drag the earlier cuts back in. Ends outside the trace clamp.
+def test_explore_cut_range_checks_only_its_cuts(tc: PersistentExplorerTester) {
+	def tr = tc.trace("late_failure", [
+		tc.store(1u64, 64u64, 8u8, tc.B),
+		tc.store(2u64, 0u64, 8u8, tc.A),
+		tc.clwb(3u64, 0u64),
+		tc.fence(4u64)
+	]);
+	def property = PersistentImageProperty.new("first store survives", 0u64, 8,
+		tc.durableProperty);
+
+	// From the fence onward the store is durable on every schedule.
+	def suffix = PersistentExplorer.checkCutRange(tr, null, 4, 99, 0, property);
+	tc.t.assertz(true, suffix.exhaustive());
+
+	// A range that reaches back before the fence fails at its own earliest cut,
+	// not at the trace's.
+	def wider = PersistentExplorer.checkCutRange(tr, null, 2, 4, 0, property);
+	tc.t.assertz(false, wider.ok());
+	tc.t.asserti(2, wider.counterexample.crashAfter);
+
+	// The whole trace is the range 0..length, and delegating to it must not
+	// change what the sweep reports.
+	def all = PersistentExplorer.checkAllCuts(tr, null, 0, property);
+	def same = PersistentExplorer.checkCutRange(tr, null, 0, tr.length(), 0, property);
+	tc.t.asserti(all.counterexample.crashAfter, same.counterexample.crashAfter);
+	tc.t.asserti(all.imagesChecked, same.imagesChecked);
 }
