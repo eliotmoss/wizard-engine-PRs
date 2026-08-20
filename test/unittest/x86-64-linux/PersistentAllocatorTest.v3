@@ -12,6 +12,7 @@ def PATX = [
 	PAT("commit_boundary_recovers_allocation", test_alloc_commit_boundary_recovers_allocation),
 	PAT("split_alloc_images_stay_consistent", test_alloc_split_alloc_images_stay_consistent),
 	PAT("coalescing_free_images_stay_consistent", test_alloc_coalescing_free_images_stay_consistent),
+	PAT("crash_during_allocator_recovery_stays_consistent", test_alloc_crash_during_allocator_recovery_stays_consistent),
 	()
 ];
 
@@ -234,4 +235,42 @@ def test_alloc_coalescing_free_images_stay_consistent(tc: PersistentAllocatorTes
 		tc.allocatorProperty("free coalescing survives every crash schedule"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.truncated);
+}
+
+
+// The two-crash profile for the allocator: crash at a split allocation's commit
+// boundary, then crash again anywhere during the mount that recovers it. Every
+// image that second crash can leave must still mount into a consistent
+// allocator -- the recovered record is not scrubbed, and replaying its
+// after-images is idempotent.
+def test_alloc_crash_during_allocator_recovery_stays_consistent(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	tc.recorder.clear();
+	def chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, chunk.isNull());
+	def trace = tc.recorder.snapshot("pwregion_split_alloc");
+	tc.cleanup();
+
+	def crashed = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
+	def recording = PersistentRecoveries.recordPWRegionRecovery(crashed, tc.BLOCKS, tc.BLOCK_SIZE,
+		"pwregion_mount_recovery");
+	if (recording == null) {
+		tc.t.fail("could not mount the crash image as an allocator");
+		return;
+	}
+	// The mount itself recovered into a consistent allocator.
+	tc.assertConsistent(recording.run.violation);
+	tc.t.assertz(false, recording.run.requiresRecovery);
+	// A mount that made nothing durable would make the sweep below vacuous.
+	tc.t.assertz(true, recording.trace.length() > 0);
+	tc.t.assertz(true, recording.trace.validate().ok());
+
+	def result = PersistentExplorer.checkAllCuts(recording.trace, crashed.bytes, 8,
+		tc.allocatorProperty("allocator survives a crash during its own recovery"));
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.imagesChecked > recording.trace.length());
 }

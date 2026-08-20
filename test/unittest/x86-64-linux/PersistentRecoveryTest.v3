@@ -13,6 +13,8 @@ def PRTX = [
 	PRT("unmet_property_yields_image_counterexample", test_recovery_unmet_property_yields_image_counterexample),
 	PRT("recovery_records_its_own_trace", test_recovery_recovery_records_its_own_trace),
 	PRT("crash_during_recovery_still_recovers", test_recovery_crash_during_recovery_still_recovers),
+	PRT("failed_replay_persist_latches_and_reopens", test_recovery_failed_replay_persist_latches_and_reopens),
+	PRT("failed_replay_persist_never_loses_a_record", test_recovery_failed_replay_persist_never_loses_a_record),
 	()
 ];
 
@@ -250,4 +252,60 @@ def test_recovery_crash_during_recovery_still_recovers(tc: PersistentRecoveryTes
 	// of a commit.
 	tc.t.assertz(true, result.exhaustive());
 	tc.t.assertz(true, result.imagesChecked > 1);
+}
+
+
+// A recovery that cannot persist what it replayed must latch rather than claim
+// a durability it did not reach -- and must leave the record intact, so a later
+// mount still restores the acknowledged after-image.
+def test_recovery_failed_replay_persist_latches_and_reopens(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+
+	def failed = PersistentRecoveries.runDualWalWithFailure(image, tc.LOG_OFFSET, tc.LOG_SIZE, 1);
+	tc.t.assertz(true, failed.recovery == DualWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(true, failed.requiresRecovery);
+
+	// The same instance is unusable, but the durable bytes are not: a fresh
+	// mount replays the record the failed attempt did not destroy.
+	def reopened = PersistentRecoveries.runDualWal(failed.recovered, tc.LOG_OFFSET, tc.LOG_SIZE);
+	tc.t.assertz(true, reopened.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(false, reopened.requiresRecovery);
+	tc.t.assert_eq(tc.VALUE, reopened.recovered.read(tc.OFFSET, 8));
+	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
+
+	// An injection that never fires leaves recovery ordinary.
+	def clean = PersistentRecoveries.runDualWalWithFailure(image, tc.LOG_OFFSET, tc.LOG_SIZE, 0);
+	tc.t.assertz(true, clean.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(false, clean.requiresRecovery);
+}
+
+// The same, over every image the commit can leave: whatever a failed recovery
+// persist leaves behind must never recover as a value that was never committed,
+// and a latch must always come with the failure that caused it.
+def test_recovery_failed_replay_persist_never_loses_a_record(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def property = PersistentRecoveryFailureProperty.new(tc.LOG_OFFSET, tc.LOG_SIZE,
+		tc.OFFSET, 8, tc.VALUE, false, 1)
+		.property("a failed recovery persist never loses or invents a record");
+
+	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 12, property);
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.truncated);
+
+	// At the commit boundary the transaction is acknowledged, so the stronger
+	// half of the contract holds there and that cut is exhaustive.
+	def acknowledged = PersistentRecoveryFailureProperty.new(tc.LOG_OFFSET, tc.LOG_SIZE,
+		tc.OFFSET, 8, tc.VALUE, true, 1)
+		.property("a failed recovery persist keeps an acknowledged transaction");
+	def atBoundary = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+		acknowledged);
+	if (!atBoundary.ok()) tc.t.fail(atBoundary.toArtifact());
+	tc.t.assertz(true, atBoundary.exhaustive());
 }

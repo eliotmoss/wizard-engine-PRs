@@ -591,8 +591,10 @@ rather than an implementation detail:
 The array mount is sound for a recovery whose *result* is being checked: the
 simulator, not the backend, already decided which bytes survived the crash, and
 recovery's own persistence boundaries are what the next section models. It
-cannot express a persistence failure or a crash during recovery, which is
-exactly what the mapped, recording mount is for.
+cannot by itself express a crash during recovery — that is what the mapped,
+recording mount is for — nor a persistence *failure*, which
+`InjectedFailureRegion` adds: an array container whose boundaries fail once, at
+a chosen call.
 
 ## Crash during recovery
 
@@ -606,13 +608,33 @@ during the recovery that follows.
 
 Recording through the production `PmemMmapRegion` rather than a copy of its
 translation is what keeps this evidence about the real seam.
+`recordPWRegionRecovery()` does the same for an allocator mount, handing the
+recording container to `PWRegion` through `PreparedRegionBackend`, so the whole
+mount — WAL recovery plus whatever the allocator publishes — is one trace.
 
 For the canonical case — a commit-boundary crash — replay writes one after-image
 and publishes it with one boundary, so the second-crash state space is small
 enough to sweep exhaustively, unlike the mid-record cuts of a commit itself. The
 acknowledged after-image must survive every one of those images: recovery does
 not scrub the record it replayed, and replay is idempotent, so a remount reaches
-the same state.
+the same state. The allocator runs the same profile, with the invariant walk as
+its property.
+
+### Recovery that cannot persist
+
+`runDualWalWithFailure()` mounts an image in the failure-injecting container and
+fails one recovery boundary. `PersistentRecoveryFailureProperty` states what
+must then hold, over every image a cut permits:
+
+- a `PERSIST_FAILED` outcome and a latched mount imply each other — recovery may
+  neither claim a durability it did not reach nor latch silently; and
+- the bytes the failed attempt left behind must still satisfy the ordinary
+  contract on a later mount.
+
+The second clause is the one with teeth. A recovery that reclaimed or scrubbed a
+record it had not durably replayed would return an honest-looking
+`PERSIST_FAILED` and still have destroyed the only durable copy of an
+acknowledged transaction.
 
 ---
 
@@ -745,8 +767,11 @@ second representation of the protocol.
 7. **First slice completed 2026-08-20:** bounded crash-during-recovery
    exploration — `recordDualWalRecovery()` captures recovery's own stores,
    writebacks and fences, and `checkCrashDuringRecovery()` explores a second
-   crash over that trace (see "Crash during recovery" above). **Remaining:**
-   allocator scenarios and recovery-persistence failures under the same profile.
+   crash over that trace, the same profile for an allocator mount
+   (`recordPWRegionRecovery()`), and recovery-persistence failure injection
+   (`InjectedFailureRegion`, `PersistentRecoveryFailureProperty`) — see "Crash
+   during recovery" above. **Remaining:** failure injection during an allocator
+   mount, and multi-transaction scenarios.
 8. Retain exhaustive short tests in the regular suite; run longer seeded
    exploration separately.
 9. Independently validate that the production PMEM implementation emits the

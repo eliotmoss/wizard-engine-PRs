@@ -90,10 +90,57 @@ component PersistentImageMounts {
 	}
 }
 
+// A byte-array container whose persistence boundaries fail once, at a chosen
+// call. The array mount cannot otherwise express a failed persist, and a failed
+// persist during recovery is precisely the case where an acknowledged
+// transaction could be lost if the WAL reclaimed a record it had not durably
+// replayed.
+class InjectedFailureRegion extends VolatileRegion {
+	def failAtBoundary: int;	// 1 = the first boundary, 0 = never fail
+	var boundaries = 0;
+
+	new(range: Range<byte>, failAtBoundary) super(range) { }
+
+	def persistRange(offset: u64, size: u64) -> bool {
+		return boundary();
+	}
+
+	def persistChanges() -> bool {
+		return boundary();
+	}
+
+	private def boundary() -> bool {
+		boundaries++;
+		return boundaries != failAtBoundary;
+	}
+}
+
+// A backend that hands out one already-prepared region, so a PWRegion can be
+// mounted over a container the caller chose -- a recording one, or one that
+// injects a persistence failure.
+class PreparedRegionBackend(prepared: BackendRegion) extends TxnRegionBackend {
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		if (prepared == null || u64.!(prepared.range.length) < size) return null;
+		return prepared;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "prepared-region";
+	}
+}
+
 // A recovery run together with the trace of what recovery itself made durable.
 // The trace's starting durable image is the image recovery was handed, so
 // exploring it is exploring a second crash during recovery.
 class PersistentRecoveryRecording(run: PersistentRecoveryRun, trace: PersistentTrace) { }
+
+// The same for an allocator mount: what the mount produced, plus the trace of
+// what it made durable.
+class PersistentRegionRecording(run: PersistentRegionRun, trace: PersistentTrace) { }
 
 component PersistentRecoveries {
 	// Mount {image} and run the production two-slot WAL recovery over it.
@@ -130,6 +177,40 @@ component PersistentRecoveries {
 		def result = wal.recover();
 		return PersistentRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
 			wal.lastCommittedSeq, wal.dataDurableSeq, mount.freeze());
+	}
+
+	// The same recovery, with one persistence boundary failed. The WAL must
+	// latch rather than claim a durability it did not reach, and the bytes left
+	// behind must still be recoverable by a later mount.
+	def runDualWalWithFailure(image: PersistentDurableImage, logChunkOffset: u64,
+		logChunkSize: u64, failAtBoundary: int) -> PersistentRecoveryRun {
+
+		def data = Array<byte>.new(image.size());
+		for (i < data.length) data[i] = image.bytes[i];
+		def region = InjectedFailureRegion.new(data[0 ..+ data.length], failAtBoundary);
+		def mount = PersistentImageMount.new(region, null);
+		return recoverOn(mount, logChunkOffset, logChunkSize);
+	}
+
+	// Mount {image} as an allocator through a recording container, so the whole
+	// mount -- WAL recovery plus whatever the allocator publishes -- is captured
+	// as a trace that a second crash can be explored over.
+	def recordPWRegionRecovery(image: PersistentDurableImage, numBlocks: u64,
+		blockSize: u64, name: string) -> PersistentRegionRecording {
+
+		def mount = PersistentImageMounts.openMapped(image, true);
+		if (mount == null) return null;
+		def region = PWRegion.new(PreparedRegionBackend.new(mount.region), numBlocks,
+			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		if (region.backendRegion == null) {
+			mount.close();
+			return null;
+		}
+		def violation = PersistentAllocatorInvariants.check(region);
+		def run = PersistentRegionRun.new(true, region.requiresRecovery(), violation, mount.freeze());
+		def trace = mount.recorder.snapshot(name);
+		region.deallocate();
+		return PersistentRegionRecording.new(run, trace);
 	}
 
 	// Every durable image a SECOND crash, during recovery from {image}, can
@@ -203,6 +284,34 @@ class PersistentWalRecoveryProperty(logChunkOffset: u64, logChunkSize: u64,
 		run.render(buf);
 		buf.puts(" durable=0x").putx_64(run.recovered.read(offset, width));
 		return buf.toString();
+	}
+}
+
+// Recovery that cannot persist what it replayed. A failed boundary must latch
+// the mount rather than let it claim a durability it did not reach, and -- the
+// property that matters -- the bytes such an attempt leaves behind must still
+// be recoverable by a later mount. A recovery that reclaimed or scrubbed a
+// record it had not durably replayed would fail this even though its own
+// return value looked honest.
+class PersistentRecoveryFailureProperty(logChunkOffset: u64, logChunkSize: u64,
+	offset: u64, width: int, value: u64, mustSurvive: bool, failAtBoundary: int) {
+
+	def check(image: PersistentDurableImage) -> string {
+		def failed = PersistentRecoveries.runDualWalWithFailure(image, logChunkOffset,
+			logChunkSize, failAtBoundary);
+		if (failed == null) return "could not mount the durable image";
+		if (failed.recovery == DualWalRecovery.PERSIST_FAILED && !failed.requiresRecovery) {
+			return "recovery reported PERSIST_FAILED without latching the mount";
+		}
+		if (failed.requiresRecovery && failed.recovery != DualWalRecovery.PERSIST_FAILED) {
+			return "recovery latched the mount without reporting PERSIST_FAILED";
+		}
+		return PersistentWalRecoveryProperty.new(logChunkOffset, logChunkSize, offset,
+			width, value, mustSurvive).check(failed.recovered);
+	}
+
+	def property(name: string) -> PersistentImageProperty {
+		return PersistentImageProperty.new(name, offset, 16, check);
 	}
 }
 
