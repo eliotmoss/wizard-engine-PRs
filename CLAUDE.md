@@ -112,7 +112,7 @@ PWRegion (block allocator)
 | `X86_64PersistentTrace.v3` | Frozen scenario artifacts over the recorder: `PersistentTrace` (immutable snapshot, crash-cut `prefix()`, baseline `validate()`, content `digest()`, `touchedLines()`, stable rendering), `PersistentCounterexample` (optional durable image + byte window via `withImage()`), `PersistentTraces.capture()` |
 | `X86_64PersistentImage.v3` | Durable-byte model over a trace: `PersistentCrashMachine` (per-line store lists, asynchronous writeback completion, fence obligations, background eviction, `crash()`), `PersistentDurableImage` (little-endian `read()`, `digest()`, `sameBytes()`), `PersistentImages.lazyCrash()`/`eagerCrash()` extremal schedules |
 | `X86_64PersistentExplorer.v3` | Schedule enumeration over a trace: `PersistentExplorer.crashImages()` (full branching search with state dedup and a reported budget) and `reducedCrashImages()` (fence-forced floor + per-line prefix product); `checkImages()`/`checkAllCuts()` run a `PersistentImageProperty` and emit a `PersistentCounterexample`; `PersistentExploration`/`PersistentCheckResult` results and artifacts |
-| `X86_64PersistentRecovery.v3` | Production recovery over an enumerated image: `PersistentRecoveries.runDualWal()` (remount + `recover()` + resulting bytes), `PersistentWalRecoveryProperty` (acknowledgement contract as a checkable property) |
+| `X86_64PersistentRecovery.v3` | Production recovery over an enumerated image: `PersistentRecoveries.runDualWal()` (remount + `recover()` + resulting bytes), `PersistentWalRecoveryProperty` (acknowledgement contract as a checkable property), `PersistentImageBackend` + `PersistentAllocatorProperty` (mount an image as a `PWRegion`), `PersistentAllocatorInvariants` (memory-order/free-list/used-state walk returning the first violation) |
 | `X86_64TxnBackend.v3` | `FileMmapRegion`, `PmemMmapRegion`, `FdMmapRegion`; `RegionFileIO`; `X86_64Backends` factory |
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, `ImmixPWRegion` |
 | `X86_64SingleTxnWal.v3` | Single-transaction in-region WAL — superseded, **not wired in**; kept as a reference implementation (see `docs/wal-comparison.md`) |
@@ -127,6 +127,7 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/PersistentImageTest.v3` | Durable-image model tests (volatility, torn writeback, fence completion, eviction, real-WAL trace image) |
 | `test/unittest/x86-64-linux/PersistentExplorerTest.v3` | Crash-image enumeration and property-check tests (image counts per cut, reduction agrees with full search, budget truncation, counterexample emission) |
 | `test/unittest/x86-64-linux/PersistentRecoveryTest.v3` | Production recovery over enumerated crash images (acknowledged survival, no invented state, idempotence, counterexample emission) |
+| `test/unittest/x86-64-linux/PersistentAllocatorTest.v3` | Allocator invariants over enumerated crash images (split alloc, coalescing free, walker self-check) |
 | `test/unittest/x86-64-linux/MultiTxnWalTest.v3` | `MultiTxnWal` unit tests (comparison implementation) |
 
 ### On-region layout

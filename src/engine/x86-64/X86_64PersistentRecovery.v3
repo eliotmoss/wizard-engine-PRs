@@ -110,3 +110,182 @@ class PersistentWalRecoveryProperty(logChunkOffset: u64, logChunkSize: u64,
 		return buf.toString();
 	}
 }
+
+// A backend that hands a PWRegion one durable image to mount. `fresh` is
+// ignored: the point of this backend is that the bytes are the crash image, not
+// a fresh format.
+class PersistentImageBackend(image: PersistentDurableImage) extends TxnRegionBackend {
+
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		if (u64.!(image.size()) < size) return null;
+		def data = Array<byte>.new(image.size());
+		for (i < data.length) data[i] = image.bytes[i];
+		return VolatileRegion.new(data[0 ..+ data.length]);
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "persistent-image";
+	}
+}
+
+// What mounting one durable image as an allocator produced.
+class PersistentRegionRun(mounted: bool, requiresRecovery: bool, violation: string,
+	recovered: PersistentDurableImage) { }
+
+// Structural check of a mounted allocator, as a first-violation string rather
+// than as assertions, so the same walk serves a unit test and a crash-model
+// property. The rules are the allocator's own invariants: the memory-order
+// chain is acyclic, index-increasing and doubly linked, ending at the region
+// marker; a free extent is classified by its actual span and appears exactly
+// once on the matching free list; free extents are never adjacent; and a used
+// entry is on no list at all.
+component PersistentAllocatorInvariants {
+	def check(region: PWRegion) -> string {
+		if (region == null || region.backendRegion == null) return "region did not mount";
+		def entryCount = int.!(region.numBlocks + 1u64);
+		def memorySeen = Array<bool>.new(entryCount);
+		def freeByIndex = Array<bool>.new(entryCount);
+		def listed = Array<bool>.new(entryCount);
+
+		var previous = BlockEntryHandle(0u64);
+		var current = region.blockTableHandle[0u64];
+		var reachedEnd = false;
+		var steps = 0;
+		while (!current.isNull()) {
+			if (steps >= entryCount) return "memory-order cycle detected";
+			if (!isBlockTableEntry(region, current)) return "memory-order link points outside block table";
+
+			def index = region.blockIndexOf(current);
+			def arrayIndex = int.!(index);
+			if (memorySeen[arrayIndex]) return at("block appears twice in memory order", index);
+			memorySeen[arrayIndex] = true;
+			if (previous.addr != current.getPrev().addr) return at("memory-order back link is wrong", index);
+
+			def next = current.getNext();
+			if (index == region.numBlocks) {
+				if (!current.getUsed()) return "region marker is not marked used";
+				if (current.getListNum() != ListKind.NONE.code) return "region marker is on a free list";
+				if (!next.isNull() || !current.getListPrev().isNull() || !current.getListNext().isNull()) {
+					return "region marker has non-null links";
+				}
+				reachedEnd = true;
+				break;
+			}
+			if (!isBlockTableEntry(region, next)) return at("memory-order chain ends before region marker", index);
+
+			def nextIndex = region.blockIndexOf(next);
+			if (nextIndex <= index) return at("memory-order block indices are not increasing", index);
+			if (current.addr != next.getPrev().addr) return at("memory-order forward link is not mirrored", index);
+
+			if (current.getUsed()) {
+				def kind = current.getListNum();
+				if (kind != ListKind.NONE.code && kind != ListKind.METADATA.code) {
+					return at("used block carries a free-list kind", index);
+				}
+				if (!current.getListPrev().isNull() || !current.getListNext().isNull()) {
+					return at("used block is linked into a free list", index);
+				}
+			} else {
+				def extentBlocks = nextIndex - index;
+				def expected = if(extentBlocks == 1u64, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code);
+				if (current.getListNum() != expected) return at("free block is on the wrong free list", index);
+				if (!previous.isNull() && !previous.getUsed()) {
+					return at("adjacent free extents were not coalesced", index);
+				}
+				freeByIndex[arrayIndex] = true;
+			}
+
+			previous = current;
+			current = next;
+			steps++;
+		}
+		if (!reachedEnd) return "memory-order chain does not reach the region marker";
+
+		var bad = walkFreeList(region, region.smallSentinel, ListKind.SMALL_FREE, listed);
+		if (bad != null) return bad;
+		bad = walkFreeList(region, region.largeSentinel, ListKind.LARGE_FREE, listed);
+		if (bad != null) return bad;
+		for (i < entryCount) {
+			if (freeByIndex[i] != listed[i]) {
+				return at("free block is missing from or extra on the free lists", u64.!(i));
+			}
+		}
+
+		if (region.requiresRecovery()) return "mount is recovery-required after recovery";
+		if (region.txn.isDirty()) return "mount left buffered writes in the transaction";
+		return null;
+	}
+
+	private def walkFreeList(region: PWRegion, sentinel: BlockEntryHandle, kind: ListKind,
+		listed: Array<bool>) -> string {
+
+		var previous = sentinel;
+		var current = sentinel.getListNext();
+		var steps = 0;
+		while (!current.isNull()) {
+			if (steps > int.!(region.numBlocks)) return "free-list cycle detected";
+			if (!isBlockTableEntry(region, current)) return "free list points outside block table";
+
+			def index = region.blockIndexOf(current);
+			def arrayIndex = int.!(index);
+			if (listed[arrayIndex]) return at("block appears more than once on the free lists", index);
+			listed[arrayIndex] = true;
+			if (current.getListNum() != kind.code) return at("free block is on the wrong list", index);
+			if (current.getUsed()) return at("used block appears on a free list", index);
+			if (previous.addr != current.getListPrev().addr) return at("free-list back link is wrong", index);
+
+			previous = current;
+			current = current.getListNext();
+			steps++;
+		}
+		return null;
+	}
+
+	private def isBlockTableEntry(region: PWRegion, entry: BlockEntryHandle) -> bool {
+		if (entry.isNull()) return false;
+		if (entry.addr < region.blockTableHandle.addr) return false;
+		def delta = entry.addr - region.blockTableHandle.addr;
+		if (delta % u64.!(BlockEntry.size) != 0) return false;
+		return delta / u64.!(BlockEntry.size) <= region.numBlocks;
+	}
+
+	private def at(text: string, index: u64) -> string {
+		return StringBuilder.new().put2("%s (block %d)", text, index).toString();
+	}
+}
+
+// Mount a durable image as an allocator and check what production recovery left
+// behind. Every image a crash can produce must mount into an internally
+// consistent allocator: checking only whether a later allocation succeeds is too
+// weak, since a broken chain can still satisfy one request.
+class PersistentAllocatorProperty(numBlocks: u64, blockSize: u64) {
+
+	def run(image: PersistentDurableImage) -> PersistentRegionRun {
+		def backend = PersistentImageBackend.new(image);
+		def region = PWRegion.new(backend, numBlocks, Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		if (region.backendRegion == null) {
+			return PersistentRegionRun.new(false, false, "region did not mount", null);
+		}
+		def violation = PersistentAllocatorInvariants.check(region);
+		def after = Array<byte>.new(region.rng.length);
+		for (i < after.length) after[i] = region.rng[i];
+		def run = PersistentRegionRun.new(true, region.requiresRecovery(), violation,
+			PersistentDurableImage.new(after));
+		region.deallocate();
+		return run;
+	}
+
+	def check(image: PersistentDurableImage) -> string {
+		def result = run(image);
+		if (!result.mounted) return "durable image did not mount as an allocator";
+		return result.violation;
+	}
+
+	def property(name: string, windowOffset: u64, windowLength: int) -> PersistentImageProperty {
+		return PersistentImageProperty.new(name, windowOffset, windowLength, check);
+	}
+}

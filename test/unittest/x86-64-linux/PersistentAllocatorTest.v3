@@ -1,0 +1,237 @@
+// Allocator-invariant tests over enumerated crash images (milestone 6 of
+// docs/pmem-crash-model.md). A real allocator transaction is recorded through
+// the production PWRegion, every durable image a crash can leave is mounted as
+// an allocator, and its memory-order chain, free lists and used/list state are
+// walked directly -- checking only whether a later allocation succeeds is too
+// weak, since a broken chain can still satisfy one request.
+
+def PAT = UnitTests.registerT("persistent_alloc:", _, PersistentAllocatorTester.new, _);
+def PATX = [
+	PAT("mounted_region_satisfies_invariants", test_alloc_mounted_region_satisfies_invariants),
+	PAT("walker_detects_a_broken_chain", test_alloc_walker_detects_a_broken_chain),
+	PAT("commit_boundary_recovers_allocation", test_alloc_commit_boundary_recovers_allocation),
+	PAT("split_alloc_images_stay_consistent", test_alloc_split_alloc_images_stay_consistent),
+	PAT("coalescing_free_images_stay_consistent", test_alloc_coalescing_free_images_stay_consistent),
+	()
+];
+
+class PersistentAllocatorTester(t: Tester) {
+	def BLOCKS = 8u64;
+	def BLOCK_SIZE = 2048u64;
+	def REGION_BYTES = 16384;
+
+	var mounted: Array<byte>;	// durable bytes before the recorded scenario
+	var trace: PersistentTrace;
+	var region: PWRegion;
+	var recorder: RecordingPersistentOperations;
+
+	// Format a region whose persistent stores are recorded, and remember the
+	// bytes it had once formatting was durable: the recorded scenario starts
+	// from a mounted allocator, not from a blank region.
+	def openRecordingRegion() -> bool {
+		region = PWRegion.new(RecordingPmemBackend.new(), BLOCKS,
+			Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, true);
+		if (region.backendRegion == null) return false;
+		recorder = RecordingPersistentOperations.!(region.backendRegion.persistentOperations());
+		return true;
+	}
+
+	def snapshotMounted() {
+		mounted = Array<byte>.new(region.rng.length);
+		for (i < mounted.length) mounted[i] = region.rng[i];
+	}
+
+	def allocatorProperty(name: string) -> PersistentImageProperty {
+		return PersistentAllocatorProperty.new(BLOCKS, BLOCK_SIZE).property(name, 0u64, 0);
+	}
+
+	def usedBlocks(image: PersistentDurableImage) -> int {
+		def result = PersistentAllocatorProperty.new(BLOCKS, BLOCK_SIZE).run(image);
+		if (!result.mounted) return -1;
+		return countUsed(image);
+	}
+
+	// Count the used data blocks by mounting the image and walking memory order.
+	def countUsed(image: PersistentDurableImage) -> int {
+		def backend = PersistentImageBackend.new(image);
+		def mount = PWRegion.new(backend, BLOCKS, Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, false);
+		if (mount.backendRegion == null) return -1;
+		var used = 0;
+		var current = mount.blockTableHandle[0u64];
+		var steps = 0;
+		while (!current.isNull() && steps <= int.!(BLOCKS)) {
+			def index = mount.blockIndexOf(current);
+			if (index == BLOCKS) break;
+			if (current.getUsed() && current.getListNum() == ListKind.NONE.code) used++;
+			current = current.getNext();
+			steps++;
+		}
+		mount.deallocate();
+		return used;
+	}
+
+	// The walker reports the first violation as a string; null is consistent.
+	def assertConsistent(violation: string) {
+		if (violation != null) t.fail(violation);
+	}
+
+	def cleanup() {
+		if (region != null) {
+			region.deallocate();
+			region = null;
+		}
+	}
+}
+
+// A PMEM-style backend with a recording persistent-operation provider, so a
+// real PWRegion's stores, cache-line writebacks and fences all land in one
+// trace. A volatile region would be wrong here: its persistence boundaries are
+// no-ops, so the trace would contain no CLWB or SFENCE at all and the model
+// would conclude that nothing the allocator wrote was ever made durable.
+class RecordingPmemBackend extends TxnRegionBackend {
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = PmemMmapRegion.new(mapping, -1);
+		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		return region;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "recording-pmem";
+	}
+}
+
+// The walker must accept the allocator the production code actually produces,
+// both freshly formatted and after an allocation. Otherwise every later check
+// would be measuring the walker, not the allocator.
+def test_alloc_mounted_region_satisfies_invariants(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.assertConsistent(PersistentAllocatorInvariants.check(tc.region));
+
+	def chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, chunk.isNull());
+	tc.assertConsistent(PersistentAllocatorInvariants.check(tc.region));
+
+	tc.t.assertz(true, tc.region.freeChunk(chunk));
+	tc.assertConsistent(PersistentAllocatorInvariants.check(tc.region));
+	tc.cleanup();
+}
+
+// A walk that cannot fail proves nothing: breaking one memory-order link in a
+// durable image must be reported rather than silently accepted.
+def test_alloc_walker_detects_a_broken_chain(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	tc.cleanup();
+
+	def good = PersistentDurableImage.new(Arrays.dup(tc.mounted));
+	def property = PersistentAllocatorProperty.new(tc.BLOCKS, tc.BLOCK_SIZE);
+	tc.assertConsistent(property.check(good));
+
+	// The block table lives at the end of the region; corrupting a link byte in
+	// it must surface as a structural violation, not as a mount that looks fine.
+	def broken = Arrays.dup(tc.mounted);
+	var changed = false;
+	for (i = broken.length - 200; i < broken.length - 8; i++) {
+		if (broken[i] != 0) {
+			broken[i] = broken[i] ^ 0x40u8;
+			changed = true;
+			break;
+		}
+	}
+	tc.t.assertz(true, changed);
+	def violation = property.check(PersistentDurableImage.new(broken));
+	tc.t.assertz(false, violation == null);
+}
+
+// The allocator transaction end to end: record a split allocation, take the
+// image a crash right after its commit boundary leaves, mount it, and let
+// production recovery replay the after-images that were never applied.
+def test_alloc_commit_boundary_recovers_allocation(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	def before = tc.countUsed(PersistentDurableImage.new(Arrays.dup(tc.mounted)));
+
+	tc.recorder.clear();
+	def chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, chunk.isNull());
+	def trace = tc.recorder.snapshot("pwregion_split_alloc");
+	tc.t.assertz(true, trace.validate().ok());
+	tc.cleanup();
+
+	def image = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
+	def property = PersistentAllocatorProperty.new(tc.BLOCKS, tc.BLOCK_SIZE);
+	tc.assertConsistent(property.check(image));
+	// Recovery replayed the allocation: one more used extent than before.
+	tc.t.asserti(before + 1, tc.countUsed(image));
+}
+
+// Every image a crash during the allocation can leave must mount into a
+// consistent allocator. A real record is written byte by byte across several
+// cache lines, so the sweep is explicitly budgeted and reports itself as not
+// exhaustive rather than hiding the bound.
+def test_alloc_split_alloc_images_stay_consistent(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	tc.recorder.clear();
+	def chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, chunk.isNull());
+	def trace = tc.recorder.snapshot("pwregion_split_alloc");
+	tc.cleanup();
+
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, 8,
+		tc.allocatorProperty("allocator structure survives every crash schedule"));
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.imagesChecked > trace.length());
+	tc.t.assertz(true, result.truncated);
+	tc.t.assertz(false, result.exhaustive());
+}
+
+// The same over a free that coalesces with its neighbour, the transaction with
+// the most link surgery: memory-order relinking plus removal from and insertion
+// into the free lists.
+def test_alloc_coalescing_free_images_stay_consistent(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	def first = tc.region.allocChunk(1u32);
+	def second = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, first.isNull());
+	tc.t.assertz(false, second.isNull());
+	tc.t.assertz(true, tc.region.freeChunk(first));
+	tc.snapshotMounted();
+
+	tc.recorder.clear();
+	tc.t.assertz(true, tc.region.freeChunk(second));
+	def trace = tc.recorder.snapshot("pwregion_coalescing_free");
+	tc.t.assertz(true, trace.validate().ok());
+	tc.cleanup();
+
+	// The completed transaction must leave a coalesced, consistent allocator.
+	def image = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
+	def property = PersistentAllocatorProperty.new(tc.BLOCKS, tc.BLOCK_SIZE);
+	tc.assertConsistent(property.check(image));
+
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, 8,
+		tc.allocatorProperty("free coalescing survives every crash schedule"));
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.truncated);
+}

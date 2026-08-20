@@ -578,6 +578,54 @@ outcomes and invariants for many of these scenarios.
 
 ---
 
+## Allocator scenarios
+
+The same pipeline runs over a whole allocator transaction. `PWRegion` is
+formatted on a trace-recording PMEM region, the recorder is cleared, and one
+`allocChunk()`/`freeChunk()` is recorded: its WAL record, its commit boundary,
+and the after-images it applies afterwards. Every image a crash can leave is
+then mounted through `PersistentAllocatorProperty`, which builds a `PWRegion`
+over the image (`PersistentImageBackend`, no fresh format), lets the production
+mount path run WAL recovery, and walks the resulting structure.
+
+`PersistentAllocatorInvariants.check()` is that walk, returning the first
+violation as a string rather than asserting, so one implementation serves both
+a unit test and a crash-model property. It requires the memory-order chain to be
+acyclic, index-increasing and doubly linked through to the region marker; every
+free extent to be classified by its actual span and to appear exactly once on the
+matching free list; free extents never to be adjacent; a used entry to be on no
+list; and the mount to be neither recovery-required nor left with buffered
+writes. `persistent_alloc:walker_detects_a_broken_chain` corrupts one byte of a
+durable block table and requires the walk to report it — a walk that cannot fail
+would make every other allocator check vacuous.
+
+Checking only whether a later allocation still succeeds would be too weak: a
+broken chain can satisfy one request.
+
+### The backend must emit the boundaries
+
+A trace recorded over a volatile region contains no `CLWB` and no `SFENCE`,
+because `VolatileRegion`'s persistence boundaries are no-ops. The model then
+concludes — correctly, for what it was shown — that nothing the allocator wrote
+was ever made durable, and the exploration reports genuine inconsistencies:
+after-images evicted without a durable record to replay them. Allocator
+scenarios are therefore recorded over a `PmemMmapRegion`, whose
+`prepareChangedRange`/`persistChanges` translate into writebacks and fences on
+the same provider. Mounting an image for recovery can still use an ordinary
+byte-array region, since the simulator, not the backend, decides which bytes
+survived.
+
+### Scale
+
+A recorded split allocation is roughly 700 events across 15 cache lines: the
+WAL record is written byte by byte, and the after-images touch the block table
+in several places. The commit boundary cut and the final cut are cheap, but the
+mid-record cuts permit far more images than a unit test should mount, so the
+per-cut sweep runs under an explicit budget and asserts that it reports itself
+as not exhaustive.
+
+---
+
 ## Controlling state explosion
 
 Naively branching after every byte store and every possible writeback is
@@ -651,7 +699,11 @@ second representation of the protocol.
    (survival, no invented state, no latch, idempotence) as a checkable property
    (see "Running real recovery over an image" above). **Remaining:** allocator
    scenarios beyond a single WAL commit, and the wider scenario matrix.
-6. Add direct allocator invariant walkers and the initial scenario matrix.
+6. **First slice completed 2026-08-20:** a direct allocator invariant walker
+   (`PersistentAllocatorInvariants`) and image mounting for `PWRegion`
+   (`PersistentImageBackend`, `PersistentAllocatorProperty`), driven by recorded
+   split-allocation and coalescing-free transactions (see "Allocator scenarios"
+   above). **Remaining:** the rest of the initial scenario matrix.
 7. Add bounded crash-during-recovery exploration.
 8. Retain exhaustive short tests in the regular suite; run longer seeded
    exploration separately.
