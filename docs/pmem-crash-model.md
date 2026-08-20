@@ -636,6 +636,15 @@ record it had not durably replayed would return an honest-looking
 `PERSIST_FAILED` and still have destroyed the only durable copy of an
 acknowledged transaction.
 
+The allocator has the same shape in `runPWRegionWithFailure()` /
+`PersistentAllocatorFailureProperty`, with one extra distinction. The invariant
+walk is split: `checkStructure()` is the on-region structure alone, and
+`check()` adds the mount-state clauses (not recovery-required, no buffered
+writes). A mount whose boundary failed is *expected* to be latched, but its
+structure must still be walkable — refusing further work is not a licence to
+leave a half-applied transaction on the region — and reopening without injection
+must produce a fully consistent allocator that has the allocation.
+
 ---
 
 ## Allocator scenarios

@@ -213,6 +213,27 @@ component PersistentRecoveries {
 		return PersistentRegionRecording.new(run, trace);
 	}
 
+	// Mount {image} as an allocator with one persistence boundary failed.
+	def runPWRegionWithFailure(image: PersistentDurableImage, numBlocks: u64,
+		blockSize: u64, failAtBoundary: int) -> PersistentRegionRun {
+
+		def data = Array<byte>.new(image.size());
+		for (i < data.length) data[i] = image.bytes[i];
+		def container = InjectedFailureRegion.new(data[0 ..+ data.length], failAtBoundary);
+		def region = PWRegion.new(PreparedRegionBackend.new(container), numBlocks,
+			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		if (region.backendRegion == null) {
+			return PersistentRegionRun.new(false, false, "region did not mount", null);
+		}
+		def violation = PersistentAllocatorInvariants.checkStructure(region);
+		def after = Array<byte>.new(region.rng.length);
+		for (i < after.length) after[i] = region.rng[i];
+		def run = PersistentRegionRun.new(true, region.requiresRecovery(), violation,
+			PersistentDurableImage.new(after));
+		region.deallocate();
+		return run;
+	}
+
 	// Every durable image a SECOND crash, during recovery from {image}, can
 	// leave must still satisfy {property}: the log record has not been scrubbed,
 	// and replay is idempotent, so a remount must reach the same state.
@@ -348,7 +369,20 @@ class PersistentRegionRun(mounted: bool, requiresRecovery: bool, violation: stri
 // once on the matching free list; free extents are never adjacent; and a used
 // entry is on no list at all.
 component PersistentAllocatorInvariants {
+	// Structure plus mount state. This is what a mount that completed its
+	// recovery must satisfy.
 	def check(region: PWRegion) -> string {
+		def bad = checkStructure(region);
+		if (bad != null) return bad;
+		if (region.requiresRecovery()) return "mount is recovery-required after recovery";
+		if (region.txn.isDirty()) return "mount left buffered writes in the transaction";
+		return null;
+	}
+
+	// Structure alone. A mount whose persistence failed is *expected* to be
+	// recovery-required, but its on-region structure must still be walkable --
+	// a latched mount is not a licence to leave a broken chain behind.
+	def checkStructure(region: PWRegion) -> string {
 		if (region == null || region.backendRegion == null) return "region did not mount";
 		def entryCount = int.!(region.numBlocks + 1u64);
 		def memorySeen = Array<bool>.new(entryCount);
@@ -419,8 +453,6 @@ component PersistentAllocatorInvariants {
 			}
 		}
 
-		if (region.requiresRecovery()) return "mount is recovery-required after recovery";
-		if (region.txn.isDirty()) return "mount left buffered writes in the transaction";
 		return null;
 	}
 
@@ -459,6 +491,31 @@ component PersistentAllocatorInvariants {
 
 	private def at(text: string, index: u64) -> string {
 		return StringBuilder.new().put2("%s (block %d)", text, index).toString();
+	}
+}
+
+// An allocator mount whose recovery cannot persist. A latched mount must still
+// leave a walkable structure, and -- the claim that matters -- the bytes it
+// leaves behind must mount cleanly and consistently afterwards. A mount that
+// half-applied a replayed transaction and then failed its boundary would break
+// the second half even though refusing further work looks correct.
+class PersistentAllocatorFailureProperty(numBlocks: u64, blockSize: u64, failAtBoundary: int) {
+
+	def check(image: PersistentDurableImage) -> string {
+		def failed = PersistentRecoveries.runPWRegionWithFailure(image, numBlocks, blockSize,
+			failAtBoundary);
+		if (!failed.mounted) return "durable image did not mount as an allocator";
+		if (failed.violation != null) {
+			return StringBuilder.new().put1("latched mount left a broken structure: %s",
+				failed.violation).toString();
+		}
+		// Reopen without injection: the surviving bytes must be a consistent
+		// allocator, whether or not the failed attempt got as far as replaying.
+		return PersistentAllocatorProperty.new(numBlocks, blockSize).check(failed.recovered);
+	}
+
+	def property(name: string) -> PersistentImageProperty {
+		return PersistentImageProperty.new(name, 0u64, 0, check);
 	}
 }
 

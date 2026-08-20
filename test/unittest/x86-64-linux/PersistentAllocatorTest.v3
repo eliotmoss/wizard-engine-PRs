@@ -13,6 +13,9 @@ def PATX = [
 	PAT("split_alloc_images_stay_consistent", test_alloc_split_alloc_images_stay_consistent),
 	PAT("coalescing_free_images_stay_consistent", test_alloc_coalescing_free_images_stay_consistent),
 	PAT("crash_during_allocator_recovery_stays_consistent", test_alloc_crash_during_allocator_recovery_stays_consistent),
+	PAT("failed_mount_persist_keeps_structure", test_alloc_failed_mount_persist_keeps_structure),
+	PAT("failed_mount_persist_sweep", test_alloc_failed_mount_persist_sweep),
+	PAT("two_transaction_images_stay_consistent", test_alloc_two_transaction_images_stay_consistent),
 	()
 ];
 
@@ -74,6 +77,27 @@ class PersistentAllocatorTester(t: Tester) {
 	// The walker reports the first violation as a string; null is consistent.
 	def assertConsistent(violation: string) {
 		if (violation != null) t.fail(violation);
+	}
+
+	// Record {count} back-to-back allocations as one scenario, starting from a
+	// mounted allocator. Two transactions exercise slot alternation and the
+	// piggybacked boundary: transaction N's after-images ride transaction N+1's
+	// commit.
+	def recordAllocations(count: int, name: string) -> PersistentTrace {
+		snapshotMounted();
+		recorder.clear();
+		for (i < count) {
+			if (region.allocChunk(1u32).isNull()) {
+				t.fail("allocation failed while recording the scenario");
+				return null;
+			}
+		}
+		def trace = recorder.snapshot(name);
+		if (!trace.validate().ok()) {
+			t.fail("recorded allocator trace is not modelable");
+			return null;
+		}
+		return trace;
 	}
 
 	def cleanup() {
@@ -273,4 +297,90 @@ def test_alloc_crash_during_allocator_recovery_stays_consistent(tc: PersistentAl
 		tc.allocatorProperty("allocator survives a crash during its own recovery"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.imagesChecked > recording.trace.length());
+}
+
+
+// A mount whose recovery cannot persist must still leave a walkable allocator,
+// and the bytes it leaves must mount cleanly afterwards. Refusing further work
+// is not a licence to leave a half-applied transaction on the region.
+def test_alloc_failed_mount_persist_keeps_structure(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	def before = tc.countUsed(PersistentDurableImage.new(Arrays.dup(tc.mounted)));
+	tc.recorder.clear();
+	def chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, chunk.isNull());
+	def trace = tc.recorder.snapshot("pwregion_split_alloc");
+	tc.cleanup();
+
+	def crashed = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
+	def failed = PersistentRecoveries.runPWRegionWithFailure(crashed, tc.BLOCKS, tc.BLOCK_SIZE, 1);
+	tc.t.assertz(true, failed.mounted);
+	tc.t.assertz(true, failed.requiresRecovery);
+	tc.assertConsistent(failed.violation);
+
+	// Reopening without injection recovers the allocation the failed mount
+	// could not publish.
+	def property = PersistentAllocatorProperty.new(tc.BLOCKS, tc.BLOCK_SIZE);
+	tc.assertConsistent(property.check(failed.recovered));
+	tc.t.asserti(before + 1, tc.countUsed(failed.recovered));
+
+	// An injection that never fires leaves the mount ordinary.
+	def clean = PersistentRecoveries.runPWRegionWithFailure(crashed, tc.BLOCKS, tc.BLOCK_SIZE, 0);
+	tc.t.assertz(false, clean.requiresRecovery);
+	tc.assertConsistent(clean.violation);
+}
+
+// The same over every crash cut of the allocation, bounded.
+def test_alloc_failed_mount_persist_sweep(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	tc.recorder.clear();
+	def chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(false, chunk.isNull());
+	def trace = tc.recorder.snapshot("pwregion_split_alloc");
+	tc.cleanup();
+
+	def property = PersistentAllocatorFailureProperty.new(tc.BLOCKS, tc.BLOCK_SIZE, 1)
+		.property("a failed mount persist leaves a recoverable allocator");
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, 3, property);
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.truncated);
+}
+
+// Two back-to-back allocations: the second commit's boundary carries the first
+// transaction's after-images, and the two records occupy alternating slots. A
+// crash anywhere must still mount into a consistent allocator, and a crash
+// after the second boundary must recover both allocations.
+def test_alloc_two_transaction_images_stay_consistent(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	def before = tc.countUsed(PersistentDurableImage.new(Arrays.dup(tc.mounted)));
+	def trace = tc.recordAllocations(2, "pwregion_two_allocations");
+	if (trace == null) {
+		tc.cleanup();
+		return;
+	}
+	tc.cleanup();
+
+	// The first transaction's after-images were applied write-behind and ride
+	// the second commit's boundary, so the end of the scenario recovers both.
+	def image = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
+	def property = PersistentAllocatorProperty.new(tc.BLOCKS, tc.BLOCK_SIZE);
+	tc.assertConsistent(property.check(image));
+	tc.t.asserti(before + 2, tc.countUsed(image));
+
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, 6,
+		tc.allocatorProperty("two transactions survive every crash schedule"));
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.imagesChecked > trace.length());
 }
