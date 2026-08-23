@@ -77,6 +77,32 @@ The VM is stored outside the repository, by default in
 abruptly for the Stage 2 experiments, `console` tails the guest boot log, and
 `destroy` removes the VM directory after confirmation.
 
+`reseed` rebuilds the cloud-init seed and reboots into it, which is the repair
+for a VM that boots but never answers ssh. Two first-boot faults produce that,
+both observed on the Ubuntu 24.04 cloud image with cloud-init 26.1:
+
+- **No sshd host keys.** The image ships without them and cloud-init writes them
+  part way through the boot. Under emulation the first connection arrives
+  earlier, the socket-activated `ssh.service` exits with `sshd: no hostkeys
+  available`, and systemd allows a unit only five restarts before it stops
+  trying -- so sshd stays down for the rest of that boot however long the host
+  waits.
+- **No sudo for the guest user.** cloud-init left
+  `/etc/sudoers.d/90-cloud-init-users` empty, so `sudo -l -U ubuntu` reported
+  the user was not allowed to run sudo at all. A clean first boot of the same
+  seed has since written that file correctly, so this is a first-boot race
+  rather than a certainty -- but the users module runs once per instance, so a
+  VM that lands wrong never repairs itself, and provisioning is all `sudo`
+  (`ndctl`, `mkfs`, `mount`).
+
+The seed's `bootcmd` closes both, and runs on every boot rather than once per
+instance, so `reseed` repairs an existing VM without a fresh `setup`. Nothing in
+it may block on a systemd job: `bootcmd` runs inside `cloud-init.service`, which
+`sysinit.target` waits for, so a plain `systemctl start` deadlocks the boot --
+use `--no-block`. `start` and `setup` now stop waiting a few minutes
+(`PMEMVM_LOGIN_GRACE`) after the guest reaches its login prompt and report the
+fault, rather than sitting out the full emulated-boot timeout.
+
 The guest is always x86-64 Linux, because the backend under test is
 x86-64-specific. Only the acceleration differs by host:
 

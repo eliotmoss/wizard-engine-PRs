@@ -14,12 +14,14 @@
 #   scripts/pmem-vm.sh stop       clean shutdown
 #   scripts/pmem-vm.sh kill       abrupt kill, for crash-consistency experiments
 #   scripts/pmem-vm.sh console    tail the guest serial log
+#   scripts/pmem-vm.sh reseed     rebuild the cloud-init seed and reboot
 #   scripts/pmem-vm.sh destroy    delete the VM directory (asks first)
 #
 # The VM lives outside the repository, by default in
 # ~/.local/share/wizard-pmem-vm. Override with PMEMVM_DIR. Other overrides:
 # PMEMVM_SSH_PORT, PMEMVM_RAM, PMEMVM_CPUS, PMEMVM_BOOT_TIMEOUT,
-# PMEMVM_IMAGE_URL, PMEMVM_DISK_SIZE, PMEMVM_PMEM_SIZE (setup only).
+# PMEMVM_LOGIN_GRACE, PMEMVM_IMAGE_URL, PMEMVM_DISK_SIZE,
+# PMEMVM_PMEM_SIZE (setup only).
 #
 # The guest is always x86-64 Linux, because the backend under test is
 # x86-64-specific. On an x86-64 Linux host this runs under KVM; on an
@@ -42,6 +44,9 @@ SERIAL_LOG="$VM_DIR/serial.log"
 GEOMETRY="$VM_DIR/geometry"
 
 SSH_PORT="${PMEMVM_SSH_PORT:-2222}"
+# How long after the guest's login prompt to keep waiting for sshd. Generous for
+# emulation, where the last cloud-init stages still run after the prompt appears.
+LOGIN_GRACE="${PMEMVM_LOGIN_GRACE:-240}"
 GUEST_USER="${PMEMVM_USER:-ubuntu}"
 GUEST_RAM="${PMEMVM_RAM:-4G}"
 DISK_SIZE="${PMEMVM_DISK_SIZE:-20G}"
@@ -166,6 +171,26 @@ ssh_args() {
 gssh()   { ssh "${SSH_BATCH[@]}" "$GUEST_USER@localhost" "$@"; }
 ssh_up() { gssh true >/dev/null 2>&1; }
 
+# The serial log tells "still booting" apart from "booted, and sshd is dead":
+# the getty prompt is the last thing a finished boot prints.
+guest_reached_login() { grep -q 'login:' "$SERIAL_LOG" 2>/dev/null; }
+
+report_dead_sshd() {
+    local n
+    n=$(grep -c 'Failed to start.*ssh\.service' "$SERIAL_LOG" 2>/dev/null || true)
+    n=${n// /}; [ -n "$n" ] || n=0
+    warn ""
+    warn "The guest reached its login prompt, but nothing answers ssh on port 22."
+    if [ "$n" != 0 ]; then
+        warn "  ssh.service failed to start $n time(s) during this boot; systemd"
+        warn "  gives a unit five restarts before it gives up for the whole boot."
+    fi
+    warn "The usual cause is that the guest has no sshd host keys yet. Repair with:"
+    warn "  scripts/pmem-vm.sh reseed"
+    warn "which rebuilds the cloud-init seed -- its bootcmd creates the missing host"
+    warn "keys and restores the ssh.socket listener -- and reboots into it."
+}
+
 # ------------------------------------------------------------------- vm control
 
 vm_pid() {
@@ -227,10 +252,20 @@ start_vm() {
     fi
 
     printf 'waiting for ssh on port %s' "$SSH_PORT"
-    local waited=0
+    local waited=0 login_at=-1
     until ssh_up; do
         vm_pid >/dev/null || { printf '\n'; die "QEMU exited during boot; see $SERIAL_LOG"; }
-        [ "$waited" -lt "$BOOT_TIMEOUT" ] || { printf '\n'; die "no ssh after ${BOOT_TIMEOUT}s; see $SERIAL_LOG"; }
+        if [ "$login_at" -lt 0 ] && guest_reached_login; then login_at=$waited; fi
+        # The login prompt ends the boot. Sitting out the rest of a 25-minute
+        # emulated-boot budget after that teaches nothing: sshd is not coming.
+        if [ "$login_at" -ge 0 ] && [ $((waited - login_at)) -ge "$LOGIN_GRACE" ]; then
+            printf '\n'; report_dead_sshd; die "no sshd in the guest; see $SERIAL_LOG"
+        fi
+        [ "$waited" -lt "$BOOT_TIMEOUT" ] || {
+            printf '\n'
+            guest_reached_login && report_dead_sshd
+            die "no ssh after ${BOOT_TIMEOUT}s; see $SERIAL_LOG"
+        }
         sleep 5; waited=$((waited + 5)); printf '.'
     done
     printf ' up after %ss\n' "$waited"
@@ -295,10 +330,42 @@ make_seed() {
 hostname: pmemvm
 users:
   - name: $GUEST_USER
-    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    sudo:
+      - "ALL=(ALL) NOPASSWD:ALL"
     shell: /bin/bash
     ssh_authorized_keys:
       - $(cat "$SSH_KEY.pub")
+# The cloud image ships without sshd host keys -- cloud-init writes them part
+# way through the boot -- and Ubuntu 24.04 activates sshd from ssh.socket. Under
+# emulation the first connection lands before the keys exist, so the activated
+# ssh.service exits with "sshd: no hostkeys available", and systemd allows a
+# unit only five restarts before it stops trying: sshd is then down for the rest
+# of the boot, however long the host waits. bootcmd runs on every boot and
+# finishes before sockets.target, which is early enough to close the race:
+# create the missing host keys, clear a start limit latched by an earlier boot,
+# and make sure the listener is in place. It runs inside cloud-init.service,
+# which sysinit.target waits for, so nothing here may block on a systemd job: a
+# plain systemctl start (no --no-block) waits for a job that is itself ordered
+# after sysinit.target and deadlocks the boot. Backquotes are just as
+# dangerous in this heredoc -- the host shell would run them at seed time.
+bootcmd:
+  # cloud-init 26.1 has been seen to leave /etc/sudoers.d/90-cloud-init-users
+  # empty, giving the user above no sudo rights at all; a clean first boot of
+  # this same seed writes it correctly, so it is a first-boot race rather than a
+  # certainty. Either way the users module is once-per-instance, so a VM that
+  # lands wrong can never repair itself, and everything this script does in the
+  # guest (ndctl, mkfs, mount) is sudo. Write the rule directly as well,
+  # syntax-checked. No new authority: it is the rule the user block asks for.
+  - [ sh, -c, "echo '$GUEST_USER ALL=(ALL) NOPASSWD:ALL' > /tmp/wizard-sudo && visudo -cqf /tmp/wizard-sudo && install -m 0440 /tmp/wizard-sudo /etc/sudoers.d/90-wizard-pmem-vm; rm -f /tmp/wizard-sudo" ]
+  - [ sh, -c, "timeout 120 ssh-keygen -A || true" ]
+  - [ sh, -c, "timeout 30 systemctl reset-failed ssh.service ssh.socket >/dev/null 2>&1 || true" ]
+  - [ sh, -c, "timeout 30 systemctl enable ssh.socket >/dev/null 2>&1 || true" ]
+  - [ sh, -c, "timeout 30 systemctl --no-block start ssh.socket >/dev/null 2>&1 || true" ]
+# Once more after the boot has settled, for a failure bootcmd ran too early to
+# see. Unlike bootcmd this runs once per instance, so it only covers first boot.
+runcmd:
+  - [ sh, -c, "systemctl reset-failed ssh.service ssh.socket >/dev/null 2>&1 || true" ]
+  - [ sh, -c, "systemctl is-active --quiet ssh.socket || systemctl restart ssh.socket" ]
 package_update: true
 packages:
   - ndctl
@@ -358,6 +425,20 @@ provision_guest() {
         || die "$MOUNT_POINT is mounted without dax=always; MAP_SYNC will be refused"
     gssh "sudo mkdir -p $SCRATCH_DIR && sudo chown $GUEST_USER: $SCRATCH_DIR"
     say "DAX mount ready at $MOUNT_POINT, scratch directory $SCRATCH_DIR"
+}
+
+# Rebuild the cloud-init seed and reboot into it. The seed's bootcmd runs on
+# every boot, so this repairs an existing VM -- an unreachable sshd above all --
+# without touching the guest disk or asking for a fresh setup.
+reseed() {
+    detect_host; ssh_args
+    [ -f "$SSH_KEY.pub" ] || die "no ssh key in $VM_DIR; run: scripts/pmem-vm.sh setup"
+    make_seed
+    if vm_pid >/dev/null; then
+        say "restarting the VM to boot the new seed"
+        stop_vm || kill_vm
+    fi
+    start_vm
 }
 
 setup() {
@@ -476,7 +557,7 @@ destroy() {
     say "removed $VM_DIR"
 }
 
-usage() { sed -n '2,29p' "$0" | sed 's/^#\( \|$\)//'; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 
 case "${1:-status}" in
     doctor)  doctor ;;
@@ -489,6 +570,7 @@ case "${1:-status}" in
     stop)    stop_vm ;;
     kill)    kill_vm ;;
     console) tail -f "$SERIAL_LOG" ;;
+    reseed)  reseed; ensure_mount || true; status_vm ;;
     destroy) destroy ;;
     help|-h|--help) usage ;;
     *)       usage; exit 2 ;;
