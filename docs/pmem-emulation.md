@@ -57,6 +57,52 @@ QEMU can map a host file into an x86-64 guest as an ACPI NVDIMM. With the
 guest's `libnvdimm` and PMEM drivers loaded, Linux discovers the emulated
 capacity and can expose it as `/dev/pmem0`.
 
+### Scripted workflow
+
+`scripts/pmem-vm.sh` performs this entire setup, and the guest configuration
+in the sections below, on any supported host:
+
+```bash
+scripts/pmem-vm.sh doctor   # report host support and missing host tools
+scripts/pmem-vm.sh setup    # one-time: fetch image, make VM, set up DAX
+scripts/pmem-vm.sh sync     # rebuild bin/pmemtest.x86-64-linux and copy it in
+scripts/pmem-vm.sh test     # run the integration tests in the guest
+scripts/pmem-vm.sh stop     # clean shutdown; `start` resumes where it left off
+```
+
+`setup` is idempotent and reformats nothing that already holds a filesystem.
+The VM is stored outside the repository, by default in
+`~/.local/share/wizard-pmem-vm`; `PMEMVM_DIR` relocates it, and
+`PMEMVM_SSH_PORT` allows more than one VM on a host. `kill` terminates QEMU
+abruptly for the Stage 2 experiments, `console` tails the guest boot log, and
+`destroy` removes the VM directory after confirmation.
+
+The guest is always x86-64 Linux, because the backend under test is
+x86-64-specific. Only the acceleration differs by host:
+
+| Host | Acceleration | Notes |
+|---|---|---|
+| x86-64 Linux, including WSL2 | KVM | Requires `/dev/kvm` access; add the user to the `kvm` group. WSL2 needs nested virtualization, which recent WSL2 kernels enable on Intel hosts |
+| Intel Mac | HVF | Guest and host architectures match |
+| Apple-silicon Mac | TCG | Whole-CPU emulation of a foreign architecture: correct, but boots take minutes rather than seconds. The script raises its own boot timeout accordingly |
+
+Building the test binary is a separate concern from running it. The binary is
+statically linked and needs no toolchain inside the guest, but the Virgil
+compiler must run on the host and emit an x86-64 Linux ELF. The Virgil
+distribution ships x86-64 macOS binaries, so on Apple silicon `v3c` requires
+Rosetta 2 (`softwareupdate --install-rosetta`). Where that is unavailable,
+build `bin/pmemtest.x86-64-linux` on another machine and copy it to the
+guest's home directory; `scripts/pmem-vm.sh test` then runs it unchanged.
+
+Reserving DRAM with the Linux `memmap` parameter is not an option under WSL2:
+its kernel is built without `CONFIG_X86_PMEM_LEGACY`, so a type-12 range would
+have no driver, and Hyper-V exposes no NFIT table to the WSL2 VM. Keep the
+NVDIMM backing file on a native Linux filesystem inside WSL2 rather than on a
+Windows drive mounted through `/mnt/c`.
+
+The remaining sections document what the script automates, and are the
+reference for doing it by hand or diagnosing a failure.
+
 ### Prerequisites
 
 The host needs:
@@ -110,7 +156,68 @@ References:
 
 ### Configure filesystem DAX in the guest
 
-First inspect what the guest discovered:
+Confirm first that the guest kernel actually provides the PMEM block-device
+and DAX drivers. Minimal guest kernels frequently do not: an Ubuntu cloud
+image installs `linux-image-virtual`, whose base module set omits `nd_pmem`
+and `dax_pmem`. Those drivers ship in `linux-modules-extra`. Without them the
+guest still loads `nfit` and reports `region0`, but no namespace can be
+enabled and `/dev/pmem0` never appears:
+
+```text
+libndctl: ndctl_namespace_enable: namespace0.0: failed to enable
+  Error: namespace0.0: failed to enable
+```
+
+A follow-up `ndctl create-namespace` then fails with `No space left on
+device`, which is a consequence rather than a second fault: the existing
+disabled namespace already claims the whole region, so no capacity remains to
+carve. `modprobe nd_pmem` reporting `Module nd_pmem not found` confirms the
+diagnosis. Install the drivers for the running kernel and enable the
+namespace:
+
+```bash
+sudo apt-get install -y linux-modules-extra-$(uname -r) linux-image-generic
+sudo modprobe nd_pmem dax_pmem
+sudo ndctl enable-namespace namespace0.0
+```
+
+`linux-modules-extra` is pinned to an exact kernel version, so the drivers
+disappear again the first time unattended upgrades install a new kernel and
+the guest reboots into it. Installing the `linux-image-generic` meta package
+prevents the recurrence: it depends on the matching
+`linux-modules-extra-<version>-generic` and therefore pulls the NVDIMM
+drivers forward across future kernel upgrades. The cloud image's
+`linux-image-virtual` does not. Once the modules are present for the running
+kernel, `nfit` autoloads them on later boots and any `/etc/fstab` entry for
+the DAX mount succeeds.
+
+A guest that boots with the drivers missing is easy to misdiagnose, because a
+bare `ndctl list` reports only enabled namespaces and therefore prints
+nothing at all. Query the idle ones explicitly, and read the result
+carefully:
+
+```bash
+sudo ndctl list -Nu --idle
+```
+
+With no driver bound, this reports the namespace as `"mode":"raw"` with a
+freshly generated UUID. That is a synthesized fallback view, not evidence of
+lost configuration: the namespace labels live on the device and are still
+intact, and the previously configured `fsdax` namespace reappears with its
+original UUID as soon as `nd_pmem` loads. Do not run `mkfs` while
+diagnosing a missing `/dev/pmem0`; the filesystem is almost certainly
+unharmed behind an unbound driver, and reformatting would destroy it. The
+recovery sequence is:
+
+```bash
+sudo ndctl list -Nu --idle      # namespace state: disabled?
+modprobe nd_pmem                # "Module not found" confirms the cause
+sudo apt-get install -y linux-modules-extra-$(uname -r)
+sudo modprobe nd_pmem
+sudo mount -a                   # an fstab entry does the rest
+```
+
+Then inspect what the guest discovered:
 
 ```bash
 sudo ndctl list --regions --namespaces
