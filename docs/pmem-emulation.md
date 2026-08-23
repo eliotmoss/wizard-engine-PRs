@@ -148,6 +148,21 @@ loss or corruption after a host crash. The guest still receives an emulated
 NVDIMM with `pmem=off`; the setting only avoids claiming host persistence
 semantics that the backing file cannot provide.
 
+Drop the `pmem=` parameter entirely on a QEMU that was not built against
+libpmem (PMDK). The property is registered only under `CONFIG_LIBPMEM`, and
+PMDK is Linux-only, so Homebrew's macOS QEMU rejects the whole `-object`
+argument with `Invalid parameter 'pmem'` rather than ignoring the unknown
+setting. Omitting it is equivalent to `pmem=off`: such a build has no
+`pmem_persist` to call and flushes the backing file with `msync`. Check with
+
+```text
+qemu-system-x86_64 -machine none -object memory-backend-file,help | grep pmem=
+```
+
+`scripts/pmem-vm.sh` performs this probe itself and reports the result in
+`doctor` output; the emulated NVDIMM and its NFIT table reach the guest either
+way.
+
 References:
 
 - [Linux NVDIMM QEMU simulation guide](https://nvdimm.docs.kernel.org/pmem_in_qemu.html)

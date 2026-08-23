@@ -110,6 +110,17 @@ check_host_tools() {
     [ "$missing" = 0 ] || { install_hint; die "install the tools above and re-run"; }
 }
 
+# QEMU registers the `pmem` property on memory-backend-file only when it was
+# built against libpmem (PMDK), and PMDK is Linux-only -- Homebrew's macOS QEMU
+# has no such property and rejects the entire -object argument with
+# "Invalid parameter 'pmem'". Off is the default behaviour, so where the
+# property is absent, omitting it is equivalent: QEMU flushes the backing file
+# with msync rather than with libpmem's persist.
+qemu_has_pmem_prop() {
+    qemu-system-x86_64 -machine none -object memory-backend-file,help 2>&1 \
+        | grep -q '^[[:space:]]*pmem='
+}
+
 # cloud-init reads its configuration from a small ISO. Every platform spells
 # building one differently; take whichever tool exists.
 seed_tool() {
@@ -126,6 +137,10 @@ doctor() {
     say "accel:       $ACCEL_NAME"
     [ "$EMULATED" = 0 ] || say "             emulated -- expect slow boots (timeout ${BOOT_TIMEOUT}s)"
     say "qemu:        $(have qemu-system-x86_64 && qemu-system-x86_64 --version | head -1 || echo MISSING)"
+    if have qemu-system-x86_64; then
+        say "pmem prop:   $(qemu_has_pmem_prop && echo 'supported (libpmem)' \
+            || echo 'absent (no libpmem; pmem=off omitted, msync flushes instead)')"
+    fi
     say "seed tool:   $(seed_tool || echo MISSING)"
     say "repo:        $REPO"
     say "vm dir:      $VM_DIR$([ -d "$VM_DIR" ] && echo '' || echo ' (not created yet)')"
@@ -195,10 +210,12 @@ start_vm() {
         rm -f "$PID_FILE"
         local drives=(-drive "if=virtio,file=$GUEST_IMG,format=qcow2")
         [ -f "$seed" ] && drives+=(-drive "if=virtio,file=$seed,format=raw")
+        local backend="memory-backend-file,id=pmem0,share=on,mem-path=$PMEM_IMG,size=$size,align=128M"
+        if qemu_has_pmem_prop; then backend+=",pmem=off"; fi
         qemu-system-x86_64 \
             -machine q35,nvdimm=on "${ACCEL_ARGS[@]}" -smp "$GUEST_CPUS" \
             -m "$GUEST_RAM",slots=4,maxmem=16G \
-            -object "memory-backend-file,id=pmem0,share=on,mem-path=$PMEM_IMG,size=$size,align=128M,pmem=off" \
+            -object "$backend" \
             -device nvdimm,id=nvdimm0,memdev=pmem0,label-size=2M \
             "${drives[@]}" \
             -netdev "user,id=n0,hostfwd=tcp::$SSH_PORT-:22" \
