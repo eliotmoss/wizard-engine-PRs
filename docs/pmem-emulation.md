@@ -301,8 +301,8 @@ file accepts `MAP_SYNC`.
 ## Available real-PMEM host: magpie
 
 The ANU School of Computing research server `magpie` was inspected on
-2026-08-12 and is the current target for the opt-in Stage 1 run. Its observed
-configuration is:
+2026-08-12 and successfully ran the opt-in Stage 1 integration on 2026-08-31.
+Its observed configuration is:
 
 | Namespace | Mode | PFN map | Alignment | Block device | Filesystem mount |
 |---|---|---|---:|---|---|
@@ -315,7 +315,8 @@ metadata resides on the PMEM device; it does **not** mean device-DAX. The
 decisive field is `"mode":"fsdax"`, which is compatible with this project's
 regular-file backend.
 
-The persistence-profile audit recorded on 2026-08-12 is:
+The persistence-profile audit recorded on 2026-08-12 and updated by the
+2026-08-31 integration run is:
 
 | Check | Observed result | Status |
 |---|---|---|
@@ -324,8 +325,8 @@ The persistence-profile audit recorded on 2026-08-12 is:
 | Cache writeback instructions | CPU flags include `clflush`, `clflushopt`, and `clwb` | `CLWB` baseline supported |
 | Region persistence domain | `region0` and `region1` both report `memory_controller` | Matches the selected ADR model; this is not eADR |
 | DIMM health/shutdown state | `ndctl list -DH` could not open `/dev/nmem*`; every health state was therefore `unknown` | Pending an administrator-privileged query |
-| `MAP_SYNC` on an assigned test file | Not yet run | Pending an assigned writable directory |
-| Emitted `CLWB`/`SFENCE` instructions | Native stubs implemented; exact encodings and a production-path smoke test are unit-pinned | Pending validation on the physical target |
+| `MAP_SYNC` on an assigned test file | `pmem_dax:backend_accepts_map_sync` passed under `/mnt/pmem0.0/sean` | Production fsdax path confirmed |
+| Emitted `CLWB`/`SFENCE` instructions | Exact encoding and native production-path smoke tests passed on Magpie before the DAX run | Physical-target execution confirmed; power-loss persistence remains untested |
 
 The topology, cache geometry, and CPU flags are readable without elevated
 privileges. The health query requires an administrator to run
@@ -337,8 +338,8 @@ administrator. Do not pass `/dev/pmem0`, `/dev/pmem1`, either mount root, or an
 existing region file to the test, and do not format, reconfigure, disable, or
 unmount either namespace. The current test has a 4 MiB peak region file; up to
 1 GiB of scratch space provides headroom for planned multi-image crash tests
-and retained traces. A positive hardware run remains pending assignment of
-that directory.
+and retained traces. `/mnt/pmem0.0/sean` is the assigned directory; the runner
+may create and remove only its own `wizard-pmem-*.region` files there.
 
 ## Alternative: reserve native Linux DRAM
 
@@ -449,8 +450,13 @@ Run it on the prepared x86-64 Linux machine with an assigned writable scratch
 directory on the fsdax mount:
 
 ```bash
-make pmem-integration PWASM_PMEM_TEST_DIR=/mnt/pmem/assigned-directory
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
 ```
+
+This exact command passed both `pmem_dax:backend_accepts_map_sync` and
+`pmem_dax:clean_remount_and_wal_replay` on Magpie on 2026-08-31. The native
+instruction encoding and production-path smoke tests also passed on that host
+before the DAX suite.
 
 The target builds a separate `bin/pmemtest.x86-64-linux` binary. Its two tests
 are not registered in the default unit suite or run by CI. The runner never
@@ -467,10 +473,10 @@ not provide this coverage. It wraps an anonymous `Mmap.reserve()` mapping
 directly in `PmemMmapRegion`, bypassing `PmemMmapBackend.create()`,
 `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`.
 
-This stage establishes functional DAX mapping, clean remount, and software WAL
-replay. The native writeback and fence path is implemented, but a guest or
-ordinary host backing file still does not establish physical cache-line
-persistence or host power-loss durability.
+The successful Magpie run establishes functional DAX mapping, execution of the
+native writeback/fence path against a real PMEM mapping, clean remount, and
+software WAL replay. It is still a controlled same-host reopen: it does not
+establish survival of abrupt process termination, host reset, or power loss.
 
 ### Stage 2 — guest crash and restart testing
 

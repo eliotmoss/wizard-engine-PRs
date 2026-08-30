@@ -533,13 +533,15 @@ fsdax scratch directory, then requires production `PmemMmapBackend.create()` /
 Run it with:
 
 ```bash
-make pmem-integration PWASM_PMEM_TEST_DIR=/mnt/pmem/assigned-directory
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
 ```
 
-The test is excluded from the default unit/CI binary and remains software
-integration evidence, not a cache-line or power-loss durability result. The
-remaining guest crash/restart and real-hardware stages are documented in
-`docs/pmem-emulation.md`.
+Both opt-in cases passed with this command on Magpie's real `/dev/pmem0` fsdax
+filesystem on 2026-08-31, after the native instruction encoding and smoke tests
+passed on the same host. The suite is excluded from the default unit/CI binary
+and remains controlled backend/hardware integration evidence, not an abrupt
+process, host-reset, or power-loss durability result. Those remaining stages
+are documented in `docs/pmem-emulation.md`.
 
 ### Correctness argument by layers
 

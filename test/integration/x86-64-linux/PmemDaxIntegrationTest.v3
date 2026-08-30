@@ -4,9 +4,9 @@
 // writable directory on a prepared filesystem-DAX mount. PmemMmapBackend maps
 // it with MAP_SHARED_VALIDATE | MAP_SYNC, so successful construction proves
 // that the test did not silently fall back to an ordinary shared file mapping.
-// These tests exercise software remount/recovery behavior only; the
-// cache-writeback and fence helpers remain placeholders and this suite does not
-// claim host power-loss durability.
+// These tests exercise the native cache-writeback/fence path plus controlled
+// software remount/recovery behavior; they do not claim abrupt-process,
+// host-reset, or host power-loss durability.
 
 def PMT = UnitTests.registerT("pmem_dax:", _, PmemDaxIntegrationTester.new, _);
 def PMX = [
