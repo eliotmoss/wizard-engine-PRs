@@ -119,6 +119,66 @@ component Target {
 	def getRdtsc() -> (void -> u64) {
 		return RDTSC_FUNC.get();
 	}
+	def cpuid(leaf: u64, subleaf: u64) -> (u64, u64, u64, u64) {
+		return CPUID_FUNC.get()(leaf, subleaf);
+	}
+	def getCpuid() -> ((u64, u64) -> (u64, u64, u64, u64)) {
+		return CPUID_FUNC.get();
+	}
+	def clflush(addr: long) {
+		CLFLUSH_FUNC.get()(addr);
+	}
+	def getClflush() -> (long -> void) {
+		return CLFLUSH_FUNC.get();
+	}
+	def clflushOpt(addr: long) {
+		CLFLUSHOPT_FUNC.get()(addr);
+	}
+	def getClflushOpt() -> (long -> void) {
+		return CLFLUSHOPT_FUNC.get();
+	}
+	def clwb(addr: long) {
+		CLWB_FUNC.get()(addr);
+	}
+	def getClwb() -> (long -> void) {
+		return CLWB_FUNC.get();
+	}
+	def mfence() {
+		MFENCE_FUNC.get()();
+	}
+	def getMfence() -> (void -> void) {
+		return MFENCE_FUNC.get();
+	}
+	def sfence() {
+		SFENCE_FUNC.get()();
+	}
+	def getSfence() -> (void -> void) {
+		return SFENCE_FUNC.get();
+	}
+	def lfence() {
+		LFENCE_FUNC.get()();
+	}
+	def getLfence() -> (void -> void) {
+		return LFENCE_FUNC.get();
+	}
+	def supportsClflush() -> bool {
+		return (cpuid(1, 0).3 & (1u64 << 19)) != 0;
+	}
+	def supportsClflushOpt() -> bool {
+		return cpuid(0, 0).0 >= 7u64 && (cpuid(7, 0).1 & (1u64 << 23)) != 0;
+	}
+	def supportsClwb() -> bool {
+		return cpuid(0, 0).0 >= 7u64 && (cpuid(7, 0).1 & (1u64 << 24)) != 0;
+	}
+	def supportsMfence() -> bool {
+		return (cpuid(1, 0).3 & (1u64 << 26)) != 0;
+	}
+	def supportsSfence() -> bool {
+		return (cpuid(1, 0).3 & (1u64 << 25)) != 0;
+	}
+	def supportsLfence() -> bool {
+		return (cpuid(1, 0).3 & (1u64 << 26)) != 0;
+	}
 	def fastFwCopy(dst: Range<byte>, src: Range<byte>) { // FAST, danger: uses unsafe Virgil features
 		var dptr = Pointer.atContents(dst), sptr = Pointer.atContents(src);
 		var i = 0, max = dst.length & ~7;
@@ -462,5 +522,74 @@ def genRdtsc(ic: X86_64InterpreterCode, w: DataWriter) {
 	asm.rdtsc();
 	asm.q.shl_r_i(X86_64Regs.RDX, 32);
 	asm.q.or_r_r(X86_64Regs.RAX, X86_64Regs.RDX); // XXX: use V3 return register symbolic constant
+	asm.ret();
+}
+
+def CPUID_FUNC = X86_64PreGenFunc<(u64, u64), (u64, u64, u64, u64)>.new("cpuid", null, genCpuid);
+
+def genCpuid(ic: X86_64InterpreterCode, w: DataWriter) {
+	def RAX = X86_64Regs.RAX;
+	def RBX = X86_64Regs.RBX;
+	def RCX = X86_64Regs.RCX;
+	def RDX = X86_64Regs.RDX;
+	def RSI = X86_64Regs.RSI;
+	def asm = X86_64Assemblers.create64(w);
+	// CPUID clobbers RBX, which the V3/System-V calling convention requires
+	// this native stub to preserve.
+	asm.pushq_r(RBX);
+	asm.movq_r_r(RAX, RSI);
+	asm.movq_r_r(RCX, RDX);
+	asm.cpuid();
+	asm.movq_r_r(RSI, RDX);
+	asm.movq_r_r(RDX, RBX);
+	asm.popq_r(RBX);
+	asm.ret();
+}
+
+def CLWB_FUNC = X86_64PreGenFunc<long, void>.new("clwb", null, genClwb);
+
+def genClwb(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.d.clwb(X86_64Regs.RSI.indirect());
+	asm.ret();
+}
+
+def CLFLUSHOPT_FUNC = X86_64PreGenFunc<long, void>.new("clflushopt", null, genClflushOpt);
+
+def genClflushOpt(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.d.clflushopt(X86_64Regs.RSI.indirect());
+	asm.ret();
+}
+
+def CLFLUSH_FUNC = X86_64PreGenFunc<long, void>.new("clflush", null, genClflush);
+
+def genClflush(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.d.clflush(X86_64Regs.RSI.indirect());
+	asm.ret();
+}
+
+def MFENCE_FUNC = X86_64PreGenFunc<void, void>.new("mfence", null, genMfence);
+
+def genMfence(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.mfence();
+	asm.ret();
+}
+
+def SFENCE_FUNC = X86_64PreGenFunc<void, void>.new("sfence", null, genSfence);
+
+def genSfence(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.sfence();
+	asm.ret();
+}
+
+def LFENCE_FUNC = X86_64PreGenFunc<void, void>.new("lfence", null, genLfence);
+
+def genLfence(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.lfence();
 	asm.ret();
 }

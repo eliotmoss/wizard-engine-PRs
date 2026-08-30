@@ -3,6 +3,8 @@
 
 def POT = UnitTests.registerT("persistent_ops:", _, PersistentOperationsTester.new, _);
 def POTX = [
+	POT("native_instruction_encodings", test_persistent_native_instruction_encodings),
+	POT("native_instruction_smoke", test_persistent_native_instruction_smoke),
 	POT("scalar_stores_are_typed_little_endian", test_persistent_scalar_stores_are_typed_little_endian),
 	POT("pmem_range_translation", test_persistent_pmem_range_translation),
 	POT("dual_wal_phase_b_trace", test_persistent_dual_wal_phase_b_trace),
@@ -172,6 +174,53 @@ class PersistentOperationsTester(t: Tester) {
 		}
 		return -1;
 	}
+}
+
+// Pin the exact native stubs used by the PMEM backend. These checks protect the
+// Virgil assembler adaptation as well as the required instruction encodings.
+def test_persistent_native_instruction_encodings(tc: PersistentOperationsTester) {
+	var w = DataWriter.new();
+	var asm = X86_64Assemblers.create64(w);
+	asm.d.clwb(X86_64Regs.RSI.indirect()).ret();
+	def clwb = [0x66u8, 0x0Fu8, 0xAEu8, 0x36u8, 0xC3u8];
+	tc.t.assert_eq(clwb.length, w.pos);
+	for (i < clwb.length) tc.t.assert_eq(clwb[i], w.data[i]);
+
+	w = DataWriter.new();
+	asm = X86_64Assemblers.create64(w);
+	asm.d.clflushopt(X86_64Regs.RSI.indirect()).ret();
+	def clflushOpt = [0x66u8, 0x0Fu8, 0xAEu8, 0x3Eu8, 0xC3u8];
+	tc.t.assert_eq(clflushOpt.length, w.pos);
+	for (i < clflushOpt.length) tc.t.assert_eq(clflushOpt[i], w.data[i]);
+
+	w = DataWriter.new();
+	asm = X86_64Assemblers.create64(w);
+	asm.d.clflush(X86_64Regs.RSI.indirect()).ret();
+	def clflush = [0x0Fu8, 0xAEu8, 0x3Eu8, 0xC3u8];
+	tc.t.assert_eq(clflush.length, w.pos);
+	for (i < clflush.length) tc.t.assert_eq(clflush[i], w.data[i]);
+
+	w = DataWriter.new();
+	asm = X86_64Assemblers.create64(w);
+	asm.sfence().ret();
+	def sfence = [0x0Fu8, 0xAEu8, 0xF8u8, 0xC3u8];
+	tc.t.assert_eq(sfence.length, w.pos);
+	for (i < sfence.length) tc.t.assert_eq(sfence[i], w.data[i]);
+}
+
+// Exercise the generated CPUID, writeback, and SFENCE stubs without requiring
+// a DAX filesystem. The writeback target is an ordinary live cache line.
+def test_persistent_native_instruction_smoke(tc: PersistentOperationsTester) {
+	def basic = Target.cpuid(0u64, 0u64);
+	tc.t.assertz(true, basic.0 > 0u64);
+	tc.t.assertz(true, Target.supportsClflush() || Target.supportsClflushOpt() || Target.supportsClwb());
+	tc.t.assertz(true, Target.supportsSfence());
+
+	def line = Array<byte>.new(int.!(MmapRegionUtils.CACHE_LINE_SIZE));
+	line[0] = 0xA5u8;
+	MmapRegionUtils.flushCacheLine(Pointer.atElement(line, 0));
+	MmapRegionUtils.storeFence();
+	tc.t.assert_eq(0xA5u8, line[0]);
 }
 
 // The recording provider executes the same native scalar stores as production,

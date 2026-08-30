@@ -16,6 +16,26 @@ component Target {
 	def ticksNs() => u64.view(u32.view(System.ticksNs()));
 	def rdtsc() => u64.view(u32.view(System.ticksNs()));
 	def getRdtsc() => rdtsc;
+	def cpuid(leaf: u64, subleaf: u64) -> (u64, u64, u64, u64) { return (0, 0, 0, 0); }
+	def getCpuid() -> ((u64, u64) -> (u64, u64, u64, u64)) { return cpuid; }
+	def clflush(addr: long) { }
+	def getClflush() -> (long -> void) { return clflush; }
+	def clflushOpt(addr: long) { }
+	def getClflushOpt() -> (long -> void) { return clflushOpt; }
+	def clwb(addr: long) { }
+	def getClwb() -> (long -> void) { return clwb; }
+	def mfence() { }
+	def getMfence() -> (void -> void) { return mfence; }
+	def sfence() { }
+	def getSfence() -> (void -> void) { return sfence; }
+	def lfence() { }
+	def getLfence() -> (void -> void) { return lfence; }
+	def supportsClflush() -> bool { return false; }
+	def supportsClflushOpt() -> bool { return false; }
+	def supportsClwb() -> bool { return false; }
+	def supportsMfence() -> bool { return false; }
+	def supportsSfence() -> bool { return false; }
+	def supportsLfence() -> bool { return false; }
 
 	def pregenIntoFile(filename: string) -> ErrorBuilder {
 		return ErrorBuilder.new().puts("interpreter generator: nothing to generate for this target");

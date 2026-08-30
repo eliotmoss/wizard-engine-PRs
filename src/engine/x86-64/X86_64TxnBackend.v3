@@ -47,6 +47,12 @@ class FdMmapRegion extends BackendRegion {
 
 component MmapRegionUtils {
 	def CACHE_LINE_SIZE = 64u64;
+	private def WRITEBACK_UNSELECTED = 0;
+	private def WRITEBACK_CLWB = 1;
+	private def WRITEBACK_CLFLUSHOPT = 2;
+	private def WRITEBACK_CLFLUSH = 3;
+	private def WRITEBACK_UNSUPPORTED = -1;
+	private var selectedWriteback = WRITEBACK_UNSELECTED;
 
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
@@ -73,19 +79,41 @@ component MmapRegionUtils {
 		return true;
 	}
 
-	// Platform-specific cache flush (requires compiler intrinsic or inline asm)
+	// Platform-specific cache flush. Prefer CLWB because it preserves the cache
+	// line; use the architecturally supported fallbacks on older processors.
 	def flushCacheLine(addr: Pointer) {
-		// TODO: This needs compiler support for inline assembly
-		// Ideally: __builtin_ia32_clwb(addr) or asm volatile("clwb (%0)" :: "r"(addr))
-		// For now, this is a placeholder that would need to be implemented
-		// with proper x86-64 CLWB/CLFLUSHOPT/CLFLUSH instruction
+		def rawAddr = addr - Pointer.NULL;
+		def instruction = writebackInstruction();
+		if (instruction == WRITEBACK_CLWB) {
+			Target.clwb(rawAddr);
+		} else if (instruction == WRITEBACK_CLFLUSHOPT) {
+			Target.clflushOpt(rawAddr);
+		} else if (instruction == WRITEBACK_CLFLUSH) {
+			Target.clflush(rawAddr);
+		} else {
+			System.error("PersistentOperationError", "no supported cache-line writeback instruction");
+		}
+	}
+
+	// CPU features cannot change while the process is running. Cache the choice
+	// so a large range does not execute CPUID once per cache line.
+	private def writebackInstruction() -> int {
+		if (selectedWriteback != WRITEBACK_UNSELECTED) return selectedWriteback;
+		if (Target.supportsClwb()) {
+			selectedWriteback = WRITEBACK_CLWB;
+		} else if (Target.supportsClflushOpt()) {
+			selectedWriteback = WRITEBACK_CLFLUSHOPT;
+		} else if (Target.supportsClflush()) {
+			selectedWriteback = WRITEBACK_CLFLUSH;
+		} else {
+			selectedWriteback = WRITEBACK_UNSUPPORTED;
+		}
+		return selectedWriteback;
 	}
 
 	// Platform-specific store fence
 	def storeFence() {
-		// TODO: This needs compiler support for inline assembly
-		// Ideally: __builtin_ia32_sfence() or asm volatile("sfence")
-		// For now, this is a placeholder
+		Target.sfence();
 	}
 }
 

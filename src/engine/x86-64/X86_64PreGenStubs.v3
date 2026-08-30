@@ -130,11 +130,22 @@ component X86_64PreGenStubs {
 	}
 	def gen() {
 		if (I.interpreterCode != null) return;
-		// Deseralize or generate the pregen stubs
+		// Deserialize or generate the pregen stubs
 		I.interpreterCode = Metrics.pregen_time_us.run(deserializeOrGenerateCode, ());
 		Metrics.pregen_bytes.val += u64.!(I.interpreterCode.end - I.interpreterCode.start);
 
 		if (Debug.pregen) Trace.OUT.put1("Created pregen stubs in %d \xCE\xBCs.\n", Metrics.pregen_time_us.val).ln();
+		// genSpecials();
+	}
+	def genSpecials() {
+		// For testing the code generation of these special functions.
+		Target.getCpuid();
+		Target.getClwb();
+		Target.getClflushOpt();
+		Target.getClflush();
+		Target.getMfence();
+		Target.getSfence();
+		Target.getLfence();
 	}
 	def genAndWriteIntoExecutable(executable: string) -> bool {
 		// generate the code and write it into
