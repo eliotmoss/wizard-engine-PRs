@@ -164,7 +164,6 @@ The retained `SingleTxnWal` and `MultiTxnWal` protocols are not wired into the a
 
 Treat `docs/ROADMAP.md` and `docs/CRITIQUE.md` as authoritative because this list can change:
 
-- `MmapRegionUtils.flushCacheLine()` and `storeFence()` are placeholders pending real `CLWB`/`CLFLUSHOPT` and `SFENCE` support.
 - `SingleTxnWal.append()` silently drops overflowing entries; this affects only the retained comparison WAL. Active `DualTxnWal` reports oversized transactions through a failed commit.
 - `Backends.getMmap()` is declared but not implemented.
 - Immix line marks are deliberately transient, bypass the WAL, and must be rebuilt after a crash.

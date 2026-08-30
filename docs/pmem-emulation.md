@@ -325,7 +325,7 @@ The persistence-profile audit recorded on 2026-08-12 is:
 | Region persistence domain | `region0` and `region1` both report `memory_controller` | Matches the selected ADR model; this is not eADR |
 | DIMM health/shutdown state | `ndctl list -DH` could not open `/dev/nmem*`; every health state was therefore `unknown` | Pending an administrator-privileged query |
 | `MAP_SYNC` on an assigned test file | Not yet run | Pending an assigned writable directory |
-| Emitted `CLWB`/`SFENCE` instructions | Backend functions remain placeholders | Pending backend implementation and disassembly/tracing |
+| Emitted `CLWB`/`SFENCE` instructions | Native stubs implemented; exact encodings and a production-path smoke test are unit-pinned | Pending validation on the physical target |
 
 The topology, cache geometry, and CPU flags are readable without elevated
 privileges. The health query requires an administrator to run
@@ -468,8 +468,9 @@ directly in `PmemMmapRegion`, bypassing `PmemMmapBackend.create()`,
 `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`.
 
 This stage establishes functional DAX mapping, clean remount, and software WAL
-replay. Because `flushCacheLine()` and `storeFence()` are still placeholders,
-it does not establish cache-line persistence or host power-loss durability.
+replay. The native writeback and fence path is implemented, but a guest or
+ordinary host backing file still does not establish physical cache-line
+persistence or host power-loss durability.
 
 ### Stage 2 — guest crash and restart testing
 
@@ -495,14 +496,10 @@ fail-before/fail-after/torn outcomes in Stage 0.
 
 Final durability validation requires a machine with real persistent memory,
 an fsdax namespace, and controlled crash or power-interruption experiments.
-It must also wait until `MmapRegionUtils.flushCacheLine()` and `storeFence()`
-emit real `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE` instructions.
-
-Those functions are currently no-op placeholders. Until they are
-implemented, neither QEMU nor physical hardware can make the project's PMEM
-persist operations correct: the environment may support DAX and `MAP_SYNC`,
-but the process does not issue the cache write-back and ordering instructions
-needed by its own persistence protocol.
+`MmapRegionUtils.flushCacheLine()` and `storeFence()` now emit the required
+CPUID-selected cache writeback and `SFENCE` instructions, so the remaining work
+is to validate that production path and the persistence protocol on the
+physical target.
 
 ## Alternatives not selected
 

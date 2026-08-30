@@ -71,7 +71,10 @@ FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
   └── PmemMmapRegion   (PMEM durability via clflush + sfence)
 ```
 
-**Note:** `MmapRegionUtils.flushCacheLine()` and `storeFence()` are currently stubs — the production operation provider reaches them, but they still require Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE` that are not yet emitted. See [Open items](#open-items).
+`MmapRegionUtils.flushCacheLine()` selects `CLWB`, `CLFLUSHOPT`, or `CLFLUSH`
+from CPUID feature bits, and `storeFence()` emits `SFENCE`; both reach native
+pre-generated stubs in `X86_64Target`. Exact encodings and the production
+CPUID/writeback/fence path are covered by `PersistentOperationsTest.v3`.
 
 ### Backend factories
 
@@ -632,7 +635,6 @@ test/unit.sh
 
 | # | Location | Description |
 |---|---|---|
-| 1 | `X86_64TxnBackend.v3:88-93` | `flushCacheLine()` and `storeFence()` need Virgil compiler intrinsics for `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE`. Until then PMEM persistence is not truly durable. |
 | 2 | `DualTxnWalTest.v3` | Extend the shadow live/durable model through a `ShadowTxnBackend` allocator integration factory. |
 | 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |

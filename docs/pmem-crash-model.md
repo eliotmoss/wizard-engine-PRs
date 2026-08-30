@@ -192,8 +192,10 @@ fence stream.
 `X86_64PersistentOperations` is the production implementation. Scalar methods
 perform the same `Pointer.store` operations as before; x86-64 supplies the
 little-endian byte order. `clwb(cacheLine)` and `sfence()` reach
-`MmapRegionUtils.flushCacheLine()` and `storeFence()`. Those native hooks are
-still placeholders, so this seam is not evidence of physical PMEM durability.
+`MmapRegionUtils.flushCacheLine()` and `storeFence()`. Those hooks now reach
+CPUID-selected `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE` native stubs. This
+connects the production seam, while physical PMEM crash testing remains
+necessary for a hardware durability claim.
 
 `RecordingPersistentOperations` works on an ordinary byte range. It executes
 the same checked scalar stores against the live image, then appends a typed
