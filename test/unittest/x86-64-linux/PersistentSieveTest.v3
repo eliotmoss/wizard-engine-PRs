@@ -266,13 +266,25 @@ def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
 	// Flip bits inside the live segment's bitmap. The block table and the
 	// descriptors are untouched, so the allocator still walks cleanly; only
 	// the cross-object check can see this.
+	//
+	// Block 3, not block 2: block 2 is the first free block after the header
+	// and the WAL, allocChunk() splits from the front, and open() allocates
+	// before step() does -- so block 2 is the root chunk and block 3 is the
+	// first segment's bitmap. Damaging block 2 would hit SieveRoot.magic and
+	// fail the reattach instead, which is a different check.
 	def damaged = Array<byte>.new(intact.size());
 	for (i < damaged.length) damaged[i] = intact.bytes[i];
-	def segmentBody = int.!(2u64 * tc.BLOCK_SIZE + u64.!(ChunkHeader.size));
+	def segmentBody = int.!(3u64 * tc.BLOCK_SIZE + u64.!(ChunkHeader.size));
 	damaged[segmentBody] = damaged[segmentBody] ^ 0xFFu8;
 	damaged[segmentBody + 1] = damaged[segmentBody + 1] ^ 0xFFu8;
 
 	def image = PersistentDurableImage.new(damaged);
 	def violation = property.check(image);
-	if (violation == null) tc.t.fail("a corrupted bitmap was accepted");
+	// Assert *which* check caught it, not merely that something did. A
+	// non-null violation is too weak a claim: damage aimed at the wrong block
+	// trips the root-magic reattach check instead, and the test would still
+	// pass while proving nothing about the cross-object one. assert_string
+	// also reports a null violation -- a corrupted bitmap accepted -- as
+	// "expected ..., got null".
+	tc.t.assert_string("segment bitmap disagrees with its descriptor", violation);
 }
