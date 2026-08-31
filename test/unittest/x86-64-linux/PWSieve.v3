@@ -63,6 +63,7 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
         private var capacity: u64;              // descriptor slots
         private var basePrimes: Array<u64>;
         private var basePrimeLimit: u64;
+        private var reclaimed: int;
 
         new() {
                 if (region != null && region.backendRegion != null) {
@@ -99,6 +100,14 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                         if (rootGet(SieveRoot.magic.offset) != PWSieveConst.MAGIC) return false;
                         if (rootGet(SieveRoot.segmentSpan.offset) != span) return false;
                         if (rootGet(SieveRoot.capacity.offset) != capacity) return false;
+                        reclaimed = reclaimLeaked();
+                        // Finish a retirement the previous run did not get to.
+                        // step() publishes a segment and retires the oldest in
+                        // two separate transactions, so a crash between them is
+                        // legitimate durable state with one segment too many
+                        // live. Re-establishing the policy here is what keeps
+                        // the bound from drifting upward across restarts.
+                        if (!retire()) return false;
                         return true;
                 }
 
@@ -116,6 +125,52 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                 // publication are one transaction: a reader either sees no
                 // root at all or sees a complete one.
                 return region.setUserRoot(rootOffset);
+        }
+
+        // Extents this mount reclaimed because nothing named them.
+        def leaksReclaimed() -> int { return reclaimed; }
+
+        // Reclaim extents allocated but never published. allocChunk() commits
+        // on its own, so a crash between an allocation and the commit that
+        // names it leaves a block marked used with nothing pointing at it.
+        // This is not hypothetical: in a small region a handful of crashes
+        // exhaust the free space and the sieve stops making progress. Nothing
+        // but the sieve can find those blocks -- the allocator only knows they
+        // are used -- so reclaiming them is the caller's job, done here at
+        // mount as a mark-sweep over the region's own memory-order chain.
+        //
+        // The chain is walked rather than the block table scanned by index,
+        // because only chain members are real extents; an interior block's
+        // stale entry says nothing about what is allocated.
+        private def reclaimLeaked() -> int {
+                def n = rootGet(SieveRoot.numSegments.offset);
+                var freed = 0;
+                var entry = region.blockTableHandle[0];
+                var guard = region.numBlocks + 1u64;
+                while (!entry.isNull() && guard > 0u64) {
+                        guard--;
+                        def next = entry.getNext();
+                        // METADATA blocks (header, WAL, metadata overhead) are
+                        // not allocations and freeChunk() would refuse them
+                        // anyway; skipping them keeps the intent explicit.
+                        if (entry.getUsed() && entry.getListNum() == ListKind.NONE.code) {
+                                def offset = region.blockIndexOf(entry) * region.blockSize;
+                                if (offset != rootOffset && !isSegmentChunk(offset, n)) {
+                                        if (region.freeChunk(ChunkHandle(region.regionStart + offset))) freed++;
+                                }
+                        }
+                        entry = next;
+                }
+                return freed;
+        }
+
+        private def isSegmentChunk(offset: u64, count: u64) -> bool {
+                var i: u64 = 0;
+                while (i < count) {
+                        if (descGet(i, SieveSegment.chunk.offset) == offset) return true;
+                        i++;
+                }
+                return false;
         }
 
         // ---------------------------------------------------------------
@@ -288,7 +343,13 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                         i++;
                 }
                 if (sum != rootGet(SieveRoot.count.offset)) return "prime count does not match the segments";
-                if (live > liveSegments) return "more live segments than the retention window allows";
+                // liveSegments + 1, not liveSegments: step() publishes a new
+                // segment and retires the oldest in separate transactions, so
+                // a crash between them durably leaves one extra live segment.
+                // open() finishes the retirement, which is why the steady-state
+                // count is exact -- but the bound that holds at every instant
+                // is this one.
+                if (live > liveSegments + 1u64) return "more live segments than the retention window allows";
                 return null;
         }
 

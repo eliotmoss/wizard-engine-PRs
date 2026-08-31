@@ -27,6 +27,8 @@ def SX = [
 	ST("retirement_frees_old_segments", test_sieve_retirement_frees_old_segments),
 	ST("last_prime_tracks_progress", test_sieve_last_prime_tracks_progress),
 	ST("next_prime_after",           test_sieve_next_prime_after),
+	ST("reclaims_leaked_extents",    test_sieve_reclaims_leaked_extents),
+	ST("open_enforces_retention_window", test_sieve_open_enforces_retention_window),
 	()
 ];
 
@@ -71,11 +73,15 @@ class PWSieveTester(t: Tester) {
 
 	// Segments that still own a bitmap chunk.
 	def liveSegments() -> u64 {
+		return liveSegmentsOf(sieve);
+	}
+
+	def liveSegmentsOf(s: PWSieve) -> u64 {
 		var live: u64 = 0;
-		def n = sieve.numSegments();
+		def n = s.numSegments();
 		var i: u64 = 0;
 		while (i < n) {
-			if (sieve.segmentChunk(i) != 0u64) live++;
+			if (s.segmentChunk(i) != 0u64) live++;
 			i++;
 		}
 		return live;
@@ -208,6 +214,50 @@ def test_sieve_next_prime_after(tc: PWSieveTester) {
 
 	// Beyond the cursor there is no answer yet.
 	tc.t.assert_eq(0u64, tc.sieve.nextPrimeAfter(10u64 * SIEVE_SPAN));
+}
+
+
+// An extent allocated but never published is invisible to everything except
+// the sieve: the allocator only knows it is used. Reclaiming it at mount is
+// what stops a crash loop from exhausting the region -- without it a small
+// region runs out of free blocks after a handful of crashes.
+def test_sieve_reclaims_leaked_extents(tc: PWSieveTester) {
+	tc.open();
+	tc.step();
+
+	// Exactly the state a crash between allocChunk() and the publishing
+	// commit leaves behind.
+	def orphan = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, orphan.isNull());
+	def before = tc.usedBlocks();
+
+	def again = PWSieve.new(tc.region, SIEVE_LIVE);
+	tc.t.assertz(true, again.open());
+	tc.t.assert_eq(1, again.leaksReclaimed());
+	tc.t.assert_eq(before - 1u64, tc.usedBlocks());
+
+	// The sieve's own extents are not among the reclaimed.
+	tc.t.assert_eq(SIEVE_PI[0], again.count());
+	tc.t.assert_eq(1u64, tc.liveSegmentsOf(again));
+	if (again.checkInvariants() != null) tc.t.fail(again.checkInvariants());
+}
+
+// step() publishes a segment and retires the oldest in two transactions, so a
+// crash between them leaves one segment too many live. open() must finish that
+// retirement rather than carry the surplus forward. Forced here by mounting a
+// sieve with a narrower window over state a wider one produced.
+def test_sieve_open_enforces_retention_window(tc: PWSieveTester) {
+	def wide = PWSieve.new(tc.region, 3u64);
+	tc.t.assertz(true, wide.open());
+	for (k < 3) tc.t.assertz(true, wide.step());
+	tc.t.assert_eq(3u64, tc.liveSegmentsOf(wide));
+
+	def narrow = PWSieve.new(tc.region, SIEVE_LIVE);
+	tc.t.assertz(true, narrow.open());
+	tc.t.assert_eq(SIEVE_LIVE, tc.liveSegmentsOf(narrow));
+	tc.t.assert_eq(3u64, narrow.numSegments());
+	tc.t.assert_eq(SIEVE_PI[2], narrow.count());
+	if (narrow.checkInvariants() != null) tc.t.fail(narrow.checkInvariants());
 }
 
 

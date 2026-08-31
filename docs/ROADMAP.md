@@ -321,19 +321,51 @@ reachable after a remount.
   `pwregion:user_root_initially_zero`, `user_root_round_trips`,
   `user_root_out_of_range_rejected`, and `pwregion_bd:user_root_survives_remount`,
   `user_root_cleared_by_reformat`.
-- [ ] **Segmented sieve harness.** A Virgil workload driving `PWRegion` directly —
-  no WASM guest, no host module (the WASM-facing object-graph layer is separate
-  work). One allocated chunk per sieve segment, retired segments freed so
-  coalescing runs, cursor and segment directory anchored at the durable root.
-- [ ] **Cross-object invariant.** Keep the cursor and prime count in the root and
-  the bitmap in the chunks, and assert `count == popcount(bitmap[0..cursor])` on
-  every remount. Without this the sieve is monotone and idempotent and would pass
-  with a broken WAL; with it, a torn multi-object commit is observable.
-- [ ] **Random-timer SIGKILL loop.** Kill mid-transaction at arbitrary points
-  rather than the 20 hand-picked protocol boundaries, remount, check the
-  invariant, resume. Final primes must match a reference list. Adds coverage the
-  deterministic slices do not have, and ages the region: exhaustion, free-list
-  reuse, repeated WAL slot reclamation.
+- [x] **Segmented sieve harness.** `test/unittest/x86-64-linux/PWSieve.v3` — a
+  Virgil workload driving `PWRegion` directly, no WASM guest and no host module.
+  One allocated chunk per sieve segment (32512 integers, one bit each), segments
+  outside a retention window freed while their descriptors survive, cursor /
+  prime count / largest prime anchored in a root chunk published at `userRoot`.
+  Bulk bitmaps are written through the `PersistentOperations` seam and persisted
+  *before* the transaction that publishes their descriptor — a kilobyte bitmap
+  would overflow a 32-byte-entry record slot many times over, and an unpublished
+  chunk is unreachable so no reader can see it torn. Retirement clears the
+  descriptor and frees the extent in **one** transaction (buffer the descriptor
+  write, then call `freeChunk()`, which commits the shared cache); the reverse
+  order would leave a descriptor naming a reusable block, which is corruption
+  rather than a leak. `open()` reclaims extents allocated but never published
+  and finishes any retirement a crash interrupted.
+- [x] **Cross-object invariant.** `PWSieve.checkInvariants()` returns the first
+  violation or null. The descriptor lives in the root chunk and the bitmap it
+  describes in another chunk, so a torn commit shows up as a disagreement
+  between them: descriptor `primeCount` against the bitmap's popcount, the root
+  `count` against the sum of all descriptors, the cursor against the segment
+  count, and every live bitmap against a freshly recomputed sieve of its range
+  byte for byte. Without this a sieve is monotone and idempotent and would look
+  correct with a broken log. Thirteen `pwsieve:` / `pwsieve_bd:` tests, including
+  an eight-step run that remounts a real file between every step.
+- [x] **Random-timer SIGKILL loop.** `test/pwsieve.main.v3`, built as
+  `bin/pwsieve.x86-64-linux` by `make pwsieve` (`PWSIEVE_ARGS` overrides path,
+  iterations, seed and geometry). A child forks, mounts, and sieves while the
+  parent sleeps a seeded pseudo-random 50 us — 20 ms interval and sends
+  `SIGKILL`; the parent then remounts from a fresh mapping, runs production
+  recovery, checks the invariants and that progress never goes backwards, and
+  repeats. Kills land at arbitrary points rather than the 20 hand-picked
+  protocol boundaries. Five seeds over 25–30 iterations each: **every** restart
+  reported `DualWalRecovery.REPLAYED`, so the kills all landed mid-transaction,
+  and the final prime count matched an independent in-process sieve exactly
+  (376,256 primes below 5,429,504). Same evidence boundary as the rest of the
+  file-backed work — process-crash consistency under one kernel, not host
+  power-loss proof.
+
+  Two findings came out of it. First, the alloc-then-publish leak is not
+  theoretical: 8–18 extents leaked per run, and without reclamation a small
+  region stops making progress after about six crashes. Second, a crash between
+  a segment's publication and the retirement that follows it durably leaves one
+  extra live segment, so the invariant that holds at every instant is
+  `live <= window + 1` and `open()` has to finish the pending retirement.
+  `PWRegion.lastRecovery` was added so a harness can tell a restart that
+  replayed a record from one that found a clean log.
 - [ ] **Feed a sieve transaction to the explorer.** Record its ops through
   `PersistentOperations` and run the existing `PersistentAllocatorProperty` over
   the enumerated crash images, promoting the workload from demonstration to

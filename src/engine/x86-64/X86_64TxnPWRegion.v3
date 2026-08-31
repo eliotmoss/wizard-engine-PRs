@@ -559,6 +559,12 @@ class PWRegion {
         private var wal: DualTxnWal;
         def var regionStart: u64;
         def var txn: RegionTransaction;
+        // Outcome of the WAL recovery this mount performed; CLEAN on a region
+        // that was formatted rather than mounted. Exposed so a crash-restart
+        // harness can report how often a restart actually replayed a record
+        // instead of finding a clean log -- the difference between killing a
+        // writer at an interesting moment and killing it while idle.
+        def var lastRecovery = DualWalRecovery.CLEAN;
         private var writer: DirectRegionWriter;
 
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
@@ -706,7 +712,8 @@ class PWRegion {
                 logChunk = ChunkHandle(regionStart + logChunkOffset);
                 ensureWal(logChunk.addr, blockSize, false);
 
-                match (txn.recover()) {
+                lastRecovery = txn.recover();
+                match (lastRecovery) {
                         CORRUPT => Trace.OUT.puts("WAL corrupt on mount: log records ignored").ln();
                         PERSIST_FAILED => Trace.OUT.puts("WAL recovery replay could not be persisted; records retained for the next mount").ln();
                         _ => ;

@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -30,6 +30,7 @@ OBJDUMP=$(ENGINE) src/objdump.main.v3
 UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 PMEMTEST_X86_64_LINUX=test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3
+PWSIEVE_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/pwsieve.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -80,6 +81,15 @@ pmem-integration: bin/pmemtest.x86-64-linux
 
 bin/pmemtest.x86-64-linux: $(ENGINE) $(PMEMTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pmemtest x86-64-linux
+
+# Random-timer crash loop over the resumable sieve. PWSIEVE_ARGS overrides the
+# region path, iteration count, seed and geometry.
+PWSIEVE_ARGS ?= /tmp/wizard-pwsieve.region 50 1
+pwsieve: bin/pwsieve.x86-64-linux
+	bin/pwsieve.x86-64-linux $(PWSIEVE_ARGS)
+
+bin/pwsieve.x86-64-linux: $(ENGINE) $(PWSIEVE_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pwsieve x86-64-linux
 
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT) build.sh
 	./build.sh spectest x86-64-linux

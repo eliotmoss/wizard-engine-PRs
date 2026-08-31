@@ -1,0 +1,253 @@
+// Random-timer crash loop for the resumable sieve.
+//
+// The existing abrupt-process tests kill a writer at twenty deterministic,
+// hand-picked WAL protocol boundaries. This kills it at arbitrary points
+// instead: a child forks, mounts the region, and sieves as fast as it can
+// while the parent sleeps a pseudo-random interval and sends SIGKILL. The
+// parent then remounts from a fresh mapping, runs production recovery, and
+// checks the sieve's cross-object invariants and the monotonicity of its
+// progress. Repeat.
+//
+// What this establishes and what it does not: the child dies without any
+// cleanup, so the mount that follows is the real recovery path, but the
+// verifier remounts under the same kernel and can see the page cache. This is
+// process-crash consistency evidence, not host power-loss proof -- the same
+// boundary as the rest of the file-backed testing (docs/persistent-backends.md,
+// layer 3).
+//
+// Usage: pwsieve.x86-64-linux <region-path> [iterations] [seed] [blocks] [blockSize]
+
+def SIGKILL = 9;
+def LIVE_SEGMENTS = 2u64;
+
+// Reference verification is a plain sieve in DRAM; refuse to build an
+// unreasonably large one rather than thrashing the machine.
+def MAX_REFERENCE = 64000000u64;
+
+component SieveLoopConfig {
+        def var path: string;
+        def var iterations = 50;
+        def var seed = 1u64;
+        def var blocks = 32u64;
+        def var blockSize = 4096u64;
+
+        // Bounds on the kill delay, in nanoseconds. The low end lands inside
+        // the first commit; the high end lets several segments complete, so
+        // the kills spread across the protocol rather than clustering at mount.
+        def MIN_DELAY_NS = 50000L;              // 50 us
+        def MAX_DELAY_NS = 20000000L;           // 20 ms
+}
+
+// Deterministic 64-bit LCG, so a failing run can be replayed from its seed.
+class SieveRandom(var state: u64) {
+        def next() -> u64 {
+                state = state * 6364136223846793005uL + 1442695040888963407uL;
+                return state >> 17;
+        }
+
+        def nextInRange(lo: u64, hi: u64) -> u64 {
+                if (hi <= lo) return lo;
+                return lo + (next() % (hi - lo));
+        }
+}
+
+def openRegion(fresh: bool) -> PWRegion {
+        return PWRegion.new(
+                X86_64Backends.getFileMapped(SieveLoopConfig.path),
+                SieveLoopConfig.blocks,
+                Array<Ref<MetaDataDesc>>.new(0),
+                SieveLoopConfig.blockSize,
+                fresh);
+}
+
+def sleepNanos(ns: long) {
+        def ts = Array<long>.new(2);
+        ts[0] = ns / 1000000000L;
+        ts[1] = ns % 1000000000L;
+        Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
+}
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        return 1;
+}
+
+// The child: mount, resume, and sieve until the region cannot take another
+// segment. It never closes cleanly -- the parent is expected to kill it -- so
+// reaching the end of the work is itself a reportable outcome.
+def runChild() -> int {
+        def region = openRegion(false);
+        if (region == null || region.backendRegion == null) return 2;
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return 3;
+        while (sieve.step()) { }
+        return 0;
+}
+
+// An independent sieve of [0, limit), used to check the final prime count.
+// Deliberately unrelated to PWSieve's own segmented implementation.
+def referenceCount(limit: u64) -> u64 {
+        if (limit < 2u64) return 0;
+        def n = int.!(limit);
+        def composite = Array<bool>.new(n);
+        var count: u64 = 0;
+        for (p = 2; p < n; p++) {
+                if (composite[p]) continue;
+                count++;
+                if (p > n / p) continue;        // p*p is past the end (and would overflow)
+                var m = p * p;
+                while (m < n) {
+                        composite[m] = true;
+                        m += p;
+                }
+        }
+        return count;
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var v: u64 = 0;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                v = v * 10u64 + u64.!(c - '0');
+        }
+        return v;
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 1 || args[0] == null || args[0].length == 0) {
+                System.puts("Usage: pwsieve.x86-64-linux <region-path> [iterations] [seed] [blocks] [blockSize]\n");
+                return 2;
+        }
+        SieveLoopConfig.path = args[0];
+        if (args.length > 1) SieveLoopConfig.iterations = int.!(parseU64(args[1], 50));
+        if (args.length > 2) SieveLoopConfig.seed = parseU64(args[2], 1);
+        if (args.length > 3) SieveLoopConfig.blocks = parseU64(args[3], 8);
+        if (args.length > 4) SieveLoopConfig.blockSize = parseU64(args[4], 4096);
+
+        // Fresh region, fresh sieve. Everything after this point must survive
+        // on its own.
+        RegionFileIO.unlink(SieveLoopConfig.path);
+        var region = openRegion(true);
+        if (region == null || region.backendRegion == null) {
+                return fail("could not create the region file");
+        }
+        var sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return fail("could not lay out the sieve root");
+        Trace.OUT.put2("region %d blocks of %d bytes", SieveLoopConfig.blocks, SieveLoopConfig.blockSize).ln();
+        Trace.OUT.put2("segment span %d, capacity %d segments",
+                sieve.segmentSpan(), sieve.segmentCapacity()).ln();
+        region.deallocate();
+
+        def rng = SieveRandom.new(SieveLoopConfig.seed);
+        var prevCursor: u64 = 0;
+        var prevCount: u64 = 0;
+        var replayed = 0;
+        var advanced = 0;
+        var finished = 0;
+        var reclaimed = 0;
+        var full = false;
+
+        for (iteration < SieveLoopConfig.iterations) {
+                def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+                if (pid < 0) return fail("fork failed");
+                if (pid == 0) {
+                        Linux.syscall(LinuxConst.SYS_exit_group, runChild());
+                        return 0;
+                }
+
+                sleepNanos(long.!(rng.nextInRange(
+                        u64.!(SieveLoopConfig.MIN_DELAY_NS),
+                        u64.!(SieveLoopConfig.MAX_DELAY_NS))));
+                Linux.syscall(LinuxConst.SYS_kill, (pid, SIGKILL));
+
+                def waitStatus = Array<int>.new(1);
+                def waited = Linux.syscall(
+                        LinuxConst.SYS_wait4,
+                        (pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
+                if (waited != pid) return fail("wait4 did not reap the child");
+                // The child either died on the signal or finished the region
+                // first; both are legitimate, and the second is worth counting
+                // because it means this iteration tested nothing.
+                if (waitStatus[0] != SIGKILL) {
+                        // Exit 0 means the child ran out of work before the
+                        // timer fired; anything else is a child that could not
+                        // mount or reattach, which is a real failure.
+                        if (waitStatus[0] != 0) {
+                                Trace.OUT.put2("iteration %d: child exited %d", iteration, waitStatus[0] >> 8).ln();
+                                return fail("child could not mount or resume");
+                        }
+                        finished++;
+                }
+
+                // Verify from a fresh mapping in this process. This mount runs
+                // production WAL recovery over whatever the child left.
+                region = openRegion(false);
+                if (region == null || region.backendRegion == null) {
+                        return fail("could not remount after the kill");
+                }
+                if (region.lastRecovery == DualWalRecovery.REPLAYED) replayed++;
+                if (region.lastRecovery == DualWalRecovery.CORRUPT) {
+                        return fail("WAL reported CORRUPT after an abrupt kill");
+                }
+                if (region.requiresRecovery()) {
+                        return fail("remount latched recovery-required");
+                }
+
+                sieve = PWSieve.new(region, LIVE_SEGMENTS);
+                if (!sieve.open()) return fail("could not reattach to the sieve root");
+                reclaimed += sieve.leaksReclaimed();
+
+                def err = sieve.checkInvariants();
+                if (err != null) {
+                        Trace.OUT.put1("iteration %d", iteration).ln();
+                        return fail(err);
+                }
+                // Progress may stall -- a kill can land before the first
+                // commit -- but it must never go backwards.
+                if (sieve.cursor() < prevCursor) return fail("cursor went backwards");
+                if (sieve.count() < prevCount) return fail("prime count went backwards");
+                if (sieve.cursor() > prevCursor) advanced++;
+                prevCursor = sieve.cursor();
+                prevCount = sieve.count();
+
+                if (sieve.numSegments() >= sieve.segmentCapacity()) full = true;
+                region.deallocate();
+                region = null;
+                if (full) {
+                        Trace.OUT.put1("stopping at iteration %d: the segment table is full", iteration).ln();
+                        break;
+                }
+        }
+
+        Trace.OUT.put2("iterations %d, seed %d", SieveLoopConfig.iterations, SieveLoopConfig.seed).ln();
+        Trace.OUT.put3("advanced %d, replayed a record %d, child finished early %d",
+                advanced, replayed, finished).ln();
+        Trace.OUT.put1("leaked extents reclaimed at mount: %d", reclaimed).ln();
+        Trace.OUT.put2("final cursor %d, primes %d", prevCursor, prevCount).ln();
+
+        // The whole point: after all those kills, the answer must still be
+        // right. Checked against an independent sieve, not against PWSieve's.
+        if (prevCursor > MAX_REFERENCE) {
+                Trace.OUT.put1("reference check skipped: cursor %d exceeds the in-memory limit", prevCursor).ln();
+        } else {
+                def expected = referenceCount(prevCursor);
+                if (expected != prevCount) {
+                        Trace.OUT.put2("expected %d primes below the cursor, durable state says %d",
+                                expected, prevCount).ln();
+                        return fail("final prime count disagrees with an independent sieve");
+                }
+                Trace.OUT.put1("reference check passed: %d primes", expected).ln();
+        }
+
+        if (advanced == 0) {
+                return fail("no iteration made progress; the kill delays are too short to test anything");
+        }
+
+        RegionFileIO.unlink(SieveLoopConfig.path);
+        System.puts("OK\n");
+        return 0;
+}
