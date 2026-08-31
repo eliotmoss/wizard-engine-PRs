@@ -301,8 +301,9 @@ file accepts `MAP_SYNC`.
 ## Available real-PMEM host: magpie
 
 The ANU School of Computing research server `magpie` was inspected on
-2026-08-12 and successfully ran the opt-in Stage 1 integration on 2026-08-31.
-Its observed configuration is:
+2026-08-12, successfully ran the opt-in Stage 1 integration on 2026-08-31, and
+ran the Stage 2 abrupt-termination crash loop over the resumable sieve on
+2026-09-01. Its observed configuration is:
 
 | Namespace | Mode | PFN map | Alignment | Block device | Filesystem mount |
 |---|---|---|---:|---|---|
@@ -316,7 +317,7 @@ decisive field is `"mode":"fsdax"`, which is compatible with this project's
 regular-file backend.
 
 The persistence-profile audit recorded on 2026-08-12 and updated by the
-2026-08-31 integration run is:
+2026-08-31 integration and 2026-09-01 crash-loop runs is:
 
 | Check | Observed result | Status |
 |---|---|---|
@@ -327,6 +328,43 @@ The persistence-profile audit recorded on 2026-08-12 and updated by the
 | DIMM health/shutdown state | `ndctl list -DH` could not open `/dev/nmem*`; every health state was therefore `unknown` | Pending an administrator-privileged query |
 | `MAP_SYNC` on an assigned test file | `pmem_dax:backend_accepts_map_sync` passed under `/mnt/pmem0.0/sean` | Production fsdax path confirmed |
 | Emitted `CLWB`/`SFENCE` instructions | Exact encoding and native production-path smoke tests passed on Magpie before the DAX run | Physical-target execution confirmed; power-loss persistence remains untested |
+| `MAP_SYNC` under a resumable workload | `make pwsieve-pmem` mapped `/mnt/pmem0.0/sean` and asserted a `PmemMmapRegion`, not its `FileMmapRegion` sibling | No silent fallback to an ordinary shared mapping |
+| WAL protocol under abrupt termination on DAX media | 13 `SIGKILL` restarts, every one reporting `DualWalRecovery.REPLAYED`; workload invariants held after each; 376,256 primes below 5,429,504 matched an independent sieve | Software crash consistency on physical PMEM |
+| Correct *placement* of `CLWB`/`SFENCE` | Not discriminated by any run to date — see the note below | Requires Stage 3 power interruption |
+
+### What the 2026-09-01 crash loop does and does not discriminate
+
+`make pwsieve-pmem` ran 13 iterations at 512 x 4096 = 2 MiB before the sieve's
+167-segment descriptor table filled. Every restart replayed a WAL record rather
+than finding a clean log, so every kill landed mid-transaction; the workload's
+cross-object invariants held after each recovery; progress never went backwards;
+three leaked extents were reclaimed at mount, the alloc-then-publish leak
+appearing on physical media exactly as it does on a file; and the durable answer
+matched an independent in-process sieve. The same geometry on the file backend
+reaches the identical 5,429,504 / 376,256 result, so the two backends agree.
+
+**This run is not sensitive to where the flushes are.** On a `MAP_SYNC` DAX
+mapping the memory *is* the media, so when the child is killed its dirty cache
+lines are still in the CPU's caches and the CPU keeps running: nothing is lost,
+and the lines reach the DIMM through ordinary cache pressure or a later flush.
+Removing every `CLWB` from the persist path would very likely leave this test
+still reporting `OK`. Since `region0`/`region1` report `memory_controller` — ADR,
+not eADR — ADR drains the memory controller's write-pending queue but **not** the
+CPU caches, so only a real power interruption can lose an un-written-back line
+and thereby discriminate a correct `CLWB` from a missing one.
+
+What this run therefore establishes is that the production writeback/fence path
+executes against real PMEM without corrupting anything, and that the WAL
+protocol and the workload's invariants survive abrupt process termination on
+physical DAX media. It does not establish that the flushes are correctly placed.
+
+That sensitivity is what layer 1b supplies instead: `PersistentExplorer`
+enumerates the durable images a crash permits *given* the recorded
+`STORE`/`CLWB`/`SFENCE` order, so a missing or misplaced flush shows up there as
+an enumerated image that production recovery cannot repair. The model is
+sensitive where this hardware test is not, and the hardware test executes the
+real instructions where the model only assumes them. Neither alone closes
+Stage 3.
 
 The topology, cache geometry, and CPU flags are readable without elevated
 privileges. The health query requires an administrator to run
@@ -336,10 +374,15 @@ output is a permission-limited result, not evidence of unhealthy media.
 Use only a writable scratch directory explicitly assigned by the server
 administrator. Do not pass `/dev/pmem0`, `/dev/pmem1`, either mount root, or an
 existing region file to the test, and do not format, reconfigure, disable, or
-unmount either namespace. The current test has a 4 MiB peak region file; up to
-1 GiB of scratch space provides headroom for planned multi-image crash tests
-and retained traces. `/mnt/pmem0.0/sean` is the assigned directory; the runner
-may create and remove only its own `wizard-pmem-*.region` files there.
+unmount either namespace. The Stage 1 integration has a 4 MiB peak region file
+and the crash loop a 2 MiB one; up to 1 GiB of scratch space provides headroom
+for planned multi-image crash tests and retained traces. `/mnt/pmem0.0/sean` is
+the assigned directory; the runners may create and remove only their own
+`wizard-pmem-*.region` and `wizard-pwsieve-*.region` files there. Both reserve a
+uniquely named file with `O_CREAT|O_EXCL` and remove only that file; a failed
+crash-loop run deliberately keeps its region image and prints the path, so an
+occasional `wizard-pwsieve-*.region` artifact is evidence awaiting inspection
+rather than litter, and no run will overwrite it.
 
 ## Alternative: reserve native Linux DRAM
 
@@ -478,7 +521,37 @@ native writeback/fence path against a real PMEM mapping, clean remount, and
 software WAL replay. It is still a controlled same-host reopen: it does not
 establish survival of abrupt process termination, host reset, or power loss.
 
-### Stage 2 — guest crash and restart testing
+### Stage 2 — abrupt termination on physical PMEM (done, 2026-09-01)
+
+The resumable-sieve crash loop runs over the production PMEM backend:
+
+```bash
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pwsieve-pmem
+```
+
+A child forks, mounts the region with `MAP_SYNC`, and sieves while the parent
+sleeps a seeded pseudo-random 50 us - 20 ms interval and sends `SIGKILL`; the
+parent then remounts from a fresh mapping, runs production WAL recovery, lets
+`PWSieve` reattach through the durable root, and checks its cross-object
+invariants and that progress never went backwards. The backend is named
+explicitly rather than inferred from the path, an unrecognised mode is rejected
+instead of defaulted, and the run asserts it received a `PmemMmapRegion` and not
+its `FileMmapRegion` sibling before doing any work — so a silent fallback to an
+ordinary shared mapping cannot be reported as a PMEM result. Because
+`PmemMmapBackend.create()` has no non-`MAP_SYNC` mapping mode, a run that starts
+at all is a run on filesystem DAX.
+
+This command passed on Magpie on 2026-09-01: 13 iterations at 512 x 4096 = 2 MiB
+before the sieve's 167-segment descriptor table filled, every restart reporting
+`DualWalRecovery.REPLAYED`, invariants holding after each recovery, three leaked
+extents reclaimed at mount, and 376,256 primes below 5,429,504 matching an
+independent in-process sieve. See the discrimination note in the Magpie section
+above: this establishes software crash consistency on physical media and clean
+execution of the production writeback/fence path, but it is **not** sensitive to
+whether the `CLWB`s are correctly placed, because killing a process on a DAX
+mapping loses nothing that is still in cache.
+
+### Stage 2b — guest crash and restart testing
 
 After Stage 1, automate interruption at WAL protocol boundaries, then reopen
 the same region file and check allocator and WAL invariants. Useful scenarios

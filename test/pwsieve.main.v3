@@ -243,6 +243,7 @@ def main(args: Array<string>) -> int {
         var advanced = 0;
         var finished = 0;
         var reclaimed = 0;
+        var completed = 0;
         var full = false;
 
         for (iteration < SieveLoopConfig.iterations) {
@@ -308,6 +309,7 @@ def main(args: Array<string>) -> int {
                 prevCursor = sieve.cursor();
                 prevCount = sieve.count();
 
+                completed++;
                 if (sieve.numSegments() >= sieve.segmentCapacity()) full = true;
                 region.deallocate();
                 region = null;
@@ -317,7 +319,11 @@ def main(args: Array<string>) -> int {
                 }
         }
 
-        Trace.OUT.put2("iterations %d, seed %d", SieveLoopConfig.iterations, SieveLoopConfig.seed).ln();
+        // Iterations actually run, not the number configured: the loop stops
+        // early once the segment table fills, and this line goes into results
+        // records where the difference is the crash count being claimed.
+        Trace.OUT.put3("iterations %d of %d requested, seed %d",
+                completed, SieveLoopConfig.iterations, SieveLoopConfig.seed).ln();
         Trace.OUT.put3("advanced %d, replayed a record %d, child finished early %d",
                 advanced, replayed, finished).ln();
         Trace.OUT.put1("leaked extents reclaimed at mount: %d", reclaimed).ln();

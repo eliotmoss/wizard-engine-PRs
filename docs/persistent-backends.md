@@ -648,7 +648,7 @@ Three harnesses drive it, at three evidence layers:
 |---|---|---|
 | `PWSieveTest.v3` | 3 | Graceful remounts preserve and resume the workload; retirement recycles blocks; a leak is reclaimed |
 | `test/pwsieve.main.v3` (`make pwsieve`) | 3 | Random-timer `SIGKILL` at arbitrary points, remount, invariants, monotone progress, final count against an independent sieve |
-| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3+ | The same loop through `PmemMmapBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Needs `PWASM_PMEM_TEST_DIR`; still process-crash, not power-loss, evidence |
+| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3 | The same loop through `PmemMmapBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Passed on Magpie 2026-09-01 (13 kills, all `REPLAYED`, 376,256 primes matching an independent sieve). Needs `PWASM_PMEM_TEST_DIR`. Executes the production path on real media but does **not** discriminate flush placement — a killed process on a DAX mapping loses nothing still in cache; that sensitivity is layer 1b's |
 | `PersistentSieveTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants |
 
 The crash loop forks a child that sieves while the parent sleeps a seeded
