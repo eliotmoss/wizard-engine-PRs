@@ -366,10 +366,27 @@ reachable after a remount.
   `live <= window + 1` and `open()` has to finish the pending retirement.
   `PWRegion.lastRecovery` was added so a harness can tell a restart that
   replayed a record from one that found a clean log.
-- [ ] **Feed a sieve transaction to the explorer.** Record its ops through
-  `PersistentOperations` and run the existing `PersistentAllocatorProperty` over
-  the enumerated crash images, promoting the workload from demonstration to
-  layer-1b evidence with no new machinery.
+- [x] **Feed a sieve transaction to the explorer.**
+  `test/unittest/x86-64-linux/PersistentSieveTest.v3` records one `step()`'s real
+  `STORE`/`CLWB`/`SFENCE` order over a recording `PmemMmapRegion`, then sweeps
+  every cut with both the existing `PersistentAllocatorProperty` and a new
+  `PersistentSieveProperty` — mount the image, run production recovery, let
+  `PWSieve` reattach through the durable root, and require its cross-object
+  invariants. That is strictly stronger than the allocator property: a torn
+  commit leaving the prime count disagreeing with the bitmaps satisfies the
+  allocator's structure and fails here. Six `persistent_sieve:` tests: the
+  recorded step validates against the crash-model baseline (>100 events, >8
+  touched lines); the final cut is checked exhaustively and permits **more than
+  one** image, because phase B defers this transaction's after-images to the next
+  commit — every one of them must still recover; budgeted sweeps over every cut
+  of an ordinary step and of a retiring step (publish, then a second transaction
+  that unpublishes a descriptor and frees its extent together); and a self-check
+  that corrupting two bytes of a durable bitmap is rejected while the block table
+  and descriptors still walk cleanly.
+
+  Geometry note: 2 KB blocks are the floor. A splitting allocation buffers around
+  twenty redo entries and the WAL slot is `(blockSize - 64) / 2` bytes, so at 1 KB
+  the region's very first allocation fails to commit.
 
 ### 6. Minor cleanups
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).

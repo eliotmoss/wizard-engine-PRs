@@ -503,6 +503,8 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
 | `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
+| `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
+| `PersistentSieveTest.v3` | 6 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check |
 
 The trace recorder deliberately has no durable image, background eviction,
 asynchronous writeback completion, crash cuts, or schedule exploration yet.
@@ -594,6 +596,67 @@ shadow backend cannot establish that Linux or a storage device honoured a
 syscall. Together the layers support scoped conclusions: protocol correctness
 under the abstract boundary and bounded PMEM event model, correct backend
 translation, software crash consistency, and finally physical durability.
+
+### Resumable workload driver
+
+`test/unittest/x86-64-linux/PWSieve.v3` is a segmented Sieve of Eratosthenes
+over a `PWRegion`, used as a workload rather than as engine code. It exists to
+drive the allocator the way a program would: stop at an arbitrary point, and on
+the next run find its own state through the durable root and continue. It has no
+WASM component -- the WASM-facing object-graph persistence layer is separate
+work.
+
+The root chunk holds a `SieveRoot` (cursor, prime count, segment count, span,
+capacity, largest prime) followed by a fixed table of segment descriptors, and is
+published at `userRoot`. Each segment covers a contiguous span of integers, one
+bit each, in its own chunk; segments outside a retention window have their chunks
+freed while their descriptors survive, so the historical count stays exact and
+the allocator sees sustained allocate/free/coalesce churn.
+
+Three ordering decisions carry the design:
+
+- **Bulk data is not logged.** A kilobyte bitmap would overflow a 32-byte-entry
+  record slot many times over. Bitmaps are written through the
+  `PersistentOperations` seam and made durable *before* the transaction that
+  publishes their descriptor. Safe because an unpublished chunk is unreachable,
+  so no reader can observe a partial one.
+- **Publication follows allocation, and leaks.** `allocChunk()` commits on its
+  own (see [Design Critique](CRITIQUE.md) #1), so a crash between allocating an
+  extent and naming it leaves a block marked used with nothing pointing at it.
+  Measured, not hypothetical: 8-18 extents per crash-loop run, and without
+  reclamation a small region stops making progress after about six crashes.
+  `open()` sweeps the region's memory-order chain and frees what no descriptor
+  names -- only the workload can do this, since the allocator only knows the
+  block is used.
+- **Unpublication precedes freeing, atomically.** Retirement buffers the
+  descriptor clear and then calls `freeChunk()`, which commits the shared cache,
+  so both land in one transaction. The reverse order would leave a descriptor
+  naming a block the allocator may hand out again -- corruption, not a leak.
+
+`checkInvariants()` is deliberately cross-object: a descriptor lives in the root
+chunk and the bitmap it describes in another, so a torn commit shows as a
+disagreement between them. It checks the descriptor count against the bitmap's
+popcount, the root total against the sum of descriptors, the cursor against the
+segment count, and every live bitmap against a freshly recomputed sieve of its
+range byte for byte. Publication and retirement are separate transactions, so the
+bound that holds at every instant is `live <= window + 1`; `open()` finishes an
+interrupted retirement so the surplus cannot accumulate.
+
+Three harnesses drive it, at three evidence layers:
+
+| Harness | Layer | What it shows |
+|---|---|---|
+| `PWSieveTest.v3` | 3 | Graceful remounts preserve and resume the workload; retirement recycles blocks; a leak is reclaimed |
+| `test/pwsieve.main.v3` (`make pwsieve`) | 3 | Random-timer `SIGKILL` at arbitrary points, remount, invariants, monotone progress, final count against an independent sieve |
+| `PersistentSieveTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants |
+
+The crash loop forks a child that sieves while the parent sleeps a seeded
+pseudo-random 50 us - 20 ms interval and sends `SIGKILL`. Across five seeds at
+25-30 iterations, every restart reported `DualWalRecovery.REPLAYED` -- the kills
+all landed mid-transaction rather than while the child was idle -- and the final
+count matched the reference exactly (376,256 primes below 5,429,504). Same
+boundary as the rest of the file-backed work: process-crash consistency under one
+kernel, not host power-loss proof.
 
 ### Shadow durable-memory test backend
 

@@ -129,11 +129,15 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/PersistentRecoveryTest.v3` | Production recovery over enumerated crash images (acknowledged survival, no invented state, idempotence, counterexample emission) |
 | `test/unittest/x86-64-linux/PersistentAllocatorTest.v3` | Allocator invariants over enumerated crash images (split alloc, coalescing free, walker self-check) |
 | `test/unittest/x86-64-linux/MultiTxnWalTest.v3` | `MultiTxnWal` unit tests (comparison implementation) |
+| `test/unittest/x86-64-linux/PWSieve.v3` | Resumable segmented Sieve of Eratosthenes over `PWRegion` — the workload driver (not engine code); root chunk at `userRoot`, one chunk per live segment, retirement + leak reclamation, `checkInvariants()` |
+| `test/unittest/x86-64-linux/PWSieveTest.v3` | Sieve workload tests (mount/resume, prime counts, invariants, retirement, remount) |
+| `test/unittest/x86-64-linux/PersistentSieveTest.v3` | Sieve through the crash-image explorer; `PersistentSieveProperty` mounts an image, recovers, reattaches and checks the workload's invariants |
+| `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve (`make pwsieve`, `PWSIEVE_ARGS`) |
 
 ### On-region layout
 
 ```
-Block 0:   Region header (PWRegionHeader) + sentinels
+Block 0:   Region header (PWRegionHeader, 88 bytes, incl. userRoot) + sentinels
 Block 1:   WAL log chunk (DualTxnWal: DualWalHeader + two fixed record slots)
 Blocks 2…N-2: User data blocks (SMALL_FREE / LARGE_FREE / USED)
 Block N-1: Metadata overhead (block table, MetaDataDesc[])
@@ -156,6 +160,7 @@ The superseded protocols are retained for comparison, **not wired in** — `Sing
 - `MmapRegionUtils.flushCacheLine` / `storeFence` are no-op placeholders — need Virgil inline-asm or intrinsic support for CLWB/SFENCE (`X86_64TxnBackend.v3:88-100`)
 - WAL overflow in `SingleTxnWal.append` (the superseded reference WAL) silently drops entries when block 1 is full; the active `DualTxnWal` surfaces an oversized transaction via a failed `commit()` instead (per-transaction capacity ≈ half the log chunk minus headers)
 - `Backends.getMmap()` declared but not implemented
+- `PWRegion.setUserRoot()` commits in its own transaction, and `allocChunk()` commits in its own, so a crash between allocating an extent and publishing it in the root leaks that extent (used, unreachable). A space leak, not an inconsistency; the caller must reclaim it (`PWSieve.open()` shows how)
 - `ImmixPWRegion` line marks are explicitly transient: mark/reset bypass the WAL and persistence boundaries, so callers must rebuild them after a crash. They are also the only remaining direct stores in the allocator — every other persistent store on the active path goes through the `PersistentOperations` seam
 - `RegionTransaction.clear()` allocates a new `HashMap` on every commit (GC pressure)
 - `RegionTransaction` is aligned-access only — mixed-width overlapping reads cause silent cache misses
