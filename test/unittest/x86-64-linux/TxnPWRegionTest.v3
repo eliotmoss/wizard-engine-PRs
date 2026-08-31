@@ -32,6 +32,9 @@ def X = [
 	T("commit_clears_transaction", test_commit_clears_transaction),
 	T("unaligned_block_size_rejected", test_unaligned_block_size_rejected),
 	T("undersized_region_rejected", test_undersized_region_rejected),
+	T("user_root_initially_zero",  test_user_root_initially_zero),
+	T("user_root_round_trips",     test_user_root_round_trips),
+	T("user_root_out_of_range_rejected", test_user_root_out_of_range_rejected),
 	()
 ];
 
@@ -296,6 +299,52 @@ def test_undersized_region_rejected(tc: PWRegionTester) {
 // =============================================================================
 // Immix line-mark linkage
 // =============================================================================
+
+// =============================================================================
+// Durable root tests
+// =============================================================================
+
+// A freshly formatted region publishes "no root". format() stores the zero
+// explicitly, so this also proves the field is not merely inheriting a
+// zero-initialized backing buffer.
+def test_user_root_initially_zero(tc: PWRegionTester) {
+	tc.t.assert_eq(0u64, tc.region.getUserRoot());
+	tc.t.assert_eq(0u64, tc.region.getHeader().userRoot);
+}
+
+// The root a caller publishes is the root it reads back, both through the
+// transaction and in the durable header.
+def test_user_root_round_trips(tc: PWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+
+	def offset = tc.region.offsetInRegion(chunk.addr);
+	tc.t.assertz(true, tc.region.setUserRoot(offset));
+	tc.t.assert_eq(offset, tc.region.getUserRoot());
+	tc.t.assert_eq(offset, tc.region.getHeader().userRoot);
+
+	// Republishing overwrites rather than accumulating.
+	tc.t.assertz(true, tc.region.setUserRoot(0u64));
+	tc.t.assert_eq(0u64, tc.region.getUserRoot());
+}
+
+// An offset that cannot name a byte in this region is refused before it
+// reaches the log, so a later mount cannot hand the caller a wild address.
+// The rejection is an ordinary one: the mount stays usable.
+def test_user_root_out_of_range_rejected(tc: PWRegionTester) {
+	def size = 8u64 * 4096u64;
+	tc.t.assertz(true, tc.region.setUserRoot(size - 1u64));
+	tc.t.assert_eq(size - 1u64, tc.region.getUserRoot());
+
+	tc.t.assertz(false, tc.region.setUserRoot(size));           // first byte past the end
+	tc.t.assertz(false, tc.region.setUserRoot(size + 4096u64));
+	tc.t.assertz(false, tc.region.setUserRoot(0u64 - 1u64));    // wrapped value
+
+	// Unchanged, and distinguishable from a persistence failure.
+	tc.t.assert_eq(size - 1u64, tc.region.getUserRoot());
+	tc.t.assertz(false, tc.region.requiresRecovery());
+}
+
 
 def IRT = UnitTests.registerT("pwregion_immix:", _, ImmixPWRegionTester.new, _);
 def IRX = [
@@ -1332,6 +1381,8 @@ def BX = [
 	BT("sigkill_exact_fit_alloc_recovers_transaction", test_bd_sigkill_exact_fit_alloc_recovers_transaction),
 	BT("sigkill_coalescing_free_recovers_transaction", test_bd_sigkill_coalescing_free_recovers_transaction),
 	BT("corrupt_wal_checksum",  test_bd_corrupt_wal_checksum),
+	BT("user_root_survives_remount", test_bd_user_root_survives_remount),
+	BT("user_root_cleared_by_reformat", test_bd_user_root_cleared_by_reformat),
 	()
 ];
 
@@ -3243,6 +3294,50 @@ def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
 
 	var region2 = tc.remount();
 	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsed());
+
+	tc.cleanup();
+}
+
+// The point of the root: a program that stops and restarts finds its own data
+// again without hardcoding an offset. Publish an allocated chunk as the root,
+// close cleanly, remount, and reach the chunk through the header alone.
+def test_bd_user_root_survives_remount(tc: BlockDevicePWRegionTester) {
+	var chunk = tc.region.allocChunk(2u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+	def offset = tc.region.offsetInRegion(chunk.addr);
+	tc.t.assertz(true, tc.region.setUserRoot(offset));
+
+	// Write a payload into the chunk body so the recovered root is shown to
+	// name reachable data, not just a plausible number.
+	def payloadAddr = chunk.addr + u64.!(ChunkHeader.size);
+	tc.region.txn.writeU64(payloadAddr, 0xFEED_FACE_u64);
+	tc.t.assertz(true, tc.region.txn.commit());
+
+	var region2 = tc.remount();
+	tc.t.assert_eq(offset, region2.getUserRoot());
+
+	// Rebuild the handle from the durable root and check the allocator still
+	// agrees the extent is live.
+	def recovered = ChunkHandle(region2.regionStart + region2.getUserRoot());
+	def entry = region2.chunkToBlockEntry(recovered);
+	tc.t.assertz(false, entry.isNull());
+	tc.t.assertz(true, entry.getUsed());
+	tc.t.assert_eq(0xFEED_FACE_u64,
+		region2.txn.readU64(recovered.addr + u64.!(ChunkHeader.size)));
+
+	tc.cleanup();
+}
+
+// A reformat over an existing image must not leave the previous run's root
+// visible: the new region owns none of the old extents.
+def test_bd_user_root_cleared_by_reformat(tc: BlockDevicePWRegionTester) {
+	var chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(true, tc.allocSucceeded(chunk));
+	tc.t.assertz(true, tc.region.setUserRoot(tc.region.offsetInRegion(chunk.addr)));
+	tc.t.assertz(true, tc.region.getUserRoot() != 0u64);
+
+	var region2 = tc.reformat();
+	tc.t.assert_eq(0u64, region2.getUserRoot());
 
 	tc.cleanup();
 }

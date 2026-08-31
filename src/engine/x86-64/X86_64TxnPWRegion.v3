@@ -29,7 +29,8 @@ layout PWRegionHeader {
         +56     magic:          u64;    // identifier to confirm region is formatted
         +64     blockSize:      u64;    // block size this region was formatted with
         +72     logChunk:       u64;    // region-relative offset of the WAL log chunk
-        =80;
+        +80     userRoot:       u64;    // region-relative offset of the caller's root object (0 = none)
+        =88;
 }
 
 layout BlockEntry {
@@ -794,6 +795,11 @@ class PWRegion {
                 headerSetU64(PWRegionHeader.numBlocks.offset, this.numBlocks);
                 headerSetU64(PWRegionHeader.numBytes.offset, size);
                 headerSetU64(PWRegionHeader.blockSize.offset, blockSize);
+                // Written explicitly rather than left at its zero-initialized
+                // value: a fresh region must publish "no root" as a store the
+                // trace can see, and a reformat over an old image must clear a
+                // stale root instead of inheriting it.
+                headerSetU64(PWRegionHeader.userRoot.offset, 0);
 
                 formatSentinels();
                 var currentRegionEnd = formatBlockTable(size);
@@ -1043,6 +1049,42 @@ class PWRegion {
                 } else {
                         insertAfter(largeSentinel, entry, ListKind.LARGE_FREE);
                 }
+                return performCommit();
+        }
+
+        // The durable root. A mounted region is otherwise opaque to its caller:
+        // the block table records which extents are in use, but not which of
+        // them the caller wants to reach after a remount. The root is a single
+        // region-relative offset the caller publishes transactionally, so a
+        // program that stops and restarts can find its own data again instead
+        // of hardcoding an offset.
+        //
+        // 0 means "no root". Offset 0 is the region header, which is never
+        // allocatable, so the sentinel cannot collide with a real target.
+        def getUserRoot() -> u64 {
+                if (txn == null) return 0;
+                return txn.readU64(regionStart + u64.view(PWRegionHeader.userRoot.offset));
+        }
+
+        // Publishes {offset} as the root in its own transaction. Returns false
+        // for a rejected value or a failed commit; use requiresRecovery() to
+        // tell an out-of-range argument from a persistence failure.
+        //
+        // The root is published by a separate transaction from the allocation
+        // it names, so a crash between the two leaks the allocated extent: it
+        // stays marked used but nothing reaches it. That is a space leak, not
+        // an inconsistency, and it is the direct consequence of allocChunk()
+        // committing on its own (see docs/CRITIQUE.md #1). A caller that must
+        // not leak should publish first and allocate into a root-reachable
+        // free list of its own.
+        def setUserRoot(offset: u64) -> bool {
+                if (requiresRecovery()) return false;
+                if (txn == null) return false;
+                // Reject an offset that cannot name a byte in this region.
+                // Without this, a remount would hand the caller back a wild
+                // address derived from regionStart.
+                if (offset >= numBlocks * blockSize) return false;
+                txn.writeU64(regionStart + u64.view(PWRegionHeader.userRoot.offset), offset);
                 return performCommit();
         }
 

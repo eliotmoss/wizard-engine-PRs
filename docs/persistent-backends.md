@@ -318,7 +318,7 @@ Block 2..N   User data  (allocated / free)
 Block N..M   Metadata   (block table, sentinels, descriptors)
 ```
 
-### `PWRegionHeader` (80 bytes, stored at offset 0)
+### `PWRegionHeader` (88 bytes, stored at offset 0)
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -332,6 +332,38 @@ Block N..M   Metadata   (block table, sentinels, descriptors)
 | `magic` | u64 | `0x50_57_41_53_4D` ("PWASM") |
 | `blockSize` | u64 | bytes per block (wrapper default 512 KB) |
 | `logChunk` | u64 | region-relative offset of the WAL log chunk (block 1 in the current layout) |
+| `userRoot` | u64 | region-relative offset of the caller's root object; `0` = none |
+
+#### The durable root
+
+`userRoot` is the allocator's only concession to what a caller stores in the
+region. Without it a mounted region is opaque to its owner: the block table
+records which extents are in use, but not which of them the caller wants to
+reach after a restart, so every caller has to remember an offset out of band.
+`PWRegion.getUserRoot()` / `setUserRoot(offset)` publish and read one
+region-relative offset transactionally, which is enough for a caller to anchor
+an arbitrary structure of its own.
+
+`0` means "no root". Offset 0 is the region header, which is never allocatable,
+so the sentinel cannot collide with a real target. `setUserRoot()` rejects an
+offset at or past the end of the region, so a remount cannot hand back a wild
+address; the rejection is ordinary and leaves the mount usable, distinguishable
+from a persistence failure via `requiresRecovery()`. `format()` stores the zero
+explicitly so a reformat clears a previous run's root rather than inheriting it.
+
+**Root publication is a separate transaction from the allocation it names.**
+`allocChunk()` commits on its own (see [Design Critique](CRITIQUE.md) #1), so a
+crash between allocating an extent and publishing it leaks that extent: it stays
+marked used and nothing reaches it. This is a space leak, not an inconsistency
+— the durable state always satisfies the allocator's invariants — and it is the
+cost of the current per-operation commit granularity.
+
+**Format change.** The header grew 80 → 88 bytes. Sentinels sit immediately
+after the header (`formatSentinels()` uses `PWRegionHeader.size`), so they moved
+with it and a region formatted by an older build cannot be mounted by this one:
+`magic`, `numBlocks` and `blockSize` still validate at their unchanged offsets,
+but the sentinel array would be read 8 bytes early. Regions must be reformatted.
+This follows the precedent of the 72 → 80 growth that added `logChunk`.
 
 ### `BlockEntry` (40 bytes)
 

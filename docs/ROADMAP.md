@@ -299,6 +299,46 @@ command, evidence boundary, and safe execution constraints.
 - [ ] **Stage 2 — guest crash/restart:** automate process termination at WAL boundaries and reopen the same file; add guest reset/QEMU restart experiments with the same NVDIMM backing file. Treat the results as software crash-consistency evidence, not physical durability proof.
 - [ ] **Stage 3 — real PMEM durability:** with the CLWB/SFENCE work in #4 complete, repeat the integration and controlled crash/power-interruption campaign on physical PMEM. Only this stage can support a host power-loss durability claim.
 
+### 7. Durable root and resumable-workload validation (2026-08-31)
+
+A mounted region had no way to tell its caller where the caller's own data is:
+the block table records which extents are used, but not which of them to reach
+after a restart. Every existing test worked around this by hardcoding an offset,
+which a real resumable program cannot do. This is the allocator-side half of the
+interface an object-graph persistence layer needs — its graph roots must be
+reachable after a remount.
+
+- [x] **Durable root.** `PWRegionHeader.userRoot` (header 80 → 88 bytes) holds one
+  region-relative offset, published through `PWRegion.setUserRoot()` and read by
+  `getUserRoot()`. `0` = none (offset 0 is the never-allocatable header, so the
+  sentinel cannot collide). Out-of-range offsets are refused as ordinary
+  rejections, leaving the mount usable. `format()` stores the zero explicitly so a
+  reformat clears a stale root. Root publication is a separate transaction from
+  the allocation it names, so a crash between them leaks the extent — a space
+  leak, not an inconsistency, and a direct consequence of `allocChunk()`
+  committing on its own (CRITIQUE #1). Sentinels moved with the header, so
+  older-format regions must be reformatted. Covered by five tests:
+  `pwregion:user_root_initially_zero`, `user_root_round_trips`,
+  `user_root_out_of_range_rejected`, and `pwregion_bd:user_root_survives_remount`,
+  `user_root_cleared_by_reformat`.
+- [ ] **Segmented sieve harness.** A Virgil workload driving `PWRegion` directly —
+  no WASM guest, no host module (the WASM-facing object-graph layer is separate
+  work). One allocated chunk per sieve segment, retired segments freed so
+  coalescing runs, cursor and segment directory anchored at the durable root.
+- [ ] **Cross-object invariant.** Keep the cursor and prime count in the root and
+  the bitmap in the chunks, and assert `count == popcount(bitmap[0..cursor])` on
+  every remount. Without this the sieve is monotone and idempotent and would pass
+  with a broken WAL; with it, a torn multi-object commit is observable.
+- [ ] **Random-timer SIGKILL loop.** Kill mid-transaction at arbitrary points
+  rather than the 20 hand-picked protocol boundaries, remount, check the
+  invariant, resume. Final primes must match a reference list. Adds coverage the
+  deterministic slices do not have, and ages the region: exhaustion, free-list
+  reuse, repeated WAL slot reclamation.
+- [ ] **Feed a sieve transaction to the explorer.** Record its ops through
+  `PersistentOperations` and run the existing `PersistentAllocatorProperty` over
+  the enumerated crash images, promoting the workload from demonstration to
+  layer-1b evidence with no new machinery.
+
 ### 6. Minor cleanups
 - [x] `RegionFileIO.openOrCreate` → split into `open` and `create`; `create` zero-initialises bytes (`O_TRUNC` + `ftruncate` zero-fill). Fresh-format intent threaded through `TxnRegionBackend.create(size, prot, fresh)`; `openBacking(path, fresh)` selects create-vs-open (open falls back to create when the file is missing).
 - [x] Add log-chunk offset to `PWRegionHeader` — new `logChunk` field (region-relative byte offset) written by `format()` and read by `mount()`, so recovery locates the log via the header instead of assuming block 1. Header grew 72 → 80 bytes; `mount()` keeps a defensive fallback to block 1 when the field reads as `0`. Covered by `TxnPWRegionTest.v3` (`format_header_fields` asserts the field; the remount/recovery tests exercise the header-driven read path).
