@@ -345,8 +345,8 @@ reachable after a remount.
   correct with a broken log. Thirteen `pwsieve:` / `pwsieve_bd:` tests, including
   an eight-step run that remounts a real file between every step.
 - [x] **Random-timer SIGKILL loop.** `test/pwsieve.main.v3`, built as
-  `bin/pwsieve.x86-64-linux` by `make pwsieve` (`PWSIEVE_ARGS` overrides path,
-  iterations, seed and geometry). A child forks, mounts, and sieves while the
+  `bin/pwsieve.x86-64-linux` by `make pwsieve` (`PWSIEVE_ARGS` overrides the
+  directory, iterations, seed and geometry). A child forks, mounts, and sieves while the
   parent sleeps a seeded pseudo-random 50 us — 20 ms interval and sends
   `SIGKILL`; the parent then remounts from a fresh mapping, runs production
   recovery, checks the invariants and that progress never goes backwards, and
@@ -357,6 +357,25 @@ reachable after a remount.
   (376,256 primes below 5,429,504). Same evidence boundary as the rest of the
   file-backed work — process-crash consistency under one kernel, not host
   power-loss proof.
+
+  The backend is selected explicitly, `file` or `pmem`, rather than inferred from
+  the path: the file backend is `mmap` + `msync`/`fdatasync`, the PMEM backend is
+  `MAP_SYNC` + `CLWB`/`SFENCE`, and reporting one as the other is the difference
+  between crash consistency on an arbitrary filesystem and crash consistency
+  through the production writeback/fence path. An unrecognised mode is rejected
+  instead of defaulted, and the run asserts it got a `PmemMmapRegion` (not its
+  `FileMmapRegion` sibling) before doing any work, so a silent fallback cannot be
+  reported as a PMEM result. `PmemMmapBackend.create()` has no non-`MAP_SYNC`
+  mapping mode, so a `pmem` run that starts at all is a run on filesystem DAX.
+  `make pwsieve-pmem` drives that path, gated on `PWASM_PMEM_TEST_DIR` exactly as
+  `make pmem-integration` is, at 512 x 4096 = 2 MiB to match a DAX mount's 2 MiB
+  alignment while keeping the fast 32512-integer span.
+
+  The runner never touches a file it did not create. It reserves a uniquely named
+  `wizard-pwsieve-*.region` with `O_CREAT|O_EXCL` inside the assigned directory,
+  as `pmem-integration.main.v3` does, and unlinks only that file, only after the
+  run passes; a failing run keeps its region image and prints the path, since the
+  durable bytes are the evidence.
 
   Two findings came out of it. First, the alloc-then-publish leak is not
   theoretical: 8–18 extents leaked per run, and without reclamation a small

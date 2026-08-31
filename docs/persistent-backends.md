@@ -648,6 +648,7 @@ Three harnesses drive it, at three evidence layers:
 |---|---|---|
 | `PWSieveTest.v3` | 3 | Graceful remounts preserve and resume the workload; retirement recycles blocks; a leak is reclaimed |
 | `test/pwsieve.main.v3` (`make pwsieve`) | 3 | Random-timer `SIGKILL` at arbitrary points, remount, invariants, monotone progress, final count against an independent sieve |
+| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3+ | The same loop through `PmemMmapBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Needs `PWASM_PMEM_TEST_DIR`; still process-crash, not power-loss, evidence |
 | `PersistentSieveTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants |
 
 The crash loop forks a child that sieves while the parent sleeps a seeded

@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -82,11 +82,25 @@ pmem-integration: bin/pmemtest.x86-64-linux
 bin/pmemtest.x86-64-linux: $(ENGINE) $(PMEMTEST_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pmemtest x86-64-linux
 
-# Random-timer crash loop over the resumable sieve. PWSIEVE_ARGS overrides the
-# region path, iteration count, seed and geometry.
-PWSIEVE_ARGS ?= /tmp/wizard-pwsieve.region 50 1
+# Random-timer crash loop over the resumable sieve, on the file backend. The
+# runner reserves its own uniquely named file inside the given directory.
+# PWSIEVE_ARGS overrides the directory, iteration count, seed and geometry.
+PWSIEVE_ARGS ?= /tmp 50 1
 pwsieve: bin/pwsieve.x86-64-linux
 	bin/pwsieve.x86-64-linux $(PWSIEVE_ARGS)
+
+# Opt-in: the same crash loop through the production PMEM backend.
+# PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax
+# mount; MAP_SYNC has no fallback, so a run that starts is a run on real DAX.
+# 512 x 4096 = 2 MiB, matching the mount's 2 MiB alignment while keeping the
+# fast 32512-integer segment span. PWSIEVE_PMEM_ARGS overrides the rest.
+PWSIEVE_PMEM_ARGS ?= 20 1 512 4096
+pwsieve-pmem: bin/pwsieve.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pwsieve.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" $(PWSIEVE_PMEM_ARGS) pmem
 
 bin/pwsieve.x86-64-linux: $(ENGINE) $(PWSIEVE_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwsieve x86-64-linux

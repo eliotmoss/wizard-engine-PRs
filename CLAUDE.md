@@ -132,7 +132,7 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/PWSieve.v3` | Resumable segmented Sieve of Eratosthenes over `PWRegion` — the workload driver (not engine code); root chunk at `userRoot`, one chunk per live segment, retirement + leak reclamation, `checkInvariants()` |
 | `test/unittest/x86-64-linux/PWSieveTest.v3` | Sieve workload tests (mount/resume, prime counts, invariants, retirement, remount) |
 | `test/unittest/x86-64-linux/PersistentSieveTest.v3` | Sieve through the crash-image explorer; `PersistentSieveProperty` mounts an image, recovers, reattaches and checks the workload's invariants |
-| `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve (`make pwsieve`, `PWSIEVE_ARGS`) |
+| `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve; selectable file or PMEM backend, reserves its own region file in a caller-assigned directory (`make pwsieve` / `make pwsieve-pmem`, `PWSIEVE_ARGS` / `PWASM_PMEM_TEST_DIR`) |
 
 ### On-region layout
 

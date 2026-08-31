@@ -15,7 +15,21 @@
 // boundary as the rest of the file-backed testing (docs/persistent-backends.md,
 // layer 3).
 //
-// Usage: pwsieve.x86-64-linux <region-path> [iterations] [seed] [blocks] [blockSize]
+// Backends. The loop runs over either the file backend (mmap + msync/fdatasync)
+// or the production PMEM backend (MAP_SYNC + CLWB/SFENCE). Which one is under
+// test is the whole difference between "process-crash consistency on whatever
+// filesystem this is" and "process-crash consistency through the production
+// writeback/fence path on real PMEM", so the mode is stated explicitly rather
+// than inferred from the path, and the run prints which region class it got.
+// PmemMmapBackend has no non-MAP_SYNC fallback, so a successful create in pmem
+// mode is itself the project-level MAP_SYNC probe.
+//
+// The runner never touches a file it did not create: it atomically reserves a
+// uniquely named region inside the caller-assigned directory, exactly as
+// pmem-integration.main.v3 does, and removes only that file. A shared research
+// host with an assigned scratch directory is the intended target.
+//
+// Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem]
 
 def SIGKILL = 9;
 def LIVE_SEGMENTS = 2u64;
@@ -25,11 +39,50 @@ def LIVE_SEGMENTS = 2u64;
 def MAX_REFERENCE = 64000000u64;
 
 component SieveLoopConfig {
+        def var directory: string;
         def var path: string;
         def var iterations = 50;
         def var seed = 1u64;
         def var blocks = 32u64;
         def var blockSize = 4096u64;
+        def var usePmem = false;        // false = file backend, true = PmemMmapBackend
+
+        def backendName() -> string {
+                return if(usePmem, "pmem (MAP_SYNC + CLWB/SFENCE)", "file (mmap + msync/fdatasync)");
+        }
+
+        // Reserve a private, uniquely named region file inside the assigned
+        // directory. O_EXCL means an existing artifact -- including one left by
+        // an earlier killed run -- is never silently replaced; the bounded
+        // retry tolerates such an artifact once Linux reuses its PID.
+        def reservePath(dir: string) -> bool {
+                directory = dir;
+                def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+                def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                for (attempt < 100) {
+                        path = StringBuilder.new()
+                                .puts(directory)
+                                .puts("/wizard-pwsieve-u")
+                                .putd(uid)
+                                .puts("-p")
+                                .putd(pid)
+                                .puts("-")
+                                .putd(attempt)
+                                .puts(".region")
+                                .toString();
+                        def fd = RegionFileIO.createExclusive(path);
+                        if (fd >= 0) {
+                                RegionFileIO.close(fd);
+                                return true;
+                        }
+                        if (fd != -LinuxConst.EEXIST) {
+                                path = null;
+                                return false;
+                        }
+                }
+                path = null;
+                return false;
+        }
 
         // Bounds on the kill delay, in nanoseconds. The low end lands inside
         // the first commit; the high end lets several segments complete, so
@@ -51,9 +104,14 @@ class SieveRandom(var state: u64) {
         }
 }
 
+def openBackend() -> TxnRegionBackend {
+        if (SieveLoopConfig.usePmem) return X86_64Backends.getPersistent(SieveLoopConfig.path);
+        return X86_64Backends.getFileMapped(SieveLoopConfig.path);
+}
+
 def openRegion(fresh: bool) -> PWRegion {
         return PWRegion.new(
-                X86_64Backends.getFileMapped(SieveLoopConfig.path),
+                openBackend(),
                 SieveLoopConfig.blocks,
                 Array<Ref<MetaDataDesc>>.new(0),
                 SieveLoopConfig.blockSize,
@@ -67,10 +125,17 @@ def sleepNanos(ns: long) {
         Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
 }
 
+// A failing run keeps its region file: the durable image is the evidence. Name
+// it, since nothing else will clean it up.
 def fail(msg: string) -> int {
         System.puts("FAIL: ");
         System.puts(msg);
         System.ln();
+        if (SieveLoopConfig.path != null) {
+                System.puts("retained region image: ");
+                System.puts(SieveLoopConfig.path);
+                System.ln();
+        }
         return 1;
 }
 
@@ -119,21 +184,50 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 1 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwsieve.x86-64-linux <region-path> [iterations] [seed] [blocks] [blockSize]\n");
+                System.puts("Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem]\n");
                 return 2;
         }
-        SieveLoopConfig.path = args[0];
         if (args.length > 1) SieveLoopConfig.iterations = int.!(parseU64(args[1], 50));
         if (args.length > 2) SieveLoopConfig.seed = parseU64(args[2], 1);
-        if (args.length > 3) SieveLoopConfig.blocks = parseU64(args[3], 8);
+        if (args.length > 3) SieveLoopConfig.blocks = parseU64(args[3], 32);
         if (args.length > 4) SieveLoopConfig.blockSize = parseU64(args[4], 4096);
+        if (args.length > 5) {
+                // Rejected rather than defaulted: silently falling back to the
+                // file backend would report a PMEM run that never happened.
+                if (Strings.equal(args[5], "pmem")) SieveLoopConfig.usePmem = true;
+                else if (!Strings.equal(args[5], "file")) {
+                        System.puts("backend must be \"file\" or \"pmem\"\n");
+                        return 2;
+                }
+        }
+
+        if (!SieveLoopConfig.reservePath(args[0])) {
+                System.puts("Could not reserve a unique region file in the supplied directory.\n");
+                return 2;
+        }
+        Trace.OUT.put1("backend %s", SieveLoopConfig.backendName()).ln();
+        Trace.OUT.put1("region file %s", SieveLoopConfig.path).ln();
 
         // Fresh region, fresh sieve. Everything after this point must survive
         // on its own.
-        RegionFileIO.unlink(SieveLoopConfig.path);
         var region = openRegion(true);
         if (region == null || region.backendRegion == null) {
+                if (SieveLoopConfig.usePmem) {
+                        return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                }
                 return fail("could not create the region file");
+        }
+        // The decisive anti-fallback check. PmemMmapRegion and FileMmapRegion are
+        // siblings under FdMmapRegion, so this distinguishes the production
+        // writeback/fence path from an ordinary shared file mapping rather than
+        // trusting the requested mode.
+        if (SieveLoopConfig.usePmem && !PmemMmapRegion.?(region.backendRegion)) {
+                region.deallocate();
+                return fail("pmem mode did not produce a PmemMmapRegion");
+        }
+        if (!SieveLoopConfig.usePmem && !FileMmapRegion.?(region.backendRegion)) {
+                region.deallocate();
+                return fail("file mode did not produce a FileMmapRegion");
         }
         var sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return fail("could not lay out the sieve root");
@@ -247,7 +341,11 @@ def main(args: Array<string>) -> int {
                 return fail("no iteration made progress; the kill delays are too short to test anything");
         }
 
-        RegionFileIO.unlink(SieveLoopConfig.path);
+        // Only the file this run reserved, and only after it passed.
+        if (!RegionFileIO.unlink(SieveLoopConfig.path)) {
+                System.puts("Could not remove the region file printed above.\n");
+                return 2;
+        }
         System.puts("OK\n");
         return 0;
 }
