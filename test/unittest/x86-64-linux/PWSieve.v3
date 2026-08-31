@@ -1,0 +1,472 @@
+// A resumable segmented Sieve of Eratosthenes over a PWRegion.
+//
+// This is a workload driver, not engine code. It exists to exercise the block
+// allocator the way a real program would: it stops at an arbitrary point, and
+// the next run finds its own data through the region's durable root and
+// continues from there. Nothing here touches WASM -- the WASM-facing
+// persistence layer is separate work -- so the only interface under test is
+// PWRegion's.
+//
+// Layout. The root chunk holds a SieveRoot followed by a fixed-capacity table
+// of SieveSegment descriptors, and is published at PWRegion's userRoot. Each
+// segment covers a contiguous span of integers, one bit each, in its own
+// allocated chunk. Segments older than the retention window have their chunks
+// freed but keep their descriptors, so the historical prime count survives
+// while the extents are returned to the allocator. That is what produces the
+// allocate/free/coalesce churn the existing short-history tests do not have.
+//
+//   root chunk:  [ChunkHeader][SieveRoot][SieveSegment * capacity]
+//   segment:     [ChunkHeader][bitmap, 1 bit per integer, LSB first]
+//
+// Why the bitmap does not go through the WAL. A segment bitmap is kilobytes;
+// each redo entry carries at most 8 bytes in a 32-byte record slot, so a
+// bitmap would overflow the log many times over. Bulk data is instead written
+// directly through the persistent-operation seam and made durable *before* the
+// transaction that publishes its descriptor. That is safe precisely because an
+// unpublished chunk is unreachable: no descriptor names it, so no reader can
+// observe a half-written bitmap. Only the small metadata -- descriptor fields
+// and root counters -- goes through the log, which is what the allocator's
+// crash-consistency machinery is for.
+
+component PWSieveConst {
+        def MAGIC = 0x53_49_45_56_45_52_30_31u64;       // "SIEVER01"
+}
+
+layout SieveRoot {
+        +0      magic:          u64;    // identity, so a foreign root is rejected rather than parsed
+        +8      cursor:         u64;    // every integer below this has been decided
+        +16     count:          u64;    // primes strictly below cursor, over all runs
+        +24     numSegments:    u64;    // descriptors in use
+        +32     segmentSpan:    u64;    // integers covered by one segment
+        +40     capacity:       u64;    // descriptor slots the root chunk holds
+        +48     lastPrime:      u64;    // largest prime found so far
+        =56;
+}
+
+layout SieveSegment {
+        +0      base:           u64;    // first integer this segment covers
+        +8      chunk:          u64;    // region-relative offset of the bitmap chunk, 0 = retired
+        +16     primeCount:     u64;    // primes in this segment
+        =24;
+}
+
+// Bit masks by index, as tables rather than variable shifts.
+def SIEVE_BIT: Array<byte> =    [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80];
+def SIEVE_NOTBIT: Array<byte> = [0xFE, 0xFD, 0xFB, 0xF7, 0xEF, 0xDF, 0xBF, 0x7F];
+
+// {liveSegments} is the retention window: the newest N segments keep their
+// bitmap chunks, older ones are freed.
+class PWSieve(region: PWRegion, liveSegments: u64) {
+        private var writer: DirectRegionWriter;
+        private var rootOffset: u64;            // region-relative offset of the root chunk
+        private var span: u64;                  // integers per segment
+        private var capacity: u64;              // descriptor slots
+        private var basePrimes: Array<u64>;
+        private var basePrimeLimit: u64;
+
+        new() {
+                if (region != null && region.backendRegion != null) {
+                        writer = DirectRegionWriter.new(
+                                X86_64PersistentOps.ensureFor(region.backendRegion),
+                                region.regionStart);
+                }
+        }
+
+        // ---------------------------------------------------------------
+        // Mount or initialize
+        // ---------------------------------------------------------------
+
+        // Attaches to an existing sieve in this region, or lays out a fresh
+        // one. Idempotent across restarts: this is the whole point of the
+        // durable root, so nothing about resuming needs an offset remembered
+        // outside the region.
+        def open() -> bool {
+                if (region == null || region.backendRegion == null) return false;
+                if (region.requiresRecovery()) return false;
+
+                def payload = region.blockSize - u64.!(ChunkHeader.size);
+                span = payload * 8u64;
+                if (payload <= u64.!(SieveRoot.size)) return false;
+                capacity = (payload - u64.!(SieveRoot.size)) / u64.!(SieveSegment.size);
+                if (capacity == 0) return false;
+
+                def existing = region.getUserRoot();
+                if (existing != 0) {
+                        rootOffset = existing;
+                        // Validate before trusting: a root published by a
+                        // different geometry would make every offset below
+                        // wrong, and the region cannot know what wrote it.
+                        if (rootGet(SieveRoot.magic.offset) != PWSieveConst.MAGIC) return false;
+                        if (rootGet(SieveRoot.segmentSpan.offset) != span) return false;
+                        if (rootGet(SieveRoot.capacity.offset) != capacity) return false;
+                        return true;
+                }
+
+                def chunk = region.allocChunk(1u32);
+                if (chunk.isNull()) return false;
+                rootOffset = region.offsetInRegion(chunk.addr);
+                rootPut(SieveRoot.magic.offset, PWSieveConst.MAGIC);
+                rootPut(SieveRoot.cursor.offset, 0);
+                rootPut(SieveRoot.count.offset, 0);
+                rootPut(SieveRoot.numSegments.offset, 0);
+                rootPut(SieveRoot.segmentSpan.offset, span);
+                rootPut(SieveRoot.capacity.offset, capacity);
+                rootPut(SieveRoot.lastPrime.offset, 0);
+                // setUserRoot() commits, so the root's fields and its
+                // publication are one transaction: a reader either sees no
+                // root at all or sees a complete one.
+                return region.setUserRoot(rootOffset);
+        }
+
+        // ---------------------------------------------------------------
+        // Progress
+        // ---------------------------------------------------------------
+
+        // Sieves one more segment. Returns false when the region or the
+        // descriptor table is full, or on any persistence failure.
+        def step() -> bool {
+                if (rootOffset == 0) return false;
+                if (region.requiresRecovery()) return false;
+
+                def index = rootGet(SieveRoot.numSegments.offset);
+                if (index >= capacity) return false;
+                def lo = rootGet(SieveRoot.cursor.offset);
+                def hi = lo + span;
+
+                def bits = buildSegment(lo, hi);
+
+                def chunk = region.allocChunk(1u32);
+                if (chunk.isNull()) return false;
+                def chunkOffset = region.offsetInRegion(chunk.addr);
+
+                // Durable before published. A crash between the allocation and
+                // the publishing commit below leaks this chunk -- it stays
+                // marked used with nothing naming it -- because allocChunk()
+                // commits on its own. A leak, not an inconsistency.
+                if (!writeBitmap(chunkOffset, bits)) return false;
+
+                def primes = popcountBits(bits);
+                def highest = highestSetBit(bits, lo);
+
+                // One transaction publishes the descriptor and advances the
+                // root counters. The descriptor and the root are separate
+                // objects; if this commit could tear, checkInvariants() would
+                // see the count and the bitmap disagree.
+                descPut(index, SieveSegment.base.offset, lo);
+                descPut(index, SieveSegment.chunk.offset, chunkOffset);
+                descPut(index, SieveSegment.primeCount.offset, primes);
+                rootPut(SieveRoot.numSegments.offset, index + 1u64);
+                rootPut(SieveRoot.cursor.offset, hi);
+                rootPut(SieveRoot.count.offset, rootGet(SieveRoot.count.offset) + primes);
+                if (highest != 0) rootPut(SieveRoot.lastPrime.offset, highest);
+                if (!region.txn.commit()) return false;
+
+                return retire();
+        }
+
+        // Frees the bitmap chunks of segments that have fallen out of the
+        // retention window, newest-first.
+        private def retire() -> bool {
+                def n = rootGet(SieveRoot.numSegments.offset);
+                var live: u64 = 0;
+                var i = n;
+                while (i > 0u64) {
+                        i--;
+                        def chunkOffset = descGet(i, SieveSegment.chunk.offset);
+                        if (chunkOffset == 0) continue;
+                        live++;
+                        if (live <= liveSegments) continue;
+
+                        // Unpublish and free in ONE transaction. freeChunk()
+                        // commits whatever the shared cache already holds, so
+                        // buffering the descriptor clear first makes both
+                        // durable together. The reverse order would leave a
+                        // window in which a descriptor names a block the
+                        // allocator is free to hand out again -- that would be
+                        // corruption, not a leak.
+                        descPut(i, SieveSegment.chunk.offset, 0);
+                        if (!region.freeChunk(ChunkHandle(region.regionStart + chunkOffset))) return false;
+                }
+                return true;
+        }
+
+        // ---------------------------------------------------------------
+        // Observation
+        // ---------------------------------------------------------------
+
+        def cursor() -> u64 { return if(rootOffset == 0, 0, rootGet(SieveRoot.cursor.offset)); }
+        def count() -> u64 { return if(rootOffset == 0, 0, rootGet(SieveRoot.count.offset)); }
+        def lastPrime() -> u64 { return if(rootOffset == 0, 0, rootGet(SieveRoot.lastPrime.offset)); }
+        def numSegments() -> u64 { return if(rootOffset == 0, 0, rootGet(SieveRoot.numSegments.offset)); }
+        def segmentSpan() -> u64 { return span; }
+        def segmentCapacity() -> u64 { return capacity; }
+
+        // Region-relative offset of segment {i}'s bitmap chunk, or 0 once the
+        // segment has been retired and its extent returned to the allocator.
+        def segmentChunk(i: u64) -> u64 {
+                if (rootOffset == 0 || i >= numSegments()) return 0;
+                return descGet(i, SieveSegment.chunk.offset);
+        }
+
+        // Primes recorded for segment {i}. Survives retirement: the descriptor
+        // outlives the bitmap, which is what keeps the historical total exact.
+        def segmentPrimeCount(i: u64) -> u64 {
+                if (rootOffset == 0 || i >= numSegments()) return 0;
+                return descGet(i, SieveSegment.primeCount.offset);
+        }
+
+        // The next prime strictly greater than {n}, if it falls inside a
+        // segment whose bitmap is still live. Returns 0 when the answer lies
+        // in a retired range or beyond the cursor.
+        def nextPrimeAfter(n: u64) -> u64 {
+                def total = numSegments();
+                var i: u64 = 0;
+                while (i < total) {
+                        def chunkOffset = descGet(i, SieveSegment.chunk.offset);
+                        if (chunkOffset == 0) { i++; continue; }
+                        def base = descGet(i, SieveSegment.base.offset);
+                        if (base + span <= n) { i++; continue; }
+                        def bits = readBitmap(chunkOffset);
+                        var k = if(n < base, 0, int.!(n - base) + 1);
+                        while (k < int.!(span)) {
+                                if (testBit(bits, k)) return base + u64.!(k);
+                                k++;
+                        }
+                        i++;
+                }
+                return 0;
+        }
+
+        // ---------------------------------------------------------------
+        // Invariants
+        // ---------------------------------------------------------------
+
+        // Returns null when the durable state is consistent, otherwise the
+        // first violation found. The checks that matter cross object
+        // boundaries: a descriptor lives in the root chunk while the bitmap it
+        // describes lives in another chunk entirely, so a torn commit shows up
+        // as a disagreement between them. Without that, a sieve is monotone
+        // and idempotent and would look correct even with a broken log.
+        def checkInvariants() -> string {
+                if (rootOffset == 0) return "sieve root not opened";
+                if (rootGet(SieveRoot.magic.offset) != PWSieveConst.MAGIC) return "root magic wrong";
+                if (rootGet(SieveRoot.segmentSpan.offset) != span) return "segment span changed";
+                if (rootGet(SieveRoot.capacity.offset) != capacity) return "segment capacity changed";
+
+                def n = rootGet(SieveRoot.numSegments.offset);
+                if (n > capacity) return "segment count exceeds capacity";
+                if (rootGet(SieveRoot.cursor.offset) != n * span) return "cursor does not match segment count";
+
+                def regionBytes = region.numBlocks * region.blockSize;
+                var sum: u64 = 0;
+                var live: u64 = 0;
+                var i: u64 = 0;
+                while (i < n) {
+                        if (descGet(i, SieveSegment.base.offset) != i * span) return "segment base out of order";
+                        def primes = descGet(i, SieveSegment.primeCount.offset);
+                        sum += primes;
+
+                        def chunkOffset = descGet(i, SieveSegment.chunk.offset);
+                        if (chunkOffset != 0) {
+                                live++;
+                                if (chunkOffset >= regionBytes) return "live segment chunk outside the region";
+                                if (chunkOffset % region.blockSize != 0) return "live segment chunk is not block aligned";
+                                def entry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + chunkOffset));
+                                if (entry.isNull()) return "live segment chunk has no block entry";
+                                if (!entry.getUsed()) return "live segment chunk is not allocated";
+
+                                def bits = readBitmap(chunkOffset);
+                                if (popcountBits(bits) != primes) return "segment bitmap disagrees with its descriptor";
+                                // The strongest statement available: the
+                                // durable bits are the sieve of that range, not
+                                // merely a bitmap with the right popcount.
+                                def expect = buildSegment(i * span, i * span + span);
+                                for (b < bits.length) {
+                                        if (bits[b] != expect[b]) return "segment bitmap is not the sieve of its range";
+                                }
+                        }
+                        i++;
+                }
+                if (sum != rootGet(SieveRoot.count.offset)) return "prime count does not match the segments";
+                if (live > liveSegments) return "more live segments than the retention window allows";
+                return null;
+        }
+
+        // ---------------------------------------------------------------
+        // Region access
+        // ---------------------------------------------------------------
+
+        private def rootAddr() -> u64 {
+                return region.regionStart + rootOffset + u64.!(ChunkHeader.size);
+        }
+
+        private def descAddr(i: u64) -> u64 {
+                return rootAddr() + u64.!(SieveRoot.size) + i * u64.!(SieveSegment.size);
+        }
+
+        private def bitmapAddr(chunkOffset: u64) -> u64 {
+                return region.regionStart + chunkOffset + u64.!(ChunkHeader.size);
+        }
+
+        private def rootGet(field: int) -> u64 {
+                return region.txn.readU64(rootAddr() + u64.view(field));
+        }
+
+        private def rootPut(field: int, v: u64) {
+                region.txn.writeU64(rootAddr() + u64.view(field), v);
+        }
+
+        private def descGet(i: u64, field: int) -> u64 {
+                return region.txn.readU64(descAddr(i) + u64.view(field));
+        }
+
+        private def descPut(i: u64, field: int, v: u64) {
+                region.txn.writeU64(descAddr(i) + u64.view(field), v);
+        }
+
+        // Bulk write through the persistent-operation seam, so a recorded
+        // trace sees these stores in the same total order as the log's.
+        private def writeBitmap(chunkOffset: u64, bits: Array<byte>) -> bool {
+                def addr = bitmapAddr(chunkOffset);
+                var i = 0;
+                while (i + 8 <= bits.length) {
+                        writer.writeU64(addr + u64.!(i), pack8(bits, i));
+                        i += 8;
+                }
+                while (i < bits.length) {
+                        writer.writeU8(addr + u64.!(i), bits[i]);
+                        i++;
+                }
+                // persistRange() rather than prepareChangedRange() +
+                // persistChanges(): this is not log-ordered metadata, and
+                // draining the WAL's queued ranges here would hide a missing
+                // commit boundary from the tests.
+                return region.backendRegion.persistRange(
+                        chunkOffset + u64.!(ChunkHeader.size), u64.!(bits.length));
+        }
+
+        private def readBitmap(chunkOffset: u64) -> Array<byte> {
+                def bytes = int.!(span / 8u64);
+                def out = Array<byte>.new(bytes);
+                def base = PWRegionUtils.pointerFromU64(bitmapAddr(chunkOffset));
+                for (i < bytes) out[i] = (base + i).load<byte>();
+                return out;
+        }
+
+        // ---------------------------------------------------------------
+        // Sieve
+        // ---------------------------------------------------------------
+
+        // The bitmap for [lo, hi), built in DRAM. Base primes are recomputed
+        // rather than stored: they are derivable from nothing, so making them
+        // durable would add state without adding evidence.
+        private def buildSegment(lo: u64, hi: u64) -> Array<byte> {
+                def bytes = int.!(span / 8u64);
+                def bits = Array<byte>.new(bytes);
+                for (i < bytes) bits[i] = 0xFF;
+                if (lo == 0) {
+                        clearBit(bits, 0);      // 0 is not prime
+                        clearBit(bits, 1);      // 1 is not prime
+                }
+
+                ensureBasePrimes(isqrt(hi - 1u64));
+                for (i < basePrimes.length) {
+                        def p = basePrimes[i];
+                        def square = p * p;
+                        if (square >= hi) break;
+                        // Start at p*p, or at the first multiple of p in this
+                        // segment when the segment begins past it. Starting at
+                        // p*p is what keeps p itself marked prime.
+                        var m = if(lo <= square, square, ((lo + p - 1u64) / p) * p);
+                        while (m < hi) {
+                                clearBit(bits, int.!(m - lo));
+                                m += p;
+                        }
+                }
+                return bits;
+        }
+
+        private def ensureBasePrimes(limit: u64) {
+                if (basePrimes != null && basePrimeLimit >= limit) return;
+                var n = int.!(limit) + 1;
+                if (n < 3) n = 3;
+                def composite = Array<bool>.new(n);
+                var found = 0;
+                for (p = 2; p < n; p++) {
+                        if (composite[p]) continue;
+                        found++;
+                        var m = p * p;
+                        while (m < n && m > 0) { composite[m] = true; m += p; }
+                }
+                def out = Array<u64>.new(found);
+                var k = 0;
+                for (p = 2; p < n; p++) {
+                        if (composite[p]) continue;
+                        out[k] = u64.!(p);
+                        k++;
+                }
+                basePrimes = out;
+                basePrimeLimit = limit;
+        }
+
+        private def isqrt(n: u64) -> u64 {
+                if (n < 2u64) return n;
+                var x = n;
+                var y = (x + 1u64) / 2u64;
+                while (y < x) {
+                        x = y;
+                        y = (x + n / x) / 2u64;
+                }
+                return x;
+        }
+
+        // ---------------------------------------------------------------
+        // Bit helpers
+        // ---------------------------------------------------------------
+
+        private def clearBit(bits: Array<byte>, i: int) {
+                bits[i >> 3] = bits[i >> 3] & SIEVE_NOTBIT[i & 7];
+        }
+
+        private def testBit(bits: Array<byte>, i: int) -> bool {
+                return (bits[i >> 3] & SIEVE_BIT[i & 7]) != 0;
+        }
+
+        private def popcountBits(bits: Array<byte>) -> u64 {
+                var total: u64 = 0;
+                for (i < bits.length) {
+                        def b = bits[i];
+                        if (b == 0) continue;
+                        for (k < 8) {
+                                if ((b & SIEVE_BIT[k]) != 0) total++;
+                        }
+                }
+                return total;
+        }
+
+        private def highestSetBit(bits: Array<byte>, lo: u64) -> u64 {
+                var i = bits.length - 1;
+                while (i >= 0) {
+                        if (bits[i] != 0) {
+                                var k = 7;
+                                while (k >= 0) {
+                                        if ((bits[i] & SIEVE_BIT[k]) != 0) return lo + u64.!(i * 8 + k);
+                                        k--;
+                                }
+                        }
+                        i--;
+                }
+                return 0;
+        }
+
+        // Little-endian pack of eight bitmap bytes, by constant shifts.
+        private def pack8(bits: Array<byte>, i: int) -> u64 {
+                var v: u64 = 0;
+                var k = 7;
+                while (k >= 0) {
+                        v = (v << 8) | u64.!(bits[i + k]);
+                        k--;
+                }
+                return v;
+        }
+}

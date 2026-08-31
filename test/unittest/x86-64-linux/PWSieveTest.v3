@@ -1,0 +1,326 @@
+// PWSieve tests
+//
+// Drives the resumable segmented sieve over a PWRegion. The region geometry is
+// the same 8 x 4096 used by TxnPWRegionTest: block 0 header, block 1 WAL,
+// blocks 2-6 allocatable (5), block 7 metadata. The sieve takes one block for
+// its root chunk and one per live segment, so a retention window of 2 leaves
+// the allocator cycling blocks in and out for the whole run.
+//
+// Segment span is (4096 - ChunkHeader.size) * 8 = 32512 integers. Reference
+// prime counts below k*32512 are from an independent sieve.
+
+def SIEVE_SPAN = 32512u64;
+def SIEVE_LIVE = 2u64;
+
+// pi(k * 32512) for k = 1..10.
+def SIEVE_PI: Array<u64> = [
+	3489, 6495, 9378, 12163, 14891, 17580, 20231, 22845, 25432, 28017
+];
+
+def ST = UnitTests.registerT("pwsieve:", _, PWSieveTester.new, _);
+def SX = [
+	ST("open_publishes_root",        test_sieve_open_publishes_root),
+	ST("open_reattaches_existing",   test_sieve_open_reattaches_existing),
+	ST("open_rejects_foreign_root",  test_sieve_open_rejects_foreign_root),
+	ST("step_matches_reference",     test_sieve_step_matches_reference),
+	ST("invariants_hold_each_step",  test_sieve_invariants_hold_each_step),
+	ST("retirement_frees_old_segments", test_sieve_retirement_frees_old_segments),
+	ST("last_prime_tracks_progress", test_sieve_last_prime_tracks_progress),
+	ST("next_prime_after",           test_sieve_next_prime_after),
+	()
+];
+
+class PWSieveTester(t: Tester) {
+	var region: PWRegion;
+	var sieve: PWSieve;
+
+	new() {
+		region = PWRegion.new(
+			Backends.getVolatile(),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			true
+		);
+		sieve = PWSieve.new(region, SIEVE_LIVE);
+	}
+
+	def open() {
+		t.assertz(true, sieve.open());
+	}
+
+	def step() {
+		t.assertz(true, sieve.step());
+	}
+
+	// Report the first invariant violation by name rather than as a bare
+	// boolean, so a failure says which one broke.
+	def checkOk() {
+		def err = sieve.checkInvariants();
+		if (err != null) t.fail(err);
+	}
+
+	// Blocks whose block-table entry is marked used.
+	def usedBlocks() -> u64 {
+		var used: u64 = 0;
+		for (i < region.numBlocks) {
+			if (region.blockTableHandle[i].getUsed()) used++;
+		}
+		return used;
+	}
+
+	// Segments that still own a bitmap chunk.
+	def liveSegments() -> u64 {
+		var live: u64 = 0;
+		def n = sieve.numSegments();
+		var i: u64 = 0;
+		while (i < n) {
+			if (sieve.segmentChunk(i) != 0u64) live++;
+			i++;
+		}
+		return live;
+	}
+}
+
+
+// =============================================================================
+// Mounting
+// =============================================================================
+
+// A fresh region has no root; open() must lay one out and publish it, so the
+// next run can find the sieve without being told where it is.
+def test_sieve_open_publishes_root(tc: PWSieveTester) {
+	tc.t.assert_eq(0u64, tc.region.getUserRoot());
+	tc.open();
+	tc.t.assertz(true, tc.region.getUserRoot() != 0u64);
+	tc.t.assert_eq(0u64, tc.sieve.cursor());
+	tc.t.assert_eq(0u64, tc.sieve.count());
+	tc.t.assert_eq(SIEVE_SPAN, tc.sieve.segmentSpan());
+	tc.checkOk();
+}
+
+// A second sieve over the same region attaches to the existing root instead of
+// starting over. This is the resume path, exercised without a remount.
+def test_sieve_open_reattaches_existing(tc: PWSieveTester) {
+	tc.open();
+	tc.step();
+	tc.step();
+	def root = tc.region.getUserRoot();
+
+	def again = PWSieve.new(tc.region, SIEVE_LIVE);
+	tc.t.assertz(true, again.open());
+	tc.t.assert_eq(root, tc.region.getUserRoot());
+	tc.t.assert_eq(2u64 * SIEVE_SPAN, again.cursor());
+	tc.t.assert_eq(SIEVE_PI[1], again.count());
+	if (again.checkInvariants() != null) tc.t.fail(again.checkInvariants());
+}
+
+// A root that is not this sieve's must be refused rather than parsed. The
+// region cannot know what published it, so the magic is the only guard.
+def test_sieve_open_rejects_foreign_root(tc: PWSieveTester) {
+	def chunk = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, chunk.isNull());
+	tc.t.assertz(true, tc.region.setUserRoot(tc.region.offsetInRegion(chunk.addr)));
+
+	tc.t.assertz(false, tc.sieve.open());
+}
+
+
+// =============================================================================
+// Progress
+// =============================================================================
+
+// Each step must sieve exactly one segment, and the durable prime count must
+// match an independent sieve of the same range.
+def test_sieve_step_matches_reference(tc: PWSieveTester) {
+	tc.open();
+	for (k < 4) {
+		tc.step();
+		tc.t.assert_eq(u64.!(k + 1) * SIEVE_SPAN, tc.sieve.cursor());
+		tc.t.assert_eq(SIEVE_PI[k], tc.sieve.count());
+		tc.t.assert_eq(u64.!(k + 1), tc.sieve.numSegments());
+	}
+}
+
+// The cross-object invariant must hold after every commit, not just at the
+// end: a descriptor in the root chunk and the bitmap in another chunk have to
+// agree, and the bitmap has to be the actual sieve of its range.
+def test_sieve_invariants_hold_each_step(tc: PWSieveTester) {
+	tc.open();
+	tc.checkOk();
+	for (k < 10) {
+		tc.step();
+		tc.checkOk();
+	}
+	tc.t.assert_eq(SIEVE_PI[9], tc.sieve.count());
+}
+
+// The retention window must actually return blocks to the allocator. Without
+// this the region would be exhausted after five segments; with it the run
+// continues indefinitely and the allocator sees repeated free and reuse.
+def test_sieve_retirement_frees_old_segments(tc: PWSieveTester) {
+	tc.open();
+	for (k < 10) tc.step();
+
+	// Region header, WAL, metadata block, root chunk, and the live segments.
+	tc.t.assert_eq(4u64 + SIEVE_LIVE, tc.usedBlocks());
+	tc.t.assert_eq(SIEVE_LIVE, tc.liveSegments());
+	tc.t.assert_eq(10u64, tc.sieve.numSegments());
+
+	// Retired descriptors keep their counts, so the historical total survives
+	// even though their bitmaps are gone. The oldest segment is retired and
+	// still reports the primes it found.
+	tc.t.assert_eq(0u64, tc.sieve.segmentChunk(0u64));
+	tc.t.assert_eq(SIEVE_PI[0], tc.sieve.segmentPrimeCount(0u64));
+	tc.t.assertz(true, tc.sieve.segmentChunk(9u64) != 0u64);
+	tc.t.assert_eq(SIEVE_PI[9], tc.sieve.count());
+	tc.checkOk();
+
+	// The freed blocks are genuinely reusable.
+	def spare = tc.region.allocChunk(1u32);
+	tc.t.assertz(false, spare.isNull());
+}
+
+// The user-visible answer -- the largest prime found -- must survive the
+// retirement of the segment that produced it, because it lives in the root.
+def test_sieve_last_prime_tracks_progress(tc: PWSieveTester) {
+	tc.open();
+	tc.step();
+	tc.t.assert_eq(32507u64, tc.sieve.lastPrime());
+	tc.step();
+	tc.t.assert_eq(65011u64, tc.sieve.lastPrime());
+
+	// Push segment 0 and 1 out of the retention window; the answer stays.
+	for (k < 4) tc.step();
+	tc.t.assertz(true, tc.sieve.lastPrime() > 65011u64);
+	tc.checkOk();
+}
+
+// Reading primes back out of a live bitmap.
+def test_sieve_next_prime_after(tc: PWSieveTester) {
+	tc.open();
+	tc.step();
+	tc.t.assert_eq(101u64, tc.sieve.nextPrimeAfter(100u64));
+	tc.t.assert_eq(2u64, tc.sieve.nextPrimeAfter(1u64));
+
+	tc.step();
+	tc.t.assert_eq(32003u64, tc.sieve.nextPrimeAfter(32000u64));
+
+	// Beyond the cursor there is no answer yet.
+	tc.t.assert_eq(0u64, tc.sieve.nextPrimeAfter(10u64 * SIEVE_SPAN));
+}
+
+
+// =============================================================================
+// Resume across a real remount
+// =============================================================================
+
+def SIEVE_BD_PATH = "/tmp/wiz_test_sieve_region";
+
+def SBT = UnitTests.registerT("pwsieve_bd:", _, PWSieveFileTester.new, _);
+def SBX = [
+	SBT("resumes_after_remount",       test_sieve_bd_resumes_after_remount),
+	SBT("resume_is_idempotent",        test_sieve_bd_resume_is_idempotent),
+	SBT("invariants_hold_across_remounts", test_sieve_bd_invariants_hold_across_remounts),
+	()
+];
+
+class PWSieveFileTester(t: Tester) {
+	var region: PWRegion;
+	var sieve: PWSieve;
+
+	new() {
+		RegionFileIO.unlink(SIEVE_BD_PATH);
+		region = openRegion(true);
+		sieve = PWSieve.new(region, SIEVE_LIVE);
+	}
+
+	private def openRegion(forceFormat: bool) -> PWRegion {
+		return PWRegion.new(
+			X86_64Backends.getFileMapped(SIEVE_BD_PATH),
+			8u64,
+			Array<Ref<MetaDataDesc>>.new(0),
+			4096u64,
+			forceFormat
+		);
+	}
+
+	// Close cleanly and mount the same file again, as a restart would.
+	def remount() {
+		if (region != null) region.deallocate();
+		region = openRegion(false);
+		sieve = PWSieve.new(region, SIEVE_LIVE);
+		t.assertz(true, sieve.open());
+	}
+
+	def open() { t.assertz(true, sieve.open()); }
+	def step() { t.assertz(true, sieve.step()); }
+
+	def checkOk() {
+		def err = sieve.checkInvariants();
+		if (err != null) t.fail(err);
+	}
+
+	def cleanup() {
+		if (region != null) {
+			region.deallocate();
+			region = null;
+		}
+		RegionFileIO.unlink(SIEVE_BD_PATH);
+	}
+}
+
+// The point of the exercise: stop, restart, and pick up where it left off,
+// with nothing remembered outside the region.
+def test_sieve_bd_resumes_after_remount(tc: PWSieveFileTester) {
+	tc.open();
+	for (k < 3) tc.step();
+	tc.t.assert_eq(SIEVE_PI[2], tc.sieve.count());
+
+	tc.remount();
+	tc.t.assert_eq(3u64 * SIEVE_SPAN, tc.sieve.cursor());
+	tc.t.assert_eq(SIEVE_PI[2], tc.sieve.count());
+	tc.t.assert_eq(3u64, tc.sieve.numSegments());
+	tc.checkOk();
+
+	// Continuing must produce the same totals as an uninterrupted run.
+	for (k < 3) tc.step();
+	tc.t.assert_eq(6u64 * SIEVE_SPAN, tc.sieve.cursor());
+	tc.t.assert_eq(SIEVE_PI[5], tc.sieve.count());
+	tc.checkOk();
+	tc.cleanup();
+}
+
+// Remounting without doing any work must change nothing. A resume that
+// advanced or rewound the cursor would corrupt the answer silently.
+def test_sieve_bd_resume_is_idempotent(tc: PWSieveFileTester) {
+	tc.open();
+	for (k < 2) tc.step();
+	def cursor = tc.sieve.cursor();
+	def count = tc.sieve.count();
+	def last = tc.sieve.lastPrime();
+
+	for (k < 3) {
+		tc.remount();
+		tc.t.assert_eq(cursor, tc.sieve.cursor());
+		tc.t.assert_eq(count, tc.sieve.count());
+		tc.t.assert_eq(last, tc.sieve.lastPrime());
+		tc.checkOk();
+	}
+	tc.cleanup();
+}
+
+// Interleaving work and restarts must leave the same durable state as running
+// straight through, including after retirement has recycled blocks.
+def test_sieve_bd_invariants_hold_across_remounts(tc: PWSieveFileTester) {
+	tc.open();
+	for (k < 8) {
+		tc.step();
+		tc.checkOk();
+		tc.remount();
+		tc.checkOk();
+	}
+	tc.t.assert_eq(8u64 * SIEVE_SPAN, tc.sieve.cursor());
+	tc.t.assert_eq(SIEVE_PI[7], tc.sieve.count());
+	tc.cleanup();
+}
