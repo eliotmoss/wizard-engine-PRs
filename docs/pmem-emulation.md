@@ -429,10 +429,13 @@ address:
 - [Kernel `memmap` parameter](https://docs.kernel.org/admin-guide/kernel-parameters.html)
 - [Choosing a PMEM `memmap` range](https://nvdimm.docs.kernel.org/memmap_kernel_params.html)
 
-Reserved DRAM remains volatile. This setup is suitable for DAX API and
-software-recovery experiments, not power-loss validation. QEMU is preferred
-for this project because it is isolated, repeatable, and does not alter the
-host boot configuration.
+Reserved DRAM remains volatile, so this setup cannot establish power-loss
+durability. It does, however, have one property neither QEMU nor a shared PMEM
+host provides: the reserved range survives a warm reboot while the CPU caches do
+not, which makes flush *placement* observable. Stage 2c below is built on
+exactly that. For ordinary DAX API and software-recovery work QEMU remains
+preferred, being isolated, repeatable, and free of host boot configuration
+changes.
 
 ## Validation stages
 
@@ -593,6 +596,50 @@ terminated with `_exit`/`SIGKILL` at the same WAL boundaries and a separate
 verifier process. Neither experiment substitutes for the deterministic
 fail-before/fail-after/torn outcomes in Stage 0.
 
+### Stage 2c — cache-loss sensitivity on reserved DRAM
+
+Stage 2 runs on real media but cannot lose a cache line; Stage 3 can lose one
+but is unavailable. This stage takes the remaining combination: a real CPU cache
+that is really discarded, over media that is only a stand-in.
+
+On a machine reserved with `memmap=<size>!<start>` (see the alternative above),
+the two properties that matter are:
+
+- reserved DRAM **survives a warm reboot**, because power is never removed; and
+- a CPU RESET **invalidates caches without writing them back**.
+
+So a line stored and never written back is lost across
+`echo b > /proc/sysrq-trigger`, while a line that was `CLWB`-ed and fenced
+survives. That is exactly the discrimination the Stage 2 crash loop lacks, and
+it needs no privileged access to a shared host. It must be a physical machine:
+a guest reset does not reset the host CPU, so a VM's dirty lines are never lost,
+which is the same reason QEMU guest reset is useless for this.
+
+What it does **not** establish: the DRAM is volatile, ADR is not involved, and a
+true power cycle erases the range entirely. This is cache-loss sensitivity on a
+DAX-API-faithful stand-in, not physical durability. It narrows the Stage 3 gap
+to the media and the firmware persistence domain; it does not close it.
+
+**The negative control is also the validity check.** Run the ordinary build and
+the elided-writeback mutant (see the flush-placement negative control in
+`docs/ROADMAP.md`) through the same reboot experiment:
+
+| Outcome | Reading |
+|---|---|
+| Mutant loses data, ordinary build recovers | The experiment discriminates. Flush placement is confirmed against real cache loss |
+| Both recover | The experiment has no sensitivity on this host — firmware flushed caches on reset, or ordinary eviction wrote the lines back before the reset landed. A cheap negative result, reportable as such |
+| Ordinary build loses data | A real defect in flush placement, or the reservation is not surviving reboot; distinguish by checking whether a known-flushed control value also vanished |
+
+This matters because the honest caveats are real: some firmware zeroes or
+retrains memory on reboot, some flushes caches on reset, and incidental eviction
+during the reboot path can write lines back regardless. The mutant detects every
+one of those as "no sensitivity", so the experiment never rests on an
+unverifiable claim about what a warm reset does.
+
+Prerequisite: root on a physical x86-64 Linux host that can be rebooted freely,
+which means a Linux installation on a machine outside the shared infrastructure.
+Tracked in `docs/ROADMAP.md`.
+
 ### Stage 3 — real PMEM durability
 
 Final durability validation requires a machine with real persistent memory,
@@ -601,6 +648,45 @@ an fsdax namespace, and controlled crash or power-interruption experiments.
 CPUID-selected cache writeback and `SFENCE` instructions, so the remaining work
 is to validate that production path and the persistence protocol on the
 physical target.
+
+#### Mechanism: what can actually lose a cache line
+
+With a `memory_controller` (ADR) persistence domain, ADR drains the memory
+controller's write-pending queue but not the CPU caches. The Stage 3 event is
+therefore any event that loses cache contents, and every such event takes the
+whole machine down.
+
+**Not attainable on Magpie (assessed 2026-09-01).** Magpie carries concurrent
+work from many users, so an interruption window is not available — and this is a
+structural constraint, not a scheduling difficulty to be revisited. Physical
+presence was never the blocker; a BMC-initiated power cycle would serve
+perfectly well on a machine that could be taken down, and none of the mechanisms
+below can be scoped to one process or one namespace. Stage 3 is therefore
+recorded as an open limitation of this work rather than as pending work, and
+Stage 2c above supplies the sensitivity it was there to supply. The mechanisms,
+for a host where the event *is* available:
+
+| Mechanism | Loses CPU caches? | Verdict |
+|---|---|---|
+| BMC hard power-off or power cycle (`ipmitool chassis power off`/`cycle`, or Redfish) | Yes — board power is removed and ADR fires | The practical Stage 3 mechanism. Unambiguous, remote, schedulable |
+| `sysrq` reboot (`echo b > /proc/sysrq-trigger`), `kexec` | Firmware-dependent — the platform may run the ADR flow on a warm reset | Same disruption, ambiguous result. Not worth using when the window allows a real power cycle |
+| QEMU guest reset / restart | No — the emulated NVDIMM is an ordinary host file and QEMU models no cache | Not a substitute at any strength. Useful only as further Stage 2 software-crash evidence |
+| Any user-space action | No | Nothing reachable without root can discard a dirty line |
+
+Nothing in software substitutes for the real event, which is the point of the
+layering: layer 1b supplies sensitivity to flush *placement* by enumerating the
+images a crash permits, and Stage 3 supplies the hardware that can actually
+produce one. With Stage 3 unavailable, the correct response is to state the gap
+precisely — the production instruction path is confirmed on physical media, the
+placement is confirmed against the model and, via Stage 2c, against real cache
+loss on volatile media — rather than to accumulate more Stage 2 runs, which are
+insensitive to placement no matter how many are run.
+
+Whichever mechanism is used, capture `sudo ndctl list -DH` immediately before and
+after each interruption. The dirty-shutdown counter is baselined at `0` on every
+DIMM (see the audit above), so an unchanged counter says ADR completed and the
+run is inside the crash model, while a raised one says the run fell into the
+excluded failure class and is not evidence about the WAL in either direction.
 
 ## Alternatives not selected
 
