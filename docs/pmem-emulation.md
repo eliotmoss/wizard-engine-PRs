@@ -317,7 +317,8 @@ decisive field is `"mode":"fsdax"`, which is compatible with this project's
 regular-file backend.
 
 The persistence-profile audit recorded on 2026-08-12 and updated by the
-2026-08-31 integration and 2026-09-01 crash-loop runs is:
+2026-08-31 integration, the 2026-09-01 crash-loop run, and the
+administrator-privileged DIMM health query of 2026-09-01 is:
 
 | Check | Observed result | Status |
 |---|---|---|
@@ -325,7 +326,7 @@ The persistence-profile audit recorded on 2026-08-12 and updated by the
 | Cache coherency line | 64 bytes for L1 data, L1 instruction, L2 unified, and L3 unified caches | Matches the 64-byte production precondition |
 | Cache writeback instructions | CPU flags include `clflush`, `clflushopt`, and `clwb` | `CLWB` baseline supported |
 | Region persistence domain | `region0` and `region1` both report `memory_controller` | Matches the selected ADR model; this is not eADR |
-| DIMM health/shutdown state | `ndctl list -DH` could not open `/dev/nmem*`; every health state was therefore `unknown` | Pending an administrator-privileged query |
+| DIMM health/shutdown state | `sudo ndctl list -DH` on 2026-09-01: all 12 DIMMs (`nmem0`-`nmem11`) report `health_state: ok`, `shutdown_state: clean`, `shutdown_count: 0`, 100% spares against a 50% threshold, no alarms, and media/controller temperatures of 29-35 °C / 31-38 °C against 82 °C / 98 °C thresholds | Healthy media; no dirty shutdown has ever occurred on this host, so the failure class the crash model excludes has not been entered |
 | `MAP_SYNC` on an assigned test file | `pmem_dax:backend_accepts_map_sync` passed under `/mnt/pmem0.0/sean` | Production fsdax path confirmed |
 | Emitted `CLWB`/`SFENCE` instructions | Exact encoding and native production-path smoke tests passed on Magpie before the DAX run | Physical-target execution confirmed; power-loss persistence remains untested |
 | `MAP_SYNC` under a resumable workload | `make pwsieve-pmem` mapped `/mnt/pmem0.0/sean` and asserted a `PmemMmapRegion`, not its `FileMmapRegion` sibling | No silent fallback to an ordinary shared mapping |
@@ -367,9 +368,30 @@ real instructions where the model only assumes them. Neither alone closes
 Stage 3.
 
 The topology, cache geometry, and CPU flags are readable without elevated
-privileges. The health query requires an administrator to run
-`ndctl list -DH` or grant the necessary read access; `unknown` in the captured
-output is a permission-limited result, not evidence of unhealthy media.
+privileges. The health query is not: `/dev/nmem*` is root-only, so the
+2026-08-12 audit recorded every health field as `unknown` — a permission limit,
+not evidence of unhealthy media. An administrator ran `sudo ndctl list -DH` on
+2026-09-01, and the result is the table row above: twelve Intel DIMMs
+(`nmem0`-`nmem5` on socket 0, `nmem6`-`nmem11` on socket 1, six per socket
+across `region0` and `region1`), all healthy, all with a dirty-shutdown count
+of zero. Every DIMM backing both namespaces is covered, so the audit has no
+gaps.
+
+That reading also establishes the Stage 3 control. The dirty-shutdown counter
+increments when a module loses power without completing its buffer flush — that
+is, precisely when ADR did *not* work as advertised, which is the failure class
+the crash model excludes (see `docs/pmem-crash-model.md`). It reads `0` on every
+DIMM now, so after a power interruption it discriminates directly: still
+`clean`/`0` means ADR completed, the run is inside the model, and any recovery
+failure is a real protocol or flush-placement defect; `dirty` or a raised count
+means ADR did not complete, the run falls outside the baseline, and it is not
+evidence about the WAL in either direction. Without that pre-run zero a single
+Stage 3 failure would be uninterpretable. Stage 3 should therefore capture
+`ndctl list -DH` immediately before and after every interruption, which needs
+either an administrator present for each run or a standing read grant on
+`/dev/nmem*`. The exact dirty-shutdown-count semantics should be pinned against
+the vendor's documentation before the campaign, since this counter becomes the
+discriminator.
 
 Use only a writable scratch directory explicitly assigned by the server
 administrator. Do not pass `/dev/pmem0`, `/dev/pmem1`, either mount root, or an

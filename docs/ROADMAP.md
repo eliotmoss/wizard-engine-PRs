@@ -271,14 +271,19 @@ software crash-consistency testing, but an ordinary host backing file cannot
 establish host power-loss durability. Native Linux `memmap` reservation
 provides the same development interface with more invasive host setup.
 
-**Real-hardware target confirmed (2026-08-12; integration run 2026-08-31):** the ANU research server
+**Real-hardware target confirmed (2026-08-12; integration run 2026-08-31; DIMM health audit 2026-09-01):** the ANU research server
 `magpie` is x86-64 and exposes two 799,063,146,496-byte `fsdax` namespaces as
 ext4 filesystems at `/mnt/pmem0.0` and `/mnt/pmem1.0`, both mounted
 `rw,relatime,dax=always`. All reported cache levels use 64-byte coherency lines,
 the CPU advertises `clwb`, and both PMEM regions report the
 `memory_controller` persistence domain, matching the agreed ADR baseline.
-DIMM health/shutdown state remains unknown because the unprivileged account
-cannot open `/dev/nmem*`. The administrator-assigned scratch directory
+An administrator-run `sudo ndctl list -DH` on 2026-09-01 closed the last open
+audit row: all twelve DIMMs report `health_state: ok`, `shutdown_state: clean`
+and a dirty-shutdown count of `0`, so the unsafe-shutdown failure class the
+crash model excludes has never been entered on this host. That zero is also the
+baseline a Stage 3 power interruption is read against — an unchanged counter
+means ADR completed and the run is inside the model, a raised one means it is
+not. The administrator-assigned scratch directory
 `/mnt/pmem0.0/sean` successfully ran the native instruction smoke tests and
 both opt-in `pmem_dax` integration cases: the production backend obtained a
 `MAP_SYNC` mapping, then format/allocation, clean remount, and committed-record
