@@ -27,7 +27,7 @@ All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live u
 ## Persistence-boundary cost (measured 2026-09-18, Magpie)
 
 Phase B's design note justified its per-commit data flush as "cheap fences —
-acceptable". Measured across four campaigns on one host: two unpinned, and one
+acceptable". Measured across five campaigns on one host: three unpinned, and one
 pinned to each NUMA node. All raw logs, CSVs and provenance are in `results/`.
 
 Three configurations, so the boundary primitive and the media are separable.
@@ -41,7 +41,7 @@ production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
 | 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133–181 µs** (see caveat) | 188–240 µs | 71–86 % |
 
 Figures are medians over the runs of each configuration in `results/`
-(four campaigns × three repetitions × four transaction sizes), at 8 entries
+(five campaigns × three repetitions × four transaction sizes), at 8 entries
 except where a size is named. Configuration 2's two values are socket-local and
 cross-socket; configuration 3 has not reproduced between sittings. Both are
 explained below.
@@ -71,7 +71,7 @@ fence. The note is correct and argues for the wrong reason.
   weakest of the three comparisons because configuration 3 has not reproduced,
   so the span is the block measurement's instability and not a property of the
   media. What does *not* move is the direction — DAX is slower in every one of
-  the 48 block runs, and the smallest gap ever observed is 4.7×. The direction
+  the 60 block runs, and the smallest gap ever observed is 4.7×. The direction
   is the opposite of the expected one, and is discussed below.
 - **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
@@ -221,9 +221,12 @@ per-`fdatasync` interconnect cost predicts and what a per-byte one would not.
 `pmem-dax` is unaffected to the resolution of the measurement at every size, and
 `file-block` is unaffected because an LVM volume is not socket-attached in the
 way a PMEM DIMM is. The pinned node-0 figures also reproduce the unpinned low
-mode to within 0.2 % at every size, so the four campaigns tell one story. `CLWB` is fire-and-forget, and an `SFENCE` at 11 ns plainly is
-not waiting for anything to reach ADR — the writebacks drain asynchronously
-inside the 13.7 µs the rest of the commit takes. `fdatasync` is the only
+mode to within 0.2 % at every size, so all five campaigns tell one story.
+
+Nothing on the PMEM path blocks on media latency. `CLWB` is fire-and-forget, and
+an `SFENCE` at 11 ns plainly is not waiting for anything to reach ADR — the
+writebacks drain asynchronously inside the 13.7 µs the rest of the commit
+takes. `fdatasync` is the only
 operation here that synchronously waits for data to reach the medium, so it is
 the only one that pays the interconnect. The same hardware penalty is invisible
 through one backend and 24 % through the other.
@@ -252,37 +255,50 @@ not control.
 ### The block-media configuration is not a controlled measurement here
 
 Once the socket is pinned, the two DAX configurations reproduce to a fraction of
-a percent across campaigns. `file-block` does not reproduce at all:
+a percent across campaigns. `file-block` does not reproduce at all. Five
+campaigns, chronologically:
 
-| | hand runs | campaign 1 | campaign 2 | campaign 3 (node 0) | campaign 4 (node 1) | spread |
-|---|---|---|---|---|---|---|
-| n=1 | — | 133,004 | 133,815 | 196,244 | 196,432 | **48 %** |
-| n=8 | 148,100 | 133,113 | 134,172 | 180,136 | 181,075 | **36 %** |
-| n=32 | — | 132,928 | 134,027 | 168,769 | 170,285 | 28 % |
-| n=56 | — | 130,672 | 131,645 | 164,943 | 166,047 | 27 % |
+| campaign | pinning | n=1 | n=8 | n=32 | n=56 |
+|---|---|---|---|---|---|
+| 044131Z | unpinned | 133,004 | 133,113 | 132,928 | 130,672 |
+| 045605Z | unpinned | 133,815 | 134,172 | 134,027 | 131,645 |
+| 062309Z | node 0 | 196,244 | 180,136 | 168,769 | 164,943 |
+| 062908Z | node 1 | 196,432 | 181,075 | 170,285 | 166,047 |
+| 065813Z | unpinned | 196,316 | 180,771 | 169,643 | 164,859 |
 
-The *shape* moved as well as the level. In the first two campaigns `file-block`
-was flat in transaction size, like the other two configurations. In the last two
-it falls monotonically, 196 µs down to 165 µs from one entry to fifty-six. Both
-pinned campaigns agree with each other closely, and both unpinned campaigns
-agree with each other closely, so this is stable within a sitting and not
-between sittings.
+**Pinning is not the cause.** The last campaign was run unpinned specifically to
+break the confound — the pinned campaigns had also been the later ones — and it
+matches pinned node 0 to within 0.52 % at every size. What changed between the
+second and third campaigns was elapsed time and the state of `/home`, not the
+CPU set.
 
-Pinning and elapsed time are confounded here — the pinned campaigns are also the
-later ones — so it is not known whether restricting the CPU set changed anything
-or whether `/home` was simply busier. One speculative mechanism for the falling
-shape, recorded as a hypothesis and nothing more: a larger transaction takes
-longer to construct, so boundaries are issued further apart, and a queued block
-device has more time to drain between them. DAX has no such queue, which would
-be why only this configuration shows it.
+Two regimes are visible, and the *shape* differs between them as well as the
+level. In the first two campaigns the boundary is **flat** in transaction size
+at ~133 µs, like the DAX configurations. In the last three it **falls
+monotonically**, 196 µs down to 165 µs from one entry to fifty-six — and those
+three agree with each other to 0.5 %, so the shape is a reproducible feature of
+the later regime rather than noise.
+
+That pattern is at least consistent with rate-dependence, offered as a
+hypothesis and not a result: a larger transaction takes longer to construct, so
+boundaries are issued further apart, and a queued block device has more time to
+drain between them. When the device is fast there is nothing to drain and the
+cost is flat; when it is slower, spacing starts to matter. DAX has no such
+queue, which would be why neither DAX configuration shows it at any time. What
+moved `/home` between regimes is not established — it is a shared LVM volume
+whose other traffic is neither controlled nor visible in a CPU load average.
+
+As a by-product, the unpinned campaign also reconfirms the NUMA mechanism:
+`file-dax` goes bimodal again the moment pinning is removed, 5 of its 12 runs
+landing in the high mode, while both pinned campaigns stayed wholly in one mode.
 
 **The consequence for this page is specific.** The comparison that isolates the
 boundary *primitive* — configuration 1 against 2, on the same DAX filesystem —
-is reproducible to 0.1 % across four campaigns and carries the headline result.
+is reproducible to 0.1 % across five campaigns and carries the headline result.
 The comparison that isolates the *media* — 2 against 3 — rests on a
-configuration that has moved 48 % between sittings on this host, and its
+configuration that has moved 50 % between sittings on this host, and its
 multiplier is a range, 4.7×–7.1×, rather than a number. The *direction* is
-unaffected: DAX was slower in all 48 block runs, worst case 4.7×, so the
+unaffected: DAX was slower in all 60 block runs, worst case 4.7×, so the
 "worst of both worlds" finding survives the instability even though the figure
 does not. `/home` is a shared LVM volume whose other traffic is neither
 controlled nor visible in a CPU load average.
@@ -388,10 +404,11 @@ one medium is not wrong on the other, merely pointless.
 - **`fdatasync` on DAX has two costs**, socket-local and cross-socket, differing
   by 23.9 %. Unpinned runs draw one at random. Every figure for configuration 2
   on this page is the socket-local one unless stated.
-- **The block-media configuration has not reproduced**: 27–48 % spread across
-  campaigns, and its shape in transaction size changed between sittings. Any
-  comparison involving it is order-of-magnitude at best.
-- What *has* reproduced, across all 144 runs in `results/`: exactly 1.000
+- **The block-media configuration has not reproduced**: 50 % spread across five
+  campaigns, in two regimes that differ in shape as well as level. Pinning is
+  excluded as the cause; what moved `/home` is not established. Any comparison
+  involving it is order-of-magnitude at best.
+- What *has* reproduced, across all 180 runs in `results/`: exactly 1.000
   boundaries per commit, `SFENCE` at 11–13 ns, the DAX boundary primitives flat
   in transaction size, `CLWB` linear at 72.0–73.5 cycles per line,
   `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size, and the
