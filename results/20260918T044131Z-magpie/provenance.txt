@@ -1,0 +1,60 @@
+---- revision
+commit 448d39e68d7e7b8681632aceff114d2b038cddd5
+authored 2026-09-18T14:27:50+10:00
+subject  scripts(pmem): drive the persistence experiments reproducibly
+dirty    no
+---- host
+hostname magpie.gpu
+kernel   Linux 6.8.0-137-generic x86_64 GNU/Linux
+started  2026-09-18T04:41:31+00:00
+load     0.00 0.00 0.00
+---- cpu
+CPU(s):                                  96
+Model name:                              Intel(R) Xeon(R) Gold 6252N CPU @ 2.30GHz
+Thread(s) per core:                      2
+Core(s) per socket:                      24
+L1d cache:                               1.5 MiB (48 instances)
+L1i cache:                               1.5 MiB (48 instances)
+L2 cache:                                48 MiB (48 instances)
+L3 cache:                                71.5 MiB (2 instances)
+clwb     yes
+---- media
+/mnt/pmem0.0/sean/
+  fstype ext4
+  source /dev/pmem0
+  options rw,relatime,dax=always
+/home/users/u7599095
+  fstype ext4
+  source /dev/mapper/ubuntu--vg-lv--home
+  options rw,relatime
+---- ndctl
+[
+  {
+    "dev":"namespace1.0",
+    "mode":"fsdax",
+    "map":"dev",
+    "size":799063146496,
+    "uuid":"6c771cc2-bcb6-4876-8817-018fb8401030",
+    "sector_size":512,
+    "align":2097152,
+    "blockdev":"pmem1"
+  },
+  {
+    "dev":"namespace0.0",
+    "mode":"fsdax",
+    "map":"dev",
+    "size":799063146496,
+    "uuid":"31cb3e92-4f70-4ed5-a8d8-02984d364e36",
+    "sector_size":512,
+    "align":2097152,
+    "blockdev":"pmem0"
+  }
+]
+---- parameters
+reps 3
+sizes 1 8 32 56
+commits 20000
+warmup 2000
+file-block: included (ext4)
+finished 2026-09-18T04:47:04+00:00
+load     0.94 0.65 0.30

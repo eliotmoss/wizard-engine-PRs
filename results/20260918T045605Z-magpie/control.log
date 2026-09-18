@@ -1,0 +1,34 @@
+---- layer 1b: explorer must reject the elided-writeback mutant
+##>4 unit tests
+##+persistent_control:mutant_trace_is_still_modelable
+##-ok
+##+persistent_control:mutant_records_no_writeback
+##-ok
+##+persistent_control:ordinary_writeback_holds
+##-ok
+##+persistent_control:elided_writeback_is_caught
+##-ok
+---- layer 3: ordinary build on real PMEM, expected OK
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+region file /mnt/pmem0.0/sean//wizard-pwsieve-u7599095-p93647-0.region
+region 512 blocks of 4096 bytes
+segment span 32512, capacity 167 segments
+stopping at iteration 15: the segment table is full
+iterations 16 of 20 requested, seed 1
+advanced 16, replayed a record 16, child finished early 1
+leaked extents reclaimed at mount: 4
+final cursor 5429504, primes 376256
+reference check passed: 376256 primes
+OK
+---- layer 3: elided-writeback mutant on real PMEM, expected OK
+backend pmem (MAP_SYNC + CLWB/SFENCE) [MUTANT: cache-line writeback elided]
+region file /mnt/pmem0.0/sean//wizard-pwsieve-u7599095-p93664-0.region
+region 512 blocks of 4096 bytes
+segment span 32512, capacity 167 segments
+stopping at iteration 16: the segment table is full
+iterations 17 of 20 requested, seed 1
+advanced 17, replayed a record 17, child finished early 1
+leaked extents reclaimed at mount: 5
+final cursor 5429504, primes 376256
+reference check passed: 376256 primes
+OK
