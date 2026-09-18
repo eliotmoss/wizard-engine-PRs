@@ -118,6 +118,11 @@ Two findings that arrived unplanned and are better material than the headline:
   `computeRecordChecksum` outweigh the entire durability boundary by 28×, so the
   protocol-level optimisation the WAL is built around is, on that medium,
   optimising 3 % of the problem.
+- **The headline ratio is size-dependent and must never be quoted bare.** Both
+  boundary primitives are flat in transaction size; only PMEM's `CLWB` loop
+  scales, which moves the gap from 6,675× at one entry to 340× at fifty-six.
+  Relatedly, batching is worth 54× on a file and 3× on PMEM — the same
+  optimisation, one interface, an eighteen-fold difference in what it buys.
 
 Full numbers, the isolation of primitive from media, and the stated limits are
 in [persistent-backends.md](persistent-backends.md).
@@ -334,12 +339,12 @@ Seven, and they need real hours budgeted.
    `fdatasync` on the same DAX media 927 µs, `fdatasync` on block storage
    148 µs. Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
    same figure.
-6b. Boundary cost against transaction size, PMEM measured at 1/8/32/56 entries:
-   `SFENCE` flat at 11 ns, `CLWB` linear at ~31.7 ns per cache line. The two
-   lines crossing a flat `fdatasync` is the figure — it shows the optimal
-   transaction size running in opposite directions on the two media. **Needs the
-   file-backend sweep before it can be drawn**; without it the `fdatasync` line
-   is an assumption.
+6b. Boundary cost against transaction size, measured at 1/8/32/56 entries on
+   both PMEM and file-on-DAX. `SFENCE` flat at 11 ns, `fdatasync` flat at
+   ~928 µs (0.17 % over a 56× size change), `CLWB` linear at ~31.7 ns per cache
+   line. Log y-axis, entries on x. The figure's point is that the *gap* closes
+   from 6,675× to 340× purely because `CLWB` scales — so the headline ratio is
+   never quotable without a transaction size.
 7. **Negative control, 2×2** — {ordinary build, elided-writeback mutant} ×
    {Magpie crash loop, layer-1b explorer}. **Data in hand as of 2026-09-18:**
    the mutant reports `OK` on Magpie with a durable answer bit-identical to the

@@ -154,25 +154,58 @@ value.
 Boundary share stays near 3.3 % at every size, because record construction
 scales with record length for the same reason the `CLWB` loop does.
 
-### What this does to the headline ratio
+### `fdatasync` is flat too, so the headline ratio is size-dependent
 
-The 2,000× advantage is a property of small transactions, not a constant. The
-PMEM boundary grows from 139 ns to 2,734 ns across the sweep while a single
-`fdatasync` is one whole-file syscall whose cost does not obviously depend on
-how many bytes the transaction dirtied. Taking config 2's 927 µs as flat, the
-advantage would narrow from ~6,700× at one entry to ~340× at fifty-six.
+The same sweep on the file backend over DAX gives 927.8, 928.1, 928.5 and
+929.4 µs at 1, 8, 32 and 56 entries — **0.17 % variation across a 56× change in
+transaction size.** One `fdatasync` is one whole-file syscall, and it costs the
+same whether the transaction dirtied 32 bytes or 1,792.
 
-**This is not yet measured.** The sweep was run on PMEM only, so the file
-backend's curve is assumed flat rather than shown flat. If it is flat, the
-practical consequence is sharp — batching more work into one transaction is
-nearly free on a file and directly costly on PMEM, so the optimal transaction
-size runs in opposite directions on the two media under one interface. That
-claim needs the file-backend sweep before it is made.
+Both boundary primitives are therefore flat in transaction size. The only thing
+that scales is PMEM's `CLWB` loop, and that is enough to move the ratio by a
+factor of twenty:
+
+| Entries | PMEM boundary/commit | `fdatasync` on DAX | Ratio |
+|---|---|---|---|
+| 1 | 139 ns | 927.8 µs | 6,675× |
+| 8 | 455 ns | 928.1 µs | 2,040× |
+| 32 | 1,604 ns | 928.5 µs | 579× |
+| 56 | 2,734 ns | 929.4 µs | 340× |
+
+**The 2,000× headline is a property of eight-entry transactions, not of the
+media.** Quoting it without the transaction size overstates the gap by 6× at the
+large end and understates it by 3× at the small end.
+
+### What batching is worth, per medium
+
+Because the boundary is flat and per-commit, amortising it over a larger
+transaction is the obvious optimisation. Its value is not remotely the same on
+the two media — whole-commit cost per entry:
+
+| Entries | PMEM | file on DAX |
+|---|---|---|
+| 1 | 4,425 ns | 934,212 ns |
+| 8 | 1,630 ns | 117,382 ns |
+| 32 | 1,541 ns | 29,936 ns |
+| 56 | 1,478 ns | 17,424 ns |
+
+Batching 1 → 56 entries is worth **54× on a file and 3× on PMEM**, and on PMEM
+it has essentially plateaued by eight entries. The reason is structural: on a
+file the flat 927 µs boundary is ~95–99 % of the commit and divides down across
+entries, while on PMEM the boundary is 3 % and both it and record construction
+scale with the record, so there is little fixed cost left to amortise.
+
+An earlier note here speculated that the optimal transaction size would run in
+*opposite* directions on the two media. The measurement does not support that
+and it should not be repeated: larger transactions are cheaper per entry on both
+media. The finding is the magnitude, not the sign — a batching strategy tuned on
+one medium is not wrong on the other, merely pointless.
 
 ### Limits of these numbers
 
-- **One transaction size measured on the file backends** (8 entries). The PMEM
-  curve is characterised; the file curve is one point.
+- The **block-storage** configuration was measured at one transaction size
+  (8 entries) and repeated four times; it was not swept. The size curves above
+  are PMEM and file-on-DAX only.
 - The **mechanism** behind configuration 2's slowness is not established, only
   its magnitude and its reproducibility.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
