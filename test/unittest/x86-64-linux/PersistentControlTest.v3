@@ -1,0 +1,185 @@
+// The flush-placement negative control.
+//
+// Every crash-consistency result on this branch rests on a claim that is stated
+// in docs/pmem-emulation.md but never measured: that the hardware crash loops
+// cannot tell a correct CLWB from a missing one, and that the layer-1b explorer
+// can. On a MAP_SYNC DAX mapping the memory is the media, so a killed process
+// loses nothing still in cache; on a file the page cache is kernel-side and
+// loses nothing either. If that is right, the correctness evidence has to come
+// from the model, and the seam that unifies the backends is also the thing that
+// makes the model possible.
+//
+// This file supplies the half of that measurement which does not need hardware.
+// It records the *same* sieve step as persistent_sieve:step_images_satisfy_sieve
+// and sweeps it with the *same* PersistentSieveProperty, changing exactly one
+// variable: the persistent-operation provider. The ordinary provider must hold;
+// the elided-writeback mutant (ElidedWritebackOps.v3) must be caught.
+//
+// The mutant being caught here is what licenses the claim that the hardware run
+// passing it is a limitation of the hardware run rather than evidence of
+// correctness. If these tests ever start passing with the mutant installed, the
+// explorer has stopped being sensitive to flush placement and every result that
+// leans on it is worth less -- which is the point of keeping this permanently
+// rather than running it once.
+
+def PCT = UnitTests.registerT("persistent_control:", _, PersistentControlTester.new, _);
+def PCTX = [
+	PCT("mutant_trace_is_still_modelable",     test_pctl_mutant_trace_is_still_modelable),
+	PCT("mutant_records_no_writeback",         test_pctl_mutant_records_no_writeback),
+	PCT("ordinary_writeback_holds",            test_pctl_ordinary_writeback_holds),
+	PCT("elided_writeback_is_caught",          test_pctl_elided_writeback_is_caught),
+	()
+];
+
+class PersistentControlTester(t: Tester) {
+	// Deliberately identical to PersistentSieveTester's geometry. The two files
+	// are the two rows of one comparison, so a difference here would make the
+	// rows incomparable.
+	def BLOCKS = 8u64;
+	def BLOCK_SIZE = 2048u64;
+	def LIVE = 2u64;
+	def BUDGET = 64;
+
+	var mounted: Array<byte>;       // durable bytes before the recorded scenario
+	var region: PWRegion;
+	var sieve: PWSieve;
+	var recorder: RecordingPersistentOperations;
+
+	// {elide} selects the mutant backend. Everything else is the ordinary
+	// recording setup, so the provider is the only thing that varies.
+	def openSieve(elide: bool) -> bool {
+		var backend: TxnRegionBackend;
+		if (elide) backend = ElidedWritebackPmemBackend.new();
+		else backend = RecordingPmemBackend.new();
+		region = PWRegion.new(backend, BLOCKS,
+			Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, true);
+		if (region.backendRegion == null) return false;
+		recorder = RecordingPersistentOperations.!(region.backendRegion.persistentOperations());
+		sieve = PWSieve.new(region, LIVE);
+		return sieve.open();
+	}
+
+	def snapshotMounted() {
+		mounted = Array<byte>.new(region.rng.length);
+		for (i < mounted.length) mounted[i] = region.rng[i];
+	}
+
+	def recordStep(name: string) -> PersistentTrace {
+		snapshotMounted();
+		recorder.clear();
+		if (!sieve.step()) {
+			t.fail("sieve step failed while recording the scenario");
+			return null;
+		}
+		return recorder.snapshot(name);
+	}
+
+	// Open, record one step, and tear the region down. Returns null after
+	// failing the test, so every caller can simply return.
+	def recordOneStep(elide: bool, name: string) -> PersistentTrace {
+		if (!openSieve(elide)) {
+			t.fail("could not lay out a recording sieve");
+			return null;
+		}
+		def trace = recordStep(name);
+		cleanup();
+		return trace;
+	}
+
+	def sieveProperty(name: string) -> PersistentImageProperty {
+		return PersistentSieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).property(name);
+	}
+
+	def cleanup() {
+		if (region != null) {
+			region.deallocate();
+			region = null;
+		}
+		sieve = null;
+	}
+}
+
+// The mutant must still produce a trace the model can represent. Without this
+// the interesting test below could "catch" the mutant for the wrong reason --
+// an unmodelable trace rather than a durability hole -- and would keep passing
+// if the explorer lost its sensitivity entirely.
+def test_pctl_mutant_trace_is_still_modelable(tc: PersistentControlTester) {
+	def trace = tc.recordOneStep(true, "pwsieve_step_elided");
+	if (trace == null) return;
+
+	tc.t.assertz(true, trace.validate().ok());
+	tc.t.assertz(true, trace.length() > 100);
+	tc.t.assertz(true, trace.touchedLines().length > 8);
+}
+
+// The mutation is exactly what it claims to be: no writebacks, and everything
+// else untouched. Asserting the STORE and SFENCE counts *match* the ordinary
+// run is the part that matters -- it rules out a mutant that simply does less
+// work, which would fail the sweep below for uninteresting reasons.
+def test_pctl_mutant_records_no_writeback(tc: PersistentControlTester) {
+	def ordinary = tc.recordOneStep(false, "pwsieve_step_ordinary");
+	if (ordinary == null) return;
+	def mutant = tc.recordOneStep(true, "pwsieve_step_elided");
+	if (mutant == null) return;
+
+	tc.t.assertz(true, ordinary.count(PersistentEventKind.CLWB) > 0);
+	tc.t.asserti(0, mutant.count(PersistentEventKind.CLWB));
+
+	tc.t.asserti(ordinary.count(PersistentEventKind.STORE),
+		mutant.count(PersistentEventKind.STORE));
+	tc.t.asserti(ordinary.count(PersistentEventKind.SFENCE),
+		mutant.count(PersistentEventKind.SFENCE));
+}
+
+// The control row, in the same file as the row it controls: with the ordinary
+// provider, every image every cut permits recovers into a consistent sieve.
+// persistent_sieve: already asserts this, and it is repeated here because a
+// negative control that cites its positive control from another file is one
+// refactor away from comparing two different things.
+def test_pctl_ordinary_writeback_holds(tc: PersistentControlTester) {
+	def trace = tc.recordOneStep(false, "pwsieve_step_ordinary");
+	if (trace == null) return;
+
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+		tc.sieveProperty("sieve invariants survive every crash schedule of a step"));
+	if (!result.ok()) tc.t.fail(result.toArtifact());
+	tc.t.assertz(true, result.imagesChecked > trace.length());
+}
+
+// The result. With no cache-line writeback the commit boundary's fence has
+// nothing to complete, so a record the API already acknowledged can be left
+// partly or wholly non-durable while after-images land anyway through ordinary
+// eviction. The explorer enumerates such an image and the property rejects it.
+//
+// What catches it is worth naming: the violation is structural -- a free block
+// reachable from the wrong size list -- so the *allocator* invariants inside
+// PersistentSieveProperty are enough, and the workload's cross-object checks are
+// never reached. The mutant corrupts the region's own bookkeeping, not merely
+// the sieve's view of it, which is a stronger failure than this control needed
+// to produce.
+def test_pctl_elided_writeback_is_caught(tc: PersistentControlTester) {
+	def trace = tc.recordOneStep(true, "pwsieve_step_elided");
+	if (trace == null) return;
+
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+		tc.sieveProperty("sieve invariants survive every crash schedule of a step"));
+	tc.t.assertz(false, result.ok());
+
+	def cx = result.counterexample;
+	if (cx == null) {
+		tc.t.fail("the elided-writeback mutant produced no counterexample");
+		return;
+	}
+	tc.t.assert_string("pwsieve_step_elided", cx.scenario);
+	tc.t.assert_string("sieve invariants survive every crash schedule of a step", cx.property);
+	// Pin the violation, not merely that one occurred. A control asserting only
+	// "something failed" would keep passing if the mutant started failing for an
+	// unrelated reason -- an unmodelable trace, a mount that never opened -- and
+	// would stop measuring what it is named for.
+	tc.t.assert_string("free block is on the wrong list (block 4)", cx.detail);
+	// The hole is inside the commit, not at either endpoint: a crash before the
+	// scenario starts or after it fully completes leaves a consistent region
+	// even without flushes, so an endpoint failure would indicate a broken
+	// baseline rather than a durability hole.
+	tc.t.assertz(true, cx.crashAfter > 0 && cx.crashAfter < trace.length());
+}

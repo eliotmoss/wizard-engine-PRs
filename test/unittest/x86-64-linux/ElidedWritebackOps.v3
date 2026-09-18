@@ -1,0 +1,88 @@
+// The elided-writeback mutant: a persistent-operation provider that issues no
+// cache-line writeback at all.
+//
+// This exists to measure the claim docs/pmem-emulation.md makes about its own
+// evidence -- that removing every CLWB would leave the hardware crash loop
+// still reporting OK, because on a MAP_SYNC DAX mapping the memory is the media
+// and a killed process loses nothing still sitting in cache. If that is true,
+// the hardware runs cannot discriminate correct flush placement, and the
+// sensitivity has to come from the layer-1b explorer instead. One mutant run
+// through both layers turns that from an argument into a result.
+//
+// Only clwb() is overridden. Stores and sfence() behave exactly as in
+// production, so a commit still returns success and the transaction is still
+// acknowledged -- which is precisely what makes the missing durability a
+// violation of the acknowledgement contract rather than a visible error. A
+// mutant that also broke sfence() would be a different and much cruder
+// experiment.
+//
+// Nothing here is reachable from a normal build: the providers are installed
+// only by the backends below, which only the negative-control test and an
+// explicit `elide-clwb` argument to pwsieve.main.v3 construct.
+
+// Production path, for the hardware run: no native CLWB is ever issued, so
+// dirty lines reach the medium only through ordinary cache pressure.
+class ElidedWritebackOperations extends X86_64PersistentOperations {
+	new(range: Range<byte>) super(range) { }
+
+	def clwb(cacheLine: u64) { }
+}
+
+// Recording path, for the explorer: stores and fences are still recorded, but a
+// writeback emits no event. The resulting trace is one in which nothing was
+// ever explicitly flushed, so the model must fall back on background eviction
+// -- which it treats as permitted at each boundary, never guaranteed.
+class ElidedWritebackRecordingOperations extends RecordingPersistentOperations {
+	new(range: Range<byte>) super(range) { }
+
+	def clwb(cacheLine: u64) { }
+}
+
+// A PMEM region whose writebacks are elided and whose remaining operations are
+// recorded. Mirrors RecordingPmemBackend in PersistentAllocatorTest.v3, which
+// is the ordinary-build half of the same comparison; the two must differ in the
+// provider and nothing else, or the experiment is not controlled.
+class ElidedWritebackPmemBackend extends TxnRegionBackend {
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = PmemMmapRegion.new(mapping, -1);
+		region.setPersistentOperations(ElidedWritebackRecordingOperations.new(region.range));
+		return region;
+	}
+
+	def isPersistent() -> bool {
+		return true;
+	}
+
+	def name() -> string {
+		return "elided-writeback-pmem";
+	}
+}
+
+// Wrap an existing backend and elide its writebacks, leaving everything else --
+// the file, the MAP_SYNC mapping, the region class -- exactly as production
+// built it. The crash loop needs this rather than ElidedWritebackPmemBackend
+// above, because the point there is to run the real PmemMmapBackend on real
+// DAX and change only the provider.
+//
+// The swap has to happen here, inside create(). PWRegion resolves its provider
+// once in its constructor and DualTxnWal caches it likewise, so a provider
+// installed after the region is built would elide the data-range writebacks and
+// leave the log's intact -- a half-mutant that would prove nothing either way.
+class ElidedWritebackBackend(inner: TxnRegionBackend) extends TxnRegionBackend {
+	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+		def region = inner.create(size, prot, fresh);
+		if (region == null) return null;
+		region.setPersistentOperations(ElidedWritebackOperations.new(region.range));
+		return region;
+	}
+
+	def isPersistent() -> bool {
+		return inner.isPersistent();
+	}
+
+	def name() -> string {
+		return "elided-writeback";
+	}
+}
