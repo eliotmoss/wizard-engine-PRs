@@ -46,9 +46,18 @@ component SieveLoopConfig {
         def var blocks = 32u64;
         def var blockSize = 4096u64;
         def var usePmem = false;        // false = file backend, true = PmemMmapBackend
+        // The flush-placement negative control. When set, the region's
+        // persistent-operation provider issues no cache-line writeback at all;
+        // stores and SFENCE are untouched, so a commit still reports success.
+        // docs/pmem-emulation.md predicts this run still passes, because on a
+        // MAP_SYNC DAX mapping a killed process loses nothing still in cache.
+        // This measures that prediction instead of asserting it.
+        def var elideWriteback = false;
 
         def backendName() -> string {
-                return if(usePmem, "pmem (MAP_SYNC + CLWB/SFENCE)", "file (mmap + msync/fdatasync)");
+                def base = if(usePmem, "pmem (MAP_SYNC + CLWB/SFENCE)", "file (mmap + msync/fdatasync)");
+                if (!elideWriteback) return base;
+                return Strings.format1("%s [MUTANT: cache-line writeback elided]", base);
         }
 
         // Reserve a private, uniquely named region file inside the assigned
@@ -105,8 +114,13 @@ class SieveRandom(var state: u64) {
 }
 
 def openBackend() -> TxnRegionBackend {
-        if (SieveLoopConfig.usePmem) return X86_64Backends.getPersistent(SieveLoopConfig.path);
-        return X86_64Backends.getFileMapped(SieveLoopConfig.path);
+        var backend: TxnRegionBackend;
+        if (SieveLoopConfig.usePmem) backend = X86_64Backends.getPersistent(SieveLoopConfig.path);
+        else backend = X86_64Backends.getFileMapped(SieveLoopConfig.path);
+        // Wrapped, not replaced: the real backend still opens the real file and
+        // takes the real MAP_SYNC mapping, and only the provider differs.
+        if (SieveLoopConfig.elideWriteback) return ElidedWritebackBackend.new(backend);
+        return backend;
 }
 
 def openRegion(fresh: bool) -> PWRegion {
@@ -184,7 +198,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 1 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem]\n");
+                System.puts("Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem] [ordinary|elide-clwb]\n");
                 return 2;
         }
         if (args.length > 1) SieveLoopConfig.iterations = int.!(parseU64(args[1], 50));
@@ -197,6 +211,16 @@ def main(args: Array<string>) -> int {
                 if (Strings.equal(args[5], "pmem")) SieveLoopConfig.usePmem = true;
                 else if (!Strings.equal(args[5], "file")) {
                         System.puts("backend must be \"file\" or \"pmem\"\n");
+                        return 2;
+                }
+        }
+        if (args.length > 6) {
+                // Rejected rather than defaulted, for the same reason the
+                // backend is: a mutant run silently reported as an ordinary one
+                // would corrupt the very comparison this argument exists for.
+                if (Strings.equal(args[6], "elide-clwb")) SieveLoopConfig.elideWriteback = true;
+                else if (!Strings.equal(args[6], "ordinary")) {
+                        System.puts("writeback mode must be \"ordinary\" or \"elide-clwb\"\n");
                         return 2;
                 }
         }
@@ -228,6 +252,19 @@ def main(args: Array<string>) -> int {
         if (!SieveLoopConfig.usePmem && !FileMmapRegion.?(region.backendRegion)) {
                 region.deallocate();
                 return fail("file mode did not produce a FileMmapRegion");
+        }
+        // The same reasoning applied to the mutation. A wiring mistake that left
+        // the production provider installed would produce an ordinary run
+        // reported as a mutant one -- the negative control's version of a silent
+        // fallback, and just as capable of inverting the conclusion.
+        def elided = ElidedWritebackOperations.?(region.backendRegion.persistentOperations());
+        if (SieveLoopConfig.elideWriteback && !elided) {
+                region.deallocate();
+                return fail("elide-clwb did not install the elided-writeback provider");
+        }
+        if (!SieveLoopConfig.elideWriteback && elided) {
+                region.deallocate();
+                return fail("an ordinary run installed the elided-writeback provider");
         }
         var sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return fail("could not lay out the sieve root");
