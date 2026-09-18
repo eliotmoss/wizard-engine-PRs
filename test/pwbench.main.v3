@@ -1,0 +1,472 @@
+// Persistence-boundary cost characterization.
+//
+// Phase B of DualTxnWal exists to reach one persistence boundary per commit,
+// and its design note justifies the per-commit data flush as "cheap fences --
+// acceptable". That is an assertion with no measurement behind it, and it is
+// the only quantitative claim in the argument that the unified interface hides
+// real differences between the media. This produces the number.
+//
+// Three configurations, not two. Comparing PMEM+SFENCE against
+// file+fdatasync on its own conflates the boundary primitive with the media,
+// and cannot separate "fences are cheap" from "PMEM is fast":
+//
+//              SFENCE boundary        fdatasync boundary
+//   DAX media  config 1 (pmem)        config 2 (file on the DAX mount)
+//   block      --                     config 3 (file on ordinary storage)
+//
+// 1 vs 2 isolates the primitive with the media held constant, 2 vs 3 isolates
+// the media with the primitive held constant, and 1 vs 3 is the deployment
+// comparison that motivated the measurement.
+//
+// Instrumentation is asymmetric because the primitives are. On PMEM the
+// boundary is a CLWB loop plus one SFENCE, both issued through the
+// PersistentOperations provider, so a timing provider measures it. On a file
+// the boundary is one fdatasync behind FileMmapRegion.syncFileData(), so a
+// timing region measures that. Both report the same semantic unit -- the
+// prepare side and the persist side of one boundary -- and the difference in
+// mechanism is itself the granularity difference under study. Neither path
+// reimplements a persistence state machine: each overrides only the narrow
+// seam the production class provides for exactly this.
+//
+// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem> [commits] [entries] [warmup]
+
+def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+
+// Cap the retained sample set. Percentiles over this many commits are stable
+// and the vector stays far away from the region under test.
+def MAX_SAMPLES = 200000;
+
+component BenchConfig {
+        def var directory: string;
+        def var path: string;
+        def var usePmem = false;
+        def var commits = 20000;
+        def var entries = 8;            // u64 redo entries per transaction
+        def var warmup = 2000;
+        def var blocks = 512u64;
+        def var blockSize = 4096u64;
+
+        def backendName() -> string {
+                return if(usePmem, "pmem (MAP_SYNC + CLWB/SFENCE)", "file (mmap + msync/fdatasync)");
+        }
+
+        // Reserve a private, uniquely named region file, exactly as
+        // pwsieve.main.v3 and pmem-integration.main.v3 do: O_EXCL so an
+        // artifact from an earlier run is never silently replaced, and removal
+        // only of the file this run created.
+        def reservePath(dir: string) -> bool {
+                directory = dir;
+                def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+                def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                for (attempt < 100) {
+                        path = StringBuilder.new()
+                                .puts(directory)
+                                .puts("/wizard-pwbench-u")
+                                .putd(uid)
+                                .puts("-p")
+                                .putd(pid)
+                                .puts("-")
+                                .putd(attempt)
+                                .puts(".region")
+                                .toString();
+                        def fd = RegionFileIO.createExclusive(path);
+                        if (fd >= 0) {
+                                RegionFileIO.close(fd);
+                                return true;
+                        }
+                        if (fd != -LinuxConst.EEXIST) {
+                                path = null;
+                                return false;
+                        }
+                }
+                path = null;
+                return false;
+        }
+}
+
+// ---------------------------------------------------------------- clock
+
+component BenchClock {
+        def var cyclesPerUs = 0u64;
+
+        def nanos() -> long {
+                def ts = Array<long>.new(2);
+                Linux.syscall(LinuxConst.SYS_clock_gettime,
+                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                return ts[0] * 1000000000L + ts[1];
+        }
+
+        def sleepNanos(ns: long) {
+                def ts = Array<long>.new(2);
+                ts[0] = ns / 1000000000L;
+                ts[1] = ns % 1000000000L;
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
+        }
+
+        // Every sample is taken with rdtsc, because an SFENCE costs far less
+        // than a clock_gettime and would otherwise be measuring the clock. The
+        // conversion to nanoseconds is therefore only as good as this
+        // calibration, and the tree has no invariant-TSC check, so the derived
+        // frequency is reported rather than assumed.
+        def calibrate() {
+                def c0 = Target.rdtsc();
+                def t0 = nanos();
+                sleepNanos(100000000L);         // 100 ms
+                def c1 = Target.rdtsc();
+                def t1 = nanos();
+                def elapsedNs = t1 - t0;
+                if (elapsedNs <= 0) return;
+                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesToNanos(cycles: u64) -> u64 {
+                if (cyclesPerUs == 0) return 0;
+                return (cycles * 1000u64) / cyclesPerUs;
+        }
+}
+
+// ------------------------------------------------------------ accumulator
+
+// One accumulator shared by the backend, the region and the provider, so both
+// instrumentation paths report into the same place.
+class BoundaryTimer {
+        def var recording = false;      // off during format and warmup
+        def var persistCalls = 0;       // SFENCE / fdatasync
+        def var prepareCalls = 0;       // CLWB loop / dirty-flag set
+        def var persistCycles = 0u64;
+        def var prepareCycles = 0u64;
+        def var clwbLines = 0;
+        def persistSamples = Vector<u64>.new();
+
+        def notePersist(cycles: u64) {
+                persistCalls++;
+                if (!recording) return;
+                persistCycles += cycles;
+                if (persistSamples.length < MAX_SAMPLES) persistSamples.put(cycles);
+        }
+
+        def notePrepare(cycles: u64) {
+                prepareCalls++;
+                if (!recording) return;
+                prepareCycles += cycles;
+        }
+
+        def reset() {
+                persistCalls = 0;
+                prepareCalls = 0;
+                clwbLines = 0;
+                persistCycles = 0;
+                prepareCycles = 0;
+                persistSamples.clear();
+        }
+}
+
+// -------------------------------------------------- PMEM instrumentation
+
+// The PMEM boundary is issued through the provider seam, so timing lives here.
+// Both methods reimplement the production body rather than delegating, which
+// is this codebase's established idiom for a seam override (see
+// RecordingPersistentOperations and FilePersistenceTraceRegion) -- the bodies
+// are one-liners over MmapRegionUtils, so there is no state machine to
+// duplicate and no risk of drifting from production behaviour.
+class TimingPersistentOperations extends X86_64PersistentOperations {
+        def timer: BoundaryTimer;
+
+        new(range: Range<byte>, timer: BoundaryTimer) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                def c0 = Target.rdtsc();
+                MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+                timer.notePrepare(Target.rdtsc() - c0);
+                timer.clwbLines++;
+        }
+
+        def sfence() {
+                def c0 = Target.rdtsc();
+                MmapRegionUtils.storeFence();
+                timer.notePersist(Target.rdtsc() - c0);
+        }
+}
+
+// Installs the timing provider inside create(), via the factory seam. It has to
+// be inside create(): PWRegion and DualTxnWal each resolve their provider once
+// at construction, so a later swap would miss the log's own writebacks.
+class TimingPmemBackend extends PmemMmapBackend {
+        def timer: BoundaryTimer;
+
+        new(path: string, timer: BoundaryTimer) super(path) { }
+
+        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+                if (newMapping == null) return null;
+                def region = PmemMmapRegion.new(newMapping, fd);
+                region.setPersistentOperations(TimingPersistentOperations.new(region.range, timer));
+                return region;
+        }
+}
+
+// -------------------------------------------------- file instrumentation
+
+// The file boundary is one fdatasync behind syncFileData(). onRangePrepared is
+// the paired seam on the prepare side; it does no syscall, so it is counted
+// rather than timed.
+class TimingFileRegion extends FileMmapRegion {
+        def timer: BoundaryTimer;
+
+        new(mapping: Mapping, fd: int, timer: BoundaryTimer) super(mapping, fd) { }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                timer.notePrepare(0);
+        }
+
+        def syncFileData() -> bool {
+                def c0 = Target.rdtsc();
+                def success = RegionFileIO.fdatasync(fd);
+                timer.notePersist(Target.rdtsc() - c0);
+                return success;
+        }
+}
+
+class TimingFileBackend extends FileMmapBackend {
+        def timer: BoundaryTimer;
+
+        new(path: string, timer: BoundaryTimer) super(path) { }
+
+        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+                if (newMapping == null) return null;
+                return TimingFileRegion.new(newMapping, fd, timer);
+        }
+}
+
+// ---------------------------------------------------------------- stats
+
+// Magpie is a shared host under concurrent load, so the sample distribution is
+// skewed by interference and a mean would report the interference. Order
+// statistics are what survive that.
+class Percentiles(sorted: Array<u64>) {
+        def at(p: int) -> u64 {
+                if (sorted.length == 0) return 0;
+                var i = (p * (sorted.length - 1)) / 100;
+                if (i < 0) i = 0;
+                if (i >= sorted.length) i = sorted.length - 1;
+                return sorted[i];
+        }
+}
+
+def sortedSamples(v: Vector<u64>) -> Array<u64> {
+        def a = v.copy();
+        return Arrays.sort(a, 0, a.length, u64.<=);
+}
+
+// ---------------------------------------------------------------- run
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        if (BenchConfig.path != null) {
+                System.puts("retained region image: ");
+                System.puts(BenchConfig.path);
+                System.ln();
+        }
+        return 1;
+}
+
+def openRegion(timer: BoundaryTimer) -> PWRegion {
+        var backend: TxnRegionBackend;
+        if (BenchConfig.usePmem) backend = TimingPmemBackend.new(BenchConfig.path, timer);
+        else backend = TimingFileBackend.new(BenchConfig.path, timer);
+        return PWRegion.new(backend, BenchConfig.blocks,
+                Array<Ref<MetaDataDesc>>.new(0), BenchConfig.blockSize, true);
+}
+
+// One transaction of exactly {entries} aligned u64 redo entries, committed
+// through the production path. Driving the transaction directly rather than
+// going through allocChunk is what makes the record size a controlled
+// variable: an allocation's entry count depends on whether it splits, which
+// would put the independent variable outside the harness's control.
+def runCommits(region: PWRegion, base: u64, count: int, timer: BoundaryTimer) -> bool {
+        for (i < count) {
+                for (e < BenchConfig.entries) {
+                        region.txn.writeU64(base + u64.!(e * 8), u64.!(i) + 0x5A5A0000u64);
+                }
+                if (!region.txn.commit()) return false;
+        }
+        return true;
+}
+
+def report(timer: BoundaryTimer, measured: int, wallNs: long) {
+        def sorted = sortedSamples(timer.persistSamples);
+        def p = Percentiles.new(sorted);
+        Trace.OUT.put2("commits measured %d, entries per commit %d",
+                measured, BenchConfig.entries).ln();
+        Trace.OUT.put2("persist boundaries %d, prepare calls %d",
+                timer.persistCalls, timer.prepareCalls).ln();
+        // Phase B claims one boundary per commit in steady state. The overwrite
+        // guard can fire a second, so this is measured rather than assumed; a
+        // ratio above 1 means the per-boundary figures below are being divided
+        // by the wrong denominator.
+        if (measured > 0) {
+                Trace.OUT.put2("boundaries per commit x1000 %d, clwb lines %d",
+                        (1000 * timer.persistCalls) / measured, timer.clwbLines).ln();
+        }
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        Trace.OUT.put3("boundary cycles: min %d median %d p90 %d",
+                p.at(0), p.at(50), p.at(90)).ln();
+        Trace.OUT.put2("boundary cycles: p99 %d max %d", p.at(99), p.at(100)).ln();
+        Trace.OUT.put3("boundary ns: min %d median %d p90 %d",
+                BenchClock.cyclesToNanos(p.at(0)),
+                BenchClock.cyclesToNanos(p.at(50)),
+                BenchClock.cyclesToNanos(p.at(90))).ln();
+        Trace.OUT.put2("boundary ns: p99 %d max %d",
+                BenchClock.cyclesToNanos(p.at(99)),
+                BenchClock.cyclesToNanos(p.at(100))).ln();
+        Trace.OUT.put1("total boundary cycles %d", timer.persistCycles).ln();
+        Trace.OUT.put1("total prepare cycles %d", timer.prepareCycles).ln();
+        // The share of a commit the boundary accounts for. appendCommittedRecord
+        // zeroes and checksums the whole record a byte at a time, so on a fast
+        // boundary that store work can dominate; without this the boundary
+        // number invites a conclusion about commit cost it does not support.
+        if (wallNs > 0) {
+                def boundaryNs = BenchClock.cyclesToNanos(timer.persistCycles + timer.prepareCycles);
+                Trace.OUT.put2("measured wall ns %d, boundary share x1000 %d",
+                        wallNs, (1000L * long.view(boundaryNs)) / wallNs).ln();
+                Trace.OUT.put1("wall ns per commit %d", wallNs / long.!(measured)).ln();
+        }
+}
+
+// The per-transaction ceiling, mirroring DualTxnWal's geometry: each of the two
+// record slots gets half the log chunk less the WAL header, and a record is a
+// header, a trailer and one 32-byte LogEntry per buffered write. Reported as an
+// estimate rather than enforced, because the commit itself is the authority --
+// this exists so an oversized sweep point fails with a number instead of a
+// shrug.
+def maxEntriesEstimate(blockSize: u64) -> u64 {
+        if (blockSize <= u64.!(DualWalHeader.size)) return 0;
+        def slot = (blockSize - u64.!(DualWalHeader.size)) / 2u64;
+        def fixed = u64.!(TxnRecordHeader.size + TxnCommitTrailer.size);
+        if (slot <= fixed) return 0;
+        return (slot - fixed) / u64.!(LogEntry.size);
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var acc = 0u64;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                acc = acc * 10 + u64.!(c - '0');
+        }
+        return acc;
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 2 || args[0] == null || args[0].length == 0) {
+                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem> [commits] [entries] [warmup] [blockSize]\n");
+                return 2;
+        }
+        // Rejected rather than defaulted: a file run reported as a PMEM one
+        // would invert the comparison this program exists to make.
+        if (Strings.equal(args[1], "pmem")) BenchConfig.usePmem = true;
+        else if (!Strings.equal(args[1], "file")) {
+                System.puts("backend must be \"file\" or \"pmem\"\n");
+                return 2;
+        }
+        if (args.length > 2) BenchConfig.commits = int.!(parseU64(args[2], 20000));
+        if (args.length > 3) BenchConfig.entries = int.!(parseU64(args[3], 8));
+        if (args.length > 4) BenchConfig.warmup = int.!(parseU64(args[4], 2000));
+        if (args.length > 5) BenchConfig.blockSize = parseU64(args[5], 4096);
+        if (BenchConfig.commits < 1 || BenchConfig.entries < 1) {
+                System.puts("commits and entries must be positive\n");
+                return 2;
+        }
+
+        if (!BenchConfig.reservePath(args[0])) {
+                System.puts("Could not reserve a unique region file in the supplied directory.\n");
+                return 2;
+        }
+        BenchClock.calibrate();
+        Trace.OUT.put1("backend %s", BenchConfig.backendName()).ln();
+        Trace.OUT.put1("region file %s", BenchConfig.path).ln();
+
+        def timer = BoundaryTimer.new();
+        def region = openRegion(timer);
+        if (region == null || region.backendRegion == null) {
+                if (BenchConfig.usePmem) {
+                        return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                }
+                return fail("could not create the region file");
+        }
+        // The same anti-fallback check the crash loop makes, for the same
+        // reason: a file mapping reported as a PMEM result would be the whole
+        // comparison inverted.
+        if (BenchConfig.usePmem && !PmemMmapRegion.?(region.backendRegion)) {
+                region.deallocate();
+                return fail("pmem mode did not produce a PmemMmapRegion");
+        }
+        if (!BenchConfig.usePmem && !FileMmapRegion.?(region.backendRegion)) {
+                region.deallocate();
+                return fail("file mode did not produce a FileMmapRegion");
+        }
+        // This is an ordinary build. The elided-writeback mutant must not be
+        // anywhere near a cost measurement.
+        if (ElidedWritebackOperations.?(region.backendRegion.persistentOperations())) {
+                region.deallocate();
+                return fail("an elided-writeback provider is installed; this must be an ordinary build");
+        }
+
+        // One chunk to write into, so the commits touch real allocated space
+        // without the allocator's own variable work entering the measurement.
+        def span = u64.!(BenchConfig.entries * 8);
+        def needed = (span + u64.!(ChunkHeader.size) + BenchConfig.blockSize - 1u64) / BenchConfig.blockSize;
+        def SCRATCH_BLOCKS = u32.!(needed);
+        def chunk = region.allocChunk(SCRATCH_BLOCKS);
+        if (chunk.isNull()) {
+                region.deallocate();
+                return fail("could not allocate the scratch chunk");
+        }
+        // chunk.addr is absolute; the header's offset/limit fields are
+        // region-relative, so the usable span is derived from the geometry
+        // rather than read back from the header.
+        var base = chunk.addr + u64.!(ChunkHeader.size);
+        base = (base + 7u64) & ~7u64;           // writeU64 requires natural alignment
+        def capacity = u64.!(SCRATCH_BLOCKS) * BenchConfig.blockSize - u64.!(ChunkHeader.size);
+        if (span > capacity) {
+                region.deallocate();
+                return fail("entries per commit exceed the scratch chunk; lower it or raise blockSize");
+        }
+        Trace.OUT.put3("region %d blocks of %d bytes, scratch %d blocks",
+                BenchConfig.blocks, BenchConfig.blockSize, SCRATCH_BLOCKS).ln();
+
+        if (!runCommits(region, base, BenchConfig.warmup, timer)) {
+                def ceiling = maxEntriesEstimate(BenchConfig.blockSize);
+                region.deallocate();
+                Trace.OUT.put3("a warmup commit failed at %d entries; the WAL slot at blockSize %d holds about %d",
+                        BenchConfig.entries, BenchConfig.blockSize, ceiling).ln();
+                return fail("a warmup commit failed; most likely the record exceeds the WAL slot");
+        }
+        // Discard everything the format, allocation and warmup did.
+        timer.reset();
+        timer.recording = true;
+
+        def t0 = BenchClock.nanos();
+        def ok = runCommits(region, base, BenchConfig.commits, timer);
+        def wallNs = BenchClock.nanos() - t0;
+        timer.recording = false;
+        if (!ok) {
+                region.deallocate();
+                return fail("a measured commit failed");
+        }
+        report(timer, BenchConfig.commits, wallNs);
+
+        region.deallocate();
+        if (!RegionFileIO.unlink(BenchConfig.path)) {
+                System.puts("Could not remove the region file printed above.\n");
+                return 2;
+        }
+        System.puts("OK\n");
+        return 0;
+}

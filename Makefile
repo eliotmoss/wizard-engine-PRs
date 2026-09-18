@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -31,6 +31,7 @@ UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 PMEMTEST_X86_64_LINUX=test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3
 PWSIEVE_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsieve.main.v3
+PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbench.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -116,6 +117,36 @@ pwsieve-pmem-mutant: bin/pwsieve.x86-64-linux
 
 bin/pwsieve.x86-64-linux: $(ENGINE) $(PWSIEVE_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwsieve x86-64-linux
+
+# Persistence-boundary cost. Three configurations: the SFENCE boundary on DAX,
+# the fdatasync boundary on the same DAX media, and the fdatasync boundary on
+# ordinary block storage. 1 vs 2 isolates the primitive, 2 vs 3 the media.
+PWBENCH_ARGS ?= 20000 8 2000
+pwbench-pmem: bin/pwbench.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pwbench.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" pmem $(PWBENCH_ARGS)
+
+pwbench-file: bin/pwbench.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pwbench.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" file $(PWBENCH_ARGS)
+
+# Block-media point. PWBENCH_DIR must name ordinary local storage; check with
+# findmnt -T first, since an fdatasync over NFS measures the network.
+pwbench-block: bin/pwbench.x86-64-linux
+	@if [ -z "$(PWBENCH_DIR)" ]; then \
+		echo "PWBENCH_DIR must name a writable directory on ordinary block storage"; \
+		exit 2; \
+	fi
+	bin/pwbench.x86-64-linux "$(PWBENCH_DIR)" file $(PWBENCH_ARGS)
+
+bin/pwbench.x86-64-linux: $(ENGINE) $(PWBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pwbench x86-64-linux
 
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT) build.sh
 	./build.sh spectest x86-64-linux
