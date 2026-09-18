@@ -65,21 +65,22 @@ fence. The note is correct and argues for the wrong reason.
   927 µs in its low mode. **≈ 2,000×.** This is the cleanest statement of what
   the unified interface hides: identical media, identical workload, identical
   geometry, one interface, three orders of magnitude.
-- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **roughly
-  five to nine times slower** than on ordinary block storage — 927 µs
-  socket-local against a block figure that has ranged from 133 to 196 µs between
-  sittings. This is the weakest of the three comparisons, because configuration 3
-  has not reproduced; read the caveat below before quoting a multiplier. The
-  direction is the opposite of the expected one, and is discussed below.
+- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **4.7× to
+  7.1× slower** than on ordinary block storage: 927 µs socket-local against a
+  block figure that has ranged from 131 to 196 µs between sittings. This is the
+  weakest of the three comparisons because configuration 3 has not reproduced,
+  so the span is the block measurement's instability and not a property of the
+  media. What does *not* move is the direction — DAX is slower in every one of
+  the 48 block runs, and the smallest gap ever observed is 4.7×. The direction
+  is the opposite of the expected one, and is discussed below.
 - **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
 ### The file backend on DAX is the worst of both worlds
 
 The surprise is configuration 2. Putting the file backend on DAX media is
-*slower* than putting it on an ordinary block device — roughly five to nine
-times, the range reflecting configuration 3's instability rather than any
-uncertainty about configuration 2 — while also forgoing the `SFENCE` path
-entirely. It pays a worse boundary than block storage and gets none of the
+*slower* than putting it on an ordinary block device — between 4.7× and 7.1×,
+the range reflecting configuration 3's instability rather than any uncertainty
+about configuration 2 — while also forgoing the `SFENCE` path entirely. It pays a worse boundary than block storage and gets none of the
 benefit of the medium it is sitting on.
 
 This is a separate question from the NUMA bimodality below, which explains the
@@ -280,8 +281,10 @@ boundary *primitive* — configuration 1 against 2, on the same DAX filesystem �
 is reproducible to 0.1 % across four campaigns and carries the headline result.
 The comparison that isolates the *media* — 2 against 3 — rests on a
 configuration that has moved 48 % between sittings on this host, and its
-multiplier should be read as "roughly five to nine times" rather than any
-particular number. `/home` is a shared LVM volume whose other traffic is neither
+multiplier is a range, 4.7×–7.1×, rather than a number. The *direction* is
+unaffected: DAX was slower in all 48 block runs, worst case 4.7×, so the
+"worst of both worlds" finding survives the instability even though the figure
+does not. `/home` is a shared LVM volume whose other traffic is neither
 controlled nor visible in a CPU load average.
 
 
