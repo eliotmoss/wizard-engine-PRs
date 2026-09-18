@@ -165,7 +165,7 @@ cannot be written around missing numbers.
 
 | Item | Estimate | Why it survives triage |
 |---|---|---|
-| Flush-placement negative control | ~1 day | Highest value in the backlog. Hardware crash loop still passes while the explorer emits a counterexample; that 2×2 *is* the thesis spine, demonstrated rather than argued. Produces the signature figure. |
+| Flush-placement negative control | ~1 day | Highest value in the backlog. Hardware crash loop still passes while the explorer emits a counterexample; that 2×2 *is* the thesis spine, demonstrated rather than argued. Produces the signature figure. **Model half done 2026-09-18** (`persistent_control:`, 4 tests); the Magpie row remains. |
 | Persistence-boundary cost characterisation | ~1 day | The only quantitative evidence for Chapter 4. Replaces an assertion with a number. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |

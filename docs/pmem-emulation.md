@@ -348,11 +348,17 @@ reaches the identical 5,429,504 / 376,256 result, so the two backends agree.
 mapping the memory *is* the media, so when the child is killed its dirty cache
 lines are still in the CPU's caches and the CPU keeps running: nothing is lost,
 and the lines reach the DIMM through ordinary cache pressure or a later flush.
-Removing every `CLWB` from the persist path would very likely leave this test
-still reporting `OK`. Since `region0`/`region1` report `memory_controller` — ADR,
-not eADR — ADR drains the memory controller's write-pending queue but **not** the
-CPU caches, so only a real power interruption can lose an un-written-back line
-and thereby discriminate a correct `CLWB` from a missing one.
+Removing every `CLWB` from the persist path would leave this test still
+reporting `OK`. Since `region0`/`region1` report `memory_controller` — ADR, not
+eADR — ADR drains the memory controller's write-pending queue but **not** the CPU
+caches, so only a real power interruption can lose an un-written-back line and
+thereby discriminate a correct `CLWB` from a missing one.
+
+That sentence used to read "would *very likely* leave this test still reporting
+`OK`", which was an assertion about the experiment's own blind spot with nothing
+behind it. It is now measured; see
+[the flush-placement negative control](#flush-placement-negative-control) below
+for what has been run and what has not.
 
 What this run therefore establishes is that the production writeback/fence path
 executes against real PMEM without corrupting anything, and that the WAL
@@ -366,6 +372,52 @@ an enumerated image that production recovery cannot repair. The model is
 sensitive where this hardware test is not, and the hardware test executes the
 real instructions where the model only assumes them. Neither alone closes
 Stage 3.
+
+### Flush-placement negative control
+
+The layering claim above — that the hardware run cannot discriminate flush
+placement and the layer-1b explorer can — is measured with an elided-writeback
+mutant: a `PersistentOperations` provider whose `clwb()` does nothing, with
+stores and `SFENCE` untouched, so a commit still returns success and the
+transaction is still acknowledged. It is installed by wrapping the real backend
+(`ElidedWritebackBackend`, `test/unittest/x86-64-linux/ElidedWritebackOps.v3`),
+so the production `PmemMmapBackend` still opens the real file and takes the real
+`MAP_SYNC` mapping and only the provider differs. The swap happens inside
+`create()` because `PWRegion` and `DualTxnWal` each resolve their provider once
+at construction; installing it later would elide the data-range writebacks and
+leave the log's intact.
+
+|  | Magpie crash loop (layer 3) | Explorer sweep (layer 1b) |
+|---|---|---|
+| Ordinary build | `OK` (2026-09-01) | property holds |
+| Elided-writeback mutant | **not yet run** | **counterexample** |
+
+**Model half — done.** The four `persistent_control:` unit tests record the same
+sieve `step()` as `persistent_sieve:step_images_satisfy_sieve` and sweep it with
+the same `PersistentSieveProperty`, changing only the provider. The mutant trace
+is still modelable (it validates against the baseline), carries zero `CLWB`
+events while its `STORE` and `SFENCE` counts match the ordinary recording
+exactly, and is rejected: a crash 710 events into a 1401-event scenario leaves a
+durable image whose *allocator* invariants already fail, with `free block is on
+the wrong list (block 4)`. The ordinary provider holds over every cut of the
+same scenario. So the model is sensitive to flush placement, and sensitive
+enough that the structural check alone catches it without the workload's
+cross-object invariants being reached.
+
+**Hardware half — outstanding.** `make pwsieve-pmem-mutant` runs the identical
+crash loop with `elide-clwb` appended, gated on `PWASM_PMEM_TEST_DIR` exactly as
+`pwsieve-pmem` is. Until that has run on Magpie, the prediction in the top of
+this section is still a prediction. A mutant run that *failed* there would be
+the more interesting result: it would mean the hardware test is more sensitive
+than this document claims, and the surrounding argument would need rewriting
+rather than confirming.
+
+The mutant is deliberately vacuous on the file backend: `FileMmapRegion` never
+calls `clwb()` at all, since its persist path is `msync`/`fdatasync`. A
+file-backed mutant run therefore exercises the wiring and nothing else, and must
+not be reported as a result. That the same mutation is meaningful on one backend
+and empty on the other is itself an instance of the granularity difference the
+unified interface hides.
 
 The topology, cache geometry, and CPU flags are readable without elevated
 privileges. The health query is not: `/dev/nmem*` is root-only, so the
