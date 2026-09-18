@@ -27,7 +27,8 @@ All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live u
 ## Persistence-boundary cost (measured 2026-09-18, Magpie)
 
 Phase B's design note justified its per-commit data flush as "cheap fences —
-acceptable". Measured, on one host, one sample per configuration.
+acceptable". Measured across four campaigns on one host: two unpinned, and one
+pinned to each NUMA node. All raw logs, CSVs and provenance are in `results/`.
 
 Three configurations, so the boundary primitive and the media are separable.
 `pwbench` drives 20,000 commits of 8 aligned `u64` redo entries each through the
@@ -37,11 +38,13 @@ production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
 |---|---|---|---|---|---|---|
 | 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.7 µs | 3.3 % |
 | 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 µs local / 1,147 µs cross-socket** | 939–1,160 µs | 98.8 % |
-| 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133 µs** | 188 µs | 70.9 % |
+| 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133–181 µs** (see caveat) | 188–240 µs | 71–86 % |
 
-Figures are medians over the 24 runs of each configuration in `results/`
-(two campaigns × three repetitions × four transaction sizes), at 8 entries
-except where a size is named. Configuration 2 is bimodal; see below.
+Figures are medians over the runs of each configuration in `results/`
+(four campaigns × three repetitions × four transaction sizes), at 8 entries
+except where a size is named. Configuration 2's two values are socket-local and
+cross-socket; configuration 3 has not reproduced between sittings. Both are
+explained below.
 
 All three measured **exactly 1.000 persistence boundaries per commit**, which is
 phase B's steady-state claim confirmed on hardware in three configurations
@@ -62,30 +65,36 @@ fence. The note is correct and argues for the wrong reason.
   927 µs in its low mode. **≈ 2,000×.** This is the cleanest statement of what
   the unified interface hides: identical media, identical workload, identical
   geometry, one interface, three orders of magnitude.
-- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **7.0×
-  slower** than on ordinary block storage when the process is on the socket
-  owning the namespace, and **8.6×** when it is not — 927 or 1,147 µs against
-  133 µs. This is the opposite of the
-  expected direction and is discussed below.
+- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **roughly
+  five to nine times slower** than on ordinary block storage — 927 µs
+  socket-local against a block figure that has ranged from 133 to 196 µs between
+  sittings. This is the weakest of the three comparisons, because configuration 3
+  has not reproduced; read the caveat below before quoting a multiplier. The
+  direction is the opposite of the expected one, and is discussed below.
 - **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
 ### The file backend on DAX is the worst of both worlds
 
 The surprise is configuration 2. Putting the file backend on DAX media is
-*slower* than putting it on a spinning-or-flash block device, by 6.3×, while
-also forgoing the `SFENCE` path entirely — so it pays a worse boundary than
-block storage and gets none of the benefit of the medium it is sitting on. The
-plausible mechanism is that `fdatasync` on a DAX mapping must walk and write
-back the dirty range itself rather than handing pages to an optimised page-cache
-writeback path, but this measurement does not establish the mechanism and no
-claim about it should be made without one.
+*slower* than putting it on an ordinary block device — roughly five to nine
+times, the range reflecting configuration 3's instability rather than any
+uncertainty about configuration 2 — while also forgoing the `SFENCE` path
+entirely. It pays a worse boundary than block storage and gets none of the
+benefit of the medium it is sitting on.
+
+This is a separate question from the NUMA bimodality below, which explains the
+*two modes within* DAX, not why DAX is slower than block storage at all. The
+plausible mechanism for the latter is that `fdatasync` on a DAX mapping must
+walk and write back the dirty range itself rather than handing pages to an
+optimised page-cache writeback path, but this measurement does not establish it
+and no claim should rest on it.
 
 The consequence for the design is the important part: **the abstraction must not
 be allowed to hide which medium is underneath.** A caller who unified on the
 file backend "because it works everywhere" and deployed it on PMEM would land in
-configuration 2 and be 71× slower per commit than configuration 1, on the same
-hardware, with no error and no warning. That is the cost of unification stated
-as a number.
+configuration 2 and be **69× slower per commit socket-local, or 85×
+cross-socket**, than configuration 1 — on the same hardware, with no error and
+no warning. That is the cost of unification stated as a number.
 
 ### What phase B's boundary reduction is worth, per medium
 
@@ -194,7 +203,24 @@ in the range.
 | `pmem` (`CLWB` + `SFENCE`) | 11 ns | 11 ns | **none** |
 | `file` (`fdatasync`) | 927,371 ns | 1,148,685 ns | **+23.9 %** |
 
-Nothing on the PMEM path blocks on media latency. `CLWB` is fire-and-forget, and an `SFENCE` at 11 ns plainly is
+Nothing on the PMEM path blocks on media latency.
+
+Two full pinned campaigns (`results/20260918T062309Z-magpie` at node 0 and
+`…062908Z…` at node 1, 36 runs each) extend that spot-check to every
+configuration and transaction size:
+
+| Configuration | n=1 | n=8 | n=32 | n=56 |
+|---|---|---|---|---|
+| `file-dax` penalty | **+24.0 %** | **+23.6 %** | **+23.6 %** | **+23.7 %** |
+| `pmem-dax` penalty | 0.0 % | 0.0 % | 0.0 % | 0.0 % |
+| `file-block` penalty | +0.1 % | +0.3 % | +0.9 % | +0.7 % |
+
+**The penalty is constant in transaction size**, which is what a fixed
+per-`fdatasync` interconnect cost predicts and what a per-byte one would not.
+`pmem-dax` is unaffected to the resolution of the measurement at every size, and
+`file-block` is unaffected because an LVM volume is not socket-attached in the
+way a PMEM DIMM is. The pinned node-0 figures also reproduce the unpinned low
+mode to within 0.2 % at every size, so the four campaigns tell one story. `CLWB` is fire-and-forget, and an `SFENCE` at 11 ns plainly is
 not waiting for anything to reach ADR — the writebacks drain asynchronously
 inside the 13.7 µs the rest of the commit takes. `fdatasync` is the only
 operation here that synchronously waits for data to reach the medium, so it is
@@ -214,24 +240,49 @@ guarantee that should at least report the mismatch. Neither `PWRegion` nor the
 backends currently have any notion of NUMA (out of scope here, and recorded as
 future work).
 
-`file-block` shows no such structure: 130,620–135,561 ns across all 24 runs,
-median 133,126 ns.
+`file-block` shows no such bimodality, but it has a different problem of its
+own; see below.
 
 So the DAX-versus-block factor is **7.0× socket-local and 8.6× cross-socket**.
 With the cause identified the figure is no longer a lottery, but it is still two
 numbers rather than one, and it is conditional on placement the allocator does
 not control.
 
-### One figure that has not reproduced
+### The block-media configuration is not a controlled measurement here
 
-The earlier hand-run measurements put `file-block` at 148.0–148.2 µs across four
-runs. Both scripted campaigns put it at 133.1 µs median, about 10 % lower, with
-no overlap. Same host, same commit, same parameters, same directory, and the
-machine idle in both cases.
+Once the socket is pinned, the two DAX configurations reproduce to a fraction of
+a percent across campaigns. `file-block` does not reproduce at all:
 
-No explanation is offered here because none has been established. It is recorded
-because it bears directly on how much weight any single absolute latency on this
-page can carry: the answer is less than four tightly-agreeing runs suggest.
+| | hand runs | campaign 1 | campaign 2 | campaign 3 (node 0) | campaign 4 (node 1) | spread |
+|---|---|---|---|---|---|---|
+| n=1 | — | 133,004 | 133,815 | 196,244 | 196,432 | **48 %** |
+| n=8 | 148,100 | 133,113 | 134,172 | 180,136 | 181,075 | **36 %** |
+| n=32 | — | 132,928 | 134,027 | 168,769 | 170,285 | 28 % |
+| n=56 | — | 130,672 | 131,645 | 164,943 | 166,047 | 27 % |
+
+The *shape* moved as well as the level. In the first two campaigns `file-block`
+was flat in transaction size, like the other two configurations. In the last two
+it falls monotonically, 196 µs down to 165 µs from one entry to fifty-six. Both
+pinned campaigns agree with each other closely, and both unpinned campaigns
+agree with each other closely, so this is stable within a sitting and not
+between sittings.
+
+Pinning and elapsed time are confounded here — the pinned campaigns are also the
+later ones — so it is not known whether restricting the CPU set changed anything
+or whether `/home` was simply busier. One speculative mechanism for the falling
+shape, recorded as a hypothesis and nothing more: a larger transaction takes
+longer to construct, so boundaries are issued further apart, and a queued block
+device has more time to drain between them. DAX has no such queue, which would
+be why only this configuration shows it.
+
+**The consequence for this page is specific.** The comparison that isolates the
+boundary *primitive* — configuration 1 against 2, on the same DAX filesystem —
+is reproducible to 0.1 % across four campaigns and carries the headline result.
+The comparison that isolates the *media* — 2 against 3 — rests on a
+configuration that has moved 48 % between sittings on this host, and its
+multiplier should be read as "roughly five to nine times" rather than any
+particular number. `/home` is a shared LVM volume whose other traffic is neither
+controlled nor visible in a CPU load average.
 
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
@@ -276,9 +327,14 @@ The same sweep on the file backend over DAX gives 927.2, 926.9, 926.4 and
 1,148.7 and 1,147.5 µs in the high mode — **under 0.25 % variation across a 56×
 change in transaction size, within either mode.** One `fdatasync` is one
 whole-file syscall, and it costs the same whether the transaction dirtied
-32 bytes or 1,792. Block storage is flat too: 133.8, 133.7, 133.9 and 130.8 µs.
+32 bytes or 1,792.
 
-Both boundary primitives are therefore flat in transaction size. The only thing
+Block storage was flat in the first two campaigns (133.8, 133.7, 133.9,
+130.8 µs) but *not* in the later pinned pair, where it falls monotonically from
+196 µs to 165 µs. Flatness is established for the DAX configurations and
+unsettled for block storage; see the reproducibility note above.
+
+Both boundary primitives are therefore flat in transaction size on DAX. The only thing
 that scales is PMEM's `CLWB` loop, and that is enough to move the ratio by a
 factor of twenty:
 
@@ -329,12 +385,14 @@ one medium is not wrong on the other, merely pointless.
 - **`fdatasync` on DAX has two costs**, socket-local and cross-socket, differing
   by 23.9 %. Unpinned runs draw one at random. Every figure for configuration 2
   on this page is the socket-local one unless stated.
-- **One absolute figure has not reproduced at all**: `file-block` measured
-  148 µs by hand and 133 µs in both scripted campaigns, unexplained.
-- What *has* reproduced, across all 72 runs in `results/`: exactly 1.000
-  boundaries per commit, `SFENCE` at 11–13 ns, both boundary primitives flat in
-  transaction size, `CLWB` linear at 72.0–73.5 cycles per line, and
-  `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size.
+- **The block-media configuration has not reproduced**: 27–48 % spread across
+  campaigns, and its shape in transaction size changed between sittings. Any
+  comparison involving it is order-of-magnitude at best.
+- What *has* reproduced, across all 144 runs in `results/`: exactly 1.000
+  boundaries per commit, `SFENCE` at 11–13 ns, the DAX boundary primitives flat
+  in transaction size, `CLWB` linear at 72.0–73.5 cycles per line,
+  `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size, and the
+  socket-local `fdatasync`-on-DAX figure to within 0.2 % once pinned.
 - Treat the ratios as orders of magnitude and the absolute latencies as
   properties of this host's storage stack on the day.
 - The **mechanism** behind configuration 2's slowness is not established, only

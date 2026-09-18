@@ -132,7 +132,15 @@ Two findings that arrived unplanned and are better material than the headline:
   does not**, and a unified interface cannot expose a knob it has no concept of.
   The PMEM backend is immune because nothing on its path blocks on media
   latency, so the same hardware penalty is invisible through one backend and
-  24 % through the other.
+  24 % through the other. Confirmed as a full factorial: the penalty is constant
+  at +23.6–24.0 % across every transaction size, `pmem-dax` is 0.0 % and
+  `file-block` 0.1–0.7 %.
+- **The block-media comparison is not a controlled measurement on this host**
+  and Chapter 6 must say so. `file-block` moved 27–48 % between sittings and
+  changed shape in transaction size; the two DAX configurations reproduce to
+  0.1 % once pinned. The headline result rests on the two reproducible
+  configurations, which is worth stating explicitly rather than leaving an
+  examiner to notice that one column is shakier than the others.
 
   Worth narrating honestly in Chapter 6, because the route to it is the
   methodological lesson: four tightly-agreeing runs read as "robust to three
