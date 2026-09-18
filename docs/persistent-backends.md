@@ -24,6 +24,97 @@ All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live u
 
 ---
 
+## Persistence-boundary cost (measured 2026-09-18, Magpie)
+
+Phase B's design note justified its per-commit data flush as "cheap fences —
+acceptable". Measured, on one host, one sample per configuration.
+
+Three configurations, so the boundary primitive and the media are separable.
+`pwbench` drives 20,000 commits of 8 aligned `u64` redo entries each through the
+production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
+
+| # | Backend | Media | Boundary | Median boundary | Per commit | Boundary share |
+|---|---|---|---|---|---|---|
+| 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.1 µs | 3.4 % |
+| 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 µs** | 937.6 µs | 98.8 % |
+| 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **148 µs** | 206.3 µs | 80.5 % |
+
+All three measured **exactly 1.000 persistence boundaries per commit**, which is
+phase B's steady-state claim confirmed on hardware in three configurations
+rather than on a counting stub.
+
+### The fences are cheap; they are also not where the cost is
+
+An `SFENCE` costs 11 ns, so the design note's claim holds. But on PMEM the
+boundary's *prepare* side — the `CLWB` loop, 14 cache lines per commit — costs
+20.4 M cycles against the fence's 0.53 M, **39× more**. The expensive half of a
+PMEM boundary is the cache-line writeback, not the fence. The note is correct
+and argues for the wrong reason.
+
+### Isolating the two variables
+
+- **Primitive, media held constant (1 vs 2).** A whole PMEM boundary averages
+  455 ns per commit; `fdatasync` on the *same DAX filesystem* costs 927 µs.
+  **≈ 2,000×.** This is the cleanest statement of what the unified interface
+  hides: identical media, identical workload, identical geometry, one interface,
+  three orders of magnitude.
+- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **6.3×
+  slower** than on ordinary block storage — 927 µs against 148 µs. This is the
+  opposite of the expected direction and is discussed below.
+- **Deployment (1 vs 3).** 455 ns against 148 µs, ≈ 326×.
+
+### The file backend on DAX is the worst of both worlds
+
+The surprise is configuration 2. Putting the file backend on DAX media is
+*slower* than putting it on a spinning-or-flash block device, by 6.3×, while
+also forgoing the `SFENCE` path entirely — so it pays a worse boundary than
+block storage and gets none of the benefit of the medium it is sitting on. The
+plausible mechanism is that `fdatasync` on a DAX mapping must walk and write
+back the dirty range itself rather than handing pages to an optimised page-cache
+writeback path, but this measurement does not establish the mechanism and no
+claim about it should be made without one.
+
+The consequence for the design is the important part: **the abstraction must not
+be allowed to hide which medium is underneath.** A caller who unified on the
+file backend "because it works everywhere" and deployed it on PMEM would land in
+configuration 2 and be 71× slower per commit than configuration 1, on the same
+hardware, with no error and no warning. That is the cost of unification stated
+as a number.
+
+### What phase B's boundary reduction is worth, per medium
+
+Phase B exists to reduce boundaries per commit. Its value is entirely
+medium-dependent:
+
+- On a file, the boundary is 80–99 % of commit cost, so removing one is nearly
+  a halving.
+- On PMEM, the boundary is 3.4 % of commit cost, so removing one is noise.
+
+On PMEM the remaining 96.6 % is WAL record construction — `zeroBytes` and
+`computeRecordChecksum` walk the record a byte at a time
+(`X86_64DualTxnWal.v3:212,239`). At 13.1 µs per commit against 0.46 µs of
+boundary, **record construction outweighs the entire durability boundary by
+28×**. Optimising the boundary further on PMEM would be effort spent on 3 % of
+the cost; the byte-at-a-time loops are where the time goes. That is a
+consequence of the measurement, not a planned change.
+
+### Limits of these numbers
+
+- **One sample per configuration.** Magpie is shared and carries concurrent work
+  from other users. The block-storage tail shows it: p99/median is 4.6× and the
+  maximum is 16.5 ms, against 1.02× and 1.05× for the two DAX configurations.
+  The medians are stable enough to carry the order-of-magnitude claims above;
+  the 6.3× DAX-versus-block result is the one that most needs a repeat, being
+  both counterintuitive and a single observation.
+- **One transaction size** (8 entries). `fdatasync` cost should scale with dirty
+  data while `SFENCE` does not, so the *shapes* are not yet measured — only one
+  point on each curve.
+- Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
+  `CLOCK_MONOTONIC` (2294 cycles/µs here). There is no invariant-TSC check in
+  the tree, so that conversion is an assumption, stated rather than hidden.
+- The absolute `fdatasync` figures are properties of this host's storage stack,
+  not of the design. The ratios are the portable result.
+
 ## Layer 1 — Storage Abstraction
 
 **Files:** `src/engine/TxnBackend.v3`, `src/engine/x86-64/X86_64TxnBackend.v3`

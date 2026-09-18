@@ -98,13 +98,29 @@ less precisely specifiable side.
 ### Boundary cost
 
 Phase B of `DualTxnWal` exists to reduce the protocol to one persistence
-boundary per commit in steady state. On PMEM that saves an `SFENCE`; on a file
-it saves an `fdatasync`. The same design decision is near-free on one medium
-and decisive on the other, which means the WAL's central optimisation has a
-completely different justification per backend. The design note currently
-calls the per-commit data flush "cheap fences — acceptable", which is an
-assertion with no measurement behind it. The cost characterisation below
-supplies the number.
+boundary per commit in steady state. **Measured on Magpie, 2026-09-18**, the
+same design decision is worth 80–99 % of a commit on a file and 3.4 % on PMEM —
+the WAL's central optimisation has a completely different value per backend, and
+now a number rather than an assertion.
+
+The headline for this chapter: on *identical* DAX media, with identical workload
+and geometry, the two boundary primitives differ by **≈2,000×** (455 ns against
+927 µs per commit). One interface, three orders of magnitude underneath it.
+
+Two findings that arrived unplanned and are better material than the headline:
+
+- **The file backend on DAX is the worst of both worlds** — 6.3× slower than the
+  same backend on block storage, while also forgoing the `SFENCE` path. A caller
+  who unified on the file backend "because it works everywhere" and deployed on
+  PMEM pays 71× per commit, silently. This is the clearest possible statement
+  that the abstraction must not hide the medium.
+- **On PMEM the boundary is not the cost.** Byte-at-a-time `zeroBytes` and
+  `computeRecordChecksum` outweigh the entire durability boundary by 28×, so the
+  protocol-level optimisation the WAL is built around is, on that medium,
+  optimising 3 % of the problem.
+
+Full numbers, the isolation of primitive from media, and the stated limits are
+in [persistent-backends.md](persistent-backends.md).
 
 ### Verifiability
 
@@ -166,7 +182,7 @@ cannot be written around missing numbers.
 | Item | Estimate | Why it survives triage |
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
-| Persistence-boundary cost characterisation | ~1 day | The only quantitative evidence for Chapter 4. Replaces an assertion with a number. |
+| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete.** ≈2,000× between the two boundary primitives on identical media; 1.000 boundaries per commit in all three configurations. Two unplanned findings: the file backend on DAX is the worst of both worlds, and on PMEM record construction outweighs the boundary by 28×. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |
 
@@ -313,8 +329,11 @@ Seven, and they need real hours budgeted.
    signature figure of the thesis.
 5. The reduction — fence-forced floor plus per-line prefix product, against
    full branching search.
-6. Boundary cost — `SFENCE`-bounded against `fdatasync`-bounded commit, at
-   identical workload and geometry.
+6. Boundary cost — three configurations, separating the boundary primitive from
+   the media. **Data in hand (2026-09-18):** `SFENCE` 11 ns, `fdatasync` on the
+   same DAX media 927 µs, `fdatasync` on block storage 148 µs. Plot on a log
+   axis; a linear one cannot show 2,000× and 6.3× on the same figure. If the
+   transaction-size sweep is run, prefer cost against size with three series.
 7. **Negative control, 2×2** — {ordinary build, elided-writeback mutant} ×
    {Magpie crash loop, layer-1b explorer}. **Data in hand as of 2026-09-18:**
    the mutant reports `OK` on Magpie with a durable answer bit-identical to the
