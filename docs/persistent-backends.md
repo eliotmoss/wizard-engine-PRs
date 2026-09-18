@@ -98,6 +98,28 @@ boundary, **record construction outweighs the entire durability boundary by
 the cost; the byte-at-a-time loops are where the time goes. That is a
 consequence of the measurement, not a planned change.
 
+### Reproducing these numbers
+
+`scripts/pmem-experiments.sh` runs the whole campaign and records what is needed
+to attribute the result:
+
+```
+scripts/pmem-experiments.sh doctor   # what this host can run, and why not
+scripts/pmem-experiments.sh cost     # the three configurations, swept and repeated
+scripts/pmem-experiments.sh control  # the flush-placement negative control
+```
+
+Each invocation writes a self-contained directory under `results/` holding the
+raw log of every run, a machine-readable `cost.csv`, and a provenance file with
+the commit, host, CPU, mount options and load average. It refuses to start from
+a dirty working tree, because a number that cannot be attributed to a revision
+is not evidence. It skips the block-media configuration, loudly, when that
+directory turns out to be on a network filesystem. Repetitions are interleaved
+by construction rather than by the operator remembering to interleave them.
+
+The defaults reproduce the tables below: `PWEXP_REPS=3`,
+`PWEXP_SIZES="1 8 32 56"`, 20,000 commits after 2,000 warm-up commits.
+
 ### Repeats: the medians are reproducible, including the surprise
 
 Four interleaved runs of each configuration, so a transient load spike lands on

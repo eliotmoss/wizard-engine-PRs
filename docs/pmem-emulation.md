@@ -433,6 +433,11 @@ than argued: **flush placement on this branch is verified by the model alone,
 and no hardware run available to this project can corroborate it.** That is the
 precise gap Stage 3 would close and Stage 2c narrows.
 
+Both halves run from one command, `scripts/pmem-experiments.sh control`, which
+also prints the 2×2 and states in the output which cell would falsify the
+layering claim. See the reproduction note in
+[Persistent Backends](persistent-backends.md).
+
 The mutant is deliberately vacuous on the file backend: `FileMmapRegion` never
 calls `clwb()` at all, since its persist path is `msync`/`fdatasync`. A
 file-backed mutant run therefore exercises the wiring and nothing else, and must
