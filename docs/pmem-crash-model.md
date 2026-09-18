@@ -720,6 +720,46 @@ the same provider. Mounting an image for recovery can still use an ordinary
 byte-array region, since the simulator, not the backend, decides which bytes
 survived.
 
+### The file-backed model is simpler, but not trivial
+
+This document models PMEM. The same seam also carries `FileMmapRegion`, whose
+`prepareChangedRange` / `persistChanges` become `msync` on a page-aligned range
+or `fdatasync` on the whole file, so the question of what a crash can leave
+behind has a second answer that the thesis has to state.
+
+It is tempting to claim the file backend admits only two images at any cut —
+the state before the boundary and the state after it. **That is wrong.** The
+kernel may write back any subset of dirty pages at any time, so a cut taken
+before a boundary fans out for exactly the reason background cache-line
+eviction makes a PMEM cut fan out. Nothing about a file makes the pre-boundary
+state singular.
+
+What genuinely differs:
+
+| Dimension | PMEM (this document) | File-backed |
+|---|---|---|
+| Flush | `CLWB` is a request; completion may land at many later points and is forced by `SFENCE` | `msync` / `fdatasync` are synchronous — on return the range or file is durable |
+| Outstanding state | The explorer must track requested-but-incomplete writebacks | None; a crash cut falls either before or after the call |
+| Unit | 64-byte cache line | 4 KiB page |
+| Scalar atomicity | Naturally aligned 1/2/4/8-byte stores are failure-atomic, and the recorder rejects traces that violate it | Writeback to a block device tears at sector granularity, and what survives beneath a journaling filesystem is filesystem-specific |
+| Discriminating crash | Host power loss or system reset | Host power loss or kernel panic; the page cache is kernel-side, so process termination loses nothing |
+
+The practical consequences are that one whole dimension of the state space —
+asynchronous flush completion — disappears, and that the per-unit prefix
+product that dominates the PMEM search shrinks sharply, since a 2 KiB WAL
+record spans one page but thirty-two cache lines.
+
+Two things get *worse* rather than better. The atomicity contract is weaker and
+cannot be stated without naming the filesystem, so the file-backed model has no
+equivalent of the crisp baseline above. And because neither backend loses
+anything on process termination, the `SIGKILL` evidence is process-crash
+consistency on both, and neither hardware crash loop discriminates flush
+placement — which is the reason the correctness evidence rests on this model
+and on the flush-placement negative control.
+
+Implementing a file-backed explorer is not currently planned. Stating the model
+is what the thesis requires; see [Honours Thesis](THESIS.md).
+
 ### Scale
 
 A recorded split allocation is roughly 700 events across 15 cache lines: the
