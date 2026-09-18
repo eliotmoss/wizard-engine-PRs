@@ -165,7 +165,7 @@ cannot be written around missing numbers.
 
 | Item | Estimate | Why it survives triage |
 |---|---|---|
-| Flush-placement negative control | ~1 day | Highest value in the backlog. Hardware crash loop still passes while the explorer emits a counterexample; that 2×2 *is* the thesis spine, demonstrated rather than argued. Produces the signature figure. **Model half done 2026-09-18** (`persistent_control:`, 4 tests); the Magpie row remains. |
+| ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
 | Persistence-boundary cost characterisation | ~1 day | The only quantitative evidence for Chapter 4. Replaces an assertion with a number. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |
@@ -316,10 +316,14 @@ Seven, and they need real hours budgeted.
 6. Boundary cost — `SFENCE`-bounded against `fdatasync`-bounded commit, at
    identical workload and geometry.
 7. **Negative control, 2×2** — {ordinary build, elided-writeback mutant} ×
-   {Magpie crash loop, layer-1b explorer}.
+   {Magpie crash loop, layer-1b explorer}. **Data in hand as of 2026-09-18:**
+   the mutant reports `OK` on Magpie with a durable answer bit-identical to the
+   ordinary run, and is rejected by the explorer at event 710 of 1401 with
+   `free block is on the wrong list (block 4)`. Draw the cells with those
+   numbers, not with ticks and crosses — the identical prime count is the part
+   that makes the top row persuasive.
 
-Figure 7 is the whole argument in one picture, and it exists only if the
-negative control runs in week 1.
+Figure 7 is the whole argument in one picture.
 
 ---
 

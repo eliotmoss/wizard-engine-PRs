@@ -390,7 +390,12 @@ leave the log's intact.
 |  | Magpie crash loop (layer 3) | Explorer sweep (layer 1b) |
 |---|---|---|
 | Ordinary build | `OK` (2026-09-01) | property holds |
-| Elided-writeback mutant | **not yet run** | **counterexample** |
+| Elided-writeback mutant | **`OK` (2026-09-18)** | **counterexample** |
+
+Both rows of the hardware column reach the *same durable answer*: 376,256 primes
+below 5,429,504, bit-identical to the ordinary run and to the file backend at the
+same geometry. The two builds are indistinguishable at layer 3 and separated at
+layer 1b, which is the claim this document used to assert and now measures.
 
 **Model half — done.** The four `persistent_control:` unit tests record the same
 sieve `step()` as `persistent_sieve:step_images_satisfy_sieve` and sweep it with
@@ -404,13 +409,29 @@ same scenario. So the model is sensitive to flush placement, and sensitive
 enough that the structural check alone catches it without the workload's
 cross-object invariants being reached.
 
-**Hardware half — outstanding.** `make pwsieve-pmem-mutant` runs the identical
-crash loop with `elide-clwb` appended, gated on `PWASM_PMEM_TEST_DIR` exactly as
-`pwsieve-pmem` is. Until that has run on Magpie, the prediction in the top of
-this section is still a prediction. A mutant run that *failed* there would be
-the more interesting result: it would mean the hardware test is more sensitive
-than this document claims, and the surrounding argument would need rewriting
-rather than confirming.
+**Hardware half — done (2026-09-18), and the prediction held.**
+`PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pwsieve-pmem-mutant` ran the
+identical crash loop with `elide-clwb` appended, at the same 512 x 4096 = 2 MiB
+geometry and the same seed. The banner confirmed the mutation and the mount's
+provider assertion passed, so this was genuinely the mutant on genuine DAX. It
+reported `OK`: 11 iterations before the 167-segment descriptor table filled,
+every restart reporting `REPLAYED`, three leaked extents reclaimed, and the
+reference check passing at 376,256 primes below 5,429,504.
+
+The iteration count differs from the ordinary run's 13 (11 advanced, one child
+finishing before its kill landed) because the kill delay is a wall-clock
+interval and the child's progress inside it varies with machine load. The
+schedules therefore differed while the durable answer did not, which is the
+stronger form of the result: *different* crash schedules, same correct output,
+with every cache-line writeback removed.
+
+A mutant run that *failed* here would have been the more interesting outcome —
+it would have meant the hardware test is more sensitive than this document
+claims, and the surrounding argument would have needed rewriting rather than
+confirming. It did not fail, so the layering claim stands as measured rather
+than argued: **flush placement on this branch is verified by the model alone,
+and no hardware run available to this project can corroborate it.** That is the
+precise gap Stage 3 would close and Stage 2c narrows.
 
 The mutant is deliberately vacuous on the file backend: `FileMmapRegion` never
 calls `clwb()` at all, since its persist path is `msync`/`fdatasync`. A
