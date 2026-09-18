@@ -98,20 +98,87 @@ boundary, **record construction outweighs the entire durability boundary by
 the cost; the byte-at-a-time loops are where the time goes. That is a
 consequence of the measurement, not a planned change.
 
+### Repeats: the medians are reproducible, including the surprise
+
+Four interleaved runs of each configuration, so a transient load spike lands on
+one sample of each rather than all samples of one.
+
+| Configuration | Median boundary, four runs | Spread |
+|---|---|---|
+| 1 — `SFENCE` on DAX | 11, 11, 11, 11 ns | none at this resolution |
+| 2 — `fdatasync` on DAX | 926.6, 928.0, 929.1, 929.2 µs | 0.3 % |
+| 3 — `fdatasync` on block | 148.2, 148.0, 148.2, 148.0 µs | 0.2 % |
+
+**The 6.3× DAX-versus-block result is robust**, not an artefact of a single
+observation: the ratio lands between 6.25× and 6.28× on every pairing. It was
+the finding most in need of a repeat and it survived one.
+
+Only the *tail* is unstable, and only on block storage: p99/median is ~4.6× with
+maxima of 0.8, 16.5, 21.1 and 22.6 ms across the four runs, against 1.02× on
+DAX. Shared-host device queueing is visible in the tail and absent from the
+median, which is the expected shape and the reason order statistics were used
+rather than a mean.
+
+### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
+
+20,000 commits at each size, PMEM backend.
+
+| Entries | `CLWB` lines/commit | `SFENCE` median | Prepare cycles/line | Whole boundary/commit | Boundary share |
+|---|---|---|---|---|---|
+| 1 | 4 | 11 ns | 72.2 | 139 ns | 3.1 % |
+| 8 | 14 | 11 ns | 72.8 | 455 ns | 3.4 % |
+| 32 | 50 | 11 ns | 73.1 | 1,604 ns | 3.2 % |
+| 56 | 86 | 11 ns | 72.6 | 2,734 ns | 3.3 % |
+
+Two clean results:
+
+- **`SFENCE` is flat.** 11 ns at every transaction size from 1 to 56 entries,
+  4 to 86 dirty cache lines. Total fence cycles stay within 523 k–607 k across
+  an 86× change in record size. A fence costs what it costs regardless of how
+  much it is fencing.
+- **`CLWB` is linear**, at **72.2–73.1 cycles (~31.7 ns) per cache line** across
+  a 21× range in line count. The whole PMEM boundary therefore scales with the
+  record, and it scales entirely through its prepare side.
+
+The line count is exactly predictable. A record is a 64-byte header, a 48-byte
+trailer and one 32-byte `LogEntry` per buffered write, aligned up to 64, and
+each after-image is prepared separately, so
+
+```
+lines/commit = ceil((112 + 32n) / 64) + n
+```
+
+which gives 4, 14, 50 and 86 at n = 1, 8, 32, 56 — matching every measured
+value.
+
+Boundary share stays near 3.3 % at every size, because record construction
+scales with record length for the same reason the `CLWB` loop does.
+
+### What this does to the headline ratio
+
+The 2,000× advantage is a property of small transactions, not a constant. The
+PMEM boundary grows from 139 ns to 2,734 ns across the sweep while a single
+`fdatasync` is one whole-file syscall whose cost does not obviously depend on
+how many bytes the transaction dirtied. Taking config 2's 927 µs as flat, the
+advantage would narrow from ~6,700× at one entry to ~340× at fifty-six.
+
+**This is not yet measured.** The sweep was run on PMEM only, so the file
+backend's curve is assumed flat rather than shown flat. If it is flat, the
+practical consequence is sharp — batching more work into one transaction is
+nearly free on a file and directly costly on PMEM, so the optimal transaction
+size runs in opposite directions on the two media under one interface. That
+claim needs the file-backend sweep before it is made.
+
 ### Limits of these numbers
 
-- **One sample per configuration.** Magpie is shared and carries concurrent work
-  from other users. The block-storage tail shows it: p99/median is 4.6× and the
-  maximum is 16.5 ms, against 1.02× and 1.05× for the two DAX configurations.
-  The medians are stable enough to carry the order-of-magnitude claims above;
-  the 6.3× DAX-versus-block result is the one that most needs a repeat, being
-  both counterintuitive and a single observation.
-- **One transaction size** (8 entries). `fdatasync` cost should scale with dirty
-  data while `SFENCE` does not, so the *shapes* are not yet measured — only one
-  point on each curve.
+- **One transaction size measured on the file backends** (8 entries). The PMEM
+  curve is characterised; the file curve is one point.
+- The **mechanism** behind configuration 2's slowness is not established, only
+  its magnitude and its reproducibility.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
-  `CLOCK_MONOTONIC` (2294 cycles/µs here). There is no invariant-TSC check in
-  the tree, so that conversion is an assumption, stated rather than hidden.
+  `CLOCK_MONOTONIC` (2294 cycles/µs on every run here). There is no invariant-TSC
+  check in the tree, so that conversion is an assumption, stated rather than
+  hidden.
 - The absolute `fdatasync` figures are properties of this host's storage stack,
   not of the design. The ratios are the portable result.
 

@@ -182,7 +182,7 @@ cannot be written around missing numbers.
 | Item | Estimate | Why it survives triage |
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
-| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete.** ≈2,000× between the two boundary primitives on identical media; 1.000 boundaries per commit in all three configurations. Two unplanned findings: the file backend on DAX is the worst of both worlds, and on PMEM record construction outweighs the boundary by 28×. |
+| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, with repeats.** ≈2,000× between the two boundary primitives on identical media; 1.000 boundaries per commit in all three configurations; medians reproducible within 0.3% over four interleaved runs. Three findings: the file backend on DAX is the worst of both worlds (6.3×, reproducible), on PMEM record construction outweighs the boundary by 28×, and `SFENCE` is flat in transaction size while `CLWB` is linear. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |
 
@@ -330,10 +330,16 @@ Seven, and they need real hours budgeted.
 5. The reduction — fence-forced floor plus per-line prefix product, against
    full branching search.
 6. Boundary cost — three configurations, separating the boundary primitive from
-   the media. **Data in hand (2026-09-18):** `SFENCE` 11 ns, `fdatasync` on the
-   same DAX media 927 µs, `fdatasync` on block storage 148 µs. Plot on a log
-   axis; a linear one cannot show 2,000× and 6.3× on the same figure. If the
-   transaction-size sweep is run, prefer cost against size with three series.
+   the media. **Data in hand (2026-09-18, four runs each):** `SFENCE` 11 ns,
+   `fdatasync` on the same DAX media 927 µs, `fdatasync` on block storage
+   148 µs. Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
+   same figure.
+6b. Boundary cost against transaction size, PMEM measured at 1/8/32/56 entries:
+   `SFENCE` flat at 11 ns, `CLWB` linear at ~31.7 ns per cache line. The two
+   lines crossing a flat `fdatasync` is the figure — it shows the optimal
+   transaction size running in opposite directions on the two media. **Needs the
+   file-backend sweep before it can be drawn**; without it the `fdatasync` line
+   is an assumption.
 7. **Negative control, 2×2** — {ordinary build, elided-writeback mutant} ×
    {Magpie crash loop, layer-1b explorer}. **Data in hand as of 2026-09-18:**
    the mutant reports `OK` on Magpie with a durable answer bit-identical to the
