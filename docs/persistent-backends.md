@@ -36,7 +36,7 @@ production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
 | # | Backend | Media | Boundary | Median boundary | Per commit | Boundary share |
 |---|---|---|---|---|---|---|
 | 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.7 µs | 3.3 % |
-| 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 or 1,147 µs** (bimodal) | 939–1,160 µs | 98.8 % |
+| 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 µs local / 1,147 µs cross-socket** | 939–1,160 µs | 98.8 % |
 | 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133 µs** | 188 µs | 70.9 % |
 
 Figures are medians over the 24 runs of each configuration in `results/`
@@ -62,9 +62,10 @@ fence. The note is correct and argues for the wrong reason.
   927 µs in its low mode. **≈ 2,000×.** This is the cleanest statement of what
   the unified interface hides: identical media, identical workload, identical
   geometry, one interface, three orders of magnitude.
-- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **7.0× or
-  8.6× slower** than on ordinary block storage, depending on which mode the DAX
-  run draws — 927 or 1,147 µs against 133 µs. This is the opposite of the
+- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **7.0×
+  slower** than on ordinary block storage when the process is on the socket
+  owning the namespace, and **8.6×** when it is not — 927 or 1,147 µs against
+  133 µs. This is the opposite of the
   expected direction and is discussed below.
 - **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
@@ -129,10 +130,10 @@ by construction rather than by the operator remembering to interleave them.
 The defaults reproduce the tables below: `PWEXP_REPS=3`,
 `PWEXP_SIZES="1 8 32 56"`, 20,000 commits after 2,000 warm-up commits.
 
-### Repeats: `fdatasync` on DAX is bimodal
+### Repeats: `fdatasync` on DAX is bimodal, and the cause is NUMA
 
 This is the most important methodological caveat on this page, and two earlier
-versions of it were wrong.
+versions of it were wrong before the mechanism was found.
 
 Within a single 20,000-commit run, the boundary cost is tight — a couple of
 percent from minimum to p99. Across runs, `fdatasync` on DAX is not noisy but
@@ -162,22 +163,54 @@ shared host. That is also wrong: the provenance files record a load average of
 `0.00 0.00 0.00` at the start of both campaigns, so the machine was idle, and
 the modes interleave *within* a campaign rather than separating between them.
 
-The mechanism is not established. A plausible candidate, and a cheap one to
-test, is the physical placement of the region file: each run creates a fresh
-2 MiB file, the namespace's alignment is 2 MiB (`ndctl` reports
-`"align":2097152`), and whether ext4 hands that file a 2 MiB-aligned extent
-determines whether DAX can map it with PMD entries instead of PTEs — which
-would plausibly produce exactly two discrete writeback costs rather than a
-spread. **This is a hypothesis.** It also turns the roadmap's
-"hardware-only backend facts (a): alignment" item from a box-ticking exercise
-into a test of something observed.
+### The mechanism is NUMA locality
+
+Pinning the process to each socket separates the modes completely.
+`ndctl` puts `region0` on NUMA node 0, and `/mnt/pmem0.0` is backed by `pmem0`:
+
+| `numactl --cpunodebind` | Runs (median boundary ns) | Median |
+|---|---|---|
+| **0** — local to `pmem0` | 927,371 / 927,082 / 927,443 | **927,371 ns** |
+| **1** — remote | 1,148,685 / 1,146,904 / 1,149,433 | **1,148,685 ns** |
+
+No overlap, and both pinned medians land within 0.1 % of the corresponding
+unpinned mode (927,254 and 1,147,424 ns). The unpinned runs were simply being
+scheduled onto one socket or the other, and the 12/12 split is the scheduler
+being indifferent.
+
+**Cross-socket access costs +23.9 % on the durability boundary.** The extent
+alignment hypothesis is excluded: it predicted a property of the file, and this
+is a property of where the process runs.
+
+The asymmetry between the backends is the interesting part. The PMEM backend
+showed no bimodality at all, and now it is clear why: nothing on its path blocks
+on media latency. `CLWB` is fire-and-forget, and an `SFENCE` at 11 ns plainly is
+not waiting for anything to reach ADR — the writebacks drain asynchronously
+inside the 13.7 µs the rest of the commit takes. `fdatasync` is the only
+operation here that synchronously waits for data to reach the medium, so it is
+the only one that pays the interconnect. The same hardware penalty is invisible
+through one backend and 24 % through the other.
+
+That is a third instance of this page's theme, and the sharpest one, because it
+is not about the interface at all: **CPU-to-media locality is a cost dimension
+that byte-addressable persistent memory has and a block device does not.**
+`/home` shows no such structure because its LVM volume is not socket-attached in
+the way a PMEM DIMM is. A unified interface cannot expose a knob it has no
+concept of.
+
+The practical consequence is concrete: a persistent-region allocator on PMEM
+should run on the socket that owns the namespace, and an engine that cannot
+guarantee that should at least report the mismatch. Neither `PWRegion` nor the
+backends currently have any notion of NUMA (out of scope here, and recorded as
+future work).
 
 `file-block` shows no such structure: 130,620–135,561 ns across all 24 runs,
 median 133,126 ns.
 
-So the DAX-versus-block factor is **7.0× or 8.6× depending on which mode the
-DAX run draws**, and the honest statement is "several times slower", not a
-three-significant-figure multiplier.
+So the DAX-versus-block factor is **7.0× socket-local and 8.6× cross-socket**.
+With the cause identified the figure is no longer a lottery, but it is still two
+numbers rather than one, and it is conditional on placement the allocator does
+not control.
 
 ### One figure that has not reproduced
 
@@ -283,8 +316,9 @@ one medium is not wrong on the other, merely pointless.
 
 ### Limits of these numbers
 
-- **`fdatasync` on DAX is bimodal** and the mode is drawn per run, so any
-  single absolute figure for configuration 2 is one of two answers.
+- **`fdatasync` on DAX has two costs**, socket-local and cross-socket, differing
+  by 23.9 %. Unpinned runs draw one at random. Every figure for configuration 2
+  on this page is the socket-local one unless stated.
 - **One absolute figure has not reproduced at all**: `file-block` measured
   148 µs by hand and 133 µs in both scripted campaigns, unexplained.
 - What *has* reproduced, across all 72 runs in `results/`: exactly 1.000

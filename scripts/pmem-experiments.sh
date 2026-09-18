@@ -32,10 +32,17 @@
 # of one. Load average is recorded beside every run so interference is auditable
 # after the fact.
 #
+# Placement. Cross-socket access to a PMEM namespace costs about 24% on the
+# fdatasync boundary, so by default the runs are pinned with numactl to the node
+# that owns the DAX namespace. Leaving this to the scheduler makes the results
+# bimodal -- which is how the effect was found. PWEXP_NUMA_NODE=none reverts to
+# unpinned, or set it to a node number to force one.
+#
 # Overrides: PWASM_PMEM_TEST_DIR (required for the DAX configs and the control),
 # PWEXP_BLOCK_DIR (default $HOME), PWEXP_REPS (3), PWEXP_SIZES ("1 8 32 56"),
 # PWEXP_COMMITS (20000), PWEXP_WARMUP (2000), PWEXP_OUT (results/<stamp>),
-# PWEXP_SIEVE_ARGS ("20 1 512 4096"), PWEXP_ALLOW_DIRTY (0).
+# PWEXP_SIEVE_ARGS ("20 1 512 4096"), PWEXP_ALLOW_DIRTY (0),
+# PWEXP_NUMA_NODE (auto).
 
 set -euo pipefail
 
@@ -83,11 +90,44 @@ source_of() {
     fi
 }
 
+# The NUMA node owning a DAX directory's namespace. Cross-socket access costs
+# about 24% on the fdatasync boundary (see docs/persistent-backends.md), so an
+# unpinned campaign silently randomises a large variable.
+numa_node_of() {
+    local src dev f
+    src=$(source_of "$1"); dev=${src##*/}
+    for f in "/sys/block/$dev/device/numa_node" "/sys/bus/nd/devices/region${dev#pmem}/numa_node"; do
+        if [ -r "$f" ]; then cat "$f"; return; fi
+    done
+    echo unknown
+}
+
 is_network_fs() {
     case "$1" in
         nfs|nfs3|nfs4|cifs|smb|smb3|smbfs|fuse.sshfs|9p|afs|glusterfs|ceph|lustre) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Resolve the pinning prefix. Default: pin to the node owning the DAX namespace,
+# so the measurement is controlled rather than left to the scheduler.
+# PWEXP_NUMA_NODE=none disables pinning; a number forces that node.
+PIN_CMD=()
+PIN_NODE=none
+resolve_pinning() {
+    local want=${PWEXP_NUMA_NODE:-auto} node
+    if [ "$want" = none ]; then PIN_NODE="disabled"; return; fi
+    if ! have numactl; then PIN_NODE="unavailable (no numactl)"; return; fi
+    if [ "$want" = auto ]; then
+        node=$(numa_node_of "${PWASM_PMEM_TEST_DIR:-/}")
+    else
+        node=$want
+    fi
+    case "$node" in
+        ''|*[!0-9]*) PIN_NODE="undetermined ($node)"; return ;;
+    esac
+    PIN_CMD=(numactl "--cpunodebind=$node" --)
+    PIN_NODE="$node"
 }
 
 # ------------------------------------------------------------------ provenance
@@ -119,6 +159,12 @@ write_provenance() {
             if have findmnt; then findmnt -no OPTIONS -T "$d" 2>/dev/null | sed 's/^/  options /' || true; fi
         done
         if have ndctl; then rule "ndctl"; ndctl list 2>/dev/null || true; fi
+        rule "numa"
+        printf 'pinned to node   %s\n' "$PIN_NODE"
+        if [ -n "${PWASM_PMEM_TEST_DIR:-}" ]; then
+            printf 'dax namespace on %s\n' "$(numa_node_of "$PWASM_PMEM_TEST_DIR")"
+        fi
+        if have numactl; then numactl --hardware 2>/dev/null | head -20 || true; fi
         rule "parameters"
         printf 'reps %s\nsizes %s\ncommits %s\nwarmup %s\n' "$REPS" "$SIZES" "$COMMITS" "$WARMUP"
     } > "$f"
@@ -179,7 +225,7 @@ run_cost_one() {
     local load; load=$(loadavg | cut -d' ' -f1)
 
     say "  $config entries=$entries rep=$rep"
-    if ! "$BENCH_BIN" "$dir" "$backend" "$COMMITS" "$entries" "$WARMUP" > "$log" 2>&1; then
+    if ! "${PIN_CMD[@]}" "$BENCH_BIN" "$dir" "$backend" "$COMMITS" "$entries" "$WARMUP" > "$log" 2>&1; then
         warn "    FAILED -- see $log"
         tail -3 "$log" >&2
         return 1
@@ -207,6 +253,8 @@ cost() {
     [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"
     [ -d "$PWASM_PMEM_TEST_DIR" ] || die "PWASM_PMEM_TEST_DIR is not a directory: $PWASM_PMEM_TEST_DIR"
     ensure_bin "$BENCH_BIN"
+    resolve_pinning
+    say "numa pinning: node $PIN_NODE"
     mkdir -p "$OUT"
     write_provenance
     csv_header
@@ -266,6 +314,7 @@ control() {
     [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"
     ensure_bin "$UNIT_BIN"
     ensure_bin "$SIEVE_BIN"
+    resolve_pinning
     mkdir -p "$OUT"
     [ -f "$OUT/provenance.txt" ] || write_provenance
 
@@ -337,6 +386,15 @@ doctor() {
         warn "  network filesystem -- file-block will be skipped, since fdatasync would measure the network"
     else
         say "  usable as the block-media configuration"
+    fi
+    rule "numa"
+    if have numactl; then
+        say "numactl present"
+        if [ -n "${PWASM_PMEM_TEST_DIR:-}" ]; then
+            say "dax namespace on node $(numa_node_of "$PWASM_PMEM_TEST_DIR")  (runs pin here by default)"
+        fi
+    else
+        warn "numactl absent -- runs cannot be pinned, and an unpinned campaign randomises a 24% variable"
     fi
     rule "load"
     say "$(loadavg)   (a shared host inflates the tail; medians survive, means do not)"

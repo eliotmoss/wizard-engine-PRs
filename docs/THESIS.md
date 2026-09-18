@@ -123,15 +123,23 @@ Two findings that arrived unplanned and are better material than the headline:
   scales, which moves the gap from ~6,700× at one entry to ~340× at fifty-six.
   Relatedly, batching is worth 54× on a file and 3× on PMEM — the same
   optimisation, one interface, an eighteen-fold difference in what it buys.
-- **`fdatasync` on DAX is bimodal**, 927 µs or 1,147 µs, drawn per run, 12 runs
-  each over 72. Two earlier readings of this were wrong — first "robust to three
-  significant figures" from four runs that drew the same mode, then a
-  between-session drift attributed to host load that the provenance files
-  disprove (load `0.00` at both starts). Worth a paragraph in Chapter 6 rather
-  than a footnote: it is a concrete instance of the thesis's own argument, since
-  a byte-addressable medium is behaving unlike the block device the file backend
-  was written for, and it is the kind of thing an examiner who has measured
-  storage will probe. Quote ratios as orders of magnitude, never to 3 s.f.
+- **Cross-socket access costs 23.9 % on the `fdatasync` boundary.** Unpinned
+  runs came out bimodal (927 µs / 1,147 µs, 12 each over 72); `numactl` pinning
+  separates the modes completely and identifies NUMA locality as the cause. This
+  earns a section, not a footnote. It is the sharpest instance of the thesis's
+  theme because it is not about the interface at all: **CPU-to-media locality is
+  a cost dimension byte-addressable persistent memory has and a block device
+  does not**, and a unified interface cannot expose a knob it has no concept of.
+  The PMEM backend is immune because nothing on its path blocks on media
+  latency, so the same hardware penalty is invisible through one backend and
+  24 % through the other.
+
+  Worth narrating honestly in Chapter 6, because the route to it is the
+  methodological lesson: four tightly-agreeing runs read as "robust to three
+  significant figures", then as a between-session drift blamed on host load,
+  which the provenance files disproved (load `0.00` at both campaign starts).
+  Only a pinning experiment settled it. Quote ratios as orders of magnitude,
+  never to 3 s.f.
 
 Full numbers, the isolation of primitive from media, and the stated limits are
 in [persistent-backends.md](persistent-backends.md).
