@@ -638,7 +638,11 @@ unverifiable claim about what a warm reset does.
 
 Prerequisite: root on a physical x86-64 Linux host that can be rebooted freely,
 which means a Linux installation on a machine outside the shared infrastructure.
-Tracked in `docs/ROADMAP.md`.
+**A suitable bare-metal host was confirmed available on 2026-09-18**, so this
+stage is in scope for the Honours thesis, timeboxed to the 2026-10-02 code
+freeze: if it is not producing a reading by then it is dropped, and the
+flush-placement negative control stands as the sole evidence for flush
+placement. Tracked in `docs/ROADMAP.md`; scope in [Honours Thesis](THESIS.md).
 
 ### Stage 3 — real PMEM durability
 
