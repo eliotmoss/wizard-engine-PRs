@@ -120,9 +120,15 @@ Two findings that arrived unplanned and are better material than the headline:
   optimising 3 % of the problem.
 - **The headline ratio is size-dependent and must never be quoted bare.** Both
   boundary primitives are flat in transaction size; only PMEM's `CLWB` loop
-  scales, which moves the gap from 6,675× at one entry to 340× at fifty-six.
+  scales, which moves the gap from ~6,700× at one entry to ~340× at fifty-six.
   Relatedly, batching is worth 54× on a file and 3× on PMEM — the same
   optimisation, one interface, an eighteen-fold difference in what it buys.
+- **Absolute latencies are session-dependent and the ratios are
+  order-of-magnitude.** Two campaigns an hour apart on the same host and commit
+  differ by 24 % on `fdatasync`-over-DAX. Within-session agreement of 0.3 % was
+  precision, not accuracy — worth one honest sentence in Chapter 6, because an
+  examiner who has measured storage will ask, and the caveat costs nothing while
+  the three-significant-figure version invites the question.
 
 Full numbers, the isolation of primitive from media, and the stated limits are
 in [persistent-backends.md](persistent-backends.md).
@@ -187,7 +193,7 @@ cannot be written around missing numbers.
 | Item | Estimate | Why it survives triage |
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
-| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, with repeats.** ≈2,000× between the two boundary primitives on identical media; 1.000 boundaries per commit in all three configurations; medians reproducible within 0.3% over four interleaved runs. Three findings: the file backend on DAX is the worst of both worlds (6.3×, reproducible), on PMEM record construction outweighs the boundary by 28×, and `SFENCE` is flat in transaction size while `CLWB` is linear. |
+| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, two campaigns.** ~3 orders of magnitude between the boundary primitives on identical media; 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is the worst of both worlds (6–9×), on PMEM record construction outweighs the boundary by 28×, `SFENCE` flat in transaction size while `CLWB` is linear — and absolute figures shift ~24% between sittings on a shared host, so quote ratios as orders of magnitude, never to 3 s.f. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |
 

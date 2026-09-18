@@ -120,26 +120,56 @@ by construction rather than by the operator remembering to interleave them.
 The defaults reproduce the tables below: `PWEXP_REPS=3`,
 `PWEXP_SIZES="1 8 32 56"`, 20,000 commits after 2,000 warm-up commits.
 
-### Repeats: the medians are reproducible, including the surprise
+### Repeats: reproducible within a session, and *not* between sessions
 
-Four interleaved runs of each configuration, so a transient load spike lands on
-one sample of each rather than all samples of one.
+This is the most important methodological caveat on this page, and it was only
+discovered by running the campaign a second time.
 
-| Configuration | Median boundary, four runs | Spread |
+Within one sitting, four interleaved runs of each configuration agree to a
+fraction of a percent:
+
+| Configuration | Median boundary, four runs, session A | Spread |
 |---|---|---|
 | 1 — `SFENCE` on DAX | 11, 11, 11, 11 ns | none at this resolution |
 | 2 — `fdatasync` on DAX | 926.6, 928.0, 929.1, 929.2 µs | 0.3 % |
 | 3 — `fdatasync` on block | 148.2, 148.0, 148.2, 148.0 µs | 0.2 % |
 
-**The 6.3× DAX-versus-block result is robust**, not an artefact of a single
-observation: the ratio lands between 6.25× and 6.28× on every pairing. It was
-the finding most in need of a repeat and it survived one.
+A second campaign on the same host and the same commit, run about an hour later
+through `scripts/pmem-experiments.sh` (three repetitions at each of four
+transaction sizes), is internally just as tight — and lands somewhere else:
 
-Only the *tail* is unstable, and only on block storage: p99/median is ~4.6× with
-maxima of 0.8, 16.5, 21.1 and 22.6 ms across the four runs, against 1.02× on
+| Configuration | Session A mean | Session B mean | Shift |
+|---|---|---|---|
+| 1 — `SFENCE` on DAX | 11 ns | 11–13 ns | none material |
+| 2 — `fdatasync` on DAX | 928.2 µs | 1,148.0 µs | **+23.7 %** |
+| 3 — `fdatasync` on block | 148.1 µs | 133.4 µs | **−9.9 %** |
+
+**Within-session agreement to 0.3 % was precision mistaken for accuracy.** The
+run-to-run spread inside a sitting measures how quiet the host was for those
+few minutes; it says nothing about how much the storage stack's behaviour moves
+between sittings on a machine carrying other users' work. An earlier version of
+this page reported "6.25×–6.28× on every pairing" and called the result robust
+to three significant figures. That was wrong, and the second campaign is what
+showed it.
+
+What actually survives both sessions:
+
+- `SFENCE` at ~11 ns, unmoved.
+- Both boundary primitives flat in transaction size.
+- Exactly 1.000 boundaries per commit.
+- `fdatasync` on DAX **several times slower** than on block storage — 6.3× in
+  session A, 8.6× in session B. The direction and the order of magnitude
+  reproduce; the multiplier does not.
+
+So the ratios on this page are order-of-magnitude claims and should be quoted
+that way. "Roughly three orders of magnitude between the boundary primitives"
+is supported. "2,040×" is not, beyond its own session.
+
+Only the *tail* was unstable within a session, and only on block storage:
+p99/median ~4.6× with maxima of 0.8, 16.5, 21.1 and 22.6 ms, against 1.02× on
 DAX. Shared-host device queueing is visible in the tail and absent from the
-median, which is the expected shape and the reason order statistics were used
-rather than a mean.
+median, which is why order statistics were used rather than a mean — but the
+between-session shift shows the median is not immune either.
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
 
@@ -196,7 +226,11 @@ factor of twenty:
 
 **The 2,000× headline is a property of eight-entry transactions, not of the
 media.** Quoting it without the transaction size overstates the gap by 6× at the
-large end and understates it by 3× at the small end.
+large end and understates it by 3× at the small end. The table above uses
+session A's `fdatasync` figures; session B's would put every entry roughly 24 %
+higher (2,523× at eight entries). Both are "about three orders of magnitude at
+small transaction sizes, closing to about two at the largest the WAL slot
+allows", and that is the claim worth making.
 
 ### What batching is worth, per medium
 
@@ -225,9 +259,12 @@ one medium is not wrong on the other, merely pointless.
 
 ### Limits of these numbers
 
-- The **block-storage** configuration was measured at one transaction size
-  (8 entries) and repeated four times; it was not swept. The size curves above
-  are PMEM and file-on-DAX only.
+- **Absolute figures are session-dependent** on this host; see the
+  between-session table above. Only the ratios, the flatness in transaction
+  size, and the 1.000 boundaries per commit have reproduced across sittings.
+- Session A measured **block storage at one transaction size** (8 entries).
+  Session B swept it, and found it flat like the others (133.8, 134.2, 134.0,
+  131.6 µs at 1, 8, 32, 56 entries).
 - The **mechanism** behind configuration 2's slowness is not established, only
   its magnitude and its reproducibility.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
