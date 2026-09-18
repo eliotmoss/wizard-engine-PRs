@@ -35,9 +35,13 @@ production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
 
 | # | Backend | Media | Boundary | Median boundary | Per commit | Boundary share |
 |---|---|---|---|---|---|---|
-| 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.1 µs | 3.4 % |
-| 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 µs** | 937.6 µs | 98.8 % |
-| 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **148 µs** | 206.3 µs | 80.5 % |
+| 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.7 µs | 3.3 % |
+| 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 or 1,147 µs** (bimodal) | 939–1,160 µs | 98.8 % |
+| 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133 µs** | 188 µs | 70.9 % |
+
+Figures are medians over the 24 runs of each configuration in `results/`
+(two campaigns × three repetitions × four transaction sizes), at 8 entries
+except where a size is named. Configuration 2 is bimodal; see below.
 
 All three measured **exactly 1.000 persistence boundaries per commit**, which is
 phase B's steady-state claim confirmed on hardware in three configurations
@@ -46,22 +50,23 @@ rather than on a counting stub.
 ### The fences are cheap; they are also not where the cost is
 
 An `SFENCE` costs 11 ns, so the design note's claim holds. But on PMEM the
-boundary's *prepare* side — the `CLWB` loop, 14 cache lines per commit — costs
-20.4 M cycles against the fence's 0.53 M, **39× more**. The expensive half of a
-PMEM boundary is the cache-line writeback, not the fence. The note is correct
-and argues for the wrong reason.
+boundary's *prepare* side — the `CLWB` loop, 14 cache lines per commit at eight
+entries — costs about 20.4 M cycles against the fence's 0.52 M, **39× more**.
+The expensive half of a PMEM boundary is the cache-line writeback, not the
+fence. The note is correct and argues for the wrong reason.
 
 ### Isolating the two variables
 
-- **Primitive, media held constant (1 vs 2).** A whole PMEM boundary averages
-  455 ns per commit; `fdatasync` on the *same DAX filesystem* costs 927 µs.
-  **≈ 2,000×.** This is the cleanest statement of what the unified interface
-  hides: identical media, identical workload, identical geometry, one interface,
-  three orders of magnitude.
-- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **6.3×
-  slower** than on ordinary block storage — 927 µs against 148 µs. This is the
-  opposite of the expected direction and is discussed below.
-- **Deployment (1 vs 3).** 455 ns against 148 µs, ≈ 326×.
+- **Primitive, media held constant (1 vs 2).** A whole PMEM boundary is 453 ns
+  per commit at eight entries; `fdatasync` on the *same DAX filesystem* costs
+  927 µs in its low mode. **≈ 2,000×.** This is the cleanest statement of what
+  the unified interface hides: identical media, identical workload, identical
+  geometry, one interface, three orders of magnitude.
+- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **7.0× or
+  8.6× slower** than on ordinary block storage, depending on which mode the DAX
+  run draws — 927 or 1,147 µs against 133 µs. This is the opposite of the
+  expected direction and is discussed below.
+- **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
 ### The file backend on DAX is the worst of both worlds
 
@@ -86,15 +91,19 @@ as a number.
 Phase B exists to reduce boundaries per commit. Its value is entirely
 medium-dependent:
 
-- On a file, the boundary is 80–99 % of commit cost, so removing one is nearly
-  a halving.
-- On PMEM, the boundary is 3.4 % of commit cost, so removing one is noise.
+- On a file over DAX, the boundary is 95–99 % of commit cost, so removing one is
+  nearly a halving.
+- On a file over block storage it is 52–86 %, falling as the transaction grows,
+  because the boundary is flat while record construction is not. An earlier
+  version of this page gave "80–99 % on a file" as one figure; that holds for
+  DAX and overstates the block case at every size above the smallest.
+- On PMEM, the boundary is ~3 % of commit cost, so removing one is noise.
 
-On PMEM the remaining 96.6 % is WAL record construction — `zeroBytes` and
+On PMEM the remaining ~97 % is WAL record construction — `zeroBytes` and
 `computeRecordChecksum` walk the record a byte at a time
-(`X86_64DualTxnWal.v3:212,239`). At 13.1 µs per commit against 0.46 µs of
+(`X86_64DualTxnWal.v3:212,239`). At 13.7 µs per commit against 0.45 µs of
 boundary, **record construction outweighs the entire durability boundary by
-28×**. Optimising the boundary further on PMEM would be effort spent on 3 % of
+29×**. Optimising the boundary further on PMEM would be effort spent on 3 % of
 the cost; the byte-at-a-time loops are where the time goes. That is a
 consequence of the measurement, not a planned change.
 
@@ -120,56 +129,67 @@ by construction rather than by the operator remembering to interleave them.
 The defaults reproduce the tables below: `PWEXP_REPS=3`,
 `PWEXP_SIZES="1 8 32 56"`, 20,000 commits after 2,000 warm-up commits.
 
-### Repeats: reproducible within a session, and *not* between sessions
+### Repeats: `fdatasync` on DAX is bimodal
 
-This is the most important methodological caveat on this page, and it was only
-discovered by running the campaign a second time.
+This is the most important methodological caveat on this page, and two earlier
+versions of it were wrong.
 
-Within one sitting, four interleaved runs of each configuration agree to a
-fraction of a percent:
+Within a single 20,000-commit run, the boundary cost is tight — a couple of
+percent from minimum to p99. Across runs, `fdatasync` on DAX is not noisy but
+**bimodal**: every run lands squarely in one of two modes and stays there.
 
-| Configuration | Median boundary, four runs, session A | Spread |
+| | Median | Runs |
 |---|---|---|
-| 1 — `SFENCE` on DAX | 11, 11, 11, 11 ns | none at this resolution |
-| 2 — `fdatasync` on DAX | 926.6, 928.0, 929.1, 929.2 µs | 0.3 % |
-| 3 — `fdatasync` on block | 148.2, 148.0, 148.2, 148.0 µs | 0.2 % |
+| low mode | 927,254 ns | 12 of 24 |
+| high mode | 1,147,424 ns | 12 of 24 |
 
-A second campaign on the same host and the same commit, run about an hour later
-through `scripts/pmem-experiments.sh` (three repetitions at each of four
-transaction sizes), is internally just as tight — and lands somewhere else:
+The ratio between the modes is 1.237, and the split is exactly even over the two
+scripted campaigns (`results/20260918T044131Z-magpie`,
+`results/20260918T045605Z-magpie`). The first campaign drew 10 low and 2 high;
+the second drew 2 low and 10 high. A representative run from each shows how
+little the mode moves within a run:
 
-| Configuration | Session A mean | Session B mean | Shift |
-|---|---|---|---|
-| 1 — `SFENCE` on DAX | 11 ns | 11–13 ns | none material |
-| 2 — `fdatasync` on DAX | 928.2 µs | 1,148.0 µs | **+23.7 %** |
-| 3 — `fdatasync` on block | 148.1 µs | 133.4 µs | **−9.9 %** |
+```
+low  (e1)   min   923,561   med   927,181   p90   928,265   p99   944,683
+high (e32)  min 1,140,702   med 1,143,660   p90 1,145,580   p99 1,153,374
+```
 
-**Within-session agreement to 0.3 % was precision mistaken for accuracy.** The
-run-to-run spread inside a sitting measures how quiet the host was for those
-few minutes; it says nothing about how much the storage stack's behaviour moves
-between sittings on a machine carrying other users' work. An earlier version of
-this page reported "6.25×–6.28× on every pairing" and called the result robust
-to three significant figures. That was wrong, and the second campaign is what
-showed it.
+**The earlier readings of this were both mistaken.** The first reported
+"6.25×–6.28× on every pairing" and called it robust — that was four runs that
+happened to draw the same mode, precision mistaken for accuracy. The second
+called the difference a between-session drift and attributed it to load on a
+shared host. That is also wrong: the provenance files record a load average of
+`0.00 0.00 0.00` at the start of both campaigns, so the machine was idle, and
+the modes interleave *within* a campaign rather than separating between them.
 
-What actually survives both sessions:
+The mechanism is not established. A plausible candidate, and a cheap one to
+test, is the physical placement of the region file: each run creates a fresh
+2 MiB file, the namespace's alignment is 2 MiB (`ndctl` reports
+`"align":2097152`), and whether ext4 hands that file a 2 MiB-aligned extent
+determines whether DAX can map it with PMD entries instead of PTEs — which
+would plausibly produce exactly two discrete writeback costs rather than a
+spread. **This is a hypothesis.** It also turns the roadmap's
+"hardware-only backend facts (a): alignment" item from a box-ticking exercise
+into a test of something observed.
 
-- `SFENCE` at ~11 ns, unmoved.
-- Both boundary primitives flat in transaction size.
-- Exactly 1.000 boundaries per commit.
-- `fdatasync` on DAX **several times slower** than on block storage — 6.3× in
-  session A, 8.6× in session B. The direction and the order of magnitude
-  reproduce; the multiplier does not.
+`file-block` shows no such structure: 130,620–135,561 ns across all 24 runs,
+median 133,126 ns.
 
-So the ratios on this page are order-of-magnitude claims and should be quoted
-that way. "Roughly three orders of magnitude between the boundary primitives"
-is supported. "2,040×" is not, beyond its own session.
+So the DAX-versus-block factor is **7.0× or 8.6× depending on which mode the
+DAX run draws**, and the honest statement is "several times slower", not a
+three-significant-figure multiplier.
 
-Only the *tail* was unstable within a session, and only on block storage:
-p99/median ~4.6× with maxima of 0.8, 16.5, 21.1 and 22.6 ms, against 1.02× on
-DAX. Shared-host device queueing is visible in the tail and absent from the
-median, which is why order statistics were used rather than a mean — but the
-between-session shift shows the median is not immune either.
+### One figure that has not reproduced
+
+The earlier hand-run measurements put `file-block` at 148.0–148.2 µs across four
+runs. Both scripted campaigns put it at 133.1 µs median, about 10 % lower, with
+no overlap. Same host, same commit, same parameters, same directory, and the
+machine idle in both cases.
+
+No explanation is offered here because none has been established. It is recorded
+because it bears directly on how much weight any single absolute latency on this
+page can carry: the answer is less than four tightly-agreeing runs suggest.
+
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
 
@@ -188,8 +208,8 @@ Two clean results:
   4 to 86 dirty cache lines. Total fence cycles stay within 523 k–607 k across
   an 86× change in record size. A fence costs what it costs regardless of how
   much it is fencing.
-- **`CLWB` is linear**, at **72.2–73.1 cycles (~31.7 ns) per cache line** across
-  a 21× range in line count. The whole PMEM boundary therefore scales with the
+- **`CLWB` is linear**, at **72.0–73.5 cycles (~31.6 ns) per cache line** across
+  a 21× range in line count and all 24 PMEM runs. The whole PMEM boundary therefore scales with the
   record, and it scales entirely through its prepare side.
 
 The line count is exactly predictable. A record is a 64-byte header, a 48-byte
@@ -200,37 +220,40 @@ each after-image is prepared separately, so
 lines/commit = ceil((112 + 32n) / 64) + n
 ```
 
-which gives 4, 14, 50 and 86 at n = 1, 8, 32, 56 — matching every measured
-value.
+which gives 4, 14, 50 and 86 at n = 1, 8, 32, 56 — matching every one of the 24
+PMEM runs exactly.
 
-Boundary share stays near 3.3 % at every size, because record construction
-scales with record length for the same reason the `CLWB` loop does.
+Boundary share stays between 2.9 % and 3.4 % at every size, because record
+construction scales with record length for the same reason the `CLWB` loop does.
 
 ### `fdatasync` is flat too, so the headline ratio is size-dependent
 
-The same sweep on the file backend over DAX gives 927.8, 928.1, 928.5 and
-929.4 µs at 1, 8, 32 and 56 entries — **0.17 % variation across a 56× change in
-transaction size.** One `fdatasync` is one whole-file syscall, and it costs the
-same whether the transaction dirtied 32 bytes or 1,792.
+The same sweep on the file backend over DAX gives 927.2, 926.9, 926.4 and
+927.5 µs at 1, 8, 32 and 56 entries in the low mode, and 1,147.7, 1,146.3,
+1,148.7 and 1,147.5 µs in the high mode — **under 0.25 % variation across a 56×
+change in transaction size, within either mode.** One `fdatasync` is one
+whole-file syscall, and it costs the same whether the transaction dirtied
+32 bytes or 1,792. Block storage is flat too: 133.8, 133.7, 133.9 and 130.8 µs.
 
 Both boundary primitives are therefore flat in transaction size. The only thing
 that scales is PMEM's `CLWB` loop, and that is enough to move the ratio by a
 factor of twenty:
 
-| Entries | PMEM boundary/commit | `fdatasync` on DAX | Ratio |
+| Entries | PMEM boundary/commit | `fdatasync` on DAX (low mode) | Ratio |
 |---|---|---|---|
-| 1 | 139 ns | 927.8 µs | 6,675× |
-| 8 | 455 ns | 928.1 µs | 2,040× |
-| 32 | 1,604 ns | 928.5 µs | 579× |
-| 56 | 2,734 ns | 929.4 µs | 340× |
+| 1 | 139 ns | 927.2 µs | 6,669× |
+| 8 | 453 ns | 926.9 µs | 2,048× |
+| 32 | 1,595 ns | 926.4 µs | 581× |
+| 56 | 2,731 ns | 927.5 µs | 340× |
+
+Against the high mode every ratio is 1.24× larger.
 
 **The 2,000× headline is a property of eight-entry transactions, not of the
 media.** Quoting it without the transaction size overstates the gap by 6× at the
-large end and understates it by 3× at the small end. The table above uses
-session A's `fdatasync` figures; session B's would put every entry roughly 24 %
-higher (2,523× at eight entries). Both are "about three orders of magnitude at
-small transaction sizes, closing to about two at the largest the WAL slot
-allows", and that is the claim worth making.
+large end and understates it by 3× at the small end. Combined with the
+bimodality, the defensible claim is "about three orders of magnitude at small
+transaction sizes, closing to about two at the largest the WAL slot allows" —
+not any single multiplier.
 
 ### What batching is worth, per medium
 
@@ -238,18 +261,19 @@ Because the boundary is flat and per-commit, amortising it over a larger
 transaction is the obvious optimisation. Its value is not remotely the same on
 the two media — whole-commit cost per entry:
 
-| Entries | PMEM | file on DAX |
-|---|---|---|
-| 1 | 4,425 ns | 934,212 ns |
-| 8 | 1,630 ns | 117,382 ns |
-| 32 | 1,541 ns | 29,936 ns |
-| 56 | 1,478 ns | 17,424 ns |
+| Entries | PMEM | file on DAX | file on block |
+|---|---|---|---|
+| 1 | 4,436 ns | 1,045,072 ns | 171,634 ns |
+| 8 | 1,710 ns | 130,872 ns | 23,528 ns |
+| 32 | 1,600 ns | 36,741 ns | 7,606 ns |
+| 56 | 1,553 ns | 17,393 ns | 4,890 ns |
 
-Batching 1 → 56 entries is worth **54× on a file and 3× on PMEM**, and on PMEM
-it has essentially plateaued by eight entries. The reason is structural: on a
-file the flat 927 µs boundary is ~95–99 % of the commit and divides down across
-entries, while on PMEM the boundary is 3 % and both it and record construction
-scale with the record, so there is little fixed cost left to amortise.
+Batching 1 → 56 entries is worth **60× on a file over DAX, 35× over block
+storage, and 2.9× on PMEM**, and on PMEM it has essentially plateaued by eight
+entries. The reason is structural: on a file the flat boundary is most of the
+commit and divides down across entries, while on PMEM the boundary is ~3 % and
+both it and record construction scale with the record, so there is little fixed
+cost left to amortise.
 
 An earlier note here speculated that the optimal transaction size would run in
 *opposite* directions on the two media. The measurement does not support that
@@ -259,12 +283,16 @@ one medium is not wrong on the other, merely pointless.
 
 ### Limits of these numbers
 
-- **Absolute figures are session-dependent** on this host; see the
-  between-session table above. Only the ratios, the flatness in transaction
-  size, and the 1.000 boundaries per commit have reproduced across sittings.
-- Session A measured **block storage at one transaction size** (8 entries).
-  Session B swept it, and found it flat like the others (133.8, 134.2, 134.0,
-  131.6 µs at 1, 8, 32, 56 entries).
+- **`fdatasync` on DAX is bimodal** and the mode is drawn per run, so any
+  single absolute figure for configuration 2 is one of two answers.
+- **One absolute figure has not reproduced at all**: `file-block` measured
+  148 µs by hand and 133 µs in both scripted campaigns, unexplained.
+- What *has* reproduced, across all 72 runs in `results/`: exactly 1.000
+  boundaries per commit, `SFENCE` at 11–13 ns, both boundary primitives flat in
+  transaction size, `CLWB` linear at 72.0–73.5 cycles per line, and
+  `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size.
+- Treat the ratios as orders of magnitude and the absolute latencies as
+  properties of this host's storage stack on the day.
 - The **mechanism** behind configuration 2's slowness is not established, only
   its magnitude and its reproducibility.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against

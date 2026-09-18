@@ -123,12 +123,15 @@ Two findings that arrived unplanned and are better material than the headline:
   scales, which moves the gap from ~6,700× at one entry to ~340× at fifty-six.
   Relatedly, batching is worth 54× on a file and 3× on PMEM — the same
   optimisation, one interface, an eighteen-fold difference in what it buys.
-- **Absolute latencies are session-dependent and the ratios are
-  order-of-magnitude.** Two campaigns an hour apart on the same host and commit
-  differ by 24 % on `fdatasync`-over-DAX. Within-session agreement of 0.3 % was
-  precision, not accuracy — worth one honest sentence in Chapter 6, because an
-  examiner who has measured storage will ask, and the caveat costs nothing while
-  the three-significant-figure version invites the question.
+- **`fdatasync` on DAX is bimodal**, 927 µs or 1,147 µs, drawn per run, 12 runs
+  each over 72. Two earlier readings of this were wrong — first "robust to three
+  significant figures" from four runs that drew the same mode, then a
+  between-session drift attributed to host load that the provenance files
+  disprove (load `0.00` at both starts). Worth a paragraph in Chapter 6 rather
+  than a footnote: it is a concrete instance of the thesis's own argument, since
+  a byte-addressable medium is behaving unlike the block device the file backend
+  was written for, and it is the kind of thing an examiner who has measured
+  storage will probe. Quote ratios as orders of magnitude, never to 3 s.f.
 
 Full numbers, the isolation of primitive from media, and the stated limits are
 in [persistent-backends.md](persistent-backends.md).
@@ -193,7 +196,7 @@ cannot be written around missing numbers.
 | Item | Estimate | Why it survives triage |
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
-| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, two campaigns.** ~3 orders of magnitude between the boundary primitives on identical media; 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is the worst of both worlds (6–9×), on PMEM record construction outweighs the boundary by 28×, `SFENCE` flat in transaction size while `CLWB` is linear — and absolute figures shift ~24% between sittings on a shared host, so quote ratios as orders of magnitude, never to 3 s.f. |
+| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is the worst of both worlds (7–8.6×), on PMEM record construction outweighs the boundary by 29×, `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |
 
