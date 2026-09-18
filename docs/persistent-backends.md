@@ -182,9 +182,19 @@ being indifferent.
 alignment hypothesis is excluded: it predicted a property of the file, and this
 is a property of where the process runs.
 
-The asymmetry between the backends is the interesting part. The PMEM backend
-showed no bimodality at all, and now it is clear why: nothing on its path blocks
-on media latency. `CLWB` is fire-and-forget, and an `SFENCE` at 11 ns plainly is
+The asymmetry between the backends is the interesting part, and it is measured
+rather than inferred. Pinning the *PMEM* backend the same way gives a median
+`SFENCE` of 11 ns on both nodes (minima 9 and 10 ns) — no node sensitivity at
+all. The `CLWB` loop agrees independently: 72.0–73.5 cycles per line across all
+24 unpinned PMEM runs, which spanned both sockets, with no bimodality anywhere
+in the range.
+
+| Backend | node 0 (local) | node 1 (remote) | Penalty |
+|---|---|---|---|
+| `pmem` (`CLWB` + `SFENCE`) | 11 ns | 11 ns | **none** |
+| `file` (`fdatasync`) | 927,371 ns | 1,148,685 ns | **+23.9 %** |
+
+Nothing on the PMEM path blocks on media latency. `CLWB` is fire-and-forget, and an `SFENCE` at 11 ns plainly is
 not waiting for anything to reach ADR — the writebacks drain asynchronously
 inside the 13.7 µs the rest of the commit takes. `fdatasync` is the only
 operation here that synchronously waits for data to reach the medium, so it is
