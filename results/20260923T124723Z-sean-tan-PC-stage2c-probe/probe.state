@@ -1,0 +1,7 @@
+probe_file /mnt/pmem0/stage2c/wizard-pwreboot-probe-u1000-p9680-0.region
+backend pmem
+bytes 2097152
+nonce 11662196942253974773
+flushed_lines 16384
+unflushed_lines 16384
+armed yes

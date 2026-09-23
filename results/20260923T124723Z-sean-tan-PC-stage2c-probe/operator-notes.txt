@@ -1,0 +1,23 @@
+Probe run 1 -- no verdict. Written by hand after the run; not verifier output.
+
+After the sysrq reset the DAX filesystem did not mount
+("EXT4-fs (pmem0): VFS: Can't find ext4 filesystem"), so verify stopped
+with "the probe file is gone" before probe-verify ran.
+
+A raw copy of /dev/pmem0, taken before anything else touched it
+(sudo dd, 1073741824 bytes), is all zero bytes: its SHA-256
+49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14
+is that of 1 GiB of zeros. The image was not kept.
+
+The firmware zeroed the range during POST. The kernel is built with
+CONFIG_RESET_ATTACK_MITIGATION=y, so it sets MemoryOverwriteRequestControl
+to 0x01 on every boot, and nothing on the sysrq path clears it; it read 01
+in the next boot, and the lock read 00. The value at the moment of the
+reset was not recorded. A clean sudo reboot four minutes before arming,
+into the boot the run was armed in, had kept the same filesystem
+(UUID 29823aa4-13e6-462e-a0d5-078d4f7c3fa6).
+
+Board: Gigabyte Z790 A PRO X WIFI7, BIOS F4.
+Reading: the reserved memory did not survive (INVALID class), so the run
+says nothing about the cache. See docs/stage2c-handoff.md,
+"The memory-overwrite request".
