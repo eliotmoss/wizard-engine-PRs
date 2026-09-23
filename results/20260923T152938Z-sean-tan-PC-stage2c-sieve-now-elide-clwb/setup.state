@@ -1,0 +1,7 @@
+region /mnt/pmem0/stage2c/wizard-pwreboot-u1000-p10780-0.region
+backend pmem
+blocks 512
+block_size 4096
+setup_steps 2
+setup_cursor 65024
+setup_count 6495

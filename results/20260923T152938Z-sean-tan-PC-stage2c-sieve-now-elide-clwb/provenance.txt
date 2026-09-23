@@ -1,0 +1,43 @@
+---- revision
+commit 59e92c17b83573aff0bf8803276c94b56f6bd5b8
+subject  results(pmem): Stage 2c sieve-now pair 2 on sean-tan-PC: verify log for elide-clwb
+dirty    no
+---- host
+hostname sean-tan-PC
+kernel   Linux 7.0.0-31-generic x86_64 GNU/Linux
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash memmap=1G!8G crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+virt     none
+boot_id  4a425907-2526-457f-9c7f-7a955ea75064
+armed    2026-09-23T15:29:38+00:00
+---- cpu
+CPU(s):                                  28
+Model name:                              Intel(R) Core(TM) i7-14700KF
+CPU(s) scaling MHz:                      18%
+L1d cache:                               768 KiB (20 instances)
+L1i cache:                               1 MiB (20 instances)
+L2 cache:                                28 MiB (11 instances)
+L3 cache:                                33 MiB (1 instance)
+clwb     yes
+---- media
+dax dir  /mnt/pmem0/stage2c
+  source /dev/pmem0
+  options rw,relatime,dax=always
+---- kernel settings
+kernel/sysrq                     176
+vm/dirty_writeback_centisecs     500
+vm/dirty_expire_centisecs        3000
+efi memory-overwrite request     00
+---- parameters
+backend pmem
+provider elide-clwb
+geometry 512x4096
+setup steps 2
+arm steps 3
+reset from inside arm, no window
+armed_unix 1790177378.173823859
+mor_at_arm 00
+---- verify
+verified 2026-09-23T15:31:04+00:00
+boot_id  01e87405-1603-4423-b440-8bb270f0e799
+rebooted yes
+booted_unix 1790177401
