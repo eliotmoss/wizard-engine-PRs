@@ -107,10 +107,16 @@ host_problems() {
     fi
 }
 
+# Whether the tracked files outside results/ match HEAD, staged or not.
+# Results waiting to be committed cannot change what runs, so they do not count.
+CODE_PATHS=(-- . ':(exclude)results')
+tree_clean() { git diff --quiet "${CODE_PATHS[@]}" && git diff --cached --quiet "${CODE_PATHS[@]}"; }
+
 require_clean_tree() {
     [ "${STAGE2C_ALLOW_DIRTY:-0}" = 1 ] && return 0
-    git diff --quiet && git diff --cached --quiet && return 0
-    die "working tree is dirty; commit first so the results name a revision, or set STAGE2C_ALLOW_DIRTY=1"
+    tree_clean && return 0
+    git status --short "${CODE_PATHS[@]}" >&2
+    die "working tree is dirty (above); commit first so the results name a revision, or set STAGE2C_ALLOW_DIRTY=1"
 }
 
 require_runnable() {
@@ -128,7 +134,12 @@ write_provenance() {
     {
         rule "revision"
         git log -1 --pretty='commit %H%nsubject  %s'
-        printf 'dirty    %s\n' "$(git diff --quiet && git diff --cached --quiet && echo no || echo YES)"
+        if tree_clean; then
+            printf 'dirty    no\n'
+        else
+            printf 'dirty    YES\n'
+            git status --short "${CODE_PATHS[@]}" | sed 's/^/  /'
+        fi
         rule "host"
         printf 'hostname %s\n' "$(hostname)"
         printf 'kernel   %s\n' "$(uname -srmo)"
@@ -375,7 +386,7 @@ verify() {
 doctor() {
     rule "revision"
     git log -1 --pretty='%h %s'
-    git diff --quiet && git diff --cached --quiet && say "tree clean" || warn "tree DIRTY"
+    if tree_clean; then say "tree clean"; else warn "tree DIRTY:"; git status --short "${CODE_PATHS[@]}" >&2; fi
     rule "host"
     printf 'kernel  %s\nvirt    %s\nwsl     %s\n' "$(uname -r)" "$(virt)" "$(is_wsl && echo yes || echo no)"
     printf 'cmdline %s\n' "$(cat /proc/cmdline)"
