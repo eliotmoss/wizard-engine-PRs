@@ -1,0 +1,6 @@
+raw image: 2097152 bytes, 7203 nonzero
+recovery: REPLAYED
+durable cursor 162560, primes 14891, leaked extents reclaimed 0
+setup cursor 65024, acknowledged cursor 162560, acknowledged primes 14891
+verdict SURVIVED
+reason all acknowledged steps are durable and every invariant holds
