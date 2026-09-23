@@ -158,11 +158,19 @@ Two findings that arrived unplanned and are better material than the headline:
   latency, so the same hardware penalty is invisible through one backend and
   24 % through the other. Confirmed as a full factorial: the penalty is constant
   at +23.6–24.0 % across every transaction size, `pmem-dax` is 0.0 % and
-  `file-block` 0.1–0.7 %.
+  `file-block` 0.1–0.7 %. **It is the same mechanism as the region-size
+  finding** (2026-09-23): at a 1 MiB region the absolute penalty falls from
+  ~220 µs to ~1 µs, in proportion to the lines flushed (~6.7 ns per line
+  cross-socket). Locality prices each line, and the 2 MiB entry decides how
+  many lines there are. Present the two findings together in Chapter 6.
 - **The block-media comparison is not a controlled measurement on this host**
   and Chapter 6 must say so. `file-block` moved 27–48 % between sittings and
   changed shape in transaction size; the two DAX configurations reproduce to
-  0.1 % once pinned. The headline result rests on the two reproducible
+  0.1 % once pinned. On 2026-09-23 the 2 MiB block figure switched regime
+  (196 → 170 µs falling, to 133 µs flat) within an hour, while a 1 MiB file
+  stayed within 1.5 % across three campaigns. That withdrew an apparent 8–14 %
+  geometry effect, whose sign reversed. The media *direction* at 1 MiB (DAX
+  31–33× faster) survives both regimes. The headline result rests on the two reproducible
   configurations, which is worth stating explicitly rather than leaving an
   examiner to notice that one column is shakier than the others.
 
