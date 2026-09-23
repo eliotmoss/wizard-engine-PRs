@@ -199,6 +199,14 @@ not a gap in the experiments — it is a property of the media, and it is the
 reason the correctness evidence has to come from the model. The
 flush-placement negative control makes this demonstrable rather than argued.
 
+A warm reset over reserved DRAM (Stage 2c) is the one hardware event available
+here that does discard the cache, and there the two builds separate: the
+mutant loses every acknowledged step and the ordinary build loses nothing,
+three times out of three. That corroborates the model on real cache loss, but
+at a single crash point per run, straight after the last acknowledgement. The
+claim that the placement is correct at *every* crash point still rests on the
+explorer alone.
+
 ---
 
 ## Chapter structure
@@ -246,7 +254,7 @@ cannot be written around missing numbers.
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
 | ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29×, `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
-| Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. **Probe readings 2026-09-24:** `NOT-SENSITIVE` with a seconds-long window before the reset, after the firmware's memory-overwrite wipe was found and cleared; **`SENSITIVE`** (95 % of unflushed lines lost) with the reset issued from inside the probe. The host can lose a cache line; the sieve pairs run with the same in-process reset. See `docs/stage2c-handoff.md`. |
+| ~~Stage 2c — reserved-DRAM warm reboot~~ | done 2026-09-24 | **Complete, the experiment discriminates.** Ordinary build `SURVIVED` and mutant `LOST` (every acknowledged step) in 3 of 3 pairs, with the reset issued from inside the process. On the way, two host facts that the write-up needs: the firmware wipes RAM after a `sysrq` reset unless the kernel's memory-overwrite request is cleared, and a seconds-long window before the reset lets every unflushed line reach memory. |
 
 ### Out of scope for the thesis
 
@@ -411,13 +419,17 @@ Seven, and they need real hours budgeted.
    2 MiB entry / proportional to mapping / fixed per call) overlaid. Log y-axis.
    The step at 2 MiB is the mechanism behind figure 6's DAX-versus-block
    direction.
-7. **Negative control, 2×2** — {ordinary build, elided-writeback mutant} ×
-   {Magpie crash loop, layer-1b explorer}. **Data in hand as of 2026-09-18:**
-   the mutant reports `OK` on Magpie with a durable answer bit-identical to the
-   ordinary run, and is rejected by the explorer at event 710 of 1401 with
-   `free block is on the wrong list (block 4)`. Draw the cells with those
-   numbers, not with ticks and crosses — the identical prime count is the part
-   that makes the top row persuasive.
+7. **Negative control, 2×3** — {ordinary build, elided-writeback mutant} ×
+   {Magpie crash loop, layer-1b explorer, Stage 2c warm reset}. **Data in hand
+   as of 2026-09-24:** the mutant reports `OK` on Magpie with a durable answer
+   bit-identical to the ordinary run, and is rejected by the explorer at event
+   710 of 1401 with `free block is on the wrong list (block 4)`. Under the warm
+   reset the mutant is `LOST` 3 of 3 (durable cursor back at the setup value,
+   65,024, raw image byte-identical to setup's) while the ordinary build
+   `SURVIVED` 3 of 3 (cursor 162,560, image byte-identical to a crash-free run).
+   Draw the cells with those numbers, not with ticks and crosses — the
+   identical prime count is the part that makes the top row persuasive, and
+   the byte-identical images are the part that makes the third column so.
 
 Figure 7 is the whole argument in one picture.
 

@@ -387,10 +387,10 @@ so the production `PmemMmapBackend` still opens the real file and takes the real
 at construction; installing it later would elide the data-range writebacks and
 leave the log's intact.
 
-|  | Magpie crash loop (layer 3) | Explorer sweep (layer 1b) |
-|---|---|---|
-| Ordinary build | `OK` (2026-09-01) | property holds |
-| Elided-writeback mutant | **`OK` (2026-09-18)** | **counterexample** |
+|  | Magpie crash loop (layer 3) | Explorer sweep (layer 1b) | Warm reset over reserved DRAM (Stage 2c) |
+|---|---|---|---|
+| Ordinary build | `OK` (2026-09-01) | property holds | `SURVIVED`, 3 of 3 (2026-09-24) |
+| Elided-writeback mutant | **`OK` (2026-09-18)** | **counterexample** | **`LOST`, 3 of 3** (2026-09-24) |
 
 Both rows of the hardware column reach the *same durable answer*: 376,256 primes
 below 5,429,504, bit-identical to the ordinary run and to the file backend at the
@@ -429,14 +429,53 @@ A mutant run that *failed* here would have been the more interesting outcome —
 it would have meant the hardware test is more sensitive than this document
 claims, and the surrounding argument would have needed rewriting rather than
 confirming. It did not fail, so the layering claim stands as measured rather
-than argued: **flush placement on this branch is verified by the model alone,
-and no hardware run available to this project can corroborate it.** That is the
-precise gap Stage 3 would close and Stage 2c narrows.
+than argued: a crash loop that kills processes cannot corroborate flush
+placement on any medium. As of 2026-09-18 that left flush placement verified
+by the model alone.
 
-Both halves run from one command, `scripts/pmem-experiments.sh control`, which
-also prints the 2×2 and states in the output which cell would falsify the
-layering claim. See the reproduction note in
-[Persistent Backends](persistent-backends.md).
+**Warm-reset half — done (2026-09-24), and the prediction held.** Stage 2c
+supplies the hardware event the crash loop lacks: a CPU reset that discards
+the cache, over reserved DRAM that keeps its contents (see Stage 2c below). At
+the same 512 x 4096 = 2 MiB geometry, `scripts/stage2c.sh sieve-now` runs 2 sieve
+steps with the production provider and closes cleanly, then remounts with one
+provider, runs 3 more steps, and resets the machine from inside the process
+straight after the fsync that makes the last acknowledgement durable. Three
+pairs, alternating:
+
+- **Ordinary build, `SURVIVED` in all three.** Recovery replayed the WAL and
+  reached the acknowledged cursor (162,560, with 14,891 primes). The raw image
+  taken before recovery is byte-identical in all three runs, and to a
+  crash-free run of the same steps on a plain file: nothing the ordinary build
+  wrote was lost.
+- **Mutant, `LOST` in all three, with `every acknowledged step was lost`.**
+  Recovery found nothing to replay, and the durable state is the setup state
+  (cursor 65,024, 6,495 primes). The raw image is byte-identical in all three
+  runs, and to the image setup alone leaves: not one store from the three
+  armed steps reached memory.
+
+The mutant fails differently from the explorer's counterexample, as predicted:
+all at once, because a 2 MiB region stays in the cache for the few
+milliseconds the armed steps take. The ordinary image matching the crash-free
+one also shows where the ordinary build's writebacks happen: `CLWB` is issued
+as each after-image is applied, and only the `SFENCE` waits for the next
+commit, so by the reset those writebacks had completed. That is one of the
+images the model permits.
+
+What this adds, and what it does not: it corroborates on real cache loss that
+the writebacks are necessary (without them every acknowledged step is lost)
+and that the production placement is correct at the one crash point the
+harness reaches, straight after the last acknowledgement. It cannot show that
+the placement is correct at every crash point; each run is one deterministic
+cut, and only the explorer enumerates them all. The media is volatile DRAM, so
+it is cache-loss sensitivity, not physical durability; Stage 3 remains the gap
+for the media and the persistence domain.
+
+The first two columns run from one command, `scripts/pmem-experiments.sh
+control`, which also prints them and states in the output which cell would
+falsify the layering claim. See the reproduction note in
+[Persistent Backends](persistent-backends.md). The third column needs a
+bare-metal reserved-DRAM host and an operator; its runbook is
+[Stage 2c Hand-off](stage2c-handoff.md).
 
 The mutant is deliberately vacuous on the file backend: `FileMmapRegion` never
 calls `clwb()` at all, since its persist path is `msync`/`fdatasync`. A
@@ -733,6 +772,12 @@ rather than in whole pages, which is what eviction by the probe's own later
 stores would leave. Store order and address order coincide in this probe, so
 the two cannot be separated. The sieve runs therefore use the same in-process
 reset (`stage2c.sh sieve-now`).
+
+**Sieve pairs (2026-09-24): the experiment discriminates.** Ordinary build
+`SURVIVED` and mutant `LOST` in each of three alternating pairs, with
+byte-identical images within each provider. The details, and what the result
+does and does not establish, are in the flush-placement negative control
+above.
 
 What it does **not** establish: the DRAM is volatile, ADR is not involved, and a
 true power cycle erases the range entirely. This is cache-loss sensitivity on a

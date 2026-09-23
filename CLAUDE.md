@@ -133,7 +133,7 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/PWSieveTest.v3` | Sieve workload tests (mount/resume, prime counts, invariants, retirement, remount) |
 | `test/unittest/x86-64-linux/PersistentSieveTest.v3` | Sieve through the crash-image explorer; `PersistentSieveProperty` mounts an image, recovers, reattaches and checks the workload's invariants |
 | `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve; selectable file or PMEM backend, reserves its own region file in a caller-assigned directory (`make pwsieve` / `make pwsieve-pmem`, `PWSIEVE_ARGS` / `PWASM_PMEM_TEST_DIR`) |
-| `test/pwreboot.main.v3` | Stage 2c warm-reboot harness: a flushed-against-unflushed cache-line probe, and the sieve armed with the production provider or the elided-writeback mutant, verified after a `sysrq` reboot on a `memmap` host (`make bin/pwreboot.x86-64-linux`) |
+| `test/pwreboot.main.v3` | Stage 2c warm-reboot harness: a flushed-against-unflushed cache-line probe, and the sieve armed with the production provider or the elided-writeback mutant, verified after a `sysrq` reboot on a `memmap` host (`make bin/pwreboot.x86-64-linux`); an optional inherited `/proc/sysrq-trigger` descriptor lets `probe-arm`/`arm` reset the machine themselves with no window after the last store, which is the form that discriminates (Stage 2c done 2026-09-24: ordinary `SURVIVED` 3/3, mutant `LOST` 3/3) |
 | `scripts/stage2c.sh` | Stage 2c operator script (`doctor`/`probe`/`probe-now`/`sieve`/`sieve-now`/`verify`); refuses to arm while the firmware's memory-overwrite request is set; host setup, runbook and cross-machine hand-off in `docs/stage2c-handoff.md` |
 
 ### On-region layout
@@ -149,7 +149,7 @@ Entry N:   End-of-region marker (no backing data)
 ### WAL commit protocol (two-slot, current — `DualTxnWal`, phase B)
 
 1. Writes buffered in `RegionTransaction` (HashMap-backed write-behind cache)
-2. `commit()`: `appendToWal → wal.commit` (write one checksummed record into slot `txnSeq % 2`, then ONE persistence boundary — `prepareChangedRange(record) + persistChanges()` — that persists the record together with the *previous* transaction's applied after-images; the commit point) `→ applyToRegion` (this transaction's after-images, applied write-behind; their persist rides the next commit's boundary) `→ clear`
+2. `commit()`: `appendToWal → wal.commit` (write one checksummed record into slot `txnSeq % 2`, then ONE persistence boundary — `prepareChangedRange(record) + persistChanges()` — that persists the record together with the *previous* transaction's applied after-images; the commit point) `→ applyToRegion` (this transaction's after-images, applied write-behind; each is `CLWB`-ed as it is applied, and only the fence — their persist — rides the next commit's boundary) `→ clear`
 3. Unmount/idle: `wal.close()` (called by `PWRegion.deallocate()`) persists the deferred data and scrubs reclaimable slots so a clean remount is replay-free; `RegionTransaction.flush()` is the explicit idle boundary
 4. On mount: validate the `DualWalHeader`, validate both slots, replay the valid records in ascending `txnSeq` (idempotent after-images, so re-replay is harmless), persist, set `nextTxnSeq = max + 1`. `recover()` returns `DualWalRecovery` (`CLEAN`/`REPLAYED`/`CORRUPT`/`PERSIST_FAILED`)
 

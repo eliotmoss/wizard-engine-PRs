@@ -5,17 +5,37 @@ argument for the experiment is in [PMEM Emulation](pmem-emulation.md#stage-2c--c
 its place in the thesis is in [Honours Thesis](THESIS.md). The code freeze and
 the Stage 2c timebox are both **2026-10-02**. If Stage 2c is not producing a
 reading by then, it is dropped and the flush-placement negative control stands
-alone.
+alone. **It produced its reading on 2026-09-24: the experiment discriminates**
+(see [Results](#results)).
 
-## Status (2026-09-23)
+## Status (2026-09-24)
 
 | Piece | State |
 |---|---|
-| `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. The optional reset descriptor (2026-09-24) works in `probe-arm` on the test host (dry run and run 3). In `arm` (`sieve-now`) it is compiled but not yet run on Linux. |
-| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set, which it did on the test host. `probe-now` (2026-09-24) works on the test host. `sieve-now` is checked on the Mac only: syntax, and the command's quoting and descriptor hand-off through a stand-in `setpriv`. |
+| `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. The optional reset descriptor (2026-09-24) works in `probe-arm` and `arm` on the test host (dry runs, probe run 3, sieve pairs 1–3). |
+| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set, which it did on the test host. `probe-now` and `sieve-now` (2026-09-24) work on the test host. Since pair 2 the clean check ignores staged results, and any other dirty path is listed in `provenance.txt`. |
 | Verifier outcomes | Checked by editing images by hand: SURVIVED, LOST (steps rolled back, WAL corrupt), INVALID (header zeroed, file missing). The image is never reformatted. |
 | Host setup on the Ubuntu dual boot | Done (2026-09-23). i7-14700KF, Ubuntu 26.04.1, kernel 7.0.0-31; `memmap=1G!8G`, ext4 `dax=always` on `/mnt/pmem0`; `doctor` says `runnable`. |
-| Any run on real hardware | Probe run 1 (2026-09-23): **no verdict.** The firmware zeroed the whole reserved range during the `sysrq` reset, because the kernel had set the memory-overwrite request ([below](#the-memory-overwrite-request)). Probe run 2 (2026-09-24, request cleared): the range survived, and the verdict was **`NOT-SENSITIVE`**, with all 16,384 unflushed lines intact. Run 3, the zero-window probe (`probe-now`): **`SENSITIVE`**, with 15,563 of 16,384 unflushed lines lost and every flushed line intact. So the host can lose a cache line, and run 2's window was what hid it. Next: the sieve pairs with `sieve-now`. |
+| Runs on real hardware | Done (2026-09-23/24): three probe runs and three `sieve-now` pairs. The experiment discriminates: ordinary build `SURVIVED` 3 of 3, mutant `LOST` 3 of 3. See [Results](#results). |
+
+## Results
+
+All on the test host (i7-14700KF, Gigabyte Z790 A PRO X WIFI7 BIOS F4, Ubuntu
+26.04.1, kernel 7.0.0-31, `memmap=1G!8G`), 512 x 4096 = 2 MiB regions and 2 MiB
+probe files. Directories are under `results/`, stamped in UTC; dates below are
+local.
+
+| Run | Directory | Reading |
+|---|---|---|
+| Probe 1 (2026-09-23) | `20260923T124723Z-…-stage2c-probe` | **No verdict.** The whole reserved range came back zeroed: the firmware's memory-overwrite wipe ([below](#the-memory-overwrite-request)). See `operator-notes.txt`. |
+| Probe 2 (2026-09-24), request cleared | `20260923T140245Z-…-stage2c-probe` | `NOT-SENSITIVE`: 16,384 of 16,384 unflushed lines intact, with the operator's window of seconds before the reset. |
+| Probe 3, `probe-now` | `20260923T143744Z-…-stage2c-probe-now` | **`SENSITIVE`**: 15,563 of 16,384 unflushed lines lost (all read as zero), every flushed line intact, none torn. The 821 survivors were all among the first 40 % stored. |
+| Sieve pairs 1–3, `sieve-now` | `20260923T145439Z` … `20260923T152938Z`, `…-sieve-now-{ordinary,elide-clwb}` | **Discriminates, 3 of 3.** Ordinary: `SURVIVED`, `REPLAYED`, cursor 162,560 = acknowledged, raw image `a11b9b16…` in every run, byte-identical to a crash-free run. Mutant: `LOST`, `every acknowledged step was lost`, `CLEAN`, cursor back at setup's 65,024, raw image `6ffc3b3a…` in every run, byte-identical to setup's. |
+
+Pair 1's mutant run reads `dirty YES` only because the ordinary run's results
+were staged first; its `operator-notes.txt` says so. The reading and its limits
+(one crash point per run) are written up in
+[PMEM Emulation](pmem-emulation.md#flush-placement-negative-control).
 
 ## The machines
 
@@ -81,7 +101,7 @@ hardware that can lose a cache line.
 
 | Sieve verdicts | Reading |
 |---|---|
-| ordinary `SURVIVED`, mutant `LOST` | **The experiment discriminates.** Flush placement is confirmed against real cache loss. |
+| ordinary `SURVIVED`, mutant `LOST` | **The experiment discriminates.** Flush placement is confirmed against real cache loss, at the one crash point the harness reaches (straight after the last acknowledgement). **Observed 3 of 3 on the test host.** |
 | both `SURVIVED` | No sensitivity on this host. The probe should already have said so. |
 | ordinary `LOST` | A real flush-placement defect, or an invalid host. Compare with a probe run. |
 | any `INVALID` | Setup's flushed state is gone, so the reserved memory did not survive. The run says nothing about flush placement. |
@@ -90,7 +110,8 @@ The mutant is expected to fail **differently from the explorer's
 counterexample**. The explorer found `free block is on the wrong list (block 4)`
 at one crash point. On hardware, most likely all three steps are lost at once
 (`every acknowledged step was lost`), because a 2 MiB region fits in the cache.
-That still fills the "mutant loses data" cell. Reproducing the explorer's exact
+That still fills the "mutant loses data" cell. **Observed in all three pairs**,
+with the mutant's surviving image byte-identical to the state setup left. Reproducing the explorer's exact
 counterexample would need a mutant that skips `CLWB` only for the last step,
 which is not planned before the freeze.
 
@@ -321,6 +342,26 @@ taken before recovery, `images.sha256`, and `verify.log` with the verdict.
 - **Reboot method.** `sysrq` `b` restarts at once through the platform's reset
   path. Keep the default `reboot=` behaviour, so a result can be tied to one
   reset method.
+
+## After Stage 2c: restoring the host
+
+Only once no re-run can be needed, and by hand, as root. None of this touches
+the results, which live in the repository.
+
+- GRUB: remove `memmap=1G!8G` from `GRUB_CMDLINE_LINUX_DEFAULT` (and set
+  `GRUB_TIMEOUT_STYLE=hidden`, `GRUB_TIMEOUT=0` back if wanted), then
+  `sudo update-grub`.
+- `/etc/fstab`: remove the `/dev/pmem0` line, then `sudo systemctl daemon-reload`
+  and `sudo rmdir /mnt/pmem0`.
+- SSH: `sudo systemctl disable --now ssh.socket ssh.service` (or remove
+  `openssh-server`), delete `/etc/ssh/sshd_config.d/10-stage2c.conf`, and remove
+  the Mac's key from `~/.ssh/authorized_keys`.
+- `~/.bashrc`: remove `clearmor` and the `STAGE2C_DAX_DIR` export.
+- Boot order: keep Ubuntu first, or put Windows back first with
+  `sudo efibootmgr -o 0000,0002`.
+- The memory-overwrite request needs nothing: the kernel sets it again on every
+  boot.
+- `gh auth logout` if the GitHub CLI token is no longer wanted.
 
 ## Optional: passwordless reboot
 
