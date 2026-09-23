@@ -14,7 +14,7 @@ alone.
 | `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. |
 | `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. |
 | Verifier outcomes | Checked by editing images by hand: SURVIVED, LOST (steps rolled back, WAL corrupt), INVALID (header zeroed, file missing). The image is never reformatted. |
-| Host setup on the Ubuntu dual boot | **Not started** |
+| Host setup on the Ubuntu dual boot | Done (2026-09-23). i7-14700KF, Ubuntu 26.04.1, kernel 7.0.0-31; `memmap=1G!8G`, ext4 `dax=always` on `/mnt/pmem0`; `doctor` says `runnable`. |
 | Any run on real hardware | **None yet** |
 
 ## The machines
@@ -23,7 +23,7 @@ alone.
 |---|---|
 | This PC, Windows + WSL | Where the harness was written. It cannot run Stage 2c: a WSL guest reset never discards the host's cache. |
 | This PC, booted into native Ubuntu | **The test host.** It reboots during every run, so do not run the controlling Claude session here. |
-| Mac | **The control machine.** It runs Claude Code, pulls from GitHub, and can reach the Ubuntu boot over SSH on the ANU network once that is checked. |
+| Mac | **The control machine.** It runs Claude Code and pulls from GitHub. It cannot drive the Ubuntu boot over SSH on the ANU campus Wi-Fi (checked 2026-09-23): connections reach `sshd`, which answers locally, but the PC's replies are lost on the way back, so the banner arrives late or never. The runbook is run by hand at the PC and its output pasted to the Mac session. |
 
 Context moves between machines through this repository, not through chat
 history. Claude's memory is per machine. Two things a new session needs to know:
@@ -133,24 +133,60 @@ Then run `sudo update-grub`. Put the range in `_DEFAULT`, not
 without the reservation if the range turns out to be wrong. Remove it after
 Stage 2c.
 
-**4. Create the namespace, the filesystem and the mount.** Do this once, after
-the first boot with `memmap`:
+On a dual boot, the firmware must also start Ubuntu first. A `sysrq` reboot
+follows the firmware's boot order, and if that starts Windows, Windows reuses
+the reserved RAM. `BootOrder` in `efibootmgr` must begin with the Ubuntu entry
+(`sudo efibootmgr -o <ubuntu>,<windows>`), and after an unattended reboot
+`BootCurrent` must be that entry. Windows updates can put Windows Boot Manager
+first again. Booting Windows at all counts as a cold boot.
+
+The kernel's EFI stub turns off physical KASLR when `memmap=` is on the command
+line (`drivers/firmware/efi/libstub/x86-stub.c`), so the kernel image loads at
+16 MiB rather than at a random address that could fall inside the range. After
+the first boot, check `sudo grep -E 'Persistent|Kernel code' /proc/iomem`:
+`Persistent Memory (legacy)` must be exactly the chosen range, and `Kernel code`
+must be below 4 GiB.
+
+**4. Create the filesystem and the mount.** No `ndctl create-namespace` is
+needed, and none should be run. The kernel makes every `memmap=` range
+DAX-capable on every boot (`drivers/nvdimm/e820.c` sets `ND_REGION_PAGEMAP`,
+and the pmem driver then builds page structures in ordinary RAM for the whole
+range). ndctl calls this native memory mode, and
+`sudo ndctl list -Nu --idle` already shows `namespace0.0` as `"mode":"fsdax"`,
+`"map":"mem"`, at the full size of the range. Converting it with
+`create-namespace` would write an info block into the reserved range, which
+every warm reboot would then also have to preserve. Confirm the mode without
+root:
 
 ```bash
-sudo ndctl list -Nu --idle                      # the reserved range, as a raw namespace
-sudo ndctl create-namespace -f -e namespace0.0 --mode=fsdax --map=mem
-sudo mkfs.ext4 -F -b 4096 /dev/pmem0
-sudo mkdir -p /mnt/pmem0 && sudo mount -o dax=always /dev/pmem0 /mnt/pmem0
-sudo mkdir -p /mnt/pmem0/stage2c && sudo chown "$USER": /mnt/pmem0/stage2c
-echo '/dev/pmem0 /mnt/pmem0 ext4 dax=always,nofail,x-systemd.device-timeout=10 0 0' | sudo tee -a /etc/fstab
+cat /sys/bus/nd/devices/namespace0.0/mode      # memory
+cat /sys/bus/nd/devices/namespace0.0/holder    # empty: nothing claims it
+cat /sys/block/pmem0/queue/dax                 # 1
 ```
 
-The `fsdax` setting and the filesystem are stored in the reserved memory
-itself. They survive a warm reboot and are lost on a **cold** boot (power off),
-after which this step must be repeated. **Never run `mkfs` or
-`create-namespace` after a warm reboot**: that destroys the evidence. If
-`/dev/pmem0` or the mount is missing after a warm reboot, stop and
-investigate. `nofail` keeps a missing device from blocking boot.
+Once, after the first boot with `memmap`:
+
+```bash
+sudo mkdir -p /mnt/pmem0
+echo '/dev/pmem0 /mnt/pmem0 ext4 dax=always,nofail,x-systemd.device-timeout=10 0 0' | sudo tee -a /etc/fstab
+sudo systemctl daemon-reload
+```
+
+After the first boot with `memmap`, and again after every **cold** boot (power
+off):
+
+```bash
+sudo mkfs.ext4 -F -b 4096 /dev/pmem0
+sudo mount /mnt/pmem0
+sudo mkdir -p /mnt/pmem0/stage2c && sudo chown "$USER": /mnt/pmem0/stage2c
+```
+
+Only the filesystem is stored in the reserved memory. The namespace mode is
+set by the kernel and comes back on every boot, including a cold one. The
+filesystem is expected to survive a warm reboot and to be lost on a cold boot.
+**Never run `mkfs` after a warm reboot**: that destroys the evidence. If the
+mount is missing after a warm reboot, stop and investigate. `nofail` keeps a
+missing filesystem from blocking boot.
 
 **5. Check.**
 
