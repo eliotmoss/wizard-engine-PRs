@@ -1,0 +1,39 @@
+---- revision
+commit f9dbae702458885896e5a2d4987c2db4f973bf02
+subject  results(pmem): Stage 2c probe run 1 on sean-tan-PC: reserved range wiped by the firmware
+dirty    no
+---- host
+hostname sean-tan-PC
+kernel   Linux 7.0.0-31-generic x86_64 GNU/Linux
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash memmap=1G!8G crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+virt     none
+boot_id  ca4209ae-ddc5-45c8-a937-26d8b0f53864
+armed    2026-09-23T14:02:45+00:00
+---- cpu
+CPU(s):                                  28
+Model name:                              Intel(R) Core(TM) i7-14700KF
+CPU(s) scaling MHz:                      19%
+L1d cache:                               768 KiB (20 instances)
+L1i cache:                               1 MiB (20 instances)
+L2 cache:                                28 MiB (11 instances)
+L3 cache:                                33 MiB (1 instance)
+clwb     yes
+---- media
+dax dir  /mnt/pmem0/stage2c
+  source /dev/pmem0
+  options rw,relatime,dax=always
+---- kernel settings
+kernel/sysrq                     176
+vm/dirty_writeback_centisecs     500
+vm/dirty_expire_centisecs        3000
+efi memory-overwrite request     00
+---- parameters
+backend pmem
+probe bytes 2097152
+armed_unix 1790172165.605213856
+mor_at_arm 00
+---- verify
+verified 2026-09-23T14:04:27+00:00
+boot_id  32437097-d119-49c6-8e15-79509e1df932
+rebooted yes
+booted_unix 1790172203

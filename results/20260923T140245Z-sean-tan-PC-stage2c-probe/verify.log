@@ -1,0 +1,4 @@
+flushed lines: intact 16384, torn 0, lost 0 (0 of them zero)
+unflushed lines: intact 16384, torn 0, lost 0 (0 of them zero)
+verdict NOT-SENSITIVE
+reason every unflushed line survived: the reset wrote the cache back, or it was evicted first
