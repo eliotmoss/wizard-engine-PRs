@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|unittest|pmemtest|pwsieve|pwbench> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|objdump|unittest|pmemtest|pwsieve|pwbench|pwreboot> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -53,6 +53,7 @@ UNITTEST="test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL_L
 UNITTEST_X86_64_LINUX="test/unittest/x86-64-linux/*.v3"
 PMEMTEST_X86_64_LINUX="test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3 $VIRGIL_LIB/test/*.v3"
 PWSIEVE_X86_64_LINUX="test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsieve.main.v3"
+PWREBOOT_X86_64_LINUX="test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwreboot.main.v3"
 PWBENCH_X86_64_LINUX="test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbench.main.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
 WASM_MODE="src/WasmMode.v3"
@@ -160,6 +161,11 @@ elif [ "$PROGRAM" = "pwsieve" ]; then
         exit_usage
     fi
     SOURCES="$ENGINE $PWSIEVE_X86_64_LINUX"
+elif [ "$PROGRAM" = "pwreboot" ]; then
+    if [[ "$TARGET" != "x86-64-linux" && "$TARGET" != "x86_64_linux" ]]; then
+        exit_usage
+    fi
+    SOURCES="$ENGINE $PWREBOOT_X86_64_LINUX"
 elif [ "$PROGRAM" = "pwbench" ]; then
     if [[ "$TARGET" != "x86-64-linux" && "$TARGET" != "x86_64_linux" ]]; then
         exit_usage

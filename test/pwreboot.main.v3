@@ -1,0 +1,514 @@
+// Stage 2c: cache-loss sensitivity across a warm reboot.
+//
+// On a host whose PMEM is DRAM reserved with memmap=<size>!<start>, the
+// reserved range survives a warm reboot (power is never removed) while a CPU
+// reset discards cache contents without writing them back. A line that was
+// stored but never written back is therefore lost across
+// `echo b > /proc/sysrq-trigger`, and a line that was CLWB-ed and fenced
+// survives. That is the discrimination the Magpie crash loop lacks: killing a
+// process never discards the cache. See docs/pmem-emulation.md, Stage 2c, and
+// docs/stage2c-handoff.md for the runbook.
+//
+// This program does the work on either side of a reboot; the reboot itself is
+// triggered by the operator (scripts/stage2c.sh prints the command). Every
+// mode except the verifiers writes a small state file and fsyncs it after each
+// line, because a sysrq reboot does not sync disks. It never syncs the DAX
+// filesystem: on a DAX file that could write back exactly the lines under test.
+//
+//   probe-arm <dax-dir> <state-file> <file|pmem> [bytes]
+//       Direct sensitivity probe, independent of the WAL. Writes a fresh file:
+//       even cache lines are stored, CLWB-ed and fenced; odd lines are only
+//       stored. Both carry a per-run nonce, so stale content cannot pass.
+//   probe-verify <probe-file> <bytes> <nonce>
+//       After the reboot: counts intact, torn and lost lines in each set.
+//
+//   setup <dax-dir> <state-file> <file|pmem> [blocks] [blockSize] [steps]
+//       Formats a fresh region and runs the sieve for a few steps with the
+//       production provider, then closes cleanly, so this state is durable
+//       before the experiment starts. It doubles as the flushed control.
+//   arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps]
+//       Remounts with the chosen provider and runs more steps, recording each
+//       acknowledged step, then exits WITHOUT closing: no clean-close
+//       writeback, exactly as a crash would leave it.
+//   verify <region> <file|pmem> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>
+//       After the reboot: checks the raw image before mounting (PWRegion
+//       formats a region whose header is missing, which would destroy the
+//       evidence), then mounts, recovers, and checks acknowledged progress,
+//       the allocator and sieve invariants, and the prime count.
+//
+// Exit status: 0 success (verify: SURVIVED; probe-verify: SENSITIVE), 1 LOST
+// (acknowledged state did not survive), 2 usage, 3 INVALID (the flushed
+// control state itself is gone, so the run says nothing about flush
+// placement), 4 NOT-SENSITIVE (probe-verify: every unflushed line survived).
+
+def LIVE_SEGMENTS = 2u64;
+def MAX_REFERENCE = 64000000u64;
+def LINE = 64;
+
+def EXIT_OK = 0;
+def EXIT_LOST = 1;
+def EXIT_USAGE = 2;
+def EXIT_INVALID = 3;
+def EXIT_NOT_SENSITIVE = 4;
+
+component RebootConfig {
+        def var usePmem = false;
+        def var elideWriteback = false;
+        def var path: string;
+}
+
+def usage() -> int {
+        System.puts("Usage:\n");
+        System.puts("  pwreboot probe-arm <dax-dir> <state-file> <file|pmem> [bytes]\n");
+        System.puts("  pwreboot probe-verify <probe-file> <bytes> <nonce>\n");
+        System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem> [blocks] [blockSize] [steps]\n");
+        System.puts("  pwreboot arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps]\n");
+        System.puts("  pwreboot verify <region> <file|pmem> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>\n");
+        return EXIT_USAGE;
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var v: u64 = 0;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                v = v * 10u64 + u64.!(c - '0');
+        }
+        return v;
+}
+
+// Strict: a malformed number in a verify argument must not become a default
+// that happens to pass.
+def requireU64(s: string, what: string) -> (bool, u64) {
+        if (s == null || s.length == 0) return (false, 0);
+        for (i < s.length) {
+                if (s[i] < '0' || s[i] > '9') {
+                        System.puts("not a number for ");
+                        System.puts(what);
+                        System.puts(": ");
+                        System.puts(s);
+                        System.ln();
+                        return (false, 0);
+                }
+        }
+        return (true, parseU64(s, 0));
+}
+
+def parseBackend(s: string) -> bool {
+        if (Strings.equal(s, "pmem")) { RebootConfig.usePmem = true; return true; }
+        if (Strings.equal(s, "file")) { RebootConfig.usePmem = false; return true; }
+        System.puts("backend must be \"file\" or \"pmem\"\n");
+        return false;
+}
+
+def parseProvider(s: string) -> bool {
+        if (Strings.equal(s, "elide-clwb")) { RebootConfig.elideWriteback = true; return true; }
+        if (Strings.equal(s, "ordinary")) { RebootConfig.elideWriteback = false; return true; }
+        System.puts("writeback mode must be \"ordinary\" or \"elide-clwb\"\n");
+        return false;
+}
+
+def openBackend() -> TxnRegionBackend {
+        var backend: TxnRegionBackend;
+        if (RebootConfig.usePmem) backend = X86_64Backends.getPersistent(RebootConfig.path);
+        else backend = X86_64Backends.getFileMapped(RebootConfig.path);
+        if (RebootConfig.elideWriteback) return ElidedWritebackBackend.new(backend);
+        return backend;
+}
+
+// The same anti-fallback checks as the crash loop: a file mapping reported as
+// a PMEM run, or an ordinary provider reported as the mutant, would invert the
+// comparison this experiment exists to make.
+def checkBackendRegion(region: BackendRegion) -> string {
+        if (region == null) return "backend region could not be created";
+        if (RebootConfig.usePmem && !PmemMmapRegion.?(region)) return "pmem mode did not produce a PmemMmapRegion";
+        if (!RebootConfig.usePmem && !FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
+        def elided = ElidedWritebackOperations.?(region.persistentOperations());
+        if (RebootConfig.elideWriteback && !elided) return "elide-clwb did not install the elided-writeback provider";
+        if (!RebootConfig.elideWriteback && elided) return "an ordinary run installed the elided-writeback provider";
+        return null;
+}
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        return EXIT_LOST;
+}
+
+// Reserve a private, uniquely named file in the assigned directory, as the
+// other runners do: O_EXCL, so an earlier run's evidence is never replaced.
+def reservePath(dir: string, stem: string) -> string {
+        def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+        def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+        for (attempt < 100) {
+                def path = StringBuilder.new()
+                        .puts(dir).puts("/").puts(stem).puts("-u").putd(uid)
+                        .puts("-p").putd(pid).puts("-").putd(attempt).puts(".region")
+                        .toString();
+                def fd = RegionFileIO.createExclusive(path);
+                if (fd >= 0) {
+                        RegionFileIO.close(fd);
+                        return path;
+                }
+                if (fd != -LinuxConst.EEXIST) return null;
+        }
+        return null;
+}
+
+// A state file on ordinary storage. Every line is fsynced as it is written:
+// the operator reboots with sysrq, which does not sync, and an acknowledgement
+// that did not reach the disk would make the verifier's reference point wrong.
+class StateFile(fd: int) {
+        def line(s: string) -> bool {
+                def bytes = StringBuilder.new().puts(s).ln().toString();
+                System.fileWriteK(fd, bytes, 0, bytes.length);
+                return Linux.syscall(LinuxConst.SYS_fsync, fd).0 == 0;
+        }
+        def close() { RegionFileIO.close(fd); }
+}
+
+def openState(path: string) -> StateFile {
+        def fd = RegionFileIO.create(path);
+        if (fd < 0) return null;
+        return StateFile.new(fd);
+}
+
+def kv(key: string, value: u64) -> string {
+        return StringBuilder.new().puts(key).puts(" ").putd(value).toString();
+}
+
+def kvs(key: string, value: string) -> string {
+        return StringBuilder.new().puts(key).puts(" ").puts(value).toString();
+}
+
+// ------------------------------------------------------------------ probe
+
+// splitmix64 finaliser: a line's expected contents are a function of the run
+// nonce and the line's position, so no earlier run's bytes can match.
+def mix(x: u64) -> u64 {
+        var z = x + 0x9E3779B97F4A7C15u64;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9u64;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBu64;
+        return z ^ (z >> 31);
+}
+
+def expectedWord(nonce: u64, line: u64, w: u64) -> u64 {
+        return mix(nonce ^ (line * 8u64 + w));
+}
+
+def randomNonce() -> u64 {
+        def buf = Array<byte>.new(8);
+        def r = Linux.syscall(LinuxConst.SYS_getrandom, (Pointer.atElement(buf, 0), 8, 0)).0;
+        if (r != 8) return 0;
+        var v: u64 = 0;
+        for (i < 8) v = (v << 8) | u64.!(buf[i]);
+        return v;
+}
+
+def probeArm(args: Array<string>) -> int {
+        if (args.length < 4) return usage();
+        if (!parseBackend(args[3])) return EXIT_USAGE;
+        def bytes = if(args.length > 4, parseU64(args[4], 0), 2u64 * 1024u64 * 1024u64);
+        if (bytes < u64.!(2 * LINE) || bytes % 4096u64 != 0) {
+                System.puts("probe size must be a positive multiple of 4096\n");
+                return EXIT_USAGE;
+        }
+        def nonce = randomNonce();
+        if (nonce == 0) return fail("getrandom failed");
+        RebootConfig.path = reservePath(args[1], "wizard-pwreboot-probe");
+        if (RebootConfig.path == null) return fail("could not reserve a probe file in the directory");
+        def state = openState(args[2]);
+        if (state == null) return fail("could not create the state file");
+
+        def region = openBackend().create(bytes, BackendProt.READ.mask | BackendProt.WRITE.mask, true);
+        def err = checkBackendRegion(region);
+        if (err != null) return fail(err);
+        def ops = X86_64PersistentOps.ensureFor(region);
+        def lines = bytes / u64.!(LINE);
+
+        // Recorded before any store, so a reboot at any later point still
+        // leaves the verifier everything it needs.
+        state.line(kvs("probe_file", RebootConfig.path));
+        state.line(kvs("backend", if(RebootConfig.usePmem, "pmem", "file")));
+        state.line(kv("bytes", bytes));
+        state.line(kv("nonce", nonce));
+        state.line(kv("flushed_lines", lines / 2u64));
+        if (!state.line(kv("unflushed_lines", lines / 2u64))) return fail("could not sync the state file");
+
+        // Flushed set first: every even line stored, written back and fenced.
+        for (line = 0u64; line < lines; line += 2u64) {
+                def base = line * u64.!(LINE);
+                for (w = 0u64; w < 8u64; w++) ops.storeU64(base + w * 8u64, expectedWord(nonce, line, w));
+                ops.clwb(base);
+        }
+        ops.sfence();
+        // Unflushed set last, so the flushed set's traffic cannot evict it:
+        // every odd line stored, never written back. The fence orders the
+        // stores but does not make them durable.
+        for (line = 1u64; line < lines; line += 2u64) {
+                def base = line * u64.!(LINE);
+                for (w = 0u64; w < 8u64; w++) ops.storeU64(base + w * 8u64, expectedWord(nonce, line, w));
+        }
+        ops.sfence();
+        state.line("armed yes");
+        state.close();
+        // Exit without unmapping explicitly: nothing here may write back the
+        // unflushed set.
+        System.puts("READY\n");
+        return EXIT_OK;
+}
+
+def le64(a: Array<byte>, off: int) -> u64 {
+        var v: u64 = 0;
+        for (i = 7; i >= 0; i--) v = (v << 8) | u64.!(a[off + i]);
+        return v;
+}
+
+def probeVerify(args: Array<string>) -> int {
+        if (args.length < 4) return usage();
+        def b = requireU64(args[2], "bytes");
+        def n = requireU64(args[3], "nonce");
+        if (!b.0 || !n.0) return EXIT_USAGE;
+        def bytes = b.1, nonce = n.1;
+        def image = System.fileLoad(args[1]);
+        if (image == null) {
+                System.puts("verdict INVALID\nreason probe file is missing\n");
+                return EXIT_INVALID;
+        }
+        if (u64.!(image.length) != bytes) {
+                System.puts("verdict INVALID\nreason probe file has the wrong size\n");
+                return EXIT_INVALID;
+        }
+        def lines = bytes / u64.!(LINE);
+        // [set][intact, torn, lost, lost-and-zero]
+        def counts = [Array<u64>.new(4), Array<u64>.new(4)];
+        for (line = 0u64; line < lines; line++) {
+                def set = int.!(line % 2u64);   // 0 = flushed, 1 = unflushed
+                var matched = 0, zero = true;
+                for (w = 0u64; w < 8u64; w++) {
+                        def v = le64(image, int.!(line * u64.!(LINE) + w * 8u64));
+                        if (v == expectedWord(nonce, line, w)) matched++;
+                        if (v != 0) zero = false;
+                }
+                if (matched == 8) counts[set][0]++;
+                else if (matched > 0) counts[set][1]++;
+                else {
+                        counts[set][2]++;
+                        if (zero) counts[set][3]++;
+                }
+        }
+        def names = ["flushed", "unflushed"];
+        for (set < 2) {
+                Trace.OUT.put3("%s lines: intact %d, torn %d", names[set], counts[set][0], counts[set][1]);
+                Trace.OUT.put2(", lost %d (%d of them zero)", counts[set][2], counts[set][3]).ln();
+        }
+        // The flushed set is the control. If it did not survive intact, the
+        // reserved memory itself did not survive the reboot, and the unflushed
+        // set's fate says nothing about the cache.
+        if (counts[0][0] != lines / 2u64) {
+                System.puts("verdict INVALID\nreason flushed control lines were lost: the reserved memory did not survive the reboot intact\n");
+                return EXIT_INVALID;
+        }
+        if (counts[1][0] == lines / 2u64) {
+                System.puts("verdict NOT-SENSITIVE\nreason every unflushed line survived: the reset wrote the cache back, or it was evicted first\n");
+                return EXIT_NOT_SENSITIVE;
+        }
+        System.puts("verdict SENSITIVE\nreason flushed lines all survived and unflushed lines were lost\n");
+        return EXIT_OK;
+}
+
+// ------------------------------------------------------------------ sieve
+
+def openRegion(blocks: u64, blockSize: u64, fresh: bool) -> PWRegion {
+        return PWRegion.new(openBackend(), blocks, Array<Ref<MetaDataDesc>>.new(0), blockSize, fresh);
+}
+
+def setup(args: Array<string>) -> int {
+        if (args.length < 4) return usage();
+        if (!parseBackend(args[3])) return EXIT_USAGE;
+        def blocks = if(args.length > 4, parseU64(args[4], 512), 512u64);
+        def blockSize = if(args.length > 5, parseU64(args[5], 4096), 4096u64);
+        def steps = if(args.length > 6, parseU64(args[6], 2), 2u64);
+        RebootConfig.elideWriteback = false;    // the control state is always flushed
+        RebootConfig.path = reservePath(args[1], "wizard-pwreboot");
+        if (RebootConfig.path == null) return fail("could not reserve a region file in the directory");
+        def state = openState(args[2]);
+        if (state == null) return fail("could not create the state file");
+
+        def region = openRegion(blocks, blockSize, true);
+        if (region == null) return fail("could not create the region");
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) return fail(err);
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return fail("could not lay out the sieve root");
+        for (i < steps) {
+                if (!sieve.step()) return fail("setup step failed");
+        }
+        def cursor = sieve.cursor(), count = sieve.count();
+        // Clean close with the production provider: everything so far is
+        // written back and fenced before the experiment begins.
+        region.deallocate();
+
+        state.line(kvs("region", RebootConfig.path));
+        state.line(kvs("backend", if(RebootConfig.usePmem, "pmem", "file")));
+        state.line(kv("blocks", blocks));
+        state.line(kv("block_size", blockSize));
+        state.line(kv("setup_steps", steps));
+        state.line(kv("setup_cursor", cursor));
+        if (!state.line(kv("setup_count", count))) return fail("could not sync the state file");
+        state.close();
+        Trace.OUT.put3("setup: %d steps, cursor %d, primes %d", steps, cursor, count).ln();
+        System.puts("OK\n");
+        return EXIT_OK;
+}
+
+def arm(args: Array<string>) -> int {
+        if (args.length < 7) return usage();
+        RebootConfig.path = args[1];
+        if (!parseBackend(args[3])) return EXIT_USAGE;
+        if (!parseProvider(args[4])) return EXIT_USAGE;
+        def bl = requireU64(args[5], "blocks"), bs = requireU64(args[6], "blockSize");
+        if (!bl.0 || !bs.0) return EXIT_USAGE;
+        def steps = if(args.length > 7, parseU64(args[7], 3), 3u64);
+        def state = openState(args[2]);
+        if (state == null) return fail("could not create the state file");
+        if (System.fileLoad(RebootConfig.path) == null) return fail("region file is missing; run setup first");
+
+        def region = openRegion(bl.1, bs.1, false);
+        if (region == null) return fail("could not mount the region");
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) return fail(err);
+        if (region.requiresRecovery()) return fail("mount latched recovery-required");
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return fail("could not reattach to the sieve root");
+
+        state.line(kvs("provider", if(RebootConfig.elideWriteback, "elide-clwb", "ordinary")));
+        state.line(kv("start_cursor", sieve.cursor()));
+        var done = 0u64;
+        for (i < steps) {
+                if (!sieve.step()) break;
+                done++;
+                // A step has returned, so its commits are acknowledged: the
+                // contract says recovery must reach at least this far.
+                state.line(StringBuilder.new().puts("ack ").putd(done)
+                        .puts(" cursor ").putd(sieve.cursor())
+                        .puts(" count ").putd(sieve.count()).toString());
+        }
+        state.line(kv("acked_steps", done));
+        state.line(kv("acked_cursor", sieve.cursor()));
+        if (!state.line(kv("acked_count", sieve.count()))) return fail("could not sync the state file");
+        state.close();
+        if (done == 0) return fail("no step completed, so nothing is under test");
+        // No deallocate(): a clean close would write back and fence the very
+        // state the mutant leaves in cache. Leave it exactly as a crash would.
+        Trace.OUT.put3("armed: %d acknowledged steps, cursor %d, primes %d",
+                done, sieve.cursor(), sieve.count()).ln();
+        System.puts("READY\n");
+        return EXIT_OK;
+}
+
+// An independent sieve of [0, limit), unrelated to PWSieve's implementation.
+def referenceCount(limit: u64) -> u64 {
+        if (limit < 2u64) return 0;
+        def n = int.!(limit);
+        def composite = Array<bool>.new(n);
+        var count: u64 = 0;
+        for (p = 2; p < n; p++) {
+                if (composite[p]) continue;
+                count++;
+                if (p > n / p) continue;
+                var m = p * p;
+                while (m < n) {
+                        composite[m] = true;
+                        m += p;
+                }
+        }
+        return count;
+}
+
+def verdict(kind: string, reason: string, code: int) -> int {
+        System.puts("verdict ");
+        System.puts(kind);
+        System.puts("\nreason ");
+        System.puts(reason);
+        System.ln();
+        return code;
+}
+
+def verify(args: Array<string>) -> int {
+        if (args.length < 8) return usage();
+        RebootConfig.path = args[1];
+        if (!parseBackend(args[2])) return EXIT_USAGE;
+        RebootConfig.elideWriteback = false;    // recovery is always the production code
+        def bl = requireU64(args[3], "blocks"), bs = requireU64(args[4], "blockSize");
+        def sc = requireU64(args[5], "setup-cursor"), ac = requireU64(args[6], "acked-cursor");
+        def an = requireU64(args[7], "acked-count");
+        if (!bl.0 || !bs.0 || !sc.0 || !ac.0 || !an.0) return EXIT_USAGE;
+        def blocks = bl.1, blockSize = bs.1, setupCursor = sc.1, ackedCursor = ac.1, ackedCount = an.1;
+
+        // Inspect the raw image first. PWRegion formats a region whose header
+        // magic is missing, so mounting before this check would erase the
+        // evidence and report a fresh, empty region.
+        def image = System.fileLoad(RebootConfig.path);
+        if (image == null) return verdict("INVALID", "region file is missing", EXIT_INVALID);
+        if (u64.!(image.length) != blocks * blockSize) {
+                return verdict("INVALID", "region file has the wrong size", EXIT_INVALID);
+        }
+        var nonzero = 0;
+        for (i < image.length) if (image[i] != 0) nonzero++;
+        Trace.OUT.put2("raw image: %d bytes, %d nonzero", image.length, nonzero).ln();
+        if (le64(image, PWRegionHeader.magic.offset) != PWRegions.MAGIC) {
+                // Setup formatted the header with the production provider and
+                // closed cleanly, so its loss is not the mutant's doing.
+                return verdict("INVALID", "the formatted header is gone: the reserved memory did not survive the reboot", EXIT_INVALID);
+        }
+        if (le64(image, PWRegionHeader.userRoot.offset) == 0) {
+                return verdict("INVALID", "the sieve root published during setup is gone", EXIT_INVALID);
+        }
+
+        def region = openRegion(blocks, blockSize, false);
+        if (region == null || region.backendRegion == null) return verdict("LOST", "the region did not mount", EXIT_LOST);
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) return fail(err);
+        Trace.OUT.put1("recovery: %s", region.lastRecovery.name).ln();
+        if (region.lastRecovery == DualWalRecovery.CORRUPT) return verdict("LOST", "the WAL header was corrupt", EXIT_LOST);
+        if (region.requiresRecovery()) return verdict("LOST", "the mount latched recovery-required", EXIT_LOST);
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return verdict("LOST", "the sieve root could not be reattached", EXIT_LOST);
+        def cursor = sieve.cursor(), count = sieve.count();
+        Trace.OUT.put3("durable cursor %d, primes %d, leaked extents reclaimed %d",
+                cursor, count, sieve.leaksReclaimed()).ln();
+        Trace.OUT.put3("setup cursor %d, acknowledged cursor %d, acknowledged primes %d",
+                setupCursor, ackedCursor, ackedCount).ln();
+
+        def inv = sieve.checkInvariants();
+        if (inv != null) return verdict("LOST", Strings.format1("invariant violated: %s", inv), EXIT_LOST);
+        if (cursor < ackedCursor) {
+                def what = if(cursor <= setupCursor, "every acknowledged step was lost", "some acknowledged steps were lost");
+                return verdict("LOST", what, EXIT_LOST);
+        }
+        if (cursor == ackedCursor && count != ackedCount) {
+                return verdict("LOST", "the acknowledged prime count did not survive", EXIT_LOST);
+        }
+        if (cursor <= MAX_REFERENCE) {
+                def expected = referenceCount(cursor);
+                if (expected != count) {
+                        return verdict("LOST", "the durable prime count disagrees with an independent sieve", EXIT_LOST);
+                }
+        }
+        region.deallocate();
+        return verdict("SURVIVED", "all acknowledged steps are durable and every invariant holds", EXIT_OK);
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 1 || args[0] == null) return usage();
+        def mode = args[0];
+        if (Strings.equal(mode, "probe-arm")) return probeArm(args);
+        if (Strings.equal(mode, "probe-verify")) return probeVerify(args);
+        if (Strings.equal(mode, "setup")) return setup(args);
+        if (Strings.equal(mode, "arm")) return arm(args);
+        if (Strings.equal(mode, "verify")) return verify(args);
+        return usage();
+}

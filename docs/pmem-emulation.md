@@ -722,6 +722,13 @@ freeze: if it is not producing a reading by then it is dropped, and the
 flush-placement negative control stands as the sole evidence for flush
 placement. Tracked in `docs/ROADMAP.md`; scope in [Honours Thesis](THESIS.md).
 
+**Harness (2026-09-23).** `test/pwreboot.main.v3` and `scripts/stage2c.sh`
+implement this stage: a direct sensitivity probe (flushed against unflushed
+cache lines), then the sieve with the production provider and with the
+elided-writeback mutant, each armed, rebooted and verified. Host setup, the
+runbook and how to read each verdict are in
+[Stage 2c Hand-off](stage2c-handoff.md).
+
 ### Stage 3 — real PMEM durability
 
 Final durability validation requires a machine with real persistent memory,

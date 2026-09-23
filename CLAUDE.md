@@ -133,6 +133,8 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/PWSieveTest.v3` | Sieve workload tests (mount/resume, prime counts, invariants, retirement, remount) |
 | `test/unittest/x86-64-linux/PersistentSieveTest.v3` | Sieve through the crash-image explorer; `PersistentSieveProperty` mounts an image, recovers, reattaches and checks the workload's invariants |
 | `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve; selectable file or PMEM backend, reserves its own region file in a caller-assigned directory (`make pwsieve` / `make pwsieve-pmem`, `PWSIEVE_ARGS` / `PWASM_PMEM_TEST_DIR`) |
+| `test/pwreboot.main.v3` | Stage 2c warm-reboot harness: a flushed-against-unflushed cache-line probe, and the sieve armed with the production provider or the elided-writeback mutant, verified after a `sysrq` reboot on a `memmap` host (`make bin/pwreboot.x86-64-linux`) |
+| `scripts/stage2c.sh` | Stage 2c operator script (`doctor`/`probe`/`sieve`/`verify`); host setup, runbook and cross-machine hand-off in `docs/stage2c-handoff.md` |
 
 ### On-region layout
 

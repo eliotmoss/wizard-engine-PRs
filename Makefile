@@ -31,6 +31,7 @@ UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 PMEMTEST_X86_64_LINUX=test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3
 PWSIEVE_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsieve.main.v3
+PWREBOOT_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwreboot.main.v3
 PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbench.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
@@ -147,6 +148,11 @@ pwbench-block: bin/pwbench.x86-64-linux
 
 bin/pwbench.x86-64-linux: $(ENGINE) $(PWBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwbench x86-64-linux
+
+# Stage 2c warm-reboot harness; driven by scripts/stage2c.sh, see
+# docs/stage2c-handoff.md.
+bin/pwreboot.x86-64-linux: $(ENGINE) $(PWREBOOT_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pwreboot x86-64-linux
 
 bin/spectest.x86-64-linux: $(SPECTEST) $(X86_64) $(JIT) build.sh
 	./build.sh spectest x86-64-linux
