@@ -36,3 +36,8 @@ arm steps 3
 reset from inside arm, no window
 armed_unix 1790176849.915713198
 mor_at_arm 00
+---- verify
+verified 2026-09-23T15:23:18+00:00
+boot_id  190fcf46-96c6-415e-9e23-eeead00b0947
+rebooted yes
+booted_unix 1790176872
