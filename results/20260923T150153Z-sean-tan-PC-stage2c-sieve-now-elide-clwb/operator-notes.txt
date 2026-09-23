@@ -1,0 +1,10 @@
+Operator note, written after the run; not tool output.
+
+provenance.txt says "dirty YES". The only difference from HEAD (6ee0fa42) was
+that the preceding ordinary run's results had been staged with git add before
+this run was armed; the operator confirmed this. No tracked file outside
+results/ was modified, and the commit that followed (13410a07) contains only
+results files. So this run executed exactly revision 6ee0fa42.
+
+Since f3421701 the clean check ignores results/, and provenance.txt lists any
+other dirty path.
