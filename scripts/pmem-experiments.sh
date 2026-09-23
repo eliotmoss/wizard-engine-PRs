@@ -38,11 +38,21 @@
 # bimodal -- which is how the effect was found. PWEXP_NUMA_NODE=none reverts to
 # unpinned, or set it to a node number to force one.
 #
+# Region geometry. pwbench's region is always 512 blocks, so its block size sets
+# the region size: 4096 gives 2 MiB, 2048 gives 1 MiB. On a DAX file this is not
+# a neutral choice -- a region of 2 MiB or more is mapped with 2 MiB DAX entries,
+# and fdatasync writes back a whole entry, so file-dax costs ~927 us at 2 MiB and
+# ~5 us at 1 MiB. PWEXP_REGION_BLOCKSIZES takes a list; the sizes are interleaved
+# within each repetition like the configurations, so a comparison across
+# geometries is never also a comparison across sittings. A smaller block size
+# also means a smaller WAL slot (about 26 entries at 2048), and the campaign
+# refuses to start if a requested transaction size cannot fit.
+#
 # Overrides: PWASM_PMEM_TEST_DIR (required for the DAX configs and the control),
 # PWEXP_BLOCK_DIR (default $HOME), PWEXP_REPS (3), PWEXP_SIZES ("1 8 32 56"),
-# PWEXP_COMMITS (20000), PWEXP_WARMUP (2000), PWEXP_OUT (results/<stamp>),
-# PWEXP_SIEVE_ARGS ("20 1 512 4096"), PWEXP_ALLOW_DIRTY (0),
-# PWEXP_NUMA_NODE (auto).
+# PWEXP_REGION_BLOCKSIZES ("4096"), PWEXP_COMMITS (20000), PWEXP_WARMUP (2000),
+# PWEXP_OUT (results/<stamp>), PWEXP_SIEVE_ARGS ("20 1 512 4096"),
+# PWEXP_ALLOW_DIRTY (0), PWEXP_NUMA_NODE (auto).
 
 set -euo pipefail
 
@@ -52,11 +62,16 @@ cd "$REPO"
 BLOCK_DIR="${PWEXP_BLOCK_DIR:-$HOME}"
 REPS="${PWEXP_REPS:-3}"
 SIZES="${PWEXP_SIZES:-1 8 32 56}"
+REGION_BLOCKSIZES="${PWEXP_REGION_BLOCKSIZES:-4096}"
 COMMITS="${PWEXP_COMMITS:-20000}"
 WARMUP="${PWEXP_WARMUP:-2000}"
 SIEVE_ARGS="${PWEXP_SIEVE_ARGS:-20 1 512 4096}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="${PWEXP_OUT:-$REPO/results/$STAMP-$(hostname -s)}"
+# A non-default geometry is named in the directory, so a 1 MiB campaign cannot be
+# mistaken for one at the 2 MiB geometry every earlier result used.
+BS_TAG=
+[ "$REGION_BLOCKSIZES" = 4096 ] || BS_TAG="-bs$(tr -s ' ' '-' <<< "$REGION_BLOCKSIZES")"
+OUT="${PWEXP_OUT:-$REPO/results/$STAMP-$(hostname -s)$BS_TAG}"
 
 BENCH_BIN=bin/pwbench.x86-64-linux
 SIEVE_BIN=bin/pwsieve.x86-64-linux
@@ -167,6 +182,7 @@ write_provenance() {
         if have numactl; then numactl --hardware 2>/dev/null | head -20 || true; fi
         rule "parameters"
         printf 'reps %s\nsizes %s\ncommits %s\nwarmup %s\n' "$REPS" "$SIZES" "$COMMITS" "$WARMUP"
+        printf 'region block sizes %s (512 blocks each)\n' "$REGION_BLOCKSIZES"
     } > "$f"
     say "provenance -> $f"
 }
@@ -184,7 +200,7 @@ ensure_bin() {
 CSV=
 csv_header() {
     CSV=$OUT/cost.csv
-    printf 'config,backend,dir,fstype,entries,commits,warmup,rep,boundaries_per_commit_x1000,clwb_lines,tsc_per_us,cyc_min,cyc_med,cyc_p90,cyc_p99,cyc_max,ns_min,ns_med,ns_p90,ns_p99,ns_max,total_boundary_cycles,total_prepare_cycles,wall_ns,boundary_share_x1000,wall_ns_per_commit,load1\n' > "$CSV"
+    printf 'config,backend,dir,fstype,entries,commits,warmup,rep,boundaries_per_commit_x1000,clwb_lines,tsc_per_us,cyc_min,cyc_med,cyc_p90,cyc_p99,cyc_max,ns_min,ns_med,ns_p90,ns_p99,ns_max,total_boundary_cycles,total_prepare_cycles,wall_ns,boundary_share_x1000,wall_ns_per_commit,load1,block_size\n' > "$CSV"
 }
 
 # Extract every measured field in one pass and emit them comma-separated.
@@ -220,12 +236,12 @@ parse_run() {
 readonly PARSED_FIELDS=18
 
 run_cost_one() {
-    local config=$1 backend=$2 dir=$3 entries=$4 rep=$5
-    local log="$OUT/cost-$config-e$entries-r$rep.log"
+    local config=$1 backend=$2 dir=$3 entries=$4 rep=$5 bs=$6
+    local log="$OUT/cost-$config-bs$bs-e$entries-r$rep.log"
     local load; load=$(loadavg | cut -d' ' -f1)
 
-    say "  $config entries=$entries rep=$rep"
-    if ! "${PIN_CMD[@]}" "$BENCH_BIN" "$dir" "$backend" "$COMMITS" "$entries" "$WARMUP" > "$log" 2>&1; then
+    say "  $config blocksize=$bs entries=$entries rep=$rep"
+    if ! "${PIN_CMD[@]}" "$BENCH_BIN" "$dir" "$backend" "$COMMITS" "$entries" "$WARMUP" "$bs" > "$log" 2>&1; then
         warn "    FAILED -- see $log"
         tail -3 "$log" >&2
         return 1
@@ -243,18 +259,40 @@ run_cost_one() {
 
     # The directory is quoted: a path may legitimately contain a comma, and an
     # unquoted one would shift every column after it.
-    printf '%s,%s,"%s",%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,"%s",%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$config" "$backend" "$dir" "$(fstype_of "$dir")" \
-        "$entries" "$COMMITS" "$WARMUP" "$rep" "$parsed" "$load" >> "$CSV"
+        "$entries" "$COMMITS" "$WARMUP" "$rep" "$parsed" "$load" "$bs" >> "$CSV"
+}
+
+# Refuse a sweep point the WAL slot cannot hold before any run starts, rather
+# than discovering it as a failed run halfway through a campaign. The arithmetic
+# mirrors pwbench's maxEntriesEstimate(): each of the two slots gets half of a
+# block less the 64-byte WAL header, and a record is a 112-byte header and
+# trailer plus one 32-byte entry per write. It is an estimate; the commit itself
+# stays the authority.
+check_geometry() {
+    local bs entries slot max
+    for bs in $REGION_BLOCKSIZES; do
+        case "$bs" in ''|*[!0-9]*) die "PWEXP_REGION_BLOCKSIZES: not a number: $bs" ;; esac
+        [ $((bs % 8)) -eq 0 ] || die "PWEXP_REGION_BLOCKSIZES: $bs is not a multiple of 8"
+        slot=$(( (bs - 64) / 2 ))
+        max=$(( slot > 112 ? (slot - 112) / 32 : 0 ))
+        for entries in $SIZES; do
+            [ "$entries" -le "$max" ] ||
+                die "$entries entries do not fit a WAL slot at block size $bs (about $max do); lower PWEXP_SIZES"
+        done
+    done
 }
 
 cost() {
     require_clean_tree
     [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"
     [ -d "$PWASM_PMEM_TEST_DIR" ] || die "PWASM_PMEM_TEST_DIR is not a directory: $PWASM_PMEM_TEST_DIR"
+    check_geometry
     ensure_bin "$BENCH_BIN"
     resolve_pinning
     say "numa pinning: node $PIN_NODE"
+    say "region block sizes: $REGION_BLOCKSIZES"
     mkdir -p "$OUT"
     write_provenance
     csv_header
@@ -272,13 +310,15 @@ cost() {
 
     local failures=0
     # rep outermost, config innermost: interleaved, so a load spike hits one
-    # sample of each configuration rather than every sample of one.
+    # sample of each configuration and geometry rather than every sample of one.
     for rep in $(seq 1 "$REPS"); do
-        for entries in $SIZES; do
-            run_cost_one pmem-dax   pmem "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" || failures=$((failures + 1))
-            run_cost_one file-dax   file "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" || failures=$((failures + 1))
-            [ $do_block = 1 ] &&
-                { run_cost_one file-block file "$BLOCK_DIR" "$entries" "$rep" || failures=$((failures + 1)); }
+        for bs in $REGION_BLOCKSIZES; do
+            for entries in $SIZES; do
+                run_cost_one pmem-dax   pmem "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" "$bs" || failures=$((failures + 1))
+                run_cost_one file-dax   file "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" "$bs" || failures=$((failures + 1))
+                [ $do_block = 1 ] &&
+                    { run_cost_one file-block file "$BLOCK_DIR" "$entries" "$rep" "$bs" || failures=$((failures + 1)); }
+            done
         done
     done
 
@@ -293,16 +333,16 @@ cost() {
 # means because the intended host is shared: interference lands in the tail.
 cost_summary() {
     rule "median boundary ns, median over $REPS repetitions"
-    awk -F, 'NR > 1 { key = $1 "\t" $5; vals[key] = vals[key] " " $18 }
+    awk -F, 'NR > 1 { key = $1 "\t" $NF "\t" $5; vals[key] = vals[key] " " $18 }
         END {
-            printf "%-12s %8s %14s\n", "config", "entries", "boundary_ns"
+            printf "%-12s %9s %8s %14s\n", "config", "blocksize", "entries", "boundary_ns"
             for (k in vals) {
                 n = split(vals[k], a, " "); m = 0
                 for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
                 m = (n % 2) ? a[(n + 1) / 2] : int((a[n / 2] + a[n / 2 + 1]) / 2)
-                split(k, p, "\t"); printf "%-12s %8s %14s\n", p[1], p[2], m
+                split(k, p, "\t"); printf "%-12s %9s %8s %14s\n", p[1], p[2], p[3], m
             }
-        }' "$CSV" | { read -r h; printf '%s\n' "$h"; sort -k1,1 -k2,2n; }
+        }' "$CSV" | { read -r h; printf '%s\n' "$h"; sort -k1,1 -k2,2n -k3,3n; }
     rule "boundaries per commit (must be 1000; a higher value means the overwrite guard fired)"
     awk -F, 'NR > 1 { print $9 }' "$CSV" | sort -u | tr '\n' ' '; echo
 }

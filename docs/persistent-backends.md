@@ -212,7 +212,13 @@ directory turns out to be on a network filesystem. Repetitions are interleaved
 by construction rather than by the operator remembering to interleave them.
 
 The defaults reproduce the tables below: `PWEXP_REPS=3`,
-`PWEXP_SIZES="1 8 32 56"`, 20,000 commits after 2,000 warm-up commits.
+`PWEXP_SIZES="1 8 32 56"`, 20,000 commits after 2,000 warm-up commits, at the
+2 MiB geometry (`PWEXP_REGION_BLOCKSIZES=4096`). That variable takes a list —
+`"2048 4096"` measures 1 MiB and 2 MiB regions interleaved within each
+repetition, so a cross-geometry comparison is never also a cross-sitting one. A
+2048-byte block holds about 26 entries per WAL slot, so pair it with
+`PWEXP_SIZES="1 8 24"`; the script refuses a size that cannot fit before any
+run starts.
 
 ### Repeats: `fdatasync` on DAX is bimodal, and the cause is NUMA
 
