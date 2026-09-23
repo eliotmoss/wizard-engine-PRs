@@ -34,6 +34,13 @@ Three configurations, so the boundary primitive and the media are separable.
 `pwbench` drives 20,000 commits of 8 aligned `u64` redo entries each through the
 production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
 
+**Every figure for configuration 2 below is conditional on that geometry.** A
+2 MiB region on this namespace is mapped with a single 2 MiB DAX entry, and
+`fdatasync` flushes the whole entry; at 1 MiB the same boundary costs ~5 µs,
+not 927 µs. See [Region size](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)
+(measured 2026-09-23), which supersedes the media reading of the comparisons
+that follow.
+
 | # | Backend | Media | Boundary | Median boundary | Per commit | Boundary share |
 |---|---|---|---|---|---|---|
 | 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.7 µs | 3.3 % |
@@ -64,38 +71,105 @@ fence. The note is correct and argues for the wrong reason.
   per commit at eight entries; `fdatasync` on the *same DAX filesystem* costs
   927 µs in its low mode. **≈ 2,000×.** This is the cleanest statement of what
   the unified interface hides: identical media, identical workload, identical
-  geometry, one interface, three orders of magnitude.
-- **Media, primitive held constant (2 vs 3).** `fdatasync` on DAX is **4.7× to
-  7.1× slower** than on ordinary block storage: 927 µs socket-local against a
-  block figure that has ranged from 131 to 196 µs between sittings. This is the
-  weakest of the three comparisons because configuration 3 has not reproduced,
-  so the span is the block measurement's instability and not a property of the
-  media. What does *not* move is the direction — DAX is slower in every one of
-  the 60 block runs, and the smallest gap ever observed is 4.7×. The direction
-  is the opposite of the expected one, and is discussed below.
+  geometry, one interface, three orders of magnitude. The geometry matters: at a
+  1 MiB region `fdatasync` on DAX is ~5 µs, and the gap would be ~11× (the PMEM
+  side has not yet been measured at 1 MiB; its boundary does not depend on the
+  kernel's mapping, so it is not expected to move).
+- **Media, primitive held constant (2 vs 3).** At 2 MiB, `fdatasync` on DAX is
+  **4.7× to 7.1× slower** than on ordinary block storage: 927 µs socket-local
+  against a block figure that has ranged from 131 to 196 µs between sittings.
+  The span is the block measurement's instability, not a property of the media.
+  DAX is slower in every one of the 60 block runs — but every one of them used a
+  2 MiB region. **The comparison does not isolate the media**: the DAX side's
+  cost is set by the kernel's 2 MiB flush granularity, and at a 1 MiB region the
+  direction reverses (~5 µs against 133–196 µs, across unmatched geometry
+  pending a matched run). See below.
 - **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
-### The file backend on DAX is the worst of both worlds
+### The file backend on DAX pays the kernel's flush granularity
 
-The surprise is configuration 2. Putting the file backend on DAX media is
-*slower* than putting it on an ordinary block device — between 4.7× and 7.1×,
-the range reflecting configuration 3's instability rather than any uncertainty
-about configuration 2 — while also forgoing the `SFENCE` path entirely. It pays a worse boundary than block storage and gets none of the
-benefit of the medium it is sitting on.
+The surprise is configuration 2. At the 2 MiB geometry every campaign used,
+putting the file backend on DAX media is *slower* than putting it on an
+ordinary block device — between 4.7× and 7.1× — while also forgoing the
+`SFENCE` path entirely. This page originally called that "the worst of both
+worlds" and attributed it to the media. **The region-size sweep below shows the
+cause is how the kernel maps and flushes a DAX file, not the device**: with a
+2 MiB DAX entry, every `fdatasync` writes back all 32,768 cache lines of it,
+however few bytes the commit touched. With 4 KiB entries the same boundary on
+the same media is ~5 µs.
 
 This is a separate question from the NUMA bimodality below, which explains the
-*two modes within* DAX, not why DAX is slower than block storage at all. The
-plausible mechanism for the latter is that `fdatasync` on a DAX mapping must
-walk and write back the dirty range itself rather than handing pages to an
-optimised page-cache writeback path, but this measurement does not establish it
-and no claim should rest on it.
+*two modes within* DAX, not the level of either.
 
-The consequence for the design is the important part: **the abstraction must not
-be allowed to hide which medium is underneath.** A caller who unified on the
-file backend "because it works everywhere" and deployed it on PMEM would land in
-configuration 2 and be **69× slower per commit socket-local, or 85×
-cross-socket**, than configuration 1 — on the same hardware, with no error and
-no warning. That is the cost of unification stated as a number.
+The consequence for the design is sharper than the original reading, not
+weaker: **the abstraction must not be allowed to hide what is underneath — and
+on DAX, what matters is a mapping decision the backend neither makes nor can
+see.** A caller who unified on the file backend "because it works everywhere"
+and deployed it on PMEM with a region of 2 MiB or more — the normal case —
+would land in configuration 2 and be **69× slower per commit socket-local, or
+85× cross-socket**, than configuration 1, on the same hardware, with no error
+and no warning. The same code with a 1 MiB region would not. That is the cost of
+unification stated as a number, and the number depends on region geometry.
+
+### Region size: `fdatasync` on DAX flushes whole 2 MiB entries
+
+Measured 2026-09-23 on Magpie (`results/20260923T032952Z-magpie-regionsize`):
+configuration 2 only, 8 entries, pinned to node 0, three repetitions per size.
+pwbench's region is always 512 blocks, so its `blockSize` argument sets the
+region size.
+
+| Region | `blockSize` | Median boundary (3 runs) |
+|---|---|---|
+| 1 MiB | 2048 | **5,094 / 4,940 / 4,966 ns** |
+| 2 MiB | 4096 | 927,370 / 925,718 / 928,089 ns |
+| 4 MiB | 8192 | 928,583 / 926,620 / 924,790 ns |
+| 8 MiB | 16384 | 926,124 / 928,610 / 928,170 ns |
+
+The sweep was designed to separate three explanations for the 927 µs, and it
+rejects two of them:
+
+- **A fixed per-call cost** (journal commit, device flush) predicts ~927 µs at
+  1 MiB. The measured cost is **~187× lower**, so at most ~5 µs of the 927 µs
+  is per-call.
+- **A cost proportional to the mapping** predicts ~1.85 ms at 4 MiB and ~3.7 ms
+  at 8 MiB. The cost is **flat from 2 MiB to 8 MiB to within 0.5 %**.
+- **Flushing whole 2 MiB DAX entries** predicts exactly this shape. A 1 MiB
+  file cannot be mapped with a 2 MiB entry, so the kernel falls back to 4 KiB
+  entries and writes back only the few dirty pages. At 2 MiB and above, the
+  file's extents let the kernel use 2 MiB entries (`filefrag`: all five extents
+  observed are 512 blocks long and start on a multiple of 512 blocks). Every
+  per-commit write — the WAL slot in block 1, and the scratch chunk, which a
+  split allocation takes from the front of the free space at block 2 — lands
+  in the first 2 MiB, so one entry is dirtied per commit regardless of region
+  size, and `fdatasync` writes back all of it.
+
+The arithmetic agrees: 927 µs over 32,768 lines is 28.3 ns, or 65 cycles, per
+line, against 72.0–73.5 cycles per line for the user-space `CLWB` loop measured
+on the PMEM backend. The mechanism also accounts for the earlier findings that
+had no explanation: the cost is **flat in transaction size** because the flush
+is the whole entry whatever was written, and the NUMA penalty is a **constant
++24 % at every transaction size** because every `fdatasync` runs the same
+32,768-line loop over memory on the namespace's socket. That the cross-socket
+penalty comes from this loop is consistent with the data but not measured.
+
+**What this does and does not establish.** The mechanism is inferred from
+timing and file layout, not observed in the kernel. The direct confirmation is
+the `fs_dax:dax_writeback_one` tracepoint, whose `pglen` should read 512 (a
+2 MiB entry) at 2 MiB and 1 (a 4 KiB page) at 1 MiB; it needs root. Not yet
+measured: the PMEM backend and block storage at 1 MiB (a matched-geometry rerun
+of all three configurations), the NUMA penalty at 1 MiB, and the prediction
+that a commit dirtying *k* separate 2 MiB entries costs about *k* × 927 µs —
+pwbench cannot test that yet, because all its writes land in one entry. Large
+regions on a 2 MiB-aligned namespace will normally get 2 MiB entries, so the
+927 µs figure is the realistic one, and a workload whose commits scatter
+across the region could pay a multiple of it.
+
+A side observation from the same `filefrag` output: the 8 MiB region file is
+sparse (logical blocks 512–1535 unallocated). `RegionFileIO.create()` zeroes a
+fresh region by extending it with `ftruncate`, so storage is allocated on first
+touch. Reads see zeros either way, so this is not a correctness issue, but a
+workload writing into untouched parts of a large region pays block allocation
+at fault time, which none of these measurements exercise.
 
 ### What phase B's boundary reduction is worth, per medium
 
@@ -189,8 +263,10 @@ scheduled onto one socket or the other, and the 12/12 split is the scheduler
 being indifferent.
 
 **Cross-socket access costs +23.9 % on the durability boundary.** The extent
-alignment hypothesis is excluded: it predicted a property of the file, and this
-is a property of where the process runs.
+alignment hypothesis is excluded *as the cause of the bimodality*: it predicted
+a property of the file, and this is a property of where the process runs.
+(Extent alignment and region size do turn out to set the *level* of the cost;
+see [Region size](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries).)
 
 The asymmetry between the backends is the interesting part, and it is measured
 rather than inferred. Pinning the *PMEM* backend the same way gives a median
@@ -247,10 +323,11 @@ future work).
 `file-block` shows no such bimodality, but it has a different problem of its
 own; see below.
 
-So the DAX-versus-block factor is **7.0× socket-local and 8.6× cross-socket**.
-With the cause identified the figure is no longer a lottery, but it is still two
-numbers rather than one, and it is conditional on placement the allocator does
-not control.
+So at a 2 MiB region the DAX-versus-block factor is **7.0× socket-local and 8.6×
+cross-socket**. With the cause identified the figure is no longer a lottery, but
+it is still two numbers rather than one, and it is conditional on placement the
+allocator does not control — and, as the region-size sweep shows, on a mapping
+granularity it does not control either.
 
 ### The block-media configuration is not a controlled measurement here
 
@@ -297,11 +374,12 @@ boundary *primitive* — configuration 1 against 2, on the same DAX filesystem �
 is reproducible to 0.1 % across five campaigns and carries the headline result.
 The comparison that isolates the *media* — 2 against 3 — rests on a
 configuration that has moved 50 % between sittings on this host, and its
-multiplier is a range, 4.7×–7.1×, rather than a number. The *direction* is
-unaffected: DAX was slower in all 60 block runs, worst case 4.7×, so the
-"worst of both worlds" finding survives the instability even though the figure
-does not. `/home` is a shared LVM volume whose other traffic is neither
-controlled nor visible in a CPU load average.
+multiplier is a range, 4.7×–7.1×, rather than a number. The *direction* at
+2 MiB is unaffected: DAX was slower in all 60 block runs, worst case 4.7×. It is
+not a media comparison, though: at a 1 MiB region the DAX side falls to ~5 µs
+(see [Region size](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)),
+so the direction depends on geometry. `/home` is a shared LVM volume whose other
+traffic is neither controlled nor visible in a CPU load average.
 
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
@@ -344,9 +422,10 @@ construction scales with record length for the same reason the `CLWB` loop does.
 The same sweep on the file backend over DAX gives 927.2, 926.9, 926.4 and
 927.5 µs at 1, 8, 32 and 56 entries in the low mode, and 1,147.7, 1,146.3,
 1,148.7 and 1,147.5 µs in the high mode — **under 0.25 % variation across a 56×
-change in transaction size, within either mode.** One `fdatasync` is one
-whole-file syscall, and it costs the same whether the transaction dirtied
-32 bytes or 1,792.
+change in transaction size, within either mode.** One `fdatasync` writes back
+the whole 2 MiB DAX entry the commit dirtied (see
+[Region size](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)), so
+it costs the same whether the transaction dirtied 32 bytes or 1,792.
 
 Block storage was flat in the first two campaigns (133.8, 133.7, 133.9,
 130.8 µs) but *not* in the later pinned pair, where it falls monotonically from
@@ -366,12 +445,14 @@ factor of twenty:
 
 Against the high mode every ratio is 1.24× larger.
 
-**The 2,000× headline is a property of eight-entry transactions, not of the
-media.** Quoting it without the transaction size overstates the gap by 6× at the
-large end and understates it by 3× at the small end. Combined with the
-bimodality, the defensible claim is "about three orders of magnitude at small
-transaction sizes, closing to about two at the largest the WAL slot allows" —
-not any single multiplier.
+**The 2,000× headline is a property of eight-entry transactions in a 2 MiB
+region, not of the media.** Quoting it without the transaction size overstates
+the gap by 6× at the large end and understates it by 3× at the small end.
+Combined with the bimodality, the defensible claim is "about three orders of
+magnitude at small transaction sizes, closing to about two at the largest the
+WAL slot allows, for regions the kernel maps with 2 MiB DAX entries" — not any
+single multiplier. With 4 KiB entries the file side is ~5 µs, and the gap is
+about one order of magnitude.
 
 ### What batching is worth, per medium
 
@@ -415,8 +496,10 @@ one medium is not wrong on the other, merely pointless.
   socket-local `fdatasync`-on-DAX figure to within 0.2 % once pinned.
 - Treat the ratios as orders of magnitude and the absolute latencies as
   properties of this host's storage stack on the day.
-- The **mechanism** behind configuration 2's slowness is not established, only
-  its magnitude and its reproducibility.
+- The **mechanism** behind configuration 2's slowness is identified from timing
+  and file layout — `fdatasync` writes back a whole 2 MiB DAX entry — but not
+  yet observed in the kernel (`fs_dax:dax_writeback_one`, needs root). Every
+  configuration-2 figure is specific to regions mapped with 2 MiB entries.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
   `CLOCK_MONOTONIC` (2294 cycles/µs on every run here). There is no invariant-TSC
   check in the tree, so that conversion is an assumption, stated rather than

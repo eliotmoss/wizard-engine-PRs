@@ -105,15 +105,27 @@ now a number rather than an assertion.
 
 The headline for this chapter: on *identical* DAX media, with identical workload
 and geometry, the two boundary primitives differ by **≈2,000×** (455 ns against
-927 µs per commit). One interface, three orders of magnitude underneath it.
+927 µs per commit) for a region the kernel maps with 2 MiB DAX entries — the
+normal case for any region of 2 MiB or more. One interface, three orders of
+magnitude underneath it, and the size of the gap set by a kernel mapping
+decision the backend never sees (~11× with 4 KiB entries; see below).
 
 Two findings that arrived unplanned and are better material than the headline:
 
-- **The file backend on DAX is the worst of both worlds** — 6.3× slower than the
-  same backend on block storage, while also forgoing the `SFENCE` path. A caller
-  who unified on the file backend "because it works everywhere" and deployed on
-  PMEM pays 71× per commit, silently. This is the clearest possible statement
-  that the abstraction must not hide the medium.
+- **The file backend on DAX pays the kernel's flush granularity** — at 2 MiB
+  regions it is 4.7–7.1× slower than the same backend on block storage, while
+  also forgoing the `SFENCE` path, and a caller who unified on the file backend
+  "because it works everywhere" and deployed on PMEM pays ~70× per commit,
+  silently. **The cause is not the media** (region-size sweep, 2026-09-23):
+  `fdatasync` writes back the whole 2 MiB DAX entry a commit dirtied, 32,768
+  cache lines at ~65 cycles each. At a 1 MiB region, which the kernel must map
+  with 4 KiB entries, the same boundary on the same media is ~5 µs, ~187×
+  cheaper; from 2 to 8 MiB it is flat at 927 µs. This was first read as "the
+  worst of both worlds" on the media; the corrected reading is a stronger
+  statement of the thesis, because the abstraction hides not just the medium
+  but a mapping granularity the backend neither chooses nor observes. Inferred
+  from timing and `filefrag`; kernel-side confirmation
+  (`fs_dax:dax_writeback_one`) needs root and is pending.
 - **On PMEM the boundary is not the cost.** Byte-at-a-time `zeroBytes` and
   `computeRecordChecksum` outweigh the entire durability boundary by 28×, so the
   protocol-level optimisation the WAL is built around is, on that medium,
@@ -212,7 +224,7 @@ cannot be written around missing numbers.
 | Item | Estimate | Why it survives triage |
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
-| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is the worst of both worlds (7–8.6×), on PMEM record construction outweighs the boundary by 29×, `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
+| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29×, `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | Stage 2c — reserved-DRAM warm reboot | ~2–3 days, risky | Real cache loss on a DAX-faithful stand-in. Bare-metal host is available (confirmed 2026-09-18). **Hard timebox: if it is not working by 2026-10-02, drop it** and present the negative control as the sole flush-placement evidence. |
 
@@ -363,13 +375,19 @@ Seven, and they need real hours budgeted.
    the media. **Data in hand (2026-09-18, four runs each):** `SFENCE` 11 ns,
    `fdatasync` on the same DAX media 927 µs, `fdatasync` on block storage
    148 µs. Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
-   same figure.
+   same figure. State the 2 MiB region geometry on the figure: the
+   `fdatasync`-on-DAX bar is conditional on it (see 6c).
 6b. Boundary cost against transaction size, measured at 1/8/32/56 entries on
    both PMEM and file-on-DAX. `SFENCE` flat at 11 ns, `fdatasync` flat at
    ~928 µs (0.17 % over a 56× size change), `CLWB` linear at ~31.7 ns per cache
    line. Log y-axis, entries on x. The figure's point is that the *gap* closes
    from 6,675× to 340× purely because `CLWB` scales — so the headline ratio is
    never quotable without a transaction size.
+6c. `fdatasync` on DAX against region size (1/2/4/8 MiB, 2026-09-23): ~5 µs at
+   1 MiB, flat at ~927 µs from 2 to 8 MiB, with the H1/H2/H3 predictions (whole
+   2 MiB entry / proportional to mapping / fixed per call) overlaid. Log y-axis.
+   The step at 2 MiB is the mechanism behind figure 6's DAX-versus-block
+   direction.
 7. **Negative control, 2×2** — {ordinary build, elided-writeback mutant} ×
    {Magpie crash loop, layer-1b explorer}. **Data in hand as of 2026-09-18:**
    the mutant reports `OK` on Magpie with a durable answer bit-identical to the
