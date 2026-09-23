@@ -1,0 +1,16 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+region file /mnt/pmem0.0/sean/wizard-pwbench-u7599095-p109428-0.region
+region 256 blocks of 4096 bytes, scratch 1 blocks
+commits measured 20000, entries per commit 1
+persist boundaries 20000, prepare calls 80000
+boundaries per commit x1000 1000, clwb lines 80000
+tsc cycles per microsecond 2294
+boundary cycles: min 22 median 30 p90 32
+boundary cycles: p99 36 max 52
+boundary ns: min 9 median 13 p90 13
+boundary ns: p99 15 max 22
+total boundary cycles 586370
+total prepare cycles 5733280
+measured wall ns 90685632, boundary share x1000 30
+wall ns per commit 4534
+OK

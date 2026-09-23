@@ -1,0 +1,22 @@
+---- median boundary ns, median over 3 repetitions
+config        geometry  entries    boundary_ns
+file-block    256x4096        1         170610
+file-block    256x4096        8         160185
+file-block    256x4096       24         158633
+file-block    512x4096        1         134083
+file-block    512x4096        8         133468
+file-block    512x4096       24         133979
+file-dax      256x4096        1           6077
+file-dax      256x4096        8           6037
+file-dax      256x4096       24           6039
+file-dax      512x4096        1        1148473
+file-dax      512x4096        8        1145491
+file-dax      512x4096       24        1147048
+pmem-dax      256x4096        1             13
+pmem-dax      256x4096        8             12
+pmem-dax      256x4096       24             12
+pmem-dax      512x4096        1             13
+pmem-dax      512x4096        8             12
+pmem-dax      512x4096       24             12
+---- boundaries per commit (must be 1000; a higher value means the overwrite guard fired)
+1000 
