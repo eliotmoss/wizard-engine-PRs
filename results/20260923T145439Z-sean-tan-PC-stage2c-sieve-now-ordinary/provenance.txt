@@ -1,0 +1,43 @@
+---- revision
+commit 6ee0fa424a2ae42a56affffc42e2ade53ffe966d
+subject  test(pmem): add sieve-now, the zero-window Stage 2c sieve arm, after probe run 3 read SENSITIVE
+dirty    no
+---- host
+hostname sean-tan-PC
+kernel   Linux 7.0.0-31-generic x86_64 GNU/Linux
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash memmap=1G!8G crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+virt     none
+boot_id  93158d11-61f4-4bb8-8fe8-ec0b51fc817b
+armed    2026-09-23T14:54:39+00:00
+---- cpu
+CPU(s):                                  28
+Model name:                              Intel(R) Core(TM) i7-14700KF
+CPU(s) scaling MHz:                      19%
+L1d cache:                               768 KiB (20 instances)
+L1i cache:                               1 MiB (20 instances)
+L2 cache:                                28 MiB (11 instances)
+L3 cache:                                33 MiB (1 instance)
+clwb     yes
+---- media
+dax dir  /mnt/pmem0/stage2c
+  source /dev/pmem0
+  options rw,relatime,dax=always
+---- kernel settings
+kernel/sysrq                     176
+vm/dirty_writeback_centisecs     500
+vm/dirty_expire_centisecs        3000
+efi memory-overwrite request     00
+---- parameters
+backend pmem
+provider ordinary
+geometry 512x4096
+setup steps 2
+arm steps 3
+reset from inside arm, no window
+armed_unix 1790175279.361396437
+mor_at_arm 00
+---- verify
+verified 2026-09-23T14:56:11+00:00
+boot_id  e21db037-dfd4-4082-bc58-2cf69dbb04b9
+rebooted yes
+booted_unix 1790175313
