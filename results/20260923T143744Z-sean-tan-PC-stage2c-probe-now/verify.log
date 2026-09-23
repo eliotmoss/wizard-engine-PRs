@@ -1,0 +1,4 @@
+flushed lines: intact 16384, torn 0, lost 0 (0 of them zero)
+unflushed lines: intact 821, torn 0, lost 15563 (15563 of them zero)
+verdict SENSITIVE
+reason flushed lines all survived and unflushed lines were lost

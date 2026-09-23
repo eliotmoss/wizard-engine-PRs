@@ -1,0 +1,40 @@
+---- revision
+commit d1e2158d714dad28f79fb3a4f16fb7223f9d79b2
+subject  test(pmem): add the zero-window Stage 2c probe, and record the first reading
+dirty    no
+---- host
+hostname sean-tan-PC
+kernel   Linux 7.0.0-31-generic x86_64 GNU/Linux
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-31-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash memmap=1G!8G crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+virt     none
+boot_id  32437097-d119-49c6-8e15-79509e1df932
+armed    2026-09-23T14:37:44+00:00
+---- cpu
+CPU(s):                                  28
+Model name:                              Intel(R) Core(TM) i7-14700KF
+CPU(s) scaling MHz:                      19%
+L1d cache:                               768 KiB (20 instances)
+L1i cache:                               1 MiB (20 instances)
+L2 cache:                                28 MiB (11 instances)
+L3 cache:                                33 MiB (1 instance)
+clwb     yes
+---- media
+dax dir  /mnt/pmem0/stage2c
+  source /dev/pmem0
+  options rw,relatime,dax=always
+---- kernel settings
+kernel/sysrq                     176
+vm/dirty_writeback_centisecs     500
+vm/dirty_expire_centisecs        3000
+efi memory-overwrite request     00
+---- parameters
+backend pmem
+probe bytes 2097152
+reset from inside the probe, no window
+armed_unix 1790174264.776821072
+mor_at_arm 00
+---- verify
+verified 2026-09-23T14:39:56+00:00
+boot_id  93158d11-61f4-4bb8-8fe8-ec0b51fc817b
+rebooted yes
+booted_unix 1790174310
