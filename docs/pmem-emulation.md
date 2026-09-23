@@ -510,7 +510,8 @@ address:
 Reserved DRAM remains volatile, so this setup cannot establish power-loss
 durability. It does, however, have one property neither QEMU nor a shared PMEM
 host provides: the reserved range survives a warm reboot while the CPU caches do
-not, which makes flush *placement* observable. Stage 2c below is built on
+not, which makes flush *placement* observable. It survives only if the firmware
+has not been asked to clear memory on reset; see Stage 2c. Stage 2c below is built on
 exactly that. For ordinary DAX API and software-recovery work QEMU remains
 preferred, being isolated, repeatable, and free of host boot configuration
 changes.
@@ -692,6 +693,16 @@ survives. That is exactly the discrimination the Stage 2 crash loop lacks, and
 it needs no privileged access to a shared host. It must be a physical machine:
 a guest reset does not reset the host CPU, so a VM's dirty lines are never lost,
 which is the same reason QEMU guest reset is useless for this.
+
+**The first property has a condition (found 2026-09-23).** A kernel built with
+`CONFIG_RESET_ATTACK_MITIGATION`, as Ubuntu's is, asks the firmware on every
+boot to zero all of RAM after any reset it does not recognise as a clean
+shutdown (the TCG memory-overwrite request). A `sysrq` reset is never a clean
+shutdown, so on the first run on real hardware the firmware zeroed the entire
+reserved range, and the run gave no reading; a clean `sudo reboot` kept it.
+Clearing the request before arming is expected to prevent the wipe, and the
+next probe run tests that. The procedure is in
+[Stage 2c Hand-off](stage2c-handoff.md#the-memory-overwrite-request).
 
 What it does **not** establish: the DRAM is volatile, ADR is not involved, and a
 true power cycle erases the range entirely. This is cache-loss sensitivity on a

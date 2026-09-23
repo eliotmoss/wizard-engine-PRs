@@ -53,6 +53,12 @@ OUT_ROOT="${STAGE2C_OUT_ROOT:-$REPO/results}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pwasm-stage2c"
 PENDING="$STATE_DIR/pending"
 REBOOT_CMD="sudo sh -c 'echo b > /proc/sysrq-trigger'"
+# The firmware's memory-overwrite request (TCG Platform Reset Attack
+# Mitigation). A kernel built with CONFIG_RESET_ATTACK_MITIGATION sets it on
+# every boot, and after a reset the firmware does not recognise as a clean
+# shutdown -- a sysrq reset is one -- the firmware zeroes all of RAM, the
+# reserved range included. It must be cleared before every armed run.
+MOR_VAR=/sys/firmware/efi/efivars/MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
@@ -69,6 +75,10 @@ mount_src() { findmnt -no SOURCE -T "$1" 2>/dev/null || true; }
 boot_id() { cat /proc/sys/kernel/random/boot_id; }
 virt() { if have systemd-detect-virt; then systemd-detect-virt 2>/dev/null || true; else echo unknown; fi; }
 is_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+# An efivarfs file is 4 attribute bytes, then the data; print the first data
+# byte in hex, or nothing if the variable is absent.
+efi_byte() { od -A n -t x1 -j 4 -N 1 "$1" 2>/dev/null | tr -d ' \n' || true; }
+mor_set() { local b; b=$(efi_byte "$MOR_VAR"); [ -n "$b" ] && (( 16#$b & 1 )); }
 
 # ----------------------------------------------------------------- checks
 
@@ -89,6 +99,9 @@ host_problems() {
     case "$(mount_opts "$DAX_DIR")" in *dax*) ;; *) echo "STAGE2C_DAX_DIR is not on a dax mount" ;; esac
     case "$(mount_src "$DAX_DIR")" in /dev/pmem*) ;; *) echo "STAGE2C_DAX_DIR is not backed by /dev/pmem*" ;; esac
     grep -qw clwb /proc/cpuinfo || grep -qw clflushopt /proc/cpuinfo || echo "the CPU reports neither clwb nor clflushopt"
+    if mor_set; then
+        echo "the firmware memory-overwrite request is set (0x$(efi_byte "$MOR_VAR")): after a sysrq reset the firmware would zero the reserved range; clear it first (docs/stage2c-handoff.md, runbook)"
+    fi
 }
 
 require_clean_tree() {
@@ -129,6 +142,8 @@ write_provenance() {
         for k in kernel/sysrq vm/dirty_writeback_centisecs vm/dirty_expire_centisecs; do
             printf '%-32s %s\n' "$k" "$(cat /proc/sys/$k 2>/dev/null || echo '?')"
         done
+        local mor; mor=$(efi_byte "$MOR_VAR")
+        printf '%-32s %s\n' "efi memory-overwrite request" "${mor:-absent}"
         rule "parameters"
         printf 'backend %s\n' "$BACKEND"
     } > "$f"
@@ -154,6 +169,9 @@ new_out() {
 finish_arming() {
     local out=$1 kind=$2
     printf 'armed_unix %s\n' "$(date +%s.%N)" >> "$out/provenance.txt"
+    # Re-read at the last moment: this is the value the reset will see.
+    local mor; mor=$(efi_byte "$MOR_VAR")
+    printf 'mor_at_arm %s\n' "${mor:-absent}" >> "$out/provenance.txt"
     mkdir -p "$STATE_DIR"
     printf '%s %s\n' "$kind" "$out" > "$PENDING"
     sync_fs_of "$out"
@@ -296,6 +314,8 @@ doctor() {
     for k in kernel/sysrq vm/dirty_writeback_centisecs vm/dirty_expire_centisecs; do
         printf '%-32s %s\n' "$k" "$(cat /proc/sys/$k 2>/dev/null || echo '?')"
     done
+    local mor; mor=$(efi_byte "$MOR_VAR")
+    printf '%-32s %s\n' "efi memory-overwrite request" "${mor:-absent}"
     rule "armed run"
     if [ -e "$PENDING" ]; then cat "$PENDING"; else say "(none)"; fi
     rule "verdict (backend $BACKEND)"

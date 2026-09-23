@@ -12,10 +12,10 @@ alone.
 | Piece | State |
 |---|---|
 | `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. |
-| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. |
+| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set; that guard is tested on fake variables only. |
 | Verifier outcomes | Checked by editing images by hand: SURVIVED, LOST (steps rolled back, WAL corrupt), INVALID (header zeroed, file missing). The image is never reformatted. |
 | Host setup on the Ubuntu dual boot | Done (2026-09-23). i7-14700KF, Ubuntu 26.04.1, kernel 7.0.0-31; `memmap=1G!8G`, ext4 `dax=always` on `/mnt/pmem0`; `doctor` says `runnable`. |
-| Any run on real hardware | **None yet** |
+| Any run on real hardware | Probe run 1 (2026-09-23): **no verdict.** The firmware zeroed the whole reserved range during the `sysrq` reset, most likely because the kernel had set the memory-overwrite request ([below](#the-memory-overwrite-request)). Run 2 clears it first. |
 
 ## The machines
 
@@ -36,7 +36,10 @@ history. Claude's memory is per machine. Two things a new session needs to know:
 ## What the experiment does
 
 Reserved DRAM (`memmap=<size>!<start>`) survives a warm reboot, because power is
-never removed. A CPU reset throws the cache away without writing it back. So a
+never removed, provided the firmware has not been asked to wipe memory: see
+[The memory-overwrite request](#the-memory-overwrite-request), which the first
+run on real hardware ran into. A CPU reset throws the cache away without
+writing it back. So a
 line that was stored but never written back (`CLWB`) is lost, and a line that
 was written back and fenced survives. Magpie's crash loop cannot tell these
 apart, because killing a process never clears the cache.
@@ -87,6 +90,35 @@ at one crash point. On hardware, most likely all three steps are lost at once
 That still fills the "mutant loses data" cell. Reproducing the explorer's exact
 counterexample would need a mutant that skips `CLWB` only for the last step,
 which is not planned before the freeze.
+
+## The memory-overwrite request
+
+The TCG reset-attack mitigation lets an operating system ask the firmware to
+zero all of RAM before the next boot, so that secrets left in memory cannot be
+read after a forced reset. The request is the EFI variable
+`MemoryOverwriteRequestControl`. Ubuntu's kernel is built with
+`CONFIG_RESET_ATTACK_MITIGATION=y`, so its EFI stub sets the variable to `0x01`
+on every boot (`drivers/firmware/efi/libstub/tpm.c`,
+`efi_enable_reset_attack_mitigation`). That value leaves the DisableAutoDetect
+bit clear, which lets the firmware recognise a clean shutdown and skip the
+wipe (EDK2, `MdePkg/Include/Guid/MemoryOverwriteControl.h`).
+
+On the test host (Gigabyte Z790 A PRO X WIFI7, BIOS F4) the first runs showed
+exactly that:
+
+| Reset | Reserved range afterwards |
+|---|---|
+| Clean `sudo reboot` | Kept: ext4 remounted with the same UUID |
+| `sysrq` reset, request set | **Zeroed**: all 1 GiB read back as zero bytes |
+
+A `sysrq` reset is never a clean shutdown, so every Stage 2c run needs the
+request cleared first. The lock variable (`MemoryOverwriteRequestControlLock`)
+reads `00` on this host, so Linux may clear it. It has to be cleared again in
+every boot, because the kernel sets it on every boot; clearing it switches the
+mitigation off for that one reset only. `doctor` and arming refuse while it is
+set, and `provenance.txt` records its value at the moment of arming
+(`mor_at_arm`). That clearing it prevents the wipe is the working explanation,
+not yet an observation; probe run 2 tests it.
 
 ## One-time host setup (Ubuntu, by hand, as root)
 
@@ -183,7 +215,9 @@ sudo mkdir -p /mnt/pmem0/stage2c && sudo chown "$USER": /mnt/pmem0/stage2c
 
 Only the filesystem is stored in the reserved memory. The namespace mode is
 set by the kernel and comes back on every boot, including a cold one. The
-filesystem is expected to survive a warm reboot and to be lost on a cold boot.
+filesystem survives a clean warm reboot (observed 2026-09-23) and is expected
+to be lost on a cold boot. It does not survive a `sysrq` reset while the
+memory-overwrite request is set (see above).
 **Never run `mkfs` after a warm reboot**: that destroys the evidence. If the
 mount is missing after a warm reboot, stop and investigate. `nofail` keeps a
 missing filesystem from blocking boot.
@@ -202,9 +236,15 @@ Set `STAGE2C_DAX_DIR=/mnt/pmem0/stage2c` in every shell. Commit before arming:
 the script refuses a dirty tree, so every result names a revision.
 
 ```bash
+# 0. Before EVERY arm, in the boot you arm in: clear the memory-overwrite request.
+MOR=/sys/firmware/efi/efivars/MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829
+sudo chattr -i $MOR && printf '\x07\x00\x00\x00\x00' | sudo tee $MOR > /dev/null && sudo chattr +i $MOR
+od -A n -t x1 $MOR                # 07 00 00 00 00
+scripts/stage2c.sh doctor         # runnable
+
 # 1. The probe, first.
 scripts/stage2c.sh probe          # arms, then offers to run the reboot via sudo
-#    ... reboot; log in; confirm /mnt/pmem0 is mounted ...
+#    ... reboot; log in; confirm /mnt/pmem0 is mounted (if not: no mkfs, see step 4) ...
 scripts/stage2c.sh verify
 
 # 2. Only if the probe said SENSITIVE: the sieve, alternating providers.
@@ -230,9 +270,14 @@ taken before recovery, `images.sha256`, and `verify.log` with the verdict.
 
 ## Open risks to watch
 
-- **Firmware may clear or retrain memory on a warm reset.** The probe reports
-  this as `INVALID`. Disabling fast boot or memory tests in the firmware
-  settings may help.
+- **Firmware may clear or retrain memory on a warm reset.** It did on the
+  first run, through the memory-overwrite request (above). Clearing of any kind
+  shows up the same way: the mount is missing after the reboot, and `verify`
+  stops with `the probe file is gone` before printing a verdict. A raw copy of
+  `/dev/pmem0` (`sudo dd`, read-only) then says whether the range came back as
+  zeros (actively cleared) or as noise (decayed or scrambled). Firmware
+  settings for fast boot and memory testing may also matter; none has been
+  changed on the test host.
 - **Eviction before the reset.** Anything that pushes the test lines out of
   the cache writes them back, and the probe measures how much. Keep the machine
   idle and reboot immediately.
