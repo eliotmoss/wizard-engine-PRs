@@ -11,11 +11,11 @@ alone.
 
 | Piece | State |
 |---|---|
-| `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. The probe's optional reset descriptor (`probe-now`, 2026-09-24) is compiled but not yet dry-run on Linux. |
-| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set, which it did on the test host. `probe-now` (2026-09-24) is checked on the Mac only: syntax, and the command's quoting and descriptor hand-off through a stand-in `setpriv`. |
+| `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. The optional reset descriptor (2026-09-24) works in `probe-arm` on the test host (dry run and run 3). In `arm` (`sieve-now`) it is compiled but not yet run on Linux. |
+| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set, which it did on the test host. `probe-now` (2026-09-24) works on the test host. `sieve-now` is checked on the Mac only: syntax, and the command's quoting and descriptor hand-off through a stand-in `setpriv`. |
 | Verifier outcomes | Checked by editing images by hand: SURVIVED, LOST (steps rolled back, WAL corrupt), INVALID (header zeroed, file missing). The image is never reformatted. |
 | Host setup on the Ubuntu dual boot | Done (2026-09-23). i7-14700KF, Ubuntu 26.04.1, kernel 7.0.0-31; `memmap=1G!8G`, ext4 `dax=always` on `/mnt/pmem0`; `doctor` says `runnable`. |
-| Any run on real hardware | Probe run 1 (2026-09-23): **no verdict.** The firmware zeroed the whole reserved range during the `sysrq` reset, because the kernel had set the memory-overwrite request ([below](#the-memory-overwrite-request)). Probe run 2 (request cleared): the range survived, and the verdict was **`NOT-SENSITIVE`**, with all 16,384 unflushed lines intact. Next: the zero-window probe (`probe-now`), which separates the two readings of that verdict. |
+| Any run on real hardware | Probe run 1 (2026-09-23): **no verdict.** The firmware zeroed the whole reserved range during the `sysrq` reset, because the kernel had set the memory-overwrite request ([below](#the-memory-overwrite-request)). Probe run 2 (2026-09-24, request cleared): the range survived, and the verdict was **`NOT-SENSITIVE`**, with all 16,384 unflushed lines intact. Run 3, the zero-window probe (`probe-now`): **`SENSITIVE`**, with 15,563 of 16,384 unflushed lines lost and every flushed line intact. So the host can lose a cache line, and run 2's window was what hid it. Next: the sieve pairs with `sieve-now`. |
 
 ## The machines
 
@@ -68,9 +68,12 @@ hardware that can lose a cache line.
    starts, and it doubles as the flushed control.
 2. `arm` remounts with either the production provider (`ordinary`) or the
    elided-writeback mutant (`elide-clwb`). It runs 3 more steps, recording each
-   acknowledged step in a state file that is fsynced after every line. Then it
+   acknowledged step in a state file that is fsynced after every step. Then it
    exits **without closing**, as a crash would.
-3. Reboot.
+3. Reboot. With `sieve-now`, `arm` resets the machine itself instead of
+   exiting, straight after the fsync that makes its last acknowledgement
+   durable. On the test host this is the form that counts: see
+   [Eviction before the reset](#open-risks-to-watch).
 4. `verify` copies the raw image, checks the header before mounting anything,
    then mounts, recovers, and checks what survived. It checks that the
    acknowledged cursor was reached, that the allocator and sieve invariants
@@ -223,7 +226,7 @@ Only the filesystem is stored in the reserved memory. The namespace mode is
 set by the kernel and comes back on every boot, including a cold one. The
 filesystem survives a clean warm reboot, and a `sysrq` reset once the
 memory-overwrite request is cleared; it does not survive a `sysrq` reset while
-the request is set, or a cold boot (all observed 2026-09-23; see above).
+the request is set, or a cold boot (all observed 2026-09-23/24; see above).
 **Never run `mkfs` after a warm reboot**: that destroys the evidence. If the
 mount is missing after a warm reboot, stop and investigate. `nofail` keeps a
 missing filesystem from blocking boot.
@@ -259,10 +262,11 @@ scripts/stage2c.sh probe-now      # records the run, then offers to store and re
 #    ... it resets by itself; log in; confirm /mnt/pmem0 is mounted ...
 scripts/stage2c.sh verify
 
-# 2. Only if the probe said SENSITIVE: the sieve, alternating providers.
-scripts/stage2c.sh sieve ordinary     ; # reboot ; scripts/stage2c.sh verify
-scripts/stage2c.sh sieve elide-clwb   ; # reboot ; scripts/stage2c.sh verify
-#    repeat the pair at least three times
+# 2. Only if a probe said SENSITIVE: the sieve, alternating providers. Use the
+#    form of the probe that did: on the test host that is sieve-now.
+sudo -v; scripts/stage2c.sh sieve-now ordinary     # resets by itself ; scripts/stage2c.sh verify
+sudo -v; scripts/stage2c.sh sieve-now elide-clwb   # resets by itself ; scripts/stage2c.sh verify
+#    repeat the pair at least three times (step 0 before each)
 
 # 3. Commit the results.
 git add results/*-stage2c-*
@@ -272,7 +276,9 @@ git commit -m "results(pmem): Stage 2c warm-reboot runs on <host>"
 Between `ARMED` and the reboot, **do nothing else on the machine**. In
 particular, do not run `sync`: it could write back the very lines under test.
 Reboot within seconds; the script records the time between arming and the next
-boot.
+boot. With `probe-now` and `sieve-now` there is no such interval: `ARMED` is
+printed before anything is stored, and the command it offers stores and resets
+in one go.
 
 Each run leaves `results/<stamp>-<host>-stage2c-<kind>/` containing
 `provenance.txt` (revision, kernel command line, CPU and cache sizes, mount
@@ -297,10 +303,15 @@ taken before recovery, `images.sha256`, and `verify.log` with the verdict.
   `sudo`. `probe-now` leaves none. Root opens `/proc/sysrq-trigger`, `setpriv`
   drops to the ordinary user and keeps that descriptor open, and the probe
   writes `b` to it straight after its last store: no other process runs, and
-  the CPU never idles. If `probe` says `NOT-SENSITIVE` and `probe-now` says
-  `SENSITIVE`, the window was the cause, and the sieve's `arm` would need the
-  same treatment. If both say `NOT-SENSITIVE`, the reset path itself writes the
-  cache back on this host, and the sieve runs cannot discriminate here.
+  the CPU never idles. **On the test host the window was the cause:** `probe`
+  read `NOT-SENSITIVE` (run 2) and `probe-now` read `SENSITIVE` (run 3). The
+  reset itself does not write the cache back. So the sieve runs use
+  `sieve-now`, whose `arm` resets the machine straight after the one fsync
+  that makes its last acknowledgement durable. In run 3 the 821 unflushed
+  lines that did survive were all among the first 40 % stored, scattered in
+  ones and twos, never a whole page. That is the pattern eviction by the
+  probe's own later stores would leave. The probe stores in ascending address
+  order, so store order and address order cannot be told apart.
 - **Kernel writeback of DAX data.** The harness never syncs the DAX
   filesystem after arming. The production mapping uses `MAP_SYNC`, and as far
   as is known the kernel does not track dirty pages on `MAP_SYNC` mappings, so

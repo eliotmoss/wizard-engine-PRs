@@ -8,6 +8,8 @@
 #   scripts/stage2c.sh probe-now              the probe, reset from inside it (no window)
 #   scripts/stage2c.sh sieve <ordinary|elide-clwb>
 #                                             arm the sieve with either provider
+#   scripts/stage2c.sh sieve-now <ordinary|elide-clwb>
+#                                             the sieve, reset from inside arm (no window)
 #   scripts/stage2c.sh verify                 after the reboot: verify the armed run
 #   scripts/stage2c.sh status                 show the armed run, if any
 #   scripts/stage2c.sh abandon                forget the armed run without verifying
@@ -216,36 +218,29 @@ probe() {
     finish_arming "$out" probe
 }
 
-# The probe with no window between its last store and the reset. Root opens
-# /proc/sysrq-trigger and hands the descriptor to the probe after dropping
-# privileges, and the probe writes 'b' to it straight after its last store:
-# no other process runs and the CPU never idles in between, so an unflushed
-# line can survive only if the reset itself writes the cache back. The
-# pointer is recorded and synced before the probe starts, because on a real
-# host the probe never returns.
-probe_now() {
-    require_clean_tree
-    require_runnable
-    have setpriv || die "setpriv (util-linux) is needed to hand the probe the reset descriptor"
-    local out; out=$(new_out probe-now)
+# Run "$BIN $args" with descriptor 3 open on the reset trigger, so that the
+# process resets the machine itself straight after its last store: no other
+# process runs and the CPU never idles in between. On a real host root opens
+# /proc/sysrq-trigger, setpriv drops to this user keeping it open, and the
+# process never returns, so the run is recorded and synced first. In a dry run
+# descriptor 3 is a plain file, and the process returns.
+arm_now() {
+    local out=$1 kind=$2 args=$3 what=$4
     case "$REPO$DAX_DIR$out" in *"'"*) die "the repository, DAX and results paths must not contain a single quote" ;; esac
-    write_provenance "$out"
-    printf 'probe bytes %s\nreset from inside the probe, no window\n' "$PROBE_BYTES" >> "$out/provenance.txt"
-    local args="probe-arm \"$DAX_DIR\" \"$out/probe.state\" $BACKEND $PROBE_BYTES 3"
     if [ "$BACKEND" != pmem ]; then
-        # Plumbing only: descriptor 3 is a plain file, so the probe returns.
         sh -c "exec 3>\"$out/reset.key\" && exec \"$REPO/$BIN\" $args" | tee "$out/arm.log"
-        grep -q '^READY$' "$out/arm.log" || die "probe-arm did not report READY; see $out/arm.log"
-        record_armed "$out" probe
+        grep -q '^READY$' "$out/arm.log" || die "the armed step did not report READY; see $out/arm.log"
+        record_armed "$out" "$kind"
         say ""
-        say "DRY RUN armed (probe, no window). No reboot is needed: run  scripts/stage2c.sh verify"
+        say "DRY RUN armed ($kind, no window). No reboot is needed: run  scripts/stage2c.sh verify"
         return
     fi
-    record_armed "$out" probe
+    have setpriv || die "setpriv (util-linux) is needed to hand over the reset descriptor"
+    record_armed "$out" "$kind"
     local cmd="sudo sh -c 'exec 3>/proc/sysrq-trigger && exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \"$REPO/$BIN\" $args'"
     say ""
-    say "ARMED (probe, no window). Nothing is stored yet: this command stores the probe"
-    say "lines and resets the machine from inside the probe. Run it and nothing else:"
+    say "ARMED ($kind, no window). $what"
+    say "Run it and nothing else:"
     say ""
     say "    $cmd"
     say ""
@@ -256,16 +251,30 @@ probe_now() {
         read -r -p "Press Enter to run it now via sudo, or Ctrl-C to run it yourself: " _
         eval "$cmd" || true
         # Reached only if the machine did not reset.
-        die "the probe returned without resetting the machine; see the output above, then run  scripts/stage2c.sh abandon"
+        die "it returned without resetting the machine; see the output above, then run  scripts/stage2c.sh abandon"
     fi
 }
 
-sieve() {
-    local provider=${1:-}
-    case "$provider" in ordinary|elide-clwb) ;; *) die "usage: scripts/stage2c.sh sieve <ordinary|elide-clwb>" ;; esac
+# The probe with no window between its last store and the reset, so an
+# unflushed line can survive only if the reset itself writes the cache back.
+probe_now() {
     require_clean_tree
     require_runnable
-    local out; out=$(new_out "sieve-$provider")
+    local out; out=$(new_out probe-now)
+    write_provenance "$out"
+    printf 'probe bytes %s\nreset from inside the probe, no window\n' "$PROBE_BYTES" >> "$out/provenance.txt"
+    arm_now "$out" probe "probe-arm \"$DAX_DIR\" \"$out/probe.state\" $BACKEND $PROBE_BYTES 3" \
+        "Nothing is stored yet: this command stores the probe lines and resets the machine from inside the probe."
+}
+
+# Setup for a sieve run: a fresh region, formatted and advanced with the
+# production provider, then closed cleanly. Sets SIEVE_OUT and SIEVE_REGION.
+sieve_setup() {
+    local provider=$1 kind=$2
+    case "$provider" in ordinary|elide-clwb) ;; *) die "usage: scripts/stage2c.sh $kind <ordinary|elide-clwb>" ;; esac
+    require_clean_tree
+    require_runnable
+    local out; out=$(new_out "$kind-$provider")
     write_provenance "$out"
     printf 'provider %s\ngeometry %sx%s\nsetup steps %s\narm steps %s\n' \
         "$provider" "$BLOCKS" "$BLOCKSIZE" "$SETUP_STEPS" "$ARM_STEPS" >> "$out/provenance.txt"
@@ -276,11 +285,30 @@ sieve() {
     # provider, so nothing is deliberately left unflushed yet. This makes the
     # new file's metadata durable before the experiment starts.
     sync_fs_of "$DAX_DIR"
-    local region; region=$(awk '$1 == "region" { print $2 }' "$out/setup.state")
+    SIEVE_OUT=$out
+    SIEVE_REGION=$(awk '$1 == "region" { print $2 }' "$out/setup.state")
+}
+
+sieve() {
+    local provider=${1:-}
+    sieve_setup "$provider" sieve
+    local out=$SIEVE_OUT region=$SIEVE_REGION
     say "arming with the $provider provider"
     "$BIN" arm "$region" "$out/arm.state" "$BACKEND" "$provider" "$BLOCKS" "$BLOCKSIZE" "$ARM_STEPS" | tee "$out/arm.log"
     grep -q '^READY$' "$out/arm.log" || die "arm did not report READY; see $out/arm.log"
     finish_arming "$out" "sieve-$provider"
+}
+
+# The sieve with no window: arm resets the machine itself straight after the
+# fsync that makes its last acknowledgement durable.
+sieve_now() {
+    local provider=${1:-}
+    sieve_setup "$provider" sieve-now
+    local out=$SIEVE_OUT region=$SIEVE_REGION
+    printf 'reset from inside arm, no window\n' >> "$out/provenance.txt"
+    arm_now "$out" "sieve-$provider" \
+        "arm \"$region\" \"$out/arm.state\" $BACKEND $provider $BLOCKS $BLOCKSIZE $ARM_STEPS 3" \
+        "Setup is done and closed cleanly: this command runs the $ARM_STEPS armed steps with the $provider provider and resets the machine from inside the process."
 }
 
 # ------------------------------------------------------------------ verify
@@ -391,6 +419,7 @@ case "${1:-doctor}" in
     doctor)  doctor ;;
     probe)   probe ;;
     probe-now) probe_now ;;
+    sieve-now) shift; sieve_now "${1:-}" ;;
     sieve)   shift; sieve "${1:-}" ;;
     verify)  verify ;;
     status)  status ;;

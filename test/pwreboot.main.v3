@@ -29,10 +29,12 @@
 //       Formats a fresh region and runs the sieve for a few steps with the
 //       production provider, then closes cleanly, so this state is durable
 //       before the experiment starts. It doubles as the flushed control.
-//   arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps]
+//   arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]
 //       Remounts with the chosen provider and runs more steps, recording each
 //       acknowledged step, then exits WITHOUT closing: no clean-close
-//       writeback, exactly as a crash would leave it.
+//       writeback, exactly as a crash would leave it. With reset-fd, as for
+//       probe-arm, it resets the machine instead of exiting, straight after
+//       the fsync that makes the last acknowledgement durable.
 //   verify <region> <file|pmem> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>
 //       After the reboot: checks the raw image before mounting (PWRegion
 //       formats a region whose header is missing, which would destroy the
@@ -65,7 +67,7 @@ def usage() -> int {
         System.puts("  pwreboot probe-arm <dax-dir> <state-file> <file|pmem> [bytes] [reset-fd]\n");
         System.puts("  pwreboot probe-verify <probe-file> <bytes> <nonce>\n");
         System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem> [blocks] [blockSize] [steps]\n");
-        System.puts("  pwreboot arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps]\n");
+        System.puts("  pwreboot arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]\n");
         System.puts("  pwreboot verify <region> <file|pmem> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>\n");
         return EXIT_USAGE;
 }
@@ -186,6 +188,29 @@ def kvs(key: string, value: string) -> string {
         return StringBuilder.new().puts(key).puts(" ").puts(value).toString();
 }
 
+// The optional reset descriptor: an inherited descriptor for
+// /proc/sysrq-trigger, or -1 when the operator resets the machine.
+def parseResetFd(args: Array<string>, index: int) -> (bool, int) {
+        if (args.length <= index) return (true, -1);
+        def r = requireU64(args[index], "reset-fd");
+        if (!r.0 || r.1 < 3u64 || r.1 > 1023u64) {
+                System.puts("reset-fd must be an inherited descriptor, 3 or above\n");
+                return (false, -1);
+        }
+        return (true, int.!(r.1));
+}
+
+// Reset the machine now, through the inherited descriptor. On
+// /proc/sysrq-trigger the write does not return. If it does, the descriptor
+// was a plain file, i.e. a plumbing dry run, and the caller carries on.
+def requestReset(fd: int) -> bool {
+        def key = "b";
+        def r = Linux.syscall(LinuxConst.SYS_write, (fd, Pointer.atContents(key), 1)).0;
+        if (r != 1) return false;
+        System.puts("reset requested, but the machine is still running\n");
+        return true;
+}
+
 // ------------------------------------------------------------------ probe
 
 // splitmix64 finaliser: a line's expected contents are a function of the run
@@ -218,15 +243,9 @@ def probeArm(args: Array<string>) -> int {
                 System.puts("probe size must be a positive multiple of 4096\n");
                 return EXIT_USAGE;
         }
-        var resetFd = -1;
-        if (args.length > 5) {
-                def r = requireU64(args[5], "reset-fd");
-                if (!r.0 || r.1 < 3u64 || r.1 > 1023u64) {
-                        System.puts("reset-fd must be an inherited descriptor, 3 or above\n");
-                        return EXIT_USAGE;
-                }
-                resetFd = int.!(r.1);
-        }
+        def rf = parseResetFd(args, 5);
+        if (!rf.0) return EXIT_USAGE;
+        def resetFd = rf.1;
         def nonce = randomNonce();
         if (nonce == 0) return fail("getrandom failed");
         RebootConfig.path = reservePath(args[1], "wizard-pwreboot-probe");
@@ -265,17 +284,9 @@ def probeArm(args: Array<string>) -> int {
                 for (w = 0u64; w < 8u64; w++) ops.storeU64(base + w * 8u64, expectedWord(nonce, line, w));
         }
         ops.sfence();
-        if (resetFd >= 0) {
-                // No window: nothing between the last store and the reset, not
-                // even the state file's fsync, which could idle the CPU. On
-                // /proc/sysrq-trigger this write does not return.
-                def key = "b";
-                def r = Linux.syscall(LinuxConst.SYS_write, (resetFd, Pointer.atContents(key), 1)).0;
-                if (r != 1) return fail("could not write to the reset descriptor");
-                // Still running, so the descriptor was not /proc/sysrq-trigger:
-                // a plumbing dry run.
-                System.puts("reset requested, but the machine is still running\n");
-        }
+        // No window: nothing between the last store and the reset, not even
+        // the state file's fsync, which could idle the CPU.
+        if (resetFd >= 0 && !requestReset(resetFd)) return fail("could not write to the reset descriptor");
         state.line("armed yes");
         state.close();
         // Exit without unmapping explicitly: nothing here may write back the
@@ -396,6 +407,9 @@ def arm(args: Array<string>) -> int {
         def bl = requireU64(args[5], "blocks"), bs = requireU64(args[6], "blockSize");
         if (!bl.0 || !bs.0) return EXIT_USAGE;
         def steps = if(args.length > 7, parseU64(args[7], 3), 3u64);
+        def rf = parseResetFd(args, 8);
+        if (!rf.0) return EXIT_USAGE;
+        def resetFd = rf.1;
         def state = openState(args[2]);
         if (state == null) return fail("could not create the state file");
         if (System.fileLoad(RebootConfig.path) == null) return fail("region file is missing; run setup first");
@@ -411,22 +425,32 @@ def arm(args: Array<string>) -> int {
         state.line(kvs("provider", if(RebootConfig.elideWriteback, "elide-clwb", "ordinary")));
         state.line(kv("start_cursor", sieve.cursor()));
         var done = 0u64;
+        var lastAck: string;
         for (i < steps) {
                 if (!sieve.step()) break;
                 done++;
                 // A step has returned, so its commits are acknowledged: the
                 // contract says recovery must reach at least this far.
-                state.line(StringBuilder.new().puts("ack ").putd(done)
+                def ack = StringBuilder.new().puts("ack ").putd(done)
                         .puts(" cursor ").putd(sieve.cursor())
-                        .puts(" count ").putd(sieve.count()).toString());
+                        .puts(" count ").putd(sieve.count()).toString();
+                // The last acknowledgement goes out with the summary, in one
+                // write and one fsync: with an in-process reset, that fsync is
+                // all that separates the last step from the reset.
+                if (done < steps) state.line(ack);
+                else lastAck = ack;
         }
-        state.line(kv("acked_steps", done));
-        state.line(kv("acked_cursor", sieve.cursor()));
-        if (!state.line(kv("acked_count", sieve.count()))) return fail("could not sync the state file");
-        state.close();
+        def summary = StringBuilder.new();
+        if (lastAck != null) summary.puts(lastAck).ln();
+        summary.puts("acked_steps ").putd(done).ln()
+                .puts("acked_cursor ").putd(sieve.cursor()).ln()
+                .puts("acked_count ").putd(sieve.count());
+        if (!state.line(summary.toString())) return fail("could not sync the state file");
         if (done == 0) return fail("no step completed, so nothing is under test");
         // No deallocate(): a clean close would write back and fence the very
         // state the mutant leaves in cache. Leave it exactly as a crash would.
+        if (resetFd >= 0 && !requestReset(resetFd)) return fail("could not write to the reset descriptor");
+        state.close();
         Trace.OUT.put3("armed: %d acknowledged steps, cursor %d, primes %d",
                 done, sieve.cursor(), sieve.count()).ln();
         System.puts("READY\n");

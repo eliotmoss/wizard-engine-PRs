@@ -704,7 +704,7 @@ Clearing the request before arming prevents the wipe: the second run cleared
 it, and the range survived. The procedure is in
 [Stage 2c Hand-off](stage2c-handoff.md#the-memory-overwrite-request).
 
-**First reading (2026-09-23): `NOT-SENSITIVE`.** With the request cleared,
+**First reading (2026-09-24): `NOT-SENSITIVE`.** With the request cleared,
 every one of 16,384 unflushed probe lines survived the `sysrq` reset intact,
 beside 16,384 flushed ones. Two alternatives that would make this a setup
 artifact were checked and ruled out:
@@ -720,6 +720,19 @@ explanations remain open: the reset path wrote the cache back, or the lines
 were evicted in the seconds between the probe's last store and the reset. A
 zero-window probe, which resets from inside the probe straight after its last
 store, separates them.
+
+**Zero-window reading (2026-09-24): `SENSITIVE`.** Resetting from inside the
+probe, 15,563 of 16,384 unflushed lines were lost (95 %), all 16,384 flushed
+lines survived, and no line was torn. The lost lines read back as zero, the
+content ext4 gave the new DAX blocks, so what vanished was exactly the
+unflushed stores. The second property holds after all: the reset discards the
+cache. What hid it in the first reading was the window of seconds between the
+last store and the reset, in which the lines reached memory anyway. The 821
+unflushed lines that survived were all among the first 40 % stored, scattered
+rather than in whole pages, which is what eviction by the probe's own later
+stores would leave. Store order and address order coincide in this probe, so
+the two cannot be separated. The sieve runs therefore use the same in-process
+reset (`stage2c.sh sieve-now`).
 
 What it does **not** establish: the DRAM is volatile, ADR is not involved, and a
 true power cycle erases the range entirely. This is cache-loss sensitivity on a
