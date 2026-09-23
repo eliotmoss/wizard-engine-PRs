@@ -183,7 +183,7 @@ interleaved within each repetition, so any difference between them is not a
 difference between sittings — the property the block configuration has lacked.
 Every cell's three runs agree to within 0.5 %, and the start-of-run load was
 `0.00`. 24 entries replaces 32 and 56 because a 2048-byte block's WAL slot holds
-about 26. Medians of three:
+26. Medians of three:
 
 | Configuration | Region | 1 entry | 8 entries | 24 entries |
 |---|---|---|---|---|
@@ -303,9 +303,17 @@ The defaults reproduce the tables below: `PWEXP_REPS=3`,
 2 MiB geometry (`PWEXP_REGION_BLOCKSIZES=4096`). That variable takes a list —
 `"2048 4096"` measures 1 MiB and 2 MiB regions interleaved within each
 repetition, so a cross-geometry comparison is never also a cross-sitting one. A
-2048-byte block holds about 26 entries per WAL slot, so pair it with
+2048-byte block holds 26 entries per WAL slot, so pair it with
 `PWEXP_SIZES="1 8 24"`; the script refuses a size that cannot fit before any
 run starts.
+
+Block size is not a pure region-size knob: it also sets the WAL slot capacity
+and moves the per-commit writes, since the WAL sits at one block and the scratch
+chunk at two. `PWEXP_REGION_GEOMETRIES` takes `<blocks>x<blockSize>` pairs
+instead (pwbench's seventh argument is the block count), so
+`"512x2048 256x4096 512x4096"` compares two 1 MiB regions that differ only in
+block size against the 2 MiB baseline, all interleaved. It replaces
+`PWEXP_REGION_BLOCKSIZES`, and setting both is refused.
 
 ### Repeats: `fdatasync` on DAX is bimodal, and the cause is NUMA
 
