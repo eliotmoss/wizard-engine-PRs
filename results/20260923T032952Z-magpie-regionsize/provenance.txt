@@ -1,0 +1,7 @@
+revision aafe1edd3f6b088a9ec3650655adbee54a62da10
+dirty    no
+started  2026-09-23T03:29:52Z
+load     0.00 0.00 0.00
+kernel   6.8.0-137-generic
+/dev/pmem0 ext4   rw,relatime,dax=always
+pinned to node 0

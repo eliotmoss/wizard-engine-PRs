@@ -1,0 +1,6 @@
+Filesystem type is: ef53
+File size of /mnt/pmem0.0/sean/wizard-pwbench-u7599095-p107637-0.region is 8388608 (2048 blocks of 4096 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..     511:    3832832..   3833343:    512:            
+   1:     1536..    2047:    3079680..   3080191:    512:    3834368: last,eof
+/mnt/pmem0.0/sean/wizard-pwbench-u7599095-p107637-0.region: 2 extents found

@@ -1,0 +1,12 @@
+bs=2048   rep=1  boundary ns: min 4533 median 5094 p90 5467
+bs=2048   rep=2  boundary ns: min 4526 median 4940 p90 5213
+bs=2048   rep=3  boundary ns: min 4504 median 4966 p90 5085
+bs=4096   rep=1  boundary ns: min 923506 median 927370 p90 928604
+bs=4096   rep=2  boundary ns: min 921576 median 925718 p90 926903
+bs=4096   rep=3  boundary ns: min 923952 median 928089 p90 929300
+bs=8192   rep=1  boundary ns: min 924501 median 928583 p90 929630
+bs=8192   rep=2  boundary ns: min 922292 median 926620 p90 927904
+bs=8192   rep=3  boundary ns: min 920993 median 924790 p90 925823
+bs=16384  rep=1  boundary ns: min 922460 median 926124 p90 927194
+bs=16384  rep=2  boundary ns: min 924294 median 928610 p90 929629
+bs=16384  rep=3  boundary ns: min 923176 median 928170 p90 929376
