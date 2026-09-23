@@ -1,0 +1,22 @@
+---- median boundary ns, median over 3 repetitions
+config       blocksize  entries    boundary_ns
+file-block        2048        1         168573
+file-block        2048        8         157825
+file-block        2048       24         156682
+file-block        4096        1         196592
+file-block        4096        8         180504
+file-block        4096       24         170453
+file-dax          2048        1           5125
+file-dax          2048        8           5024
+file-dax          2048       24           5047
+file-dax          4096        1         926976
+file-dax          4096        8         928659
+file-dax          4096       24         927693
+pmem-dax          2048        1             13
+pmem-dax          2048        8             11
+pmem-dax          2048       24             11
+pmem-dax          4096        1             13
+pmem-dax          4096        8             11
+pmem-dax          4096       24             11
+---- boundaries per commit (must be 1000; a higher value means the overwrite guard fired)
+1000 
