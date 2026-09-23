@@ -15,10 +15,13 @@
 // line, because a sysrq reboot does not sync disks. It never syncs the DAX
 // filesystem: on a DAX file that could write back exactly the lines under test.
 //
-//   probe-arm <dax-dir> <state-file> <file|pmem> [bytes]
+//   probe-arm <dax-dir> <state-file> <file|pmem> [bytes] [reset-fd]
 //       Direct sensitivity probe, independent of the WAL. Writes a fresh file:
 //       even cache lines are stored, CLWB-ed and fenced; odd lines are only
 //       stored. Both carry a per-run nonce, so stale content cannot pass.
+//       With reset-fd (an inherited descriptor for /proc/sysrq-trigger), the
+//       probe writes 'b' to it straight after its last store, so no window
+//       is left in which the unflushed lines could be evicted.
 //   probe-verify <probe-file> <bytes> <nonce>
 //       After the reboot: counts intact, torn and lost lines in each set.
 //
@@ -59,7 +62,7 @@ component RebootConfig {
 
 def usage() -> int {
         System.puts("Usage:\n");
-        System.puts("  pwreboot probe-arm <dax-dir> <state-file> <file|pmem> [bytes]\n");
+        System.puts("  pwreboot probe-arm <dax-dir> <state-file> <file|pmem> [bytes] [reset-fd]\n");
         System.puts("  pwreboot probe-verify <probe-file> <bytes> <nonce>\n");
         System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem> [blocks] [blockSize] [steps]\n");
         System.puts("  pwreboot arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps]\n");
@@ -215,6 +218,15 @@ def probeArm(args: Array<string>) -> int {
                 System.puts("probe size must be a positive multiple of 4096\n");
                 return EXIT_USAGE;
         }
+        var resetFd = -1;
+        if (args.length > 5) {
+                def r = requireU64(args[5], "reset-fd");
+                if (!r.0 || r.1 < 3u64 || r.1 > 1023u64) {
+                        System.puts("reset-fd must be an inherited descriptor, 3 or above\n");
+                        return EXIT_USAGE;
+                }
+                resetFd = int.!(r.1);
+        }
         def nonce = randomNonce();
         if (nonce == 0) return fail("getrandom failed");
         RebootConfig.path = reservePath(args[1], "wizard-pwreboot-probe");
@@ -235,6 +247,7 @@ def probeArm(args: Array<string>) -> int {
         state.line(kv("bytes", bytes));
         state.line(kv("nonce", nonce));
         state.line(kv("flushed_lines", lines / 2u64));
+        state.line(kvs("reset", if(resetFd >= 0, "in-probe", "operator")));
         if (!state.line(kv("unflushed_lines", lines / 2u64))) return fail("could not sync the state file");
 
         // Flushed set first: every even line stored, written back and fenced.
@@ -252,6 +265,17 @@ def probeArm(args: Array<string>) -> int {
                 for (w = 0u64; w < 8u64; w++) ops.storeU64(base + w * 8u64, expectedWord(nonce, line, w));
         }
         ops.sfence();
+        if (resetFd >= 0) {
+                // No window: nothing between the last store and the reset, not
+                // even the state file's fsync, which could idle the CPU. On
+                // /proc/sysrq-trigger this write does not return.
+                def key = "b";
+                def r = Linux.syscall(LinuxConst.SYS_write, (resetFd, Pointer.atContents(key), 1)).0;
+                if (r != 1) return fail("could not write to the reset descriptor");
+                // Still running, so the descriptor was not /proc/sysrq-trigger:
+                // a plumbing dry run.
+                System.puts("reset requested, but the machine is still running\n");
+        }
         state.line("armed yes");
         state.close();
         // Exit without unmapping explicitly: nothing here may write back the

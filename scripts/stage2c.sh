@@ -5,6 +5,7 @@
 #
 #   scripts/stage2c.sh doctor                 check this host can run the experiment
 #   scripts/stage2c.sh probe                  arm the direct sensitivity probe
+#   scripts/stage2c.sh probe-now              the probe, reset from inside it (no window)
 #   scripts/stage2c.sh sieve <ordinary|elide-clwb>
 #                                             arm the sieve with either provider
 #   scripts/stage2c.sh verify                 after the reboot: verify the armed run
@@ -164,9 +165,9 @@ new_out() {
     echo "$try"
 }
 
-# Record the pointer, sync the results filesystem, then ask for the reboot.
-# Nothing may touch the DAX filesystem between arming and the reboot.
-finish_arming() {
+# Record the pointer and sync the results filesystem, so everything verify
+# needs survives a reset that does not sync.
+record_armed() {
     local out=$1 kind=$2
     printf 'armed_unix %s\n' "$(date +%s.%N)" >> "$out/provenance.txt"
     # Re-read at the last moment: this is the value the reset will see.
@@ -176,6 +177,13 @@ finish_arming() {
     printf '%s %s\n' "$kind" "$out" > "$PENDING"
     sync_fs_of "$out"
     sync_fs_of "$PENDING"
+}
+
+# Record the pointer, then ask for the reboot. Nothing may touch the DAX
+# filesystem between arming and the reboot.
+finish_arming() {
+    local out=$1 kind=$2
+    record_armed "$out" "$kind"
     say ""
     if [ "$BACKEND" != pmem ]; then
         say "DRY RUN armed ($kind). No reboot is needed: run  scripts/stage2c.sh verify"
@@ -206,6 +214,50 @@ probe() {
     "$BIN" probe-arm "$DAX_DIR" "$out/probe.state" "$BACKEND" "$PROBE_BYTES" | tee "$out/arm.log"
     grep -q '^READY$' "$out/arm.log" || die "probe-arm did not report READY; see $out/arm.log"
     finish_arming "$out" probe
+}
+
+# The probe with no window between its last store and the reset. Root opens
+# /proc/sysrq-trigger and hands the descriptor to the probe after dropping
+# privileges, and the probe writes 'b' to it straight after its last store:
+# no other process runs and the CPU never idles in between, so an unflushed
+# line can survive only if the reset itself writes the cache back. The
+# pointer is recorded and synced before the probe starts, because on a real
+# host the probe never returns.
+probe_now() {
+    require_clean_tree
+    require_runnable
+    have setpriv || die "setpriv (util-linux) is needed to hand the probe the reset descriptor"
+    local out; out=$(new_out probe-now)
+    case "$REPO$DAX_DIR$out" in *"'"*) die "the repository, DAX and results paths must not contain a single quote" ;; esac
+    write_provenance "$out"
+    printf 'probe bytes %s\nreset from inside the probe, no window\n' "$PROBE_BYTES" >> "$out/provenance.txt"
+    local args="probe-arm \"$DAX_DIR\" \"$out/probe.state\" $BACKEND $PROBE_BYTES 3"
+    if [ "$BACKEND" != pmem ]; then
+        # Plumbing only: descriptor 3 is a plain file, so the probe returns.
+        sh -c "exec 3>\"$out/reset.key\" && exec \"$REPO/$BIN\" $args" | tee "$out/arm.log"
+        grep -q '^READY$' "$out/arm.log" || die "probe-arm did not report READY; see $out/arm.log"
+        record_armed "$out" probe
+        say ""
+        say "DRY RUN armed (probe, no window). No reboot is needed: run  scripts/stage2c.sh verify"
+        return
+    fi
+    record_armed "$out" probe
+    local cmd="sudo sh -c 'exec 3>/proc/sysrq-trigger && exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \"$REPO/$BIN\" $args'"
+    say ""
+    say "ARMED (probe, no window). Nothing is stored yet: this command stores the probe"
+    say "lines and resets the machine from inside the probe. Run it and nothing else:"
+    say ""
+    say "    $cmd"
+    say ""
+    say "After it comes back: mount the DAX filesystem if fstab does not, then run"
+    say "    scripts/stage2c.sh verify"
+    if [ "$REBOOT_MODE" = prompt ] && [ -t 0 ]; then
+        say ""
+        read -r -p "Press Enter to run it now via sudo, or Ctrl-C to run it yourself: " _
+        eval "$cmd" || true
+        # Reached only if the machine did not reset.
+        die "the probe returned without resetting the machine; see the output above, then run  scripts/stage2c.sh abandon"
+    fi
 }
 
 sieve() {
@@ -255,6 +307,7 @@ verify() {
 
     local img code
     if [ "$kind" = probe ]; then
+        [ -e "$out/probe.state" ] || die "the probe never ran: there is no probe.state in $out; abandon this run"
         local f; f=$(state_value "$out/probe.state" probe_file)
         [ -e "$f" ] || die "the probe file is gone: $f (is the DAX filesystem mounted?)"
         cp --sparse=never "$f" "$out/probe.img"
@@ -337,6 +390,7 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 case "${1:-doctor}" in
     doctor)  doctor ;;
     probe)   probe ;;
+    probe-now) probe_now ;;
     sieve)   shift; sieve "${1:-}" ;;
     verify)  verify ;;
     status)  status ;;

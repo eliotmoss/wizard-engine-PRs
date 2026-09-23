@@ -11,11 +11,11 @@ alone.
 
 | Piece | State |
 |---|---|
-| `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. |
-| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set; that guard is tested on fake variables only. |
+| `test/pwreboot.main.v3` — probe, setup, arm, verify | Built. Dry-run tested on WSL with the file backend. The probe's optional reset descriptor (`probe-now`, 2026-09-24) is compiled but not yet dry-run on Linux. |
+| `scripts/stage2c.sh` — operator script | Built. Dry-run tested on WSL. Guards tested: it refuses WSL, VMs, hosts without `memmap=`, non-DAX directories, a results directory on the DAX filesystem, a second armed run, and a verify in the same boot. Since 2026-09-23 it also refuses to arm while the firmware's memory-overwrite request is set, which it did on the test host. `probe-now` (2026-09-24) is checked on the Mac only: syntax, and the command's quoting and descriptor hand-off through a stand-in `setpriv`. |
 | Verifier outcomes | Checked by editing images by hand: SURVIVED, LOST (steps rolled back, WAL corrupt), INVALID (header zeroed, file missing). The image is never reformatted. |
 | Host setup on the Ubuntu dual boot | Done (2026-09-23). i7-14700KF, Ubuntu 26.04.1, kernel 7.0.0-31; `memmap=1G!8G`, ext4 `dax=always` on `/mnt/pmem0`; `doctor` says `runnable`. |
-| Any run on real hardware | Probe run 1 (2026-09-23): **no verdict.** The firmware zeroed the whole reserved range during the `sysrq` reset, most likely because the kernel had set the memory-overwrite request ([below](#the-memory-overwrite-request)). Run 2 clears it first. |
+| Any run on real hardware | Probe run 1 (2026-09-23): **no verdict.** The firmware zeroed the whole reserved range during the `sysrq` reset, because the kernel had set the memory-overwrite request ([below](#the-memory-overwrite-request)). Probe run 2 (request cleared): the range survived, and the verdict was **`NOT-SENSITIVE`**, with all 16,384 unflushed lines intact. Next: the zero-window probe (`probe-now`), which separates the two readings of that verdict. |
 
 ## The machines
 
@@ -109,7 +109,13 @@ exactly that:
 | Reset | Reserved range afterwards |
 |---|---|
 | Clean `sudo reboot` | Kept: ext4 remounted with the same UUID |
-| `sysrq` reset, request set | **Zeroed**: all 1 GiB read back as zero bytes |
+| `sysrq` reset, request set (probe run 1) | **Zeroed**: all 1 GiB read back as zero bytes |
+| `sysrq` reset, request cleared (probe run 2) | Kept: ext4 remounted, all 16,384 flushed probe lines intact |
+| Power off for a cold boot | Lost: 99.6 % of bytes non-zero, and zero bytes at 0.382 %, close to the 0.391 % of uniform noise |
+
+The last row is the control for reading the second: memory that loses power
+comes back as noise on this platform, so an all-zero range was actively
+cleared.
 
 A `sysrq` reset is never a clean shutdown, so every Stage 2c run needs the
 request cleared first. The lock variable (`MemoryOverwriteRequestControlLock`)
@@ -117,8 +123,8 @@ reads `00` on this host, so Linux may clear it. It has to be cleared again in
 every boot, because the kernel sets it on every boot; clearing it switches the
 mitigation off for that one reset only. `doctor` and arming refuse while it is
 set, and `provenance.txt` records its value at the moment of arming
-(`mor_at_arm`). That clearing it prevents the wipe is the working explanation,
-not yet an observation; probe run 2 tests it.
+(`mor_at_arm`). Clearing it prevents the wipe: probe run 2 cleared it, and the
+range survived the `sysrq` reset.
 
 ## One-time host setup (Ubuntu, by hand, as root)
 
@@ -215,9 +221,9 @@ sudo mkdir -p /mnt/pmem0/stage2c && sudo chown "$USER": /mnt/pmem0/stage2c
 
 Only the filesystem is stored in the reserved memory. The namespace mode is
 set by the kernel and comes back on every boot, including a cold one. The
-filesystem survives a clean warm reboot (observed 2026-09-23) and is expected
-to be lost on a cold boot. It does not survive a `sysrq` reset while the
-memory-overwrite request is set (see above).
+filesystem survives a clean warm reboot, and a `sysrq` reset once the
+memory-overwrite request is cleared; it does not survive a `sysrq` reset while
+the request is set, or a cold boot (all observed 2026-09-23; see above).
 **Never run `mkfs` after a warm reboot**: that destroys the evidence. If the
 mount is missing after a warm reboot, stop and investigate. `nofail` keeps a
 missing filesystem from blocking boot.
@@ -245,6 +251,12 @@ scripts/stage2c.sh doctor         # runnable
 # 1. The probe, first.
 scripts/stage2c.sh probe          # arms, then offers to run the reboot via sudo
 #    ... reboot; log in; confirm /mnt/pmem0 is mounted (if not: no mkfs, see step 4) ...
+scripts/stage2c.sh verify
+
+# 1b. If the probe said NOT-SENSITIVE: the zero-window probe, to tell why.
+sudo -v                           # so the command below does not stop at a password prompt
+scripts/stage2c.sh probe-now      # records the run, then offers to store and reset in one command
+#    ... it resets by itself; log in; confirm /mnt/pmem0 is mounted ...
 scripts/stage2c.sh verify
 
 # 2. Only if the probe said SENSITIVE: the sieve, alternating providers.
@@ -280,7 +292,15 @@ taken before recovery, `images.sha256`, and `verify.log` with the verdict.
   changed on the test host.
 - **Eviction before the reset.** Anything that pushes the test lines out of
   the cache writes them back, and the probe measures how much. Keep the machine
-  idle and reboot immediately.
+  idle and reboot immediately. `probe` leaves a window of seconds between its
+  last store and the reset: the script's own work, the wait for Enter, and
+  `sudo`. `probe-now` leaves none. Root opens `/proc/sysrq-trigger`, `setpriv`
+  drops to the ordinary user and keeps that descriptor open, and the probe
+  writes `b` to it straight after its last store: no other process runs, and
+  the CPU never idles. If `probe` says `NOT-SENSITIVE` and `probe-now` says
+  `SENSITIVE`, the window was the cause, and the sieve's `arm` would need the
+  same treatment. If both say `NOT-SENSITIVE`, the reset path itself writes the
+  cache back on this host, and the sieve runs cannot discriminate here.
 - **Kernel writeback of DAX data.** The harness never syncs the DAX
   filesystem after arming. The production mapping uses `MAP_SYNC`, and as far
   as is known the kernel does not track dirty pages on `MAP_SYNC` mappings, so

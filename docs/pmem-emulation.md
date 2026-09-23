@@ -700,9 +700,26 @@ boot to zero all of RAM after any reset it does not recognise as a clean
 shutdown (the TCG memory-overwrite request). A `sysrq` reset is never a clean
 shutdown, so on the first run on real hardware the firmware zeroed the entire
 reserved range, and the run gave no reading; a clean `sudo reboot` kept it.
-Clearing the request before arming is expected to prevent the wipe, and the
-next probe run tests that. The procedure is in
+Clearing the request before arming prevents the wipe: the second run cleared
+it, and the range survived. The procedure is in
 [Stage 2c Hand-off](stage2c-handoff.md#the-memory-overwrite-request).
+
+**First reading (2026-09-23): `NOT-SENSITIVE`.** With the request cleared,
+every one of 16,384 unflushed probe lines survived the `sysrq` reset intact,
+beside 16,384 flushed ones. Two alternatives that would make this a setup
+artifact were checked and ruled out:
+- The range is mapped write-back (PAT, and no uncachable MTRR covers it), so
+  the unflushed stores did sit in the cache.
+- The reset is the FADT's hard reset (`0x06` to port `0xCF9`), which keeps the
+  memory powered.
+
+By the table above, the experiment as run has no sensitivity on this host.
+The second property, that a reset discards the cache, was not observed. This
+contradicts the expectation this section was written with, and two
+explanations remain open: the reset path wrote the cache back, or the lines
+were evicted in the seconds between the probe's last store and the reset. A
+zero-window probe, which resets from inside the probe straight after its last
+store, separates them.
 
 What it does **not** establish: the DRAM is volatile, ADR is not involved, and a
 true power cycle erases the range entirely. This is cache-loss sensitivity on a
