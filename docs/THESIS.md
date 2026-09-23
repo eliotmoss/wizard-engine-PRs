@@ -108,7 +108,8 @@ and geometry, the two boundary primitives differ by **≈2,000×** (455 ns again
 927 µs per commit) for a region the kernel maps with 2 MiB DAX entries — the
 normal case for any region of 2 MiB or more. One interface, three orders of
 magnitude underneath it, and the size of the gap set by a kernel mapping
-decision the backend never sees (~11× with 4 KiB entries; see below).
+decision the backend never sees (11× with 4 KiB entries, measured at a matched
+1 MiB geometry; see below).
 
 Two findings that arrived unplanned and are better material than the headline:
 
@@ -120,12 +121,23 @@ Two findings that arrived unplanned and are better material than the headline:
   `fdatasync` writes back the whole 2 MiB DAX entry a commit dirtied, 32,768
   cache lines at ~65 cycles each. At a 1 MiB region, which the kernel must map
   with 4 KiB entries, the same boundary on the same media is ~5 µs, ~187×
-  cheaper; from 2 to 8 MiB it is flat at 927 µs. This was first read as "the
+  cheaper; from 2 to 8 MiB it is flat at 927 µs. A matched-geometry campaign
+  (all three configurations at 1 and 2 MiB, one sitting) confirms the reversal:
+  at 1 MiB the file backend on DAX is **31–33× faster** than on block storage,
+  and only **1.27× slower per commit** than the PMEM backend at eight entries
+  (71× at 2 MiB). This was first read as "the
   worst of both worlds" on the media; the corrected reading is a stronger
   statement of the thesis, because the abstraction hides not just the medium
   but a mapping granularity the backend neither chooses nor observes. Inferred
   from timing and `filefrag`; kernel-side confirmation
   (`fs_dax:dax_writeback_one`) needs root and is pending.
+- **Whole commits, not boundaries, decide the comparison once the boundary is
+  small.** At 1 MiB and 24 entries the file backend on DAX commits *faster*
+  than the PMEM backend (28.9 µs against 37.3 µs), because the PMEM backend's
+  non-boundary work grows about twice as fast per entry on the same media and
+  the same record-construction code. The cause is not established; a candidate
+  is `CLWB` evicting the written-back lines on Cascade Lake. Worth a paragraph
+  in Chapter 6 as an open finding, not a claim.
 - **On PMEM the boundary is not the cost.** Byte-at-a-time `zeroBytes` and
   `computeRecordChecksum` outweigh the entire durability boundary by 28×, so the
   protocol-level optimisation the WAL is built around is, on that medium,
@@ -376,7 +388,10 @@ Seven, and they need real hours budgeted.
    `fdatasync` on the same DAX media 927 µs, `fdatasync` on block storage
    148 µs. Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
    same figure. State the 2 MiB region geometry on the figure: the
-   `fdatasync`-on-DAX bar is conditional on it (see 6c).
+   `fdatasync`-on-DAX bar is conditional on it (see 6c). Better: draw it as
+   two panels, 1 MiB and 2 MiB, from the matched campaign
+   (`results/20260923T043535Z-magpie-bs2048-4096`), so the reversal of the
+   DAX-versus-block direction is visible in the figure itself.
 6b. Boundary cost against transaction size, measured at 1/8/32/56 entries on
    both PMEM and file-on-DAX. `SFENCE` flat at 11 ns, `fdatasync` flat at
    ~928 µs (0.17 % over a 56× size change), `CLWB` linear at ~31.7 ns per cache

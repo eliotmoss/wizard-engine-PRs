@@ -38,8 +38,9 @@ production path, after 2,000 warm-up commits, at 512 × 4096 = 2 MiB.
 2 MiB region on this namespace is mapped with a single 2 MiB DAX entry, and
 `fdatasync` flushes the whole entry; at 1 MiB the same boundary costs ~5 µs,
 not 927 µs. See [Region size](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)
-(measured 2026-09-23), which supersedes the media reading of the comparisons
-that follow.
+and [Matched geometry](#matched-geometry-all-three-configurations-at-1-mib-and-2-mib)
+(both measured 2026-09-23), which supersede the media reading of the
+comparisons that follow.
 
 | # | Backend | Media | Boundary | Median boundary | Per commit | Boundary share |
 |---|---|---|---|---|---|---|
@@ -72,18 +73,18 @@ fence. The note is correct and argues for the wrong reason.
   927 µs in its low mode. **≈ 2,000×.** This is the cleanest statement of what
   the unified interface hides: identical media, identical workload, identical
   geometry, one interface, three orders of magnitude. The geometry matters: at a
-  1 MiB region `fdatasync` on DAX is ~5 µs, and the gap would be ~11× (the PMEM
-  side has not yet been measured at 1 MiB; its boundary does not depend on the
-  kernel's mapping, so it is not expected to move).
+  1 MiB region `fdatasync` on DAX is 5.0 µs while the PMEM boundary is
+  unchanged, so the gap is **11×** at eight entries — one order of magnitude,
+  not three.
 - **Media, primitive held constant (2 vs 3).** At 2 MiB, `fdatasync` on DAX is
   **4.7× to 7.1× slower** than on ordinary block storage: 927 µs socket-local
   against a block figure that has ranged from 131 to 196 µs between sittings.
   The span is the block measurement's instability, not a property of the media.
   DAX is slower in every one of the 60 block runs — but every one of them used a
   2 MiB region. **The comparison does not isolate the media**: the DAX side's
-  cost is set by the kernel's 2 MiB flush granularity, and at a 1 MiB region the
-  direction reverses (~5 µs against 133–196 µs, across unmatched geometry
-  pending a matched run). See below.
+  cost is set by the kernel's 2 MiB flush granularity. At a matched 1 MiB
+  region in one campaign the direction reverses: DAX is **31–33× faster**
+  (5.0 µs against 157–169 µs). See below.
 - **Deployment (1 vs 3).** 453 ns against 133 µs, ≈ 295×.
 
 ### The file backend on DAX pays the kernel's flush granularity
@@ -108,8 +109,10 @@ see.** A caller who unified on the file backend "because it works everywhere"
 and deployed it on PMEM with a region of 2 MiB or more — the normal case —
 would land in configuration 2 and be **69× slower per commit socket-local, or
 85× cross-socket**, than configuration 1, on the same hardware, with no error
-and no warning. The same code with a 1 MiB region would not. That is the cost of
-unification stated as a number, and the number depends on region geometry.
+and no warning. The same code with a 1 MiB region is **1.27× slower** per
+commit at eight entries, and at 24 entries it is *faster* than the PMEM
+backend. That is the cost of unification stated as a number, and the number
+depends on region geometry.
 
 ### Region size: `fdatasync` on DAX flushes whole 2 MiB entries
 
@@ -155,9 +158,9 @@ penalty comes from this loop is consistent with the data but not measured.
 **What this does and does not establish.** The mechanism is inferred from
 timing and file layout, not observed in the kernel. The direct confirmation is
 the `fs_dax:dax_writeback_one` tracepoint, whose `pglen` should read 512 (a
-2 MiB entry) at 2 MiB and 1 (a 4 KiB page) at 1 MiB; it needs root. Not yet
-measured: the PMEM backend and block storage at 1 MiB (a matched-geometry rerun
-of all three configurations), the NUMA penalty at 1 MiB, and the prediction
+2 MiB entry) at 2 MiB and 1 (a 4 KiB page) at 1 MiB; it needs root. The PMEM
+backend and block storage at 1 MiB are covered by the matched-geometry campaign
+below. Not yet measured: the NUMA penalty at 1 MiB, and the prediction
 that a commit dirtying *k* separate 2 MiB entries costs about *k* × 927 µs —
 pwbench cannot test that yet, because all its writes land in one entry. Large
 regions on a 2 MiB-aligned namespace will normally get 2 MiB entries, so the
@@ -170,6 +173,90 @@ fresh region by extending it with `ftruncate`, so storage is allocated on first
 touch. Reads see zeros either way, so this is not a correctness issue, but a
 workload writing into untouched parts of a large region pays block allocation
 at fault time, which none of these measurements exercise.
+
+### Matched geometry: all three configurations at 1 MiB and 2 MiB
+
+Measured 2026-09-23 on Magpie (`results/20260923T043535Z-magpie-bs2048-4096`):
+all three configurations at `blockSize` 2048 (1 MiB) and 4096 (2 MiB), 1, 8 and
+24 entries, three repetitions, pinned to node 0. The two geometries are
+interleaved within each repetition, so any difference between them is not a
+difference between sittings — the property the block configuration has lacked.
+Every cell's three runs agree to within 0.5 %, and the start-of-run load was
+`0.00`. 24 entries replaces 32 and 56 because a 2048-byte block's WAL slot holds
+about 26. Medians of three:
+
+| Configuration | Region | 1 entry | 8 entries | 24 entries |
+|---|---|---|---|---|
+| `pmem-dax`, whole boundary | 1 MiB | 140 ns | 453 ns | 1,210 ns |
+| | 2 MiB | 139 ns | 453 ns | 1,210 ns |
+| `file-dax`, `fdatasync` | 1 MiB | **5,125 ns** | **5,024 ns** | **5,047 ns** |
+| | 2 MiB | 926,976 ns | 928,659 ns | 927,693 ns |
+| `file-block`, `fdatasync` | 1 MiB | 168,573 ns | 157,825 ns | 156,682 ns |
+| | 2 MiB | 196,592 ns | 180,504 ns | 170,453 ns |
+
+The PMEM "whole boundary" is `CLWB` prepare plus `SFENCE` per commit; the
+`SFENCE` alone is 11–13 ns at both geometries. `CLWB` lines per commit are 4, 14
+and 38, matching `ceil((112 + 32n)/64) + n` at the new size too.
+
+Against the predictions made before the run:
+
+- **`file-dax` — held.** 5.0 µs at 1 MiB against 927 µs at 2 MiB, 181–185×,
+  flat in transaction size at both geometries. The 1 MiB figure reproduces the
+  region-size sweep to 1.2 %.
+- **`pmem-dax` — held.** Identical at both geometries to within 1 ns. Its
+  boundary is a user-space loop over the lines the commit wrote, so the kernel's
+  mapping granularity never enters it.
+- **`file-block` — did not hold.** The prediction was no change, since the page
+  cache works in 4 KiB pages either way. Instead 1 MiB is **14 %, 13 % and 8 %
+  cheaper** at 1, 8 and 24 entries, with no overlap between the geometries in
+  any cell. It is not the rate-dependence suggested for this configuration's
+  shape: the time between boundaries is the same at both geometries (24.3 and
+  24.5 µs outside the boundary at one entry). The cause is not established. One
+  untested difference: a commit dirties the same two pages at both geometries,
+  but at 2048-byte blocks they are the file's pages 0–1 and at 4096-byte blocks
+  pages 1–2, so the write sits at a different offset on the device. The 2 MiB
+  figures reproduce the three later campaigns to 0.2 %, so the block
+  configuration was stable within this sitting.
+
+**The media comparison at matched geometry.** At 1 MiB, `fdatasync` on DAX is
+**31–33× faster** than on block storage; at 2 MiB it is **4.7–5.4× slower**. Both
+are within one campaign on one geometry each, so this is the controlled version
+of the comparison the 2026-09-18 campaigns could not make. The earlier finding
+that DAX is slower than block storage is **reversed** once the kernel maps the
+file with 4 KiB entries, which confirms it was a property of the mapping, not
+the media.
+
+**The primitive comparison at matched geometry.** At 1 MiB the PMEM boundary is
+37×, 11× and 4.2× cheaper than `fdatasync` on DAX at 1, 8 and 24 entries,
+against 6,669×, 2,050× and 767× at 2 MiB.
+
+**Whole commits tell a different story from boundaries.** Wall time per commit:
+
+| Region | Entries | `pmem-dax` | `file-dax` | `file-block` |
+|---|---|---|---|---|
+| 1 MiB | 1 | 4.5 µs | 12.5 µs | 212 µs |
+| | 8 | 13.4 µs | 17.1 µs | 221 µs |
+| | 24 | 37.3 µs | **28.9 µs** | 250 µs |
+| 2 MiB | 8 | 13.2 µs | 940 µs | 245 µs |
+
+At 1 MiB and eight entries, the file backend on DAX is only **1.27×** slower per
+commit than the PMEM backend, against 71× at 2 MiB, and at 24 entries it is
+**1.29× faster**. The boundary is not the reason. Outside its boundary, a PMEM
+commit costs 4.3, 13.0 and 36.1 µs at 1, 8 and 24 entries, against 7.4, 12.0 and
+23.8 µs for the file backend at 1 MiB. That is about 1.44 µs per entry against
+0.74 µs, on the same media, for the same record-construction code. What makes
+the PMEM backend's non-boundary work grow twice as fast is **not established**.
+One candidate: on this CPU generation (Cascade Lake), `CLWB` is reported to
+evict the line it writes back, so the next commit's writes to the same WAL and
+scratch lines would miss to PMEM. That is untested, and the per-entry numbers
+do not fit it cleanly. The file backend's extra fixed ~3 µs at one entry is
+consistent with re-dirtying write faults after each `fdatasync` write-protects
+the pages, also untested.
+
+This refines the earlier "record construction outweighs the boundary by 29×"
+finding: record construction dominates the PMEM commit, but above about eight
+entries part of that cost is specific to the PMEM backend, because the file
+backend runs the same construction code faster.
 
 ### What phase B's boundary reduction is worth, per medium
 
@@ -384,7 +471,8 @@ multiplier is a range, 4.7×–7.1×, rather than a number. The *direction* at
 2 MiB is unaffected: DAX was slower in all 60 block runs, worst case 4.7×. It is
 not a media comparison, though: at a 1 MiB region the DAX side falls to ~5 µs
 (see [Region size](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)),
-so the direction depends on geometry. `/home` is a shared LVM volume whose other
+so the direction depends on geometry. The matched-geometry campaign confirms
+the reversal within one sitting: 31–33× faster at 1 MiB. `/home` is a shared LVM volume whose other
 traffic is neither controlled nor visible in a CPU load average.
 
 
@@ -457,8 +545,8 @@ the gap by 6× at the large end and understates it by 3× at the small end.
 Combined with the bimodality, the defensible claim is "about three orders of
 magnitude at small transaction sizes, closing to about two at the largest the
 WAL slot allows, for regions the kernel maps with 2 MiB DAX entries" — not any
-single multiplier. With 4 KiB entries the file side is ~5 µs, and the gap is
-about one order of magnitude.
+single multiplier. With 4 KiB entries the file side is 5.0 µs, and the measured
+gap is 37×, 11× and 4.2× at 1, 8 and 24 entries: about one order of magnitude.
 
 ### What batching is worth, per medium
 
@@ -494,18 +582,26 @@ one medium is not wrong on the other, merely pointless.
 - **The block-media configuration has not reproduced**: 50 % spread across five
   campaigns, in two regimes that differ in shape as well as level. Pinning is
   excluded as the cause; what moved `/home` is not established. Any comparison
-  involving it is order-of-magnitude at best.
-- What *has* reproduced, across all 180 runs in `results/`: exactly 1.000
+  involving it across sittings is order-of-magnitude at best. Within one
+  sitting it is tight (0.5 % across repetitions in the matched-geometry
+  campaign), and it has an unexplained 8–14 % geometry effect of its own.
+- What *has* reproduced, across all 246 runs in `results/`: exactly 1.000
   boundaries per commit, `SFENCE` at 11–13 ns, the DAX boundary primitives flat
-  in transaction size, `CLWB` linear at 72.0–73.5 cycles per line,
-  `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size, and the
-  socket-local `fdatasync`-on-DAX figure to within 0.2 % once pinned.
+  in transaction size at every geometry, `CLWB` linear at 72.0–73.5 cycles per
+  line, `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size, the
+  socket-local 2 MiB `fdatasync`-on-DAX figure to within 0.2 % once pinned, and
+  the 1 MiB figure at ~5.0 µs across two campaigns.
 - Treat the ratios as orders of magnitude and the absolute latencies as
   properties of this host's storage stack on the day.
 - The **mechanism** behind configuration 2's slowness is identified from timing
   and file layout — `fdatasync` writes back a whole 2 MiB DAX entry — but not
   yet observed in the kernel (`fs_dax:dax_writeback_one`, needs root). Every
-  configuration-2 figure is specific to regions mapped with 2 MiB entries.
+  configuration-2 figure is specific to regions mapped with 2 MiB entries unless
+  a 1 MiB region is named.
+- Two observations from the matched-geometry campaign are **unexplained**: the
+  block configuration's 8–14 % geometry effect, and the PMEM backend's
+  non-boundary commit work growing at about twice the file backend's rate per
+  entry.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
   `CLOCK_MONOTONIC` (2294 cycles/µs on every run here). There is no invariant-TSC
   check in the tree, so that conversion is an assumption, stated rather than
