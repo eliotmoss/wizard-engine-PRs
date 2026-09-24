@@ -5,8 +5,8 @@
 // instead: a child forks, mounts the region, and sieves as fast as it can
 // while the parent sleeps a pseudo-random interval and sends SIGKILL. The
 // parent then remounts from a fresh mapping, runs production recovery, and
-// checks the sieve's cross-object invariants and the monotonicity of its
-// progress. Repeat.
+// checks the sieve's cross-object invariants, the monotonicity of its
+// progress, and that every step the child had acknowledged survived. Repeat.
 //
 // What this establishes and what it does not: the child dies without any
 // cleanup, so the mount that follows is the real recovery path, but the
@@ -15,21 +15,42 @@
 // boundary as the rest of the file-backed testing (docs/persistent-backends.md,
 // layer 3).
 //
-// Backends. The loop runs over either the file backend (mmap + msync/fdatasync)
-// or the production PMEM backend (MAP_SYNC + CLWB/SFENCE). Which one is under
-// test is the whole difference between "process-crash consistency on whatever
-// filesystem this is" and "process-crash consistency through the production
-// writeback/fence path on real PMEM", so the mode is stated explicitly rather
-// than inferred from the path, and the run prints which region class it got.
-// PmemMmapBackend has no non-MAP_SYNC fallback, so a successful create in pmem
-// mode is itself the project-level MAP_SYNC probe.
+// Backends. The loop runs over the file backend (mmap + msync/fdatasync), the
+// production PMEM backend (MAP_SYNC + CLWB/SFENCE), or the direct-I/O backend
+// (pwrite + O_DIRECT from a private staging buffer), on a file or on a raw
+// block device. Which one is under test is the whole difference between
+// "process-crash consistency on whatever filesystem this is" and "through the
+// production writeback/fence path on real PMEM", so the mode is stated
+// explicitly rather than inferred from the path, and the run checks which
+// region class it got. PmemMmapBackend has no non-MAP_SYNC fallback, so a
+// successful create in pmem mode is itself the project-level MAP_SYNC probe.
+//
+// Acknowledgements. A step that returns has committed, so recovery must reach
+// at least that far. The child records each acknowledged cursor in a page
+// shared with the parent; a store to shared memory outlives the SIGKILL, so the
+// parent knows what was promised and checks it against what it remounts. A
+// remount behind that is a LOST restart: the loop counts it and carries on, and
+// the run ends LOST rather than OK.
+//
+// The flush-placement mutant runs in the children only. The parent formats and
+// verifies with the production provider, as pwreboot's setup and verify do, so
+// a mutant's losses are measured against state the production code made
+// durable. On the file and PMEM backends a killed process loses nothing that
+// was stored, so the mutant is expected to pass there; on the direct backend
+// process death discards the staging buffer, whatever was never written back is
+// gone, and the mutant is expected to be LOST.
 //
 // The runner never touches a file it did not create: it atomically reserves a
 // uniquely named region inside the caller-assigned directory, exactly as
 // pmem-integration.main.v3 does, and removes only that file. A shared research
-// host with an assigned scratch directory is the intended target.
+// host with an assigned scratch directory is the intended target. A raw device
+// (direct-device) is used in place and never removed; its path must be given
+// both as the first argument and inside the mode word.
 //
-// Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem]
+// Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize]
+//            [file|pmem|direct] [ordinary|elide-clwb] [max-delay-us]
+//        pwsieve.x86-64-linux <device> <iterations> <seed> <blocks> <blockSize>
+//            direct-device=<device> [ordinary|elide-clwb] [max-delay-us]
 
 def SIGKILL = 9;
 def LIVE_SEGMENTS = 2u64;
@@ -38,6 +59,17 @@ def LIVE_SEGMENTS = 2u64;
 // unreasonably large one rather than thrashing the machine.
 def MAX_REFERENCE = 64000000u64;
 
+// Exit status of a child whose own mount did not have the region class or the
+// provider the run asked for.
+def EXIT_CHILD_WIRING = 7;
+
+enum SieveBackend(arg: string, label: string) {
+        FILE("file", "file (mmap + msync/fdatasync)"),
+        PMEM("pmem", "pmem (MAP_SYNC + CLWB/SFENCE)"),
+        DIRECT("direct", "direct (pwrite + O_DIRECT + fdatasync) on a file"),
+        DIRECT_DEVICE("direct-device", "direct (pwrite + O_DIRECT + fdatasync) on a raw block device")
+}
+
 component SieveLoopConfig {
         def var directory: string;
         def var path: string;
@@ -45,19 +77,17 @@ component SieveLoopConfig {
         def var seed = 1u64;
         def var blocks = 32u64;
         def var blockSize = 4096u64;
-        def var usePmem = false;        // false = file backend, true = PmemMmapBackend
-        // The flush-placement negative control. When set, the region's
+        def var backend = SieveBackend.FILE;
+        // The flush-placement negative control. When set, each child's
         // persistent-operation provider issues no cache-line writeback at all;
         // stores and SFENCE are untouched, so a commit still reports success.
-        // docs/pmem-emulation.md predicts this run still passes, because on a
-        // MAP_SYNC DAX mapping a killed process loses nothing still in cache.
-        // This measures that prediction instead of asserting it.
         def var elideWriteback = false;
+        def var maxDelayNs = 20000000L;         // 20 ms
 
         def backendName() -> string {
-                def base = if(usePmem, "pmem (MAP_SYNC + CLWB/SFENCE)", "file (mmap + msync/fdatasync)");
+                def base = backend.label;
                 if (!elideWriteback) return base;
-                return Strings.format1("%s [MUTANT: cache-line writeback elided]", base);
+                return Strings.format1("%s [MUTANT in the children: cache-line writeback elided]", base);
         }
 
         // Reserve a private, uniquely named region file inside the assigned
@@ -93,11 +123,37 @@ component SieveLoopConfig {
                 return false;
         }
 
-        // Bounds on the kill delay, in nanoseconds. The low end lands inside
-        // the first commit; the high end lets several segments complete, so
-        // the kills spread across the protocol rather than clustering at mount.
+        // Lower bound on the kill delay, in nanoseconds; it lands inside the
+        // first commit. The upper bound, maxDelayNs, lets several segments
+        // complete, so the kills spread across the protocol rather than
+        // clustering at mount. Its 20 ms default suits the page cache and DAX;
+        // the direct backend pays a device flush on every commit and a
+        // whole-region read at every mount, and may need more on slow media.
         def MIN_DELAY_NS = 50000L;              // 50 us
-        def MAX_DELAY_NS = 20000000L;           // 20 ms
+}
+
+// What a child has acknowledged, in a page it shares with the parent. A store
+// here survives the child's SIGKILL, so the parent learns what was promised.
+// The Mapping is held here: dropping it would let its finalizer unmap the page.
+component SieveAck {
+        def CURSOR = 0;         // cursor after the last step that returned
+        def WIRING = 8;         // 1 once the child has checked its own mount
+        def STEPS = 16;         // steps acknowledged by this child
+        private var page: Mapping;
+
+        def init() -> bool {
+                page = Mmap.map(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE,
+                        Mmap.MAP_SHARED | Mmap.MAP_ANONYMOUS, -1, 0u64);
+                return page != null;
+        }
+
+        def get(slot: int) -> u64 {
+                return (page.range.start + slot).load<u64>();
+        }
+
+        def set(slot: int, v: u64) {
+                (page.range.start + slot).store<u64>(v);
+        }
 }
 
 // Deterministic 64-bit LCG, so a failing run can be replayed from its seed.
@@ -113,23 +169,53 @@ class SieveRandom(var state: u64) {
         }
 }
 
-def openBackend() -> TxnRegionBackend {
+var lastDirectBackend: DirectIoBackend;
+
+def openBackend(elide: bool) -> TxnRegionBackend {
         var backend: TxnRegionBackend;
-        if (SieveLoopConfig.usePmem) backend = X86_64Backends.getPersistent(SieveLoopConfig.path);
-        else backend = X86_64Backends.getFileMapped(SieveLoopConfig.path);
+        def path = SieveLoopConfig.path;
+        match (SieveLoopConfig.backend) {
+                PMEM => backend = X86_64Backends.getPersistent(path);
+                FILE => backend = X86_64Backends.getFileMapped(path);
+                DIRECT => backend = lastDirectBackend = DirectIoBackend.new(path, DirectIoTarget.FILE);
+                DIRECT_DEVICE => backend = lastDirectBackend = DirectIoBackend.new(path, DirectIoTarget.BLOCK_DEVICE);
+        }
         // Wrapped, not replaced: the real backend still opens the real file and
-        // takes the real MAP_SYNC mapping, and only the provider differs.
-        if (SieveLoopConfig.elideWriteback) return ElidedWritebackBackend.new(backend);
+        // takes the real mapping, and only the provider differs.
+        if (elide) return ElidedWritebackBackend.new(backend);
         return backend;
 }
 
-def openRegion(fresh: bool) -> PWRegion {
+def openRegion(fresh: bool, elide: bool) -> PWRegion {
         return PWRegion.new(
-                openBackend(),
+                openBackend(elide),
                 SieveLoopConfig.blocks,
                 Array<Ref<MetaDataDesc>>.new(0),
                 SieveLoopConfig.blockSize,
                 fresh);
+}
+
+// The decisive anti-fallback check, applied to every mount. The region classes
+// are siblings, so this distinguishes the backend actually under test rather
+// than trusting the requested mode; and the same reasoning applies to the
+// provider, since an ordinary provider reported as the mutant (or the reverse)
+// would invert the conclusion.
+def wiringError(region: BackendRegion, expectElided: bool) -> string {
+        if (region == null) return "the backend region could not be created";
+        match (SieveLoopConfig.backend) {
+                PMEM => if (!PmemMmapRegion.?(region)) return "pmem mode did not produce a PmemMmapRegion";
+                FILE => if (!FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
+                DIRECT => if (!DirectIoRegion.?(region) || DirectIoRegion.!(region).blockDevice) {
+                        return "direct mode did not produce a file-backed DirectIoRegion";
+                }
+                DIRECT_DEVICE => if (!DirectIoRegion.?(region) || !DirectIoRegion.!(region).blockDevice) {
+                        return "direct-device mode did not produce a device-backed DirectIoRegion";
+                }
+        }
+        def elided = ElidedWritebackOperations.?(region.persistentOperations());
+        if (expectElided && !elided) return "elide-clwb did not install the elided-writeback provider";
+        if (!expectElided && elided) return "a production mount installed the elided-writeback provider";
+        return null;
 }
 
 def sleepNanos(ns: long) {
@@ -145,23 +231,34 @@ def fail(msg: string) -> int {
         System.puts("FAIL: ");
         System.puts(msg);
         System.ln();
+        retained();
+        return 1;
+}
+
+def retained() {
         if (SieveLoopConfig.path != null) {
                 System.puts("retained region image: ");
                 System.puts(SieveLoopConfig.path);
                 System.ln();
         }
-        return 1;
 }
 
-// The child: mount, resume, and sieve until the region cannot take another
-// segment. It never closes cleanly -- the parent is expected to kill it -- so
-// reaching the end of the work is itself a reportable outcome.
+// The child: mount (with the mutant provider, if this is the mutant run),
+// check its own wiring, resume, and sieve until the region cannot take another
+// segment, publishing each acknowledged cursor. It never closes cleanly -- the
+// parent is expected to kill it -- so reaching the end of the work is itself a
+// reportable outcome.
 def runChild() -> int {
-        def region = openRegion(false);
+        def region = openRegion(false, SieveLoopConfig.elideWriteback);
         if (region == null || region.backendRegion == null) return 2;
+        if (wiringError(region.backendRegion, SieveLoopConfig.elideWriteback) != null) return EXIT_CHILD_WIRING;
+        SieveAck.set(SieveAck.WIRING, 1);
         def sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return 3;
-        while (sieve.step()) { }
+        while (sieve.step()) {
+                SieveAck.set(SieveAck.CURSOR, sieve.cursor());
+                SieveAck.set(SieveAck.STEPS, SieveAck.get(SieveAck.STEPS) + 1);
+        }
         return 0;
 }
 
@@ -196,21 +293,32 @@ def parseU64(s: string, dflt: u64) -> u64 {
         return v;
 }
 
+def usage() -> int {
+        System.puts("Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem|direct] [ordinary|elide-clwb] [max-delay-us]\n");
+        System.puts("       pwsieve.x86-64-linux <device> <iterations> <seed> <blocks> <blockSize> direct-device=<device> [ordinary|elide-clwb] [max-delay-us]\n");
+        return 2;
+}
+
 def main(args: Array<string>) -> int {
-        if (args.length < 1 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwsieve.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem] [ordinary|elide-clwb]\n");
-                return 2;
-        }
+        if (args.length < 1 || args[0] == null || args[0].length == 0) return usage();
         if (args.length > 1) SieveLoopConfig.iterations = int.!(parseU64(args[1], 50));
         if (args.length > 2) SieveLoopConfig.seed = parseU64(args[2], 1);
         if (args.length > 3) SieveLoopConfig.blocks = parseU64(args[3], 32);
         if (args.length > 4) SieveLoopConfig.blockSize = parseU64(args[4], 4096);
         if (args.length > 5) {
                 // Rejected rather than defaulted: silently falling back to the
-                // file backend would report a PMEM run that never happened.
-                if (Strings.equal(args[5], "pmem")) SieveLoopConfig.usePmem = true;
-                else if (!Strings.equal(args[5], "file")) {
-                        System.puts("backend must be \"file\" or \"pmem\"\n");
+                // file backend would report a run that never happened.
+                def mode = args[5];
+                if (Strings.equal(mode, "pmem")) SieveLoopConfig.backend = SieveBackend.PMEM;
+                else if (Strings.equal(mode, "direct")) SieveLoopConfig.backend = SieveBackend.DIRECT;
+                else if (Strings.startsWith(mode, "direct-device=")) {
+                        if (!Strings.equal(Arrays.range(mode, 14, mode.length), args[0])) {
+                                System.puts("direct-device=<device> must name the same device as the first argument\n");
+                                return 2;
+                        }
+                        SieveLoopConfig.backend = SieveBackend.DIRECT_DEVICE;
+                } else if (!Strings.equal(mode, "file")) {
+                        System.puts("backend must be \"file\", \"pmem\", \"direct\" or \"direct-device=<device>\"\n");
                         return 2;
                 }
         }
@@ -224,53 +332,48 @@ def main(args: Array<string>) -> int {
                         return 2;
                 }
         }
+        if (args.length > 7) {
+                def us = parseU64(args[7], 0);
+                if (us == 0) {
+                        System.puts("max-delay-us must be a positive number of microseconds\n");
+                        return 2;
+                }
+                SieveLoopConfig.maxDelayNs = long.!(us) * 1000L;
+        }
 
-        if (!SieveLoopConfig.reservePath(args[0])) {
+        if (SieveLoopConfig.backend == SieveBackend.DIRECT_DEVICE) {
+                SieveLoopConfig.path = args[0];
+        } else if (!SieveLoopConfig.reservePath(args[0])) {
                 System.puts("Could not reserve a unique region file in the supplied directory.\n");
                 return 2;
         }
+        if (!SieveAck.init()) return fail("could not map the acknowledgement page");
         Trace.OUT.put1("backend %s", SieveLoopConfig.backendName()).ln();
         Trace.OUT.put1("region file %s", SieveLoopConfig.path).ln();
 
-        // Fresh region, fresh sieve. Everything after this point must survive
-        // on its own.
-        var region = openRegion(true);
+        // Fresh region, fresh sieve, production provider. Everything after this
+        // point must survive on its own.
+        var region = openRegion(true, false);
         if (region == null || region.backendRegion == null) {
-                if (SieveLoopConfig.usePmem) {
+                if (SieveLoopConfig.backend == SieveBackend.PMEM) {
                         return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                }
+                if (lastDirectBackend != null && lastDirectBackend.lastError != null) {
+                        return fail(Strings.format1("DirectIoBackend.create failed: %s", lastDirectBackend.lastError));
                 }
                 return fail("could not create the region file");
         }
-        // The decisive anti-fallback check. PmemMmapRegion and FileMmapRegion are
-        // siblings under FdMmapRegion, so this distinguishes the production
-        // writeback/fence path from an ordinary shared file mapping rather than
-        // trusting the requested mode.
-        if (SieveLoopConfig.usePmem && !PmemMmapRegion.?(region.backendRegion)) {
+        def wiring = wiringError(region.backendRegion, false);
+        if (wiring != null) {
                 region.deallocate();
-                return fail("pmem mode did not produce a PmemMmapRegion");
-        }
-        if (!SieveLoopConfig.usePmem && !FileMmapRegion.?(region.backendRegion)) {
-                region.deallocate();
-                return fail("file mode did not produce a FileMmapRegion");
-        }
-        // The same reasoning applied to the mutation. A wiring mistake that left
-        // the production provider installed would produce an ordinary run
-        // reported as a mutant one -- the negative control's version of a silent
-        // fallback, and just as capable of inverting the conclusion.
-        def elided = ElidedWritebackOperations.?(region.backendRegion.persistentOperations());
-        if (SieveLoopConfig.elideWriteback && !elided) {
-                region.deallocate();
-                return fail("elide-clwb did not install the elided-writeback provider");
-        }
-        if (!SieveLoopConfig.elideWriteback && elided) {
-                region.deallocate();
-                return fail("an ordinary run installed the elided-writeback provider");
+                return fail(wiring);
         }
         var sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return fail("could not lay out the sieve root");
         Trace.OUT.put2("region %d blocks of %d bytes", SieveLoopConfig.blocks, SieveLoopConfig.blockSize).ln();
         Trace.OUT.put2("segment span %d, capacity %d segments",
                 sieve.segmentSpan(), sieve.segmentCapacity()).ln();
+        Trace.OUT.put1("kill delay up to %d us", SieveLoopConfig.maxDelayNs / 1000L).ln();
         region.deallocate();
 
         def rng = SieveRandom.new(SieveLoopConfig.seed);
@@ -281,9 +384,16 @@ def main(args: Array<string>) -> int {
         var finished = 0;
         var reclaimed = 0;
         var completed = 0;
+        var ackChecks = 0;
+        var lost = 0;
+        var confirmed = 0;
+        var ackedSteps = 0uL;
         var full = false;
 
         for (iteration < SieveLoopConfig.iterations) {
+                SieveAck.set(SieveAck.CURSOR, prevCursor);
+                SieveAck.set(SieveAck.WIRING, 0);
+                SieveAck.set(SieveAck.STEPS, 0);
                 def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
                 if (pid < 0) return fail("fork failed");
                 if (pid == 0) {
@@ -293,7 +403,7 @@ def main(args: Array<string>) -> int {
 
                 sleepNanos(long.!(rng.nextInRange(
                         u64.!(SieveLoopConfig.MIN_DELAY_NS),
-                        u64.!(SieveLoopConfig.MAX_DELAY_NS))));
+                        u64.!(SieveLoopConfig.maxDelayNs))));
                 Linux.syscall(LinuxConst.SYS_kill, (pid, SIGKILL));
 
                 def waitStatus = Array<int>.new(1);
@@ -308,19 +418,27 @@ def main(args: Array<string>) -> int {
                         // Exit 0 means the child ran out of work before the
                         // timer fired; anything else is a child that could not
                         // mount or reattach, which is a real failure.
+                        def code = waitStatus[0] >> 8;
                         if (waitStatus[0] != 0) {
-                                Trace.OUT.put2("iteration %d: child exited %d", iteration, waitStatus[0] >> 8).ln();
+                                Trace.OUT.put2("iteration %d: child exited %d", iteration, code).ln();
+                                if (code == EXIT_CHILD_WIRING) return fail("a child's own mount did not have the requested backend or provider");
                                 return fail("child could not mount or resume");
                         }
                         finished++;
                 }
+                def ackedCursor = SieveAck.get(SieveAck.CURSOR);
+                if (SieveAck.get(SieveAck.WIRING) == 1) confirmed++;
+                ackedSteps += SieveAck.get(SieveAck.STEPS);
 
-                // Verify from a fresh mapping in this process. This mount runs
-                // production WAL recovery over whatever the child left.
-                region = openRegion(false);
+                // Verify from a fresh mapping in this process, with the
+                // production provider. This mount runs production WAL recovery
+                // over whatever the child left.
+                region = openRegion(false, false);
                 if (region == null || region.backendRegion == null) {
                         return fail("could not remount after the kill");
                 }
+                def remountWiring = wiringError(region.backendRegion, false);
+                if (remountWiring != null) return fail(remountWiring);
                 if (region.lastRecovery == DualWalRecovery.REPLAYED) replayed++;
                 if (region.lastRecovery == DualWalRecovery.CORRUPT) {
                         return fail("WAL reported CORRUPT after an abrupt kill");
@@ -342,6 +460,15 @@ def main(args: Array<string>) -> int {
                 // commit -- but it must never go backwards.
                 if (sieve.cursor() < prevCursor) return fail("cursor went backwards");
                 if (sieve.count() < prevCount) return fail("prime count went backwards");
+                // And whatever the child acknowledged must be there.
+                if (ackedCursor > prevCursor) {
+                        ackChecks++;
+                        if (sieve.cursor() < ackedCursor) {
+                                lost++;
+                                Trace.OUT.put3("iteration %d: LOST acknowledged cursor %d, durable cursor %d",
+                                        iteration, ackedCursor, sieve.cursor()).ln();
+                        }
+                }
                 if (sieve.cursor() > prevCursor) advanced++;
                 prevCursor = sieve.cursor();
                 prevCount = sieve.count();
@@ -363,6 +490,9 @@ def main(args: Array<string>) -> int {
                 completed, SieveLoopConfig.iterations, SieveLoopConfig.seed).ln();
         Trace.OUT.put3("advanced %d, replayed a record %d, child finished early %d",
                 advanced, replayed, finished).ln();
+        Trace.OUT.put3("acknowledged-step checks %d, lost %d, children confirmed wiring %d",
+                ackChecks, lost, confirmed).ln();
+        Trace.OUT.put2("steps acknowledged by children %d over %d iterations", ackedSteps, completed).ln();
         Trace.OUT.put1("leaked extents reclaimed at mount: %d", reclaimed).ln();
         Trace.OUT.put2("final cursor %d, primes %d", prevCursor, prevCount).ln();
 
@@ -380,12 +510,21 @@ def main(args: Array<string>) -> int {
                 Trace.OUT.put1("reference check passed: %d primes", expected).ln();
         }
 
+        // Before the progress check: a run whose acknowledged steps were lost
+        // may well have made no durable progress, and that is its finding, not
+        // a configuration problem.
+        if (lost > 0) {
+                System.puts("LOST\n");
+                retained();
+                return 1;
+        }
         if (advanced == 0) {
                 return fail("no iteration made progress; the kill delays are too short to test anything");
         }
 
-        // Only the file this run reserved, and only after it passed.
-        if (!RegionFileIO.unlink(SieveLoopConfig.path)) {
+        // Only the file this run reserved, and only after it passed. A device
+        // is never removed.
+        if (SieveLoopConfig.backend != SieveBackend.DIRECT_DEVICE && !RegionFileIO.unlink(SieveLoopConfig.path)) {
                 System.puts("Could not remove the region file printed above.\n");
                 return 2;
         }
