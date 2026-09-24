@@ -1,0 +1,499 @@
+// Direct-I/O persistence backend: the region lives in a process-private DRAM
+// staging buffer and is written back explicitly with pwrite() on an O_DIRECT
+// descriptor -- a preallocated regular file or a raw block device -- with one
+// fdatasync() per persistence boundary.
+//
+// FileMmapRegion is a page-cache backend: the kernel owns writeback, so it may
+// write any dirty page at any time, and a killed process loses nothing. Here
+// nothing reaches the device unless this region writes it, and nothing
+// survives the process unless it was written: process death discards the
+// staging buffer the way a reset discards unflushed cache lines.
+//
+// The boundary methods mirror PmemMmapRegion exactly -- prepareChangedRange()
+// issues one clwb() per 64-byte line through the provider, persistChanges() and
+// persistRange() one sfence() -- so a recorded trace is identical to the PMEM
+// backend's for the same call sequence. The provider's clwb() marks the line's
+// 4 KiB write unit dirty instead of executing CLWB, and the region drains every
+// marked unit at the fence, as SFENCE completes every outstanding CLWB. The
+// dirty tracking lives in the provider on purpose: a provider whose clwb()
+// does nothing (ElidedWritebackOperations) then writes nothing back, which
+// makes it this backend's form of the elided-writeback mutant.
+//
+// Every image this backend can leave on the device is one the PMEM crash model
+// admits for the same trace, provided the device never tears a 64-byte-aligned
+// span (512-byte sector atomicity suffices) and a completed fdatasync() makes
+// every completed write durable. A crash inside a boundary's write-back
+// corresponds to the cut just before that boundary's SFENCE.
+
+component DirectIoConst {
+        // x86-64 values LinuxConst does not define. LinuxConst.O_SYNC (0x1000)
+        // is really O_DSYNC; Linux's O_SYNC is 0x101000.
+        def O_DIRECT = 0x4000;
+        def F_GETFL = 3;
+        def F_SETFL = 4;
+        def S_IFMT = 0xF000;
+        def S_IFREG = 0x8000;
+        def S_IFBLK = 0x6000;
+        def STAT_SIZE = 144;            // struct stat
+        def STAT_MODE_OFFSET = 24;      // st_mode, a u32
+        def BLKSSZGET = 0x1268;         // logical block size, int result
+        // Write-back granularity: a multiple of every logical block size in use
+        // (512 and 4096), and the staging buffer is page-aligned, so every run
+        // meets O_DIRECT's offset, length and memory alignment.
+        def WRITE_UNIT = 4096u64;
+        // FdMmapRegion forges its range with int.!, so the region must fit an int.
+        def MAX_REGION = 0x7FFF_F000u64;
+        // Bytes examined for a foreign signature before a fresh format of a raw
+        // device; btrfs's superblock magic sits at 65600.
+        def SIGNATURE_SCAN = 131072u64;
+}
+
+// The write units a boundary must write back, as a bitmap with the bounds of
+// the marked span so a boundary scans only what it touched.
+class DirectIoDirtyUnits(unitBytes: u64, unitCount: u64) {
+        def bits = Array<u64>.new(int.!((unitCount + 63u64) / 64u64));
+        def var lo: u64 = unitCount;    // first marked unit; unitCount when empty
+        def var hi: u64 = 0u64;         // one past the last marked unit
+
+        def markLine(line: u64) {
+                def unit = line / unitBytes;
+                if (unit >= unitCount) return;
+                bits[int.!(unit >> 6)] |= 1u64 << u6.view(unit & 63u64);
+                if (unit < lo) lo = unit;
+                if (unit + 1u64 > hi) hi = unit + 1u64;
+        }
+
+        def isMarked(unit: u64) -> bool {
+                if (unit >= unitCount) return false;
+                return (bits[int.!(unit >> 6)] & (1u64 << u6.view(unit & 63u64))) != 0u64;
+        }
+
+        def isEmpty() -> bool {
+                return lo >= hi;
+        }
+
+        def markedCount() -> u64 {
+                var n = 0u64;
+                for (u = lo; u < hi; u++) if (isMarked(u)) n++;
+                return n;
+        }
+
+        def clear() {
+                if (lo < hi) {
+                        def last = int.!((hi - 1u64) >> 6);
+                        for (w = int.!(lo >> 6); w <= last; w++) bits[w] = 0u64;
+                }
+                lo = unitCount;
+                hi = 0u64;
+        }
+}
+
+// The production provider beneath DirectIoOperations. Stores go natively into
+// the staging buffer. A writeback request only validates its line: the buffer
+// is ordinary DRAM, so a CLWB would buy nothing. A fence does nothing either;
+// the region performs the write-back itself, so that an I/O failure reaches
+// the WAL as a failed boundary.
+class DirectIoStagingOperations extends X86_64PersistentOperations {
+        new(range: Range<byte>) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+        }
+
+        def sfence() { }
+}
+
+// The provider a DirectIoRegion installs: every operation goes to {inner}, and a
+// writeback request also marks its line's unit dirty. Production passes
+// DirectIoStagingOperations; tests pass a RecordingPersistentOperations, so the
+// recorded trace and the dirty set come from the same calls.
+class DirectIoOperations(inner: PersistentOperations, dirty: DirectIoDirtyUnits) extends PersistentOperations {
+        def storeU8(offset: u64, value: u8) {
+                inner.storeU8(offset, value);
+        }
+
+        def storeU16(offset: u64, value: u16) {
+                inner.storeU16(offset, value);
+        }
+
+        def storeU32(offset: u64, value: u32) {
+                inner.storeU32(offset, value);
+        }
+
+        def storeU64(offset: u64, value: u64) {
+                inner.storeU64(offset, value);
+        }
+
+        def clwb(cacheLine: u64) {
+                inner.clwb(cacheLine);
+                dirty.markLine(cacheLine);
+        }
+
+        def sfence() {
+                inner.sfence();
+        }
+}
+
+// FdMmapRegion supplies the Mapping and fd ownership and the teardown; here the
+// Mapping is the anonymous staging buffer rather than a mapping of {fd}.
+class DirectIoRegion extends FdMmapRegion {
+        def blockDevice: bool;
+        def var dirty: DirectIoDirtyUnits;
+        def var hasPendingWriteback = false;
+
+        new(mapping: Mapping, fd: int, blockDevice) super(mapping, fd) {
+                // Built here rather than in a field initializer: Virgil runs field
+                // initializers before super(), when {range} is not yet set.
+                def unit = DirectIoConst.WRITE_UNIT;
+                dirty = DirectIoDirtyUnits.new(unit, (u64.!(range.length) + unit - 1u64) / unit);
+                wrapProvider(DirectIoStagingOperations.new(range));
+        }
+
+        // Install {inner} beneath the dirty-marking provider. Only before the
+        // region reaches PWRegion, which captures the provider at construction.
+        def wrapProvider(inner: PersistentOperations) {
+                setPersistentOperations(DirectIoOperations.new(inner, dirty));
+        }
+
+        def prepareChangedRange(offset: u64, size: u64) -> bool {
+                if (mapping == null) return false;
+                if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
+                if (size != 0) hasPendingWriteback = true;
+                onRangePrepared(offset, size);
+                return true;
+        }
+
+        // Observation hook, as FileMmapRegion.onRangePrepared().
+        def onRangePrepared(offset: u64, size: u64) { }
+
+        def persistChanges() -> bool {
+                if (mapping == null || fd < 0) return false;
+                if (!hasPendingWriteback) return true;
+                persistentOperations().sfence();
+                if (!writeBackDirty()) return false;
+                hasPendingWriteback = false;
+                return true;
+        }
+
+        // Drains every marked unit, not only this range's: the fence that ends a
+        // PMEM persistRange() completes every outstanding CLWB, and the crash
+        // model's images depend on that. The pending flag is left as
+        // PmemMmapRegion leaves it, so the recorded fences match.
+        def persistRange(offset: u64, size: u64) -> bool {
+                if (mapping == null || fd < 0) return false;
+                if (!validRange(offset, size)) return false;
+                if (size == 0) return true;
+                if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
+                persistentOperations().sfence();
+                return writeBackDirty();
+        }
+
+        // Write every marked unit back from the staging buffer, adjacent units in
+        // one write, then make them durable with one fdatasync(). Order within a
+        // boundary is irrelevant: the WAL needs only that all of them are durable
+        // once this returns true.
+        def writeBackDirty() -> bool {
+                if (dirty.isEmpty()) return true;
+                def unit = DirectIoConst.WRITE_UNIT;
+                def hi = dirty.hi;
+                var u = dirty.lo;
+                while (u < hi) {
+                        if (!dirty.isMarked(u)) {
+                                u++;
+                                continue;
+                        }
+                        var end = u + 1u64;
+                        while (end < hi && dirty.isMarked(end)) end++;
+                        if (!writeUnits(u * unit, (end - u) * unit)) return false;
+                        u = end;
+                }
+                if (!syncDevice()) return false;
+                dirty.clear();
+                return true;
+        }
+
+        // One write of a run of whole units. With syncDevice(), a narrow virtual
+        // seam like FileMmapRegion.syncFileData(), so tests and the benchmark can
+        // observe or fail it without reimplementing the boundary state machine.
+        // Virgil has no super calls, so an override that still wants the real
+        // I/O calls performWrite()/performSync(), which are never overridden.
+        def writeUnits(offset: u64, size: u64) -> bool {
+                return performWrite(offset, size);
+        }
+
+        def syncDevice() -> bool {
+                return performSync();
+        }
+
+        def performWrite(offset: u64, size: u64) -> bool {
+                if (!validRange(offset, size)) return false;
+                return DirectIoFileIO.pwriteFully(fd, mapping.range.start + i64.view(offset), size, offset);
+        }
+
+        def performSync() -> bool {
+                return RegionFileIO.fdatasync(fd);
+        }
+
+        // Nothing is written back on destroy: dropping unwritten staging data is
+        // exactly what a crash does, and the WAL's close() is the clean path.
+        def cleanupBeforeDestroy() {
+                hasPendingWriteback = false;
+                if (dirty != null) dirty.clear();
+        }
+
+        // One pwrite pass plus one fdatasync per boundary.
+        def checkpointCost() -> CheckpointCost {
+                return CheckpointCost.EXPENSIVE;
+        }
+}
+
+component DirectIoFileIO {
+        // Read {size} bytes at {offset} into {dst}. Zero bytes before {size} is a
+        // failure (end of file or device), never a cue to spin.
+        def preadFully(fd: int, dst: Pointer, size: u64, offset: u64) -> bool {
+                var done = 0u64;
+                while (done < size) {
+                        def r = Linux.syscall(LinuxConst.SYS_pread64,
+                                (fd, dst + i64.view(done), size - done, offset + done)).0;
+                        if (r == -LinuxConst.EINTR) continue;
+                        if (r <= 0) return false;
+                        done += u64.view(r);
+                }
+                return true;
+        }
+
+        // Write {size} bytes from {src} at {offset}. A short count is a failure,
+        // not a cue to retry: on an O_DIRECT descriptor the remainder would start
+        // misaligned.
+        def pwriteFully(fd: int, src: Pointer, size: u64, offset: u64) -> bool {
+                var r = Linux.syscall(LinuxConst.SYS_pwrite64, (fd, src, size, offset)).0;
+                while (r == -LinuxConst.EINTR) {
+                        r = Linux.syscall(LinuxConst.SYS_pwrite64, (fd, src, size, offset)).0;
+                }
+                return r == i64.view(size);
+        }
+
+        // st_mode of {fd}, or -1 if fstat fails.
+        def fstatMode(fd: int) -> int {
+                def buf = Array<byte>.new(DirectIoConst.STAT_SIZE);
+                def r = Linux.syscall(LinuxConst.SYS_fstat, (fd, Pointer.atContents(buf))).0;
+                if (r != 0) return -1;
+                def o = DirectIoConst.STAT_MODE_OFFSET;
+                return int.view(u32.view(buf[o]) | (u32.view(buf[o + 1]) << 8) |
+                        (u32.view(buf[o + 2]) << 16) | (u32.view(buf[o + 3]) << 24));
+        }
+
+        def fileType(fd: int) -> int {
+                def mode = fstatMode(fd);
+                if (mode < 0) return -1;
+                return mode & DirectIoConst.S_IFMT;
+        }
+
+        def setODirect(fd: int) -> bool {
+                def flags = Linux.syscall(LinuxConst.SYS_fcntl, (fd, DirectIoConst.F_GETFL, 0)).0;
+                if (flags < 0) return false;
+                return Linux.syscall(LinuxConst.SYS_fcntl,
+                        (fd, DirectIoConst.F_SETFL, flags | DirectIoConst.O_DIRECT)).0 == 0;
+        }
+
+        def hasODirect(fd: int) -> bool {
+                def flags = Linux.syscall(LinuxConst.SYS_fcntl, (fd, DirectIoConst.F_GETFL, 0)).0;
+                return flags >= 0 && (flags & DirectIoConst.O_DIRECT) != 0;
+        }
+
+        // Whether {fd} really bypasses the page cache. That the flag was accepted
+        // proves little: tmpfs accepts O_DIRECT and buffers anyway (kernel 6.6+),
+        // ext4 with data=journal falls back to buffered I/O, and an emulator
+        // could mistranslate the flag. A genuinely direct descriptor rejects a
+        // misaligned write with EINVAL. The probe writes back the byte already at
+        // that offset ({staging} holds what was just read from {fd}), so a
+        // descriptor that accepts it changes nothing.
+        def behavesDirect(fd: int, staging: Pointer) -> bool {
+                if (!hasODirect(fd)) return false;
+                def r = Linux.syscall(LinuxConst.SYS_pwrite64, (fd, staging + 1, 1, 1)).0;
+                return r == -LinuxConst.EINVAL;
+        }
+
+        // Logical block size of a block device, or -1.
+        def logicalBlockSize(fd: int) -> int {
+                def out = Array<int>.new(1);
+                def r = Linux.syscall(LinuxConst.SYS_ioctl,
+                        (fd, DirectIoConst.BLKSSZGET, Pointer.atElement(out, 0))).0;
+                if (r != 0) return -1;
+                return out[0];
+        }
+
+        // Size of a file or block device in bytes, or a negative errno.
+        def deviceSize(fd: int) -> i64 {
+                return Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
+        }
+
+        // O_EXCL on a block device, without O_CREAT, fails with EBUSY while the
+        // device is mounted or otherwise claimed. Never creates anything.
+        // NOTE: builds the C string inline, as RegionFileIO.unlink() does and for
+        // the same reason (the latent precise-GC note there).
+        def openBlockDeviceExclusive(path: string) -> int {
+                var pathBuf = Array<byte>.new(path.length + 1);
+                for (i < path.length) pathBuf[i] = path[i];
+                pathBuf[path.length] = 0;
+                def r = Linux.syscall(LinuxConst.SYS_open, (Pointer.atElement(pathBuf, 0),
+                        LinuxConst.O_RDWR | LinuxConst.O_EXCL | DirectIoConst.O_DIRECT, 0));
+                return int.!(r.0);
+        }
+
+        // The name of a partition-table, filesystem, volume-manager, encryption or
+        // swap signature in {b} (the start of a device), or null. O_EXCL refuses
+        // only a device in use; this refuses one that holds something else.
+        def foreignSignature(b: Range<byte>) -> string {
+                if (matches(b, 0, "XFSB")) return "XFS";
+                if (matches(b, 0, "LUKS")) return "LUKS";
+                if (b.length > 511 && b[510] == 0x55 && b[511] == 0xAA) return "MBR/boot sector";
+                if (matches(b, 512, "EFI PART")) return "GPT";
+                for (s < 4) if (matches(b, s * 512, "LABELONE")) return "LVM2";
+                if (b.length > 1081 && b[1080] == 0x53 && b[1081] == 0xEF) return "ext2/3/4";
+                if (matches(b, 4086, "SWAPSPACE2")) return "swap";
+                if (matches(b, 65600, "_BHRfS_M")) return "btrfs";
+                return null;
+        }
+
+        private def matches(b: Range<byte>, offset: int, s: string) -> bool {
+                if (offset + s.length > b.length) return false;
+                for (i < s.length) if (b[offset + i] != s[i]) return false;
+                return true;
+        }
+}
+
+enum DirectIoTarget {
+        FILE,           // a regular file, created and sized as FileMmapBackend does
+        BLOCK_DEVICE    // an existing raw block device, never created or truncated
+}
+
+class DirectIoBackend extends TxnRegionBackend {
+        def path: string;
+        def target: DirectIoTarget;
+        // Why the last create() returned null, for harness messages.
+        def var lastError: string;
+
+        new(path, target) { }
+
+        def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+                lastError = null;
+                if (size == 0 || size % DirectIoConst.WRITE_UNIT != 0) {
+                        return reject("the region size must be a nonzero multiple of 4096");
+                }
+                if (size > DirectIoConst.MAX_REGION) return reject("the region must be smaller than 2 GiB");
+                if ((prot & BackendProt.WRITE.mask) == 0) return reject("the staging buffer must be writable");
+                def blockDevice = target == DirectIoTarget.BLOCK_DEVICE;
+                def fd = if(blockDevice, openDevice(size), openFile(size, fresh));
+                if (fd < 0) return null;
+
+                var mapping = Mmap.reserve(size, MmapRegionUtils.convertProt(prot));
+                if (mapping == null) return abandon(fd, null, "could not reserve the staging buffer");
+                // PWRegion reads the header straight out of the range once create()
+                // returns, so the staging buffer must already hold the image.
+                if (!DirectIoFileIO.preadFully(fd, mapping.range.start, size, 0)) {
+                        return abandon(fd, mapping, "could not read the region into the staging buffer");
+                }
+                if (!DirectIoFileIO.behavesDirect(fd, mapping.range.start)) {
+                        return abandon(fd, mapping, "the descriptor does not behave as O_DIRECT (tmpfs, ext4 data=journal, or an emulator?)");
+                }
+                if (blockDevice && fresh) {
+                        // A fresh format starts from zeroed backing
+                        // (TxnRegionBackend.create); a file gets that from O_TRUNC +
+                        // ftruncate, a device has to be written.
+                        def err = checkDeviceIsBlank(fd);
+                        if (err != null) return abandon(fd, mapping, err);
+                        mapping.range.unmap();
+                        mapping = Mmap.reserve(size, MmapRegionUtils.convertProt(prot));
+                        if (mapping == null) return abandon(fd, null, "could not reserve the staging buffer");
+                        if (!DirectIoFileIO.pwriteFully(fd, mapping.range.start, size, 0) ||
+                                !RegionFileIO.fdatasync(fd)) {
+                                return abandon(fd, mapping, "could not zero the device region");
+                        }
+                }
+                def region = makeDirectRegion(mapping, fd, blockDevice);
+                if (region == null) return abandon(fd, mapping, "could not construct the region");
+                return region;
+        }
+
+        // Factory hook, as FileMmapBackend.makeFileRegion(), for timing and test
+        // subclasses.
+        def makeDirectRegion(mapping: Mapping, fd: int, blockDevice: bool) -> DirectIoRegion {
+                return DirectIoRegion.new(mapping, fd, blockDevice);
+        }
+
+        def isPersistent() -> bool {
+                return true;
+        }
+
+        def name() -> string {
+                return if(target == DirectIoTarget.BLOCK_DEVICE, "direct-device", "direct-file");
+        }
+
+        private def openFile(size: u64, fresh: bool) -> int {
+                def fd = RegionFileIO.openBacking(path, fresh);
+                if (fd < 0) return rejectFd(-1, "could not open the region file");
+                // Before anything can change the size: a device or character file
+                // named as a file target is refused, not truncated or written.
+                if (DirectIoFileIO.fileType(fd) != DirectIoConst.S_IFREG) {
+                        return rejectFd(fd, "the region path is not a regular file");
+                }
+                if (!RegionFileIO.ensureSize(fd, size)) return rejectFd(fd, "could not size the region file");
+                if (!DirectIoFileIO.setODirect(fd)) return rejectFd(fd, "the filesystem refused O_DIRECT");
+                return fd;
+        }
+
+        private def openDevice(size: u64) -> int {
+                def fd = DirectIoFileIO.openBlockDeviceExclusive(path);
+                if (fd == -LinuxConst.EBUSY) return rejectFd(-1, "the device is in use (mounted or claimed)");
+                if (fd < 0) return rejectFd(-1, "could not open the device exclusively");
+                if (DirectIoFileIO.fileType(fd) != DirectIoConst.S_IFBLK) {
+                        return rejectFd(fd, "the region path is not a block device");
+                }
+                def lbs = DirectIoFileIO.logicalBlockSize(fd);
+                if (lbs <= 0 || 4096 % lbs != 0) return rejectFd(fd, "the device's logical block size does not divide 4096");
+                if (DirectIoFileIO.deviceSize(fd) < i64.view(size)) return rejectFd(fd, "the device is smaller than the region");
+                return fd;
+        }
+
+        private def checkDeviceIsBlank(fd: int) -> string {
+                def devSize = u64.view(DirectIoFileIO.deviceSize(fd));
+                var scanBytes = DirectIoConst.SIGNATURE_SCAN;
+                if (devSize < scanBytes) scanBytes = devSize - devSize % DirectIoConst.WRITE_UNIT;
+                if (scanBytes == 0) return null;
+                def scan = Mmap.reserve(scanBytes, Mmap.PROT_READ | Mmap.PROT_WRITE);
+                if (scan == null) return "could not reserve the signature scan buffer";
+                var err: string;
+                if (!DirectIoFileIO.preadFully(fd, scan.range.start, scanBytes, 0)) {
+                        err = "could not read the start of the device";
+                } else {
+                        def sig = DirectIoFileIO.foreignSignature(
+                                CiRuntime.forgeRange<byte>(scan.range.start, int.!(scanBytes)));
+                        if (sig != null) err = StringBuilder.new()
+                                .put1("refusing to format: the device carries a %s signature", sig).toString();
+                }
+                scan.range.unmap();
+                return err;
+        }
+
+        private def reject(msg: string) -> BackendRegion {
+                lastError = msg;
+                return null;
+        }
+
+        private def rejectFd(fd: int, msg: string) -> int {
+                if (fd >= 0) RegionFileIO.close(fd);
+                lastError = msg;
+                return -1;
+        }
+
+        private def abandon(fd: int, mapping: Mapping, msg: string) -> BackendRegion {
+                if (mapping != null) mapping.range.unmap();
+                RegionFileIO.close(fd);
+                lastError = msg;
+                return null;
+        }
+}
