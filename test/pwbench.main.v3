@@ -6,7 +6,7 @@
 // the only quantitative claim in the argument that the unified interface hides
 // real differences between the media. This produces the number.
 //
-// Three configurations, not two. Comparing PMEM+SFENCE against
+// Three configurations, not two, plus a fourth backend. Comparing PMEM+SFENCE against
 // file+fdatasync on its own conflates the boundary primitive with the media,
 // and cannot separate "fences are cheap" from "PMEM is fast":
 //
@@ -16,7 +16,10 @@
 //
 // 1 vs 2 isolates the primitive with the media held constant, 2 vs 3 isolates
 // the media with the primitive held constant, and 1 vs 3 is the deployment
-// comparison that motivated the measurement.
+// comparison that motivated the measurement. The direct backend (pwrite +
+// O_DIRECT from a private staging buffer, one fdatasync per boundary) is the
+// fourth: block media without the page cache, on a file (`direct`) or a raw
+// block device (`direct-device=<device>`).
 //
 // Instrumentation is asymmetric because the primitives are. On PMEM the
 // boundary is a CLWB loop plus one SFENCE, both issued through the
@@ -26,9 +29,19 @@
 // prepare side and the persist side of one boundary -- and the difference in
 // mechanism is itself the granularity difference under study. Neither path
 // reimplements a persistence state machine: each overrides only the narrow
-// seam the production class provides for exactly this.
+// seam the production class provides for exactly this. On the direct backend
+// the boundary is the region's own write-back -- pwrite of the marked units,
+// then one fdatasync -- behind DirectIoRegion.writeUnits()/syncDevice(), and
+// both are timed together as one boundary sample.
 //
-// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem> [commits] [entries] [warmup] [blockSize] [blocks]
+// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks]
+//        pwbench.x86-64-linux <device> direct-device=<device> [commits] ...
+//
+// A raw device is overwritten from offset 0 for the region's length. Its path
+// has to be given twice, as the first argument and inside the mode word, so a
+// directory argument edited into a device path cannot select it by accident;
+// the backend also refuses a mounted device and one carrying a known
+// filesystem or partition signature.
 //
 // The region is blocks x blockSize bytes (default 512 x 4096 = 2 MiB). Both are
 // exposed because they are not interchangeable: blockSize also sets the WAL slot
@@ -36,6 +49,16 @@
 // changes only the region's size. Varying blocks alone isolates region size.
 
 def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def RUSAGE_SELF = 0;
+def RU_MINFLT_OFFSET = 64;      // struct rusage: two timevals, then longs
+def RUSAGE_SIZE = 144;
+
+enum BenchBackend(arg: string, label: string) {
+        FILE("file", "file (mmap + msync/fdatasync)"),
+        PMEM("pmem", "pmem (MAP_SYNC + CLWB/SFENCE)"),
+        DIRECT("direct", "direct (pwrite + O_DIRECT + fdatasync) on a file"),
+        DIRECT_DEVICE("direct-device", "direct (pwrite + O_DIRECT + fdatasync) on a raw block device")
+}
 
 // Cap the retained sample set. Percentiles over this many commits are stable
 // and the vector stays far away from the region under test.
@@ -44,7 +67,7 @@ def MAX_SAMPLES = 200000;
 component BenchConfig {
         def var directory: string;
         def var path: string;
-        def var usePmem = false;
+        def var backend = BenchBackend.FILE;
         def var commits = 20000;
         def var entries = 8;            // u64 redo entries per transaction
         def var warmup = 2000;
@@ -52,7 +75,11 @@ component BenchConfig {
         def var blockSize = 4096u64;
 
         def backendName() -> string {
-                return if(usePmem, "pmem (MAP_SYNC + CLWB/SFENCE)", "file (mmap + msync/fdatasync)");
+                return backend.label;
+        }
+
+        def isDirect() -> bool {
+                return backend == BenchBackend.DIRECT || backend == BenchBackend.DIRECT_DEVICE;
         }
 
         // Reserve a private, uniquely named region file, exactly as
@@ -142,6 +169,12 @@ class BoundaryTimer {
         def var prepareCycles = 0u64;
         def var clwbLines = 0;
         def persistSamples = Vector<u64>.new();
+        // Direct backend only: the two halves of each boundary sample.
+        def var directWrites = 0;
+        def var directBytes = 0u64;
+        def var directWriteCycles = 0u64;
+        def var directSyncs = 0;
+        def var directSyncCycles = 0u64;
 
         def notePersist(cycles: u64) {
                 persistCalls++;
@@ -163,6 +196,24 @@ class BoundaryTimer {
                 persistCycles = 0;
                 prepareCycles = 0;
                 persistSamples.clear();
+                directWrites = 0;
+                directBytes = 0;
+                directWriteCycles = 0;
+                directSyncs = 0;
+                directSyncCycles = 0;
+        }
+
+        def noteDirectWrite(bytes: u64, cycles: u64) {
+                if (!recording) return;
+                directWrites++;
+                directBytes += bytes;
+                directWriteCycles += cycles;
+        }
+
+        def noteDirectSync(cycles: u64) {
+                if (!recording) return;
+                directSyncs++;
+                directSyncCycles += cycles;
         }
 }
 
@@ -246,6 +297,64 @@ class TimingFileBackend extends FileMmapBackend {
         }
 }
 
+// ------------------------------------------------ direct instrumentation
+
+// The direct boundary is the region's own write-back: one pwrite per run of
+// marked units, then one fdatasync. The writes are accumulated and reported
+// with the fdatasync as a single persist sample, so a boundary is still one
+// sample and "boundaries per commit" still counts boundaries. The two halves
+// are also kept apart for the direct io: lines.
+class TimingDirectRegion extends DirectIoRegion {
+        def timer: BoundaryTimer;
+        var pendingWriteCycles = 0u64;
+
+        new(mapping: Mapping, fd: int, blockDevice: bool, timer) super(mapping, fd, blockDevice) { }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                timer.notePrepare(0);
+        }
+
+        def writeUnits(offset: u64, size: u64) -> bool {
+                def c0 = Target.rdtsc();
+                def success = performWrite(offset, size);
+                def cycles = Target.rdtsc() - c0;
+                pendingWriteCycles += cycles;
+                timer.noteDirectWrite(size, cycles);
+                return success;
+        }
+
+        def syncDevice() -> bool {
+                def c0 = Target.rdtsc();
+                def success = performSync();
+                def cycles = Target.rdtsc() - c0;
+                timer.noteDirectSync(cycles);
+                timer.notePersist(pendingWriteCycles + cycles);
+                pendingWriteCycles = 0;
+                return success;
+        }
+}
+
+class TimingDirectBackend extends DirectIoBackend {
+        def timer: BoundaryTimer;
+
+        new(path: string, target: DirectIoTarget, timer: BoundaryTimer) super(path, target) { }
+
+        def makeDirectRegion(mapping: Mapping, fd: int, blockDevice: bool) -> DirectIoRegion {
+                return TimingDirectRegion.new(mapping, fd, blockDevice, timer);
+        }
+}
+
+// Minor page faults so far in this process, or -1. On the mmap backends the
+// first store to a page after each writeback takes a write-protect fault; the
+// direct backend's anonymous staging buffer should take none once touched.
+def minorFaults() -> long {
+        def buf = Array<byte>.new(RUSAGE_SIZE);
+        if (Linux.syscall(LinuxConst.SYS_getrusage, (RUSAGE_SELF, Pointer.atContents(buf))).0 != 0) return -1;
+        var v = 0L;
+        for (i < 8) v |= long.view(u64.view(buf[RU_MINFLT_OFFSET + i]) << u6.view(8 * i));
+        return v;
+}
+
 // ---------------------------------------------------------------- stats
 
 // Magpie is a shared host under concurrent load, so the sample distribution is
@@ -280,10 +389,16 @@ def fail(msg: string) -> int {
         return 1;
 }
 
+var directBackend: TimingDirectBackend;
+
 def openRegion(timer: BoundaryTimer) -> PWRegion {
         var backend: TxnRegionBackend;
-        if (BenchConfig.usePmem) backend = TimingPmemBackend.new(BenchConfig.path, timer);
-        else backend = TimingFileBackend.new(BenchConfig.path, timer);
+        match (BenchConfig.backend) {
+                PMEM => backend = TimingPmemBackend.new(BenchConfig.path, timer);
+                FILE => backend = TimingFileBackend.new(BenchConfig.path, timer);
+                DIRECT => backend = directBackend = TimingDirectBackend.new(BenchConfig.path, DirectIoTarget.FILE, timer);
+                DIRECT_DEVICE => backend = directBackend = TimingDirectBackend.new(BenchConfig.path, DirectIoTarget.BLOCK_DEVICE, timer);
+        }
         return PWRegion.new(backend, BenchConfig.blocks,
                 Array<Ref<MetaDataDesc>>.new(0), BenchConfig.blockSize, true);
 }
@@ -303,7 +418,7 @@ def runCommits(region: PWRegion, base: u64, count: int, timer: BoundaryTimer) ->
         return true;
 }
 
-def report(timer: BoundaryTimer, measured: int, wallNs: long) {
+def report(timer: BoundaryTimer, measured: int, wallNs: long, faults: long) {
         def sorted = sortedSamples(timer.persistSamples);
         def p = Percentiles.new(sorted);
         Trace.OUT.put2("commits measured %d, entries per commit %d",
@@ -341,6 +456,15 @@ def report(timer: BoundaryTimer, measured: int, wallNs: long) {
                         wallNs, (1000L * long.view(boundaryNs)) / wallNs).ln();
                 Trace.OUT.put1("wall ns per commit %d", wallNs / long.!(measured)).ln();
         }
+        // Not parsed by scripts/pmem-experiments.sh, so none of these lines may
+        // contain one of the substrings parse_run() matches.
+        if (faults >= 0) Trace.OUT.put1("minor faults %d during the measured commits", faults).ln();
+        if (BenchConfig.isDirect()) {
+                Trace.OUT.put3("direct io: writes %d, bytes %d, syncs %d",
+                        timer.directWrites, timer.directBytes, timer.directSyncs).ln();
+                Trace.OUT.put2("direct io: write cycles %d, sync cycles %d",
+                        timer.directWriteCycles, timer.directSyncCycles).ln();
+        }
 }
 
 // The per-transaction ceiling, mirroring DualTxnWal's geometry: each of the two
@@ -371,14 +495,23 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 2 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem> [commits] [entries] [warmup] [blockSize] [blocks]\n");
+                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks]\n");
+                System.puts("       pwbench.x86-64-linux <device> direct-device=<device> [commits] [entries] [warmup] [blockSize] [blocks]\n");
                 return 2;
         }
         // Rejected rather than defaulted: a file run reported as a PMEM one
         // would invert the comparison this program exists to make.
-        if (Strings.equal(args[1], "pmem")) BenchConfig.usePmem = true;
-        else if (!Strings.equal(args[1], "file")) {
-                System.puts("backend must be \"file\" or \"pmem\"\n");
+        if (Strings.equal(args[1], "pmem")) BenchConfig.backend = BenchBackend.PMEM;
+        else if (Strings.equal(args[1], "direct")) BenchConfig.backend = BenchBackend.DIRECT;
+        else if (Strings.startsWith(args[1], "direct-device=")) {
+                def named = Arrays.range(args[1], 14, args[1].length);
+                if (!Strings.equal(named, args[0])) {
+                        System.puts("direct-device=<device> must name the same device as the first argument\n");
+                        return 2;
+                }
+                BenchConfig.backend = BenchBackend.DIRECT_DEVICE;
+        } else if (!Strings.equal(args[1], "file")) {
+                System.puts("backend must be \"file\", \"pmem\", \"direct\" or \"direct-device=<device>\"\n");
                 return 2;
         }
         if (args.length > 2) BenchConfig.commits = int.!(parseU64(args[2], 20000));
@@ -398,7 +531,10 @@ def main(args: Array<string>) -> int {
                 return 2;
         }
 
-        if (!BenchConfig.reservePath(args[0])) {
+        if (BenchConfig.backend == BenchBackend.DIRECT_DEVICE) {
+                // A device is used in place: never reserved, never unlinked.
+                BenchConfig.path = args[0];
+        } else if (!BenchConfig.reservePath(args[0])) {
                 System.puts("Could not reserve a unique region file in the supplied directory.\n");
                 return 2;
         }
@@ -409,21 +545,28 @@ def main(args: Array<string>) -> int {
         def timer = BoundaryTimer.new();
         def region = openRegion(timer);
         if (region == null || region.backendRegion == null) {
-                if (BenchConfig.usePmem) {
+                if (BenchConfig.backend == BenchBackend.PMEM) {
                         return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                }
+                if (directBackend != null && directBackend.lastError != null) {
+                        return fail(Strings.format1("DirectIoBackend.create failed: %s", directBackend.lastError));
                 }
                 return fail("could not create the region file");
         }
         // The same anti-fallback check the crash loop makes, for the same
         // reason: a file mapping reported as a PMEM result would be the whole
         // comparison inverted.
-        if (BenchConfig.usePmem && !PmemMmapRegion.?(region.backendRegion)) {
-                region.deallocate();
-                return fail("pmem mode did not produce a PmemMmapRegion");
+        def got = region.backendRegion;
+        var mismatch: string;
+        match (BenchConfig.backend) {
+                PMEM => if (!PmemMmapRegion.?(got)) mismatch = "pmem mode did not produce a PmemMmapRegion";
+                FILE => if (!FileMmapRegion.?(got)) mismatch = "file mode did not produce a FileMmapRegion";
+                DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) mismatch = "direct mode did not produce a file-backed DirectIoRegion";
+                DIRECT_DEVICE => if (!DirectIoRegion.?(got) || !DirectIoRegion.!(got).blockDevice) mismatch = "direct-device mode did not produce a device-backed DirectIoRegion";
         }
-        if (!BenchConfig.usePmem && !FileMmapRegion.?(region.backendRegion)) {
+        if (mismatch != null) {
                 region.deallocate();
-                return fail("file mode did not produce a FileMmapRegion");
+                return fail(mismatch);
         }
         // This is an ordinary build. The elided-writeback mutant must not be
         // anywhere near a cost measurement.
@@ -466,18 +609,22 @@ def main(args: Array<string>) -> int {
         timer.reset();
         timer.recording = true;
 
+        def faults0 = minorFaults();
         def t0 = BenchClock.nanos();
         def ok = runCommits(region, base, BenchConfig.commits, timer);
         def wallNs = BenchClock.nanos() - t0;
+        def faults1 = minorFaults();
         timer.recording = false;
         if (!ok) {
                 region.deallocate();
                 return fail("a measured commit failed");
         }
-        report(timer, BenchConfig.commits, wallNs);
+        report(timer, BenchConfig.commits, wallNs, if(faults0 >= 0 && faults1 >= 0, faults1 - faults0, -1L));
 
         region.deallocate();
-        if (!RegionFileIO.unlink(BenchConfig.path)) {
+        if (BenchConfig.backend == BenchBackend.DIRECT_DEVICE) {
+                // The device keeps the region; there is no file of ours to remove.
+        } else if (!RegionFileIO.unlink(BenchConfig.path)) {
                 System.puts("Could not remove the region file printed above.\n");
                 return 2;
         }
