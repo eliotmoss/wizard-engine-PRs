@@ -25,21 +25,28 @@
 //   probe-verify <probe-file> <bytes> <nonce>
 //       After the reboot: counts intact, torn and lost lines in each set.
 //
-//   setup <dax-dir> <state-file> <file|pmem> [blocks] [blockSize] [steps]
+//   setup <dax-dir> <state-file> <file|pmem|direct> [blocks] [blockSize] [steps]
 //       Formats a fresh region and runs the sieve for a few steps with the
 //       production provider, then closes cleanly, so this state is durable
 //       before the experiment starts. It doubles as the flushed control.
-//   arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]
+//   arm <region> <state-file> <file|pmem|direct> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]
 //       Remounts with the chosen provider and runs more steps, recording each
 //       acknowledged step, then exits WITHOUT closing: no clean-close
 //       writeback, exactly as a crash would leave it. With reset-fd, as for
 //       probe-arm, it resets the machine instead of exiting, straight after
 //       the fsync that makes the last acknowledgement durable.
-//   verify <region> <file|pmem> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>
+//   verify <region> <file|pmem|direct> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>
 //       After the reboot: checks the raw image before mounting (PWRegion
 //       formats a region whose header is missing, which would destroy the
 //       evidence), then mounts, recovers, and checks acknowledged progress,
 //       the allocator and sieve invariants, and the prime count.
+//
+// The same three sieve modes also accept `direct`, the pwrite + O_DIRECT
+// backend over a private staging buffer. There no reboot is needed: process
+// exit already discards whatever was never written back, so setup -> arm ->
+// verify is the whole experiment, with the crash straight after the last
+// acknowledgement. The probe modes drive clwb/sfence on the provider directly
+// and have no meaning for it, so they refuse it.
 //
 // Exit status: 0 success (verify: SURVIVED; probe-verify: SENSITIVE), 1 LOST
 // (acknowledged state did not survive), 2 usage, 3 INVALID (the flushed
@@ -58,6 +65,7 @@ def EXIT_NOT_SENSITIVE = 4;
 
 component RebootConfig {
         def var usePmem = false;
+        def var useDirect = false;
         def var elideWriteback = false;
         def var path: string;
 }
@@ -66,9 +74,9 @@ def usage() -> int {
         System.puts("Usage:\n");
         System.puts("  pwreboot probe-arm <dax-dir> <state-file> <file|pmem> [bytes] [reset-fd]\n");
         System.puts("  pwreboot probe-verify <probe-file> <bytes> <nonce>\n");
-        System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem> [blocks] [blockSize] [steps]\n");
-        System.puts("  pwreboot arm <region> <state-file> <file|pmem> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]\n");
-        System.puts("  pwreboot verify <region> <file|pmem> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>\n");
+        System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem|direct> [blocks] [blockSize] [steps]\n");
+        System.puts("  pwreboot arm <region> <state-file> <file|pmem|direct> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]\n");
+        System.puts("  pwreboot verify <region> <file|pmem|direct> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>\n");
         return EXIT_USAGE;
 }
 
@@ -101,10 +109,17 @@ def requireU64(s: string, what: string) -> (bool, u64) {
 }
 
 def parseBackend(s: string) -> bool {
-        if (Strings.equal(s, "pmem")) { RebootConfig.usePmem = true; return true; }
-        if (Strings.equal(s, "file")) { RebootConfig.usePmem = false; return true; }
-        System.puts("backend must be \"file\" or \"pmem\"\n");
+        RebootConfig.usePmem = Strings.equal(s, "pmem");
+        RebootConfig.useDirect = Strings.equal(s, "direct");
+        if (RebootConfig.usePmem || RebootConfig.useDirect || Strings.equal(s, "file")) return true;
+        System.puts("backend must be \"file\", \"pmem\" or \"direct\"\n");
         return false;
+}
+
+def backendLabel() -> string {
+        if (RebootConfig.usePmem) return "pmem";
+        if (RebootConfig.useDirect) return "direct";
+        return "file";
 }
 
 def parseProvider(s: string) -> bool {
@@ -117,6 +132,7 @@ def parseProvider(s: string) -> bool {
 def openBackend() -> TxnRegionBackend {
         var backend: TxnRegionBackend;
         if (RebootConfig.usePmem) backend = X86_64Backends.getPersistent(RebootConfig.path);
+        else if (RebootConfig.useDirect) backend = DirectIoBackend.new(RebootConfig.path, DirectIoTarget.FILE);
         else backend = X86_64Backends.getFileMapped(RebootConfig.path);
         if (RebootConfig.elideWriteback) return ElidedWritebackBackend.new(backend);
         return backend;
@@ -128,7 +144,8 @@ def openBackend() -> TxnRegionBackend {
 def checkBackendRegion(region: BackendRegion) -> string {
         if (region == null) return "backend region could not be created";
         if (RebootConfig.usePmem && !PmemMmapRegion.?(region)) return "pmem mode did not produce a PmemMmapRegion";
-        if (!RebootConfig.usePmem && !FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
+        if (RebootConfig.useDirect && !DirectIoRegion.?(region)) return "direct mode did not produce a DirectIoRegion";
+        if (!RebootConfig.usePmem && !RebootConfig.useDirect && !FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
         def elided = ElidedWritebackOperations.?(region.persistentOperations());
         if (RebootConfig.elideWriteback && !elided) return "elide-clwb did not install the elided-writeback provider";
         if (!RebootConfig.elideWriteback && elided) return "an ordinary run installed the elided-writeback provider";
@@ -238,6 +255,10 @@ def randomNonce() -> u64 {
 def probeArm(args: Array<string>) -> int {
         if (args.length < 4) return usage();
         if (!parseBackend(args[3])) return EXIT_USAGE;
+        if (RebootConfig.useDirect) {
+                System.puts("the probe drives clwb/sfence itself; it has no meaning for the direct backend\n");
+                return EXIT_USAGE;
+        }
         def bytes = if(args.length > 4, parseU64(args[4], 0), 2u64 * 1024u64 * 1024u64);
         if (bytes < u64.!(2 * LINE) || bytes % 4096u64 != 0) {
                 System.puts("probe size must be a positive multiple of 4096\n");
@@ -262,7 +283,7 @@ def probeArm(args: Array<string>) -> int {
         // Recorded before any store, so a reboot at any later point still
         // leaves the verifier everything it needs.
         state.line(kvs("probe_file", RebootConfig.path));
-        state.line(kvs("backend", if(RebootConfig.usePmem, "pmem", "file")));
+        state.line(kvs("backend", backendLabel()));
         state.line(kv("bytes", bytes));
         state.line(kv("nonce", nonce));
         state.line(kv("flushed_lines", lines / 2u64));
@@ -387,7 +408,7 @@ def setup(args: Array<string>) -> int {
         region.deallocate();
 
         state.line(kvs("region", RebootConfig.path));
-        state.line(kvs("backend", if(RebootConfig.usePmem, "pmem", "file")));
+        state.line(kvs("backend", backendLabel()));
         state.line(kv("blocks", blocks));
         state.line(kv("block_size", blockSize));
         state.line(kv("setup_steps", steps));
