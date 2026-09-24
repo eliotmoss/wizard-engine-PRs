@@ -5,9 +5,11 @@
 # docs/pmem-emulation.md for the flush-placement negative control.
 #
 #   scripts/pmem-experiments.sh doctor    report what this host can run, and why
-#   scripts/pmem-experiments.sh cost      boundary-cost campaign, three configs
+#   scripts/pmem-experiments.sh cost      boundary-cost campaign, four configs
 #   scripts/pmem-experiments.sh control   flush-placement negative control
-#   scripts/pmem-experiments.sh all       both campaigns
+#   scripts/pmem-experiments.sh direct-control
+#                                         the same control on the direct backend
+#   scripts/pmem-experiments.sh all       all three campaigns
 #
 # Every run writes a self-contained directory under results/, holding the raw
 # log of each invocation, a machine-readable cost.csv, and a provenance file
@@ -18,14 +20,25 @@
 # Configurations. The cost campaign separates the boundary primitive from the
 # media, which a two-way PMEM-versus-file comparison cannot do:
 #
-#   pmem-dax    SFENCE boundary    on the DAX mount      (PWASM_PMEM_TEST_DIR)
-#   file-dax    fdatasync boundary on the same DAX mount (PWASM_PMEM_TEST_DIR)
-#   file-block  fdatasync boundary on block storage      (PWEXP_BLOCK_DIR)
+#   pmem-dax      SFENCE boundary    on the DAX mount      (PWASM_PMEM_TEST_DIR)
+#   file-dax      fdatasync boundary on the same DAX mount (PWASM_PMEM_TEST_DIR)
+#   file-block    fdatasync boundary on block storage      (PWEXP_BLOCK_DIR)
+#   direct-block  pwrite + O_DIRECT + fdatasync, no page cache, on the same
+#                 block storage                            (PWEXP_BLOCK_DIR)
 #
 # pmem-dax versus file-dax isolates the primitive with the media held constant;
 # file-dax versus file-block isolates the media with the primitive held
-# constant. file-block is skipped, loudly, when its directory is on a network
-# filesystem: an fdatasync dominated by a round trip measures the network.
+# constant; file-block versus direct-block isolates the page cache with the
+# media and the fdatasync held constant. file-block and direct-block are
+# skipped, loudly, when their directory is on a network filesystem: an
+# fdatasync dominated by a round trip measures the network. direct-block is
+# also skipped when the directory does not honour O_DIRECT (tmpfs, for one).
+#
+# direct-control needs no DAX at all: on the direct backend process death is
+# the crash, so pwreboot (crash straight after the last acknowledgement) and
+# pwsieve (crash at random points) each run once with the ordinary provider,
+# which must survive, and once with the elided-writeback mutant, which must be
+# LOST. It runs on PWEXP_BLOCK_DIR.
 #
 # Repetitions are interleaved rather than batched, so a transient load spike on
 # a shared host lands on one sample of each configuration instead of all samples
@@ -95,6 +108,7 @@ OUT="${PWEXP_OUT:-$REPO/results/$STAMP-$(hostname -s)$BS_TAG}"
 
 BENCH_BIN=bin/pwbench.x86-64-linux
 SIEVE_BIN=bin/pwsieve.x86-64-linux
+REBOOT_BIN=bin/pwreboot.x86-64-linux
 UNIT_BIN=bin/unittest.x86-64-linux
 
 say()  { printf '%s\n' "$*"; }
@@ -135,6 +149,20 @@ numa_node_of() {
         if [ -r "$f" ]; then cat "$f"; return; fi
     done
     echo unknown
+}
+
+# Whether a directory honours O_DIRECT, checked by doing it: a direct write of
+# one aligned block to a scratch file. tmpfs is refused outright, since newer
+# kernels accept O_DIRECT there and buffer anyway, which the direct backend's
+# own probe then refuses -- this keeps that from failing every run.
+odirect_ok() {
+    local dir=$1 probe ok=0
+    [ "$(fstype_of "$dir")" = tmpfs ] && return 1
+    have dd || return 1
+    probe=$(mktemp "$dir/.pwexp-odirect-XXXXXX" 2>/dev/null) || return 1
+    dd if=/dev/zero of="$probe" bs=4096 count=1 oflag=direct status=none 2>/dev/null && ok=1
+    rm -f "$probe"
+    [ $ok = 1 ]
 }
 
 is_network_fs() {
@@ -335,6 +363,13 @@ cost() {
     fi
     printf 'file-block: %s (%s)\n' \
         "$([ $do_block = 1 ] && echo included || echo SKIPPED)" "$block_fs" >> "$OUT/provenance.txt"
+    local do_direct=$do_block
+    if [ $do_direct = 1 ] && ! odirect_ok "$BLOCK_DIR"; then
+        warn "skipping direct-block: $BLOCK_DIR ($block_fs) does not honour O_DIRECT"
+        do_direct=0
+    fi
+    printf 'direct-block: %s (%s)\n' \
+        "$([ $do_direct = 1 ] && echo included || echo SKIPPED)" "$block_fs" >> "$OUT/provenance.txt"
 
     local failures=0
     # rep outermost, config innermost: interleaved, so a load spike hits one
@@ -347,6 +382,8 @@ cost() {
                 run_cost_one file-dax   file "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1))
                 [ $do_block = 1 ] &&
                     { run_cost_one file-block file "$BLOCK_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1)); }
+                [ $do_direct = 1 ] &&
+                    { run_cost_one direct-block direct "$BLOCK_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1)); }
             done
         done
     done
@@ -389,16 +426,18 @@ control() {
 
     local log=$OUT/control.log
     local rc=0
-    {
-        rule "layer 1b: explorer must reject the elided-writeback mutant"
-        "$UNIT_BIN" 'persistent_control:*' 2>&1 || rc=1
-        rule "layer 3: ordinary build on real PMEM, expected OK"
-        # shellcheck disable=SC2086
-        "$SIEVE_BIN" "$PWASM_PMEM_TEST_DIR" $SIEVE_ARGS pmem 2>&1 || rc=1
-        rule "layer 3: elided-writeback mutant on real PMEM, expected OK"
-        # shellcheck disable=SC2086
-        "$SIEVE_BIN" "$PWASM_PMEM_TEST_DIR" $SIEVE_ARGS pmem elide-clwb 2>&1 || rc=1
-    } 2>&1 | tee "$log"
+    # Each command is piped to tee on its own. Under pipefail the pipeline fails
+    # when the command does, and `|| rc=1` then runs in this shell; a brace group
+    # piped to tee runs in a subshell, where rc=1 never reached the return below.
+    : > "$log"
+    rule "layer 1b: explorer must reject the elided-writeback mutant" | tee -a "$log"
+    "$UNIT_BIN" 'persistent_control:*' 2>&1 | tee -a "$log" || rc=1
+    rule "layer 3: ordinary build on real PMEM, expected OK" | tee -a "$log"
+    # shellcheck disable=SC2086
+    "$SIEVE_BIN" "$PWASM_PMEM_TEST_DIR" $SIEVE_ARGS pmem 2>&1 | tee -a "$log" || rc=1
+    rule "layer 3: elided-writeback mutant on real PMEM, expected OK" | tee -a "$log"
+    # shellcheck disable=SC2086
+    "$SIEVE_BIN" "$PWASM_PMEM_TEST_DIR" $SIEVE_ARGS pmem elide-clwb 2>&1 | tee -a "$log" || rc=1
 
     say ""
     rule "2x2"
@@ -416,6 +455,79 @@ control() {
     say "the surrounding argument needs rewriting rather than confirming."
     say "log -> $log"
     return $rc
+}
+
+# ------------------------------------------ negative control, direct backend
+
+# One pwreboot setup -> arm -> verify cycle with the given provider, on the
+# direct backend. Prints the verdict word; returns verify's exit status
+# (0 SURVIVED, 1 LOST, anything else a harness problem).
+reboot_direct_one() {
+    local provider=$1 d="$OUT/direct-reboot-$provider" region status
+    mkdir -p "$d"
+    val() { awk -v k="$1" '$1 == k { v = $2 } END { print v }' "$2"; }
+    "$REBOOT_BIN" setup "$BLOCK_DIR" "$d/setup.state" direct 512 4096 2 > "$d/setup.log" 2>&1 ||
+        { warn "  pwreboot setup failed -- see $d/setup.log"; return 2; }
+    region=$(val region "$d/setup.state")
+    "$REBOOT_BIN" arm "$region" "$d/arm.state" direct "$provider" 512 4096 3 > "$d/arm.log" 2>&1 ||
+        { warn "  pwreboot arm failed -- see $d/arm.log"; return 2; }
+    # The pre-recovery image, by digest: verify mounts, and mounting recovers.
+    sha256sum "$region" > "$d/pre-recovery.sha256" 2>/dev/null || true
+    status=0
+    "$REBOOT_BIN" verify "$region" direct 512 4096 "$(val setup_cursor "$d/setup.state")" \
+        "$(val acked_cursor "$d/arm.state")" "$(val acked_count "$d/arm.state")" > "$d/verify.log" 2>&1 || status=$?
+    # The region is ours (setup reserved it) and its digest and verdict are kept.
+    rm -f "$region"
+    awk '$1 == "verdict" { print $2 }' "$d/verify.log"
+    return $status
+}
+
+direct_control() {
+    require_clean_tree
+    [ -d "$BLOCK_DIR" ] || die "PWEXP_BLOCK_DIR is not a directory: $BLOCK_DIR"
+    local fs; fs=$(fstype_of "$BLOCK_DIR")
+    is_network_fs "$fs" && die "$BLOCK_DIR is $fs; the direct backend needs local block storage"
+    odirect_ok "$BLOCK_DIR" || die "$BLOCK_DIR ($fs) does not honour O_DIRECT"
+    ensure_bin "$REBOOT_BIN"
+    ensure_bin "$SIEVE_BIN"
+    mkdir -p "$OUT"
+    [ -f "$OUT/provenance.txt" ] || write_provenance
+
+    local rv=() rs=() provider v s
+    for provider in ordinary elide-clwb; do
+        say "  pwreboot direct $provider"
+        s=0; v=$(reboot_direct_one "$provider") || s=$?
+        rv+=("${v:-none}"); rs+=("$s")
+    done
+    local sv=() ss=() log
+    for provider in ordinary elide-clwb; do
+        log="$OUT/direct-sieve-$provider.log"
+        say "  pwsieve direct $provider"
+        s=0
+        # shellcheck disable=SC2086
+        "$SIEVE_BIN" "$BLOCK_DIR" $SIEVE_ARGS direct "$provider" > "$log" 2>&1 || s=$?
+        v=$(grep -E '^(OK|LOST|FAIL)' "$log" | tail -1 | cut -d: -f1)
+        sv+=("${v:-none}"); ss+=("$s")
+    done
+    printf 'finished %s\nload     %s\n' "$(date -uIseconds)" "$(loadavg)" >> "$OUT/provenance.txt"
+
+    {
+        say ""
+        rule "direct backend: process death as cache loss ($BLOCK_DIR, $fs)"
+        printf '%-44s %-9s %s\n' "run" "verdict" "exit"
+        printf '%-44s %-9s %s\n' "pwreboot ordinary   (expected SURVIVED, 0)" "${rv[0]}" "${rs[0]}"
+        printf '%-44s %-9s %s\n' "pwreboot elide-clwb (expected LOST, 1)"     "${rv[1]}" "${rs[1]}"
+        printf '%-44s %-9s %s\n' "pwsieve  ordinary   (expected OK, 0)"       "${sv[0]}" "${ss[0]}"
+        printf '%-44s %-9s %s\n' "pwsieve  elide-clwb (expected LOST, 1)"     "${sv[1]}" "${ss[1]}"
+        for provider in ordinary elide-clwb; do
+            printf '  pwsieve %-10s %s\n' "$provider" \
+                "$(grep -E '^acknowledged-step checks' "$OUT/direct-sieve-$provider.log" || echo '(no summary)')"
+        done
+    } | tee "$OUT/direct-control-summary.txt"
+    say "logs -> $OUT"
+    [ "${rv[0]}" = SURVIVED ] && [ "${rs[0]}" = 0 ] && [ "${rv[1]}" = LOST ] && [ "${rs[1]}" = 1 ] &&
+        [ "${sv[0]}" = OK ] && [ "${ss[0]}" = 0 ] && [ "${sv[1]}" = LOST ] && [ "${ss[1]}" = 1 ] ||
+        die "direct-control did not produce the expected outcome; see the logs above"
 }
 
 # --------------------------------------------------------------------- doctor
@@ -455,6 +567,11 @@ doctor() {
         warn "  network filesystem -- file-block will be skipped, since fdatasync would measure the network"
     else
         say "  usable as the block-media configuration"
+        if odirect_ok "$BLOCK_DIR"; then
+            say "  honours O_DIRECT -- direct-block and direct-control are available"
+        else
+            warn "  does not honour O_DIRECT -- direct-block will be skipped and direct-control refuses"
+        fi
     fi
     rule "numa"
     if have numactl; then
@@ -475,7 +592,8 @@ case "${1:-doctor}" in
     doctor)  doctor ;;
     cost)    cost ;;
     control) control ;;
-    all)     cost; control ;;
+    direct-control) direct_control ;;
+    all)     cost; control; direct_control ;;
     help|-h|--help) usage ;;
     *)       usage; exit 2 ;;
 esac
