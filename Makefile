@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsieve-direct pwsieve-direct-mutant pwsieve-device
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -116,6 +116,38 @@ pwsieve-pmem-mutant: bin/pwsieve.x86-64-linux
 	fi
 	bin/pwsieve.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" $(PWSIEVE_PMEM_ARGS) pmem elide-clwb
 
+# The crash loop on the direct-I/O backend (pwrite + O_DIRECT from a private
+# staging buffer), where process death is the crash: whatever the child never
+# wrote back dies with it. The ordinary build must report OK and the mutant must
+# report LOST -- the random-crash-point counterpart of the Stage 2c pair.
+# PWDIRECT_DIR must name local block storage that honours O_DIRECT (not tmpfs).
+# The optional eighth argument raises the 20 ms kill delay on slow media.
+PWSIEVE_DIRECT_ARGS ?= 20 1 512 4096
+pwsieve-direct: bin/pwsieve.x86-64-linux
+	@if [ -z "$(PWDIRECT_DIR)" ]; then \
+		echo "PWDIRECT_DIR must name a writable directory on block storage that honours O_DIRECT"; \
+		exit 2; \
+	fi
+	bin/pwsieve.x86-64-linux "$(PWDIRECT_DIR)" $(PWSIEVE_DIRECT_ARGS) direct ordinary
+
+pwsieve-direct-mutant: bin/pwsieve.x86-64-linux
+	@if [ -z "$(PWDIRECT_DIR)" ]; then \
+		echo "PWDIRECT_DIR must name a writable directory on block storage that honours O_DIRECT"; \
+		exit 2; \
+	fi
+	bin/pwsieve.x86-64-linux "$(PWDIRECT_DIR)" $(PWSIEVE_DIRECT_ARGS) direct elide-clwb
+
+# The same loop on a raw block device, overwritten from offset 0 for the
+# region's length; see pwbench-device for the safeguards. PWDIRECT_WRITEBACK
+# selects ordinary (default) or elide-clwb.
+PWDIRECT_WRITEBACK ?= ordinary
+pwsieve-device: bin/pwsieve.x86-64-linux
+	@if [ -z "$(PWDIRECT_DEVICE)" ]; then \
+		echo "PWDIRECT_DEVICE must name a spare block device whose first 2 MiB may be overwritten"; \
+		exit 2; \
+	fi
+	bin/pwsieve.x86-64-linux "$(PWDIRECT_DEVICE)" $(PWSIEVE_DIRECT_ARGS) direct-device="$(PWDIRECT_DEVICE)" $(PWDIRECT_WRITEBACK)
+
 bin/pwsieve.x86-64-linux: $(ENGINE) $(PWSIEVE_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwsieve x86-64-linux
 
@@ -145,6 +177,28 @@ pwbench-block: bin/pwbench.x86-64-linux
 		exit 2; \
 	fi
 	bin/pwbench.x86-64-linux "$(PWBENCH_DIR)" file $(PWBENCH_ARGS)
+
+# Direct-I/O backend on block storage: pwrite + O_DIRECT from a private staging
+# buffer, one fdatasync per boundary, no page cache. PWDIRECT_DIR must name a
+# local block-backed filesystem that honours O_DIRECT; tmpfs and NFS do not, and
+# the backend refuses a descriptor that only pretends to.
+pwbench-direct: bin/pwbench.x86-64-linux
+	@if [ -z "$(PWDIRECT_DIR)" ]; then \
+		echo "PWDIRECT_DIR must name a writable directory on block storage that honours O_DIRECT"; \
+		exit 2; \
+	fi
+	bin/pwbench.x86-64-linux "$(PWDIRECT_DIR)" direct $(PWBENCH_ARGS)
+
+# The same on a raw block device, overwritten from offset 0 for the region's
+# length (2 MiB by default). The binary refuses a mounted device and one that
+# carries a known partition, filesystem, LVM, LUKS or swap signature, and the
+# device path is passed to it twice on purpose.
+pwbench-device: bin/pwbench.x86-64-linux
+	@if [ -z "$(PWDIRECT_DEVICE)" ]; then \
+		echo "PWDIRECT_DEVICE must name a spare block device whose first 2 MiB may be overwritten"; \
+		exit 2; \
+	fi
+	bin/pwbench.x86-64-linux "$(PWDIRECT_DEVICE)" direct-device="$(PWDIRECT_DEVICE)" $(PWBENCH_ARGS)
 
 bin/pwbench.x86-64-linux: $(ENGINE) $(PWBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwbench x86-64-linux
