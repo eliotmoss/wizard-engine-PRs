@@ -751,14 +751,87 @@ record spans one page but thirty-two cache lines.
 
 Two things get *worse* rather than better. The atomicity contract is weaker and
 cannot be stated without naming the filesystem, so the file-backed model has no
-equivalent of the crisp baseline above. And because neither backend loses
+equivalent of the crisp baseline above. And because neither mmap backend loses
 anything on process termination, the `SIGKILL` evidence is process-crash
-consistency on both, and neither hardware crash loop discriminates flush
+consistency on both, and neither of their crash loops discriminates flush
 placement — which is the reason the correctness evidence rests on this model
-and on the flush-placement negative control.
+and on the flush-placement negative control. That is a property of where those
+two backends keep dirty data, not of block storage: the direct backend below
+keeps it in the process, and its crash loop does discriminate.
 
 Implementing a file-backed explorer is not currently planned. Stating the model
 is what the thesis requires; see [Honours Thesis](THESIS.md).
+
+### The direct backend is a restriction of the PMEM model
+
+The direct-I/O backend (`DirectIoRegion`, see
+[Persistent Backends](persistent-backends.md#the-direct-io-backend-added-2026-09-24-measured-2026-09-27))
+keeps the region in a private DRAM staging buffer and writes it back itself:
+the provider's `clwb()` marks the line's 4 KiB unit, and at each fence the
+region `pwrite`s every marked unit from the staging buffer on an `O_DIRECT`
+descriptor and then calls `fdatasync`. Its trace is the PMEM backend's for the
+same history (`direct_io:trace_matches_pmem_region`), so the question is only
+which durable images each admits.
+
+**Claim.** Every durable image the direct backend can leave on the device is an
+image this model admits for the same trace, provided the device
+
+1. never tears a naturally aligned 64-byte span — which any device whose
+   power-fail atomic unit is at least a 512-byte sector satisfies — and
+2. makes every completed write durable once a flush (or FUA) completes.
+
+A crash inside a boundary's write-back is admitted at the cut *just before*
+that boundary's `SFENCE`, which is recorded before the I/O is issued.
+
+**Why.** A written unit carries the staging buffer's current contents, which
+for each line in it is the full prefix of that line's stores so far — the
+model's eviction of that line. Nothing reaches the device unless it is written,
+so a line never CLWB-ed and never sharing a unit with one stays at its initial
+value — the model's "no eviction". A fence drains every marked unit before
+returning, so every line whose CLWB preceded it is durable with at least its
+content at the CLWB — the model's fence-forced floor. Lines are independent in
+the model, so the unit-wise mix of old and new that a crash mid-write-back can
+leave is admitted whenever both the old and the new file are admitted line by
+line at that cut.
+
+**Checked, not only argued.** `direct_io:boundary_images_are_model_images`
+records a format, two allocations, a free and a clean close over a real
+`O_DIRECT` file, snapshots the file's bytes after every real `fdatasync`, and
+checks each snapshot against this model exactly: for each touched line, some
+prefix of its stores at or above the floor must equal the file's 64 bytes, and
+every untouched byte must be the initial one. The new file must be admitted
+after the fence, and both the previous and the new file before it. It runs at
+4 KiB and 2 KiB blocks; at 2 KiB the WAL shares its unit with the region header,
+so the check sees a file that differs from the lazy image, which exercises the
+rounding. It rejects a flipped header byte, and a deliberately broken write-back
+(only the first run written) was rejected at the fifth boundary. No explorer
+enumeration and no budget are involved, so the check is exact for the scenario.
+
+**What changes against the PMEM model.** There is no background eviction and no
+asynchronous writeback completion inside the process: state that was never
+handed to the kernel is discarded by process death. A `SIGKILL` of the direct
+backend therefore samples, on real hardware and at a random cut, roughly the
+model's *lazy* schedule — the weakest image recovery must cope with — which is
+why the direct backend's kill loop separates the elided-writeback mutant from
+the ordinary build (`LOST` against `OK`, both hosts, 2026-09-27) while the same
+loop on DAX cannot. The sensitivity is coarser than the model's: 4 KiB units and
+drain-all fences hide a missing request for a line that shares a unit with a
+requested one. The device's own cache is never lost to a `SIGKILL`, so none of
+this says anything about power loss.
+
+**The atomicity contract becomes statable, and exposes a layout assumption.**
+Assumption 1 is a property a device reports: sean-tan-PC's NVMe reports an
+atomic write unit of 512 B (`atomic_write_unit_max_bytes`, AWUPF 0, i.e. one
+LBA). The two-slot WAL's argument, though, rests on the *slots* failing
+independently, and at 4 KiB blocks the WAL header and both slots share one
+4 KiB unit (`[4096, 8192)`; pinned by `direct_io:record_write_rewrites_whole_log_unit`),
+so every commit rewrites all three. On a device that is old-or-new per 512-byte
+sector this is harmless — slot 1 starts on a sector boundary (6144) and the
+rewritten neighbours are byte-identical — but a device that can leave a torn
+sector *unreadable* rather than old-or-new could take out the slot holding the
+only durable copy of acknowledged data. The same holds for the mmap file
+backend, whose writeback is page-granular. The layout, not the interface, has to
+know the device's write unit to rule it out.
 
 ### Scale
 

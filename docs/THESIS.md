@@ -56,7 +56,11 @@ The seam is `BackendRegion` / `TxnRegionBackend` plus the per-region
 `PersistentOperations` provider (`src/engine/TxnBackend.v3`,
 `src/engine/x86-64/X86_64PersistentOperations.v3`), carrying one allocator
 (`PWRegion`) and one log (`DualTxnWal`) over `VolatileRegion`,
-`FileMmapRegion` and `PmemMmapRegion` without conditionals in the layers above.
+`FileMmapRegion`, `PmemMmapRegion` and `DirectIoRegion` (explicit `pwrite` +
+`O_DIRECT` from a private staging buffer, to a file or a raw block device,
+added 2026-09-24) without conditionals in the layers above. The direct backend
+emits the PMEM backend's `STORE`/`CLWB`/`SFENCE` trace for the same history,
+which is the seam's claim made checkable.
 
 **2. A recorded-trace crash-image method that checks production recovery over
 every durable image a crash permits.**
@@ -184,6 +188,38 @@ Two findings that arrived unplanned and are better material than the headline:
 Full numbers, the isolation of primitive from media, and the stated limits are
 in [persistent-backends.md](persistent-backends.md).
 
+### Where the persistence point is
+
+Measured 2026-09-27 with the direct backend, whose timing splits each boundary
+into its `pwrite` and its `fdatasync`. The same seam call, the same single
+boundary per commit, and the cost lands in a different system call on each host:
+
+| Host | Device as Linux sees it | Boundary | `pwrite` | `fdatasync` |
+|---|---|---|---|---|
+| Magpie `/home` | MegaRAID SAS3508 volume, `write through`, no FUA | 129 µs | ~144 µs | ~1.7 µs |
+| sean-tan-PC `$HOME` | Solidigm NVMe, volatile write cache, FUA | 241 µs | ~23 µs | ~233 µs |
+
+On Magpie the barrier is empty — Linux sees a write-through device and sends no
+flush — and the write carries 99 % of the boundary; on the PC the flush carries
+91 %. This is the thesis's theme at its sharpest: the interface hides not only
+the medium and its mapping granularity but *where the persistence point is*,
+and whether the barrier does anything at all.
+
+It also corrects the block-media column of everything above. `/home` reports a
+7,200 rpm drive, and a write acknowledged in ~130 µs has not reached a platter:
+every `file-block` figure is the latency to a RAID controller's acknowledgement.
+Whether that acknowledgement is power-safe depends on the controller's
+configuration and is not established (it needs `storcli` and an administrator).
+Chapter 6 must say so where it quotes a block figure, and should present the PC
+as the host where the flush demonstrably reaches a device with a volatile cache.
+
+Two smaller results from the same runs. Bypassing the page cache changes the
+boundary by under 8 % on either host, in opposite directions, so the page cache
+is not where block cost lives. And the mmap backends take one write-protect
+fault per dirtied page per commit (none for the direct backend); on DAX it is
+one per commit at 2 MiB but two at 1 MiB, because both dirtied pages sit under a
+single 2 MiB entry — root-free corroboration of the region-size mechanism above.
+
 ### Verifiability
 
 The two media are not interchangeable for validation, and this is the axis that
@@ -194,18 +230,26 @@ matters most because it is the one that connects to contribution 2.
 - On a file, the page cache is kernel-side and shared, so a killed process
   loses nothing either; only a host crash or power loss discards it.
 
-Neither hardware crash loop can discriminate correct flush placement. That is
-not a gap in the experiments — it is a property of the media, and it is the
-reason the correctness evidence has to come from the model. The
+Neither of those crash loops can discriminate correct flush placement, and the
 flush-placement negative control makes this demonstrable rather than argued.
+This section used to call that "a property of the media". **That was wrong as
+stated**: it is a property of where those two backends keep dirty data. The
+direct backend keeps it in the process, so process death discards whatever was
+never written back, and its kill loop does discriminate: the elided-writeback
+mutant loses every acknowledged step at random crash points (8 of 8 on Magpie,
+19 of 19 on the PC, 2026-09-27) while the ordinary build loses none. That
+discrimination is coarse (4 KiB units, drain-all fences) and tests the
+placement of write-back requests, not what `CLWB` and `SFENCE` do on PMEM, so
+the fine-grained evidence still comes from the model.
 
 A warm reset over reserved DRAM (Stage 2c) is the one hardware event available
-here that does discard the cache, and there the two builds separate: the
+here that does discard the CPU cache, and there the two builds separate: the
 mutant loses every acknowledged step and the ordinary build loses nothing,
 three times out of three. That corroborates the model on real cache loss, but
 at a single crash point per run, straight after the last acknowledgement. The
-claim that the placement is correct at *every* crash point still rests on the
-explorer alone.
+direct backend's kill loop adds many random crash points on real hardware, but
+at 4 KiB granularity; the claim that the placement is correct at *every* crash
+point, line by line, still rests on the explorer alone.
 
 ---
 
@@ -240,7 +284,8 @@ available evidence that the workload-level invariants are not vacuous:
 ## Scope triage
 
 Six weeks to submission. The implementation is over-delivered for Honours
-already — 260 implementation tests across thirteen files, a working crash-image
+already — 286 implementation tests across fifteen files (260 at the
+2026-09-01 audit, then the negative control's 4 and the direct backend's 22), a working crash-image
 explorer, and validation on real fsdax hardware. The risk from here is an
 unwritten thesis, not a thin contribution. Experiments are triaged accordingly.
 
@@ -254,6 +299,7 @@ cannot be written around missing numbers.
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
 | ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29×, `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
+| ~~Third backend: direct I/O~~ | done 2026-09-24, hardware 2026-09-27 | **Added after the plan, before the freeze.** `DirectIoRegion`: private staging buffer, `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a file or a raw block device. Same trace as the PMEM backend; every post-`fdatasync` file image checked exactly against the PMEM model; kill-loop mutant `LOST` / ordinary `OK` on Magpie and the PC; and the finding that Magpie's block storage is a write-through RAID controller, so every `file-block` figure is a controller round trip. See "Where the persistence point is" above. |
 | ~~Stage 2c — reserved-DRAM warm reboot~~ | done 2026-09-24 | **Complete, the experiment discriminates.** Ordinary build `SURVIVED` and mutant `LOST` (every acknowledged step) in 3 of 3 pairs, with the reset issued from inside the process. On the way, two host facts that the write-up needs: the firmware wipes RAM after a `sysrq` reset unless the kernel's memory-overwrite request is cleared, and a seconds-long window before the reset lets every unflushed line reach memory. |
 
 ### Out of scope for the thesis
@@ -312,8 +358,20 @@ What genuinely changes, and belongs in the thesis:
   atomicity above. The PMEM model can state its baseline precisely; the file
   model cannot, and has to name the filesystem.
 - **The crash class differs.** Process termination loses nothing on either
-  backend, so the existing `SIGKILL` evidence is process-crash consistency on
+  mmap backend, so their `SIGKILL` evidence is process-crash consistency on
   both, and host power loss is the only event that discriminates.
+
+The direct backend has a third model, and it is a *restriction* of the PMEM
+one: every image it can leave is one the PMEM model admits for the same trace,
+provided the device never tears a 64-byte-aligned span (512-byte sector
+atomicity suffices) and a completed flush makes completed writes durable. There
+is no background eviction, so a `SIGKILL` samples roughly the model's lazy
+schedule — which is why its kill loop discriminates. The claim is checked, not
+only argued: `direct_io:boundary_images_are_model_images` compares the real
+file after every `fdatasync` with the model, line by line and exactly. Recorded
+in [PMEM Crash Model](pmem-crash-model.md#the-direct-backend-is-a-restriction-of-the-pmem-model),
+together with the layout assumption it exposes: at 4 KiB blocks the WAL header
+and both slots share one 4 KiB write unit.
 
 Whether to *implement* a file-backed explorer is out of scope; stating the
 model and its relationship to the PMEM one is in scope, and is the analysis
@@ -338,6 +396,15 @@ enumeration work:
   logging (Romulus, OneFile) for the WAL design comparison.
 - **Persistent-memory filesystems**, for the block-backed comparison — NOVA,
   SplitFS.
+- **Block-level crash testing and the buffer-pool question**, for the direct
+  backend — CrashMonkey (OSDI '18) and dm-log-writes/replay-log record block
+  writes with their FLUSH/FUA flags and replay the crash states they permit, the
+  block-level counterpart of the explorer; Pillai et al., "All File Systems Are
+  Not Created Equal" (OSDI '14); Crotty, Leis and Pavlo, "Are You Sure You Want
+  to Use MMAP in Your DBMS?" (CIDR '22), the mmap-versus-buffer-pool argument
+  this backend demonstrates within one seam; Rebello et al., "Can Applications
+  Recover from fsync Failures?" (ATC '20), against which `DualTxnWal`'s
+  latch-and-reopen contract should be positioned.
 
 Claimed differentiators, to be stated only after the closest work is read
 properly rather than assumed:
@@ -392,7 +459,7 @@ complete draft passes.
 Seven, and they need real hours budgeted.
 
 1. Layer stack — `PWRegion` → `RegionTransaction` → `DualTxnWal` →
-   `BackendRegion` → the three backends.
+   `BackendRegion` → the four backends (volatile, mmap file, PMEM, direct I/O).
 2. On-region layout.
 3. Phase B commit timeline, showing the piggybacked boundary.
 4. **One trace cut fanning out into its permitted durable images.** The
@@ -402,11 +469,16 @@ Seven, and they need real hours budgeted.
 6. Boundary cost — three configurations, separating the boundary primitive from
    the media. **Data in hand (2026-09-18, four runs each):** `SFENCE` 11 ns,
    `fdatasync` on the same DAX media 927 µs, `fdatasync` on block storage
-   148 µs. Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
+   148 µs. A fourth bar since 2026-09-27: `direct-block`, 129 µs against
+   `file-block`'s 137 µs in the same campaign; label both block bars as a
+   write-through RAID controller, which is what they measure.
+   Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
    same figure. State the 2 MiB region geometry on the figure: the
    `fdatasync`-on-DAX bar is conditional on it (see 6c). Better: draw it as
    two panels, 1 MiB and 2 MiB, from the matched campaign
-   (`results/20260923T043535Z-magpie-bs2048-4096`), so the reversal of the
+   (`results/20260923T043535Z-magpie-bs2048-4096`, or its 2026-09-27 rerun
+   `results/20260927T080050Z-magpie-bs2048-4096`, which has all four
+   configurations), so the reversal of the
    DAX-versus-block direction is visible in the figure itself.
 6b. Boundary cost against transaction size, measured at 1/8/32/56 entries on
    both PMEM and file-on-DAX. `SFENCE` flat at 11 ns, `fdatasync` flat at
@@ -414,6 +486,13 @@ Seven, and they need real hours budgeted.
    line. Log y-axis, entries on x. The figure's point is that the *gap* closes
    from 6,675× to 340× purely because `CLWB` scales — so the headline ratio is
    never quotable without a transaction size.
+6d. Where the boundary's time goes, per host (2026-09-27): the direct backend's
+   boundary split into `pwrite` and `fdatasync`, Magpie (~144 µs / ~1.7 µs,
+   write-through RAID controller) beside sean-tan-PC (~23 µs / ~233 µs, NVMe
+   with a volatile cache), with the mmap file backend's single `fdatasync` on the
+   same filesystems (137 µs, 237 µs) as a reference bar. Stacked bars, linear
+   axis. The figure's point is that the persistence point, not the interface,
+   decides which call pays.
 6c. `fdatasync` on DAX against region size (1/2/4/8 MiB, 2026-09-23): ~5 µs at
    1 MiB, flat at ~927 µs from 2 to 8 MiB, with the H1/H2/H3 predictions (whole
    2 MiB entry / proportional to mapping / fixed per call) overlaid. Log y-axis.
@@ -430,6 +509,12 @@ Seven, and they need real hours budgeted.
    Draw the cells with those numbers, not with ticks and crosses — the
    identical prime count is the part that makes the top row persuasive, and
    the byte-identical images are the part that makes the third column so.
+   **Since 2026-09-27 it is 2×4**: a fourth column, the kill loop on the
+   direct backend, where the ordinary build loses 0 of 8 acknowledged steps on
+   Magpie and 0 of 17 on the PC and the mutant loses 8 of 8 and 19 of 19. It is
+   the only hardware column with random crash points; say in the caption that it
+   is 4 KiB-granular. `pwreboot` on the same backend reproduces the third
+   column's cursor values (162,560 against 65,024) without a reboot.
 
 Figure 7 is the whole argument in one picture.
 
@@ -444,3 +529,9 @@ Figure 7 is the whole argument in one picture.
   integration, so it cannot carry a contribution chapter.
 - Agree the code freeze date, so that late suggestions arrive as future work
   rather than as implementation.
+- Report the direct-I/O backend, added before the freeze, and what it found:
+  the flush-placement mutant is caught by a plain kill loop, and Magpie's
+  `/home` is a write-through RAID controller, so the `file-block` figures
+  already shown are controller round trips. Ask whoever administers Magpie for
+  `storcli /c0/v0 show all` and the cache module's status, which decide whether
+  those acknowledgements are power-safe.

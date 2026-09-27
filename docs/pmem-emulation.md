@@ -387,10 +387,23 @@ so the production `PmemMmapBackend` still opens the real file and takes the real
 at construction; installing it later would elide the data-range writebacks and
 leave the log's intact.
 
-|  | Magpie crash loop (layer 3) | Explorer sweep (layer 1b) | Warm reset over reserved DRAM (Stage 2c) |
-|---|---|---|---|
-| Ordinary build | `OK` (2026-09-01) | property holds | `SURVIVED`, 3 of 3 (2026-09-24) |
-| Elided-writeback mutant | **`OK` (2026-09-18)** | **counterexample** | **`LOST`, 3 of 3** (2026-09-24) |
+|  | Magpie crash loop (layer 3) | Explorer sweep (layer 1b) | Warm reset over reserved DRAM (Stage 2c) | Kill loop on the direct backend |
+|---|---|---|---|---|
+| Ordinary build | `OK` (2026-09-01; again 2026-09-27) | property holds | `SURVIVED`, 3 of 3 (2026-09-24) | `OK`: 0 of 8 acknowledged steps lost (Magpie), 0 of 17 (sean-tan-PC) |
+| Elided-writeback mutant | **`OK` (2026-09-18; again 2026-09-27)** | **counterexample** | **`LOST`, 3 of 3** (2026-09-24) | **`LOST`: 8 of 8 lost (Magpie), 19 of 19 (sean-tan-PC)** (2026-09-27) |
+
+The fourth column (added 2026-09-27) runs the same `pwsieve` kill loop on the
+direct-I/O backend, which keeps the region in a private staging buffer and
+writes it back with `pwrite` + `O_DIRECT`, so process death discards whatever
+was never written back. It discriminates at random crash points, which Stage 2c
+cannot, and needs no reboot or host setup; `pwreboot`'s setup → arm → verify on
+the same backend gives the Stage 2c pair and cursor values (`SURVIVED` at
+162,560 against `LOST` at 65,024) with no reset. It is coarser than the explorer
+(4 KiB units, drain-all fences) and says nothing about `CLWB`/`SFENCE` on PMEM.
+The 2026-09-27 reruns of the first column used the stricter `pwsieve` that also
+checks every acknowledged step and runs the mutant in the children only; the
+PMEM mutant still loses nothing (0 of 13). Details in
+[Persistent Backends](persistent-backends.md#crash-behaviour-process-death-is-the-crash).
 
 Both rows of the hardware column reach the *same durable answer*: 376,256 primes
 below 5,429,504, bit-identical to the ordinary run and to the file backend at the

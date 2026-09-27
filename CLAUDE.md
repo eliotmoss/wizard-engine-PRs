@@ -100,7 +100,8 @@ PWRegion (block allocator)
               └── BackendRegion (persistence abstraction)
                     ├── VolatileRegion      (Array<byte>, GC-managed)
                     ├── FileMmapRegion      (mmap + msync/fdatasync — block device)
-                    └── PmemMmapRegion      (mmap + clwb/sfence — PMEM/DAX)
+                    ├── PmemMmapRegion      (mmap + clwb/sfence — PMEM/DAX)
+                    └── DirectIoRegion      (private staging buffer + pwrite/O_DIRECT + fdatasync — file or raw block device)
 ```
 
 ### Key files (all under `src/engine/x86-64/` unless noted)
@@ -114,6 +115,7 @@ PWRegion (block allocator)
 | `X86_64PersistentExplorer.v3` | Schedule enumeration over a trace: `PersistentExplorer.crashImages()` (full branching search with state dedup and a reported budget) and `reducedCrashImages()` (fence-forced floor + per-line prefix product); `checkImages()`/`checkAllCuts()`/`checkCutRange()` run a `PersistentImageProperty` over one cut, every cut, or a range of cuts and emit a `PersistentCounterexample`; `PersistentExploration`/`PersistentCheckResult` results and artifacts |
 | `X86_64PersistentRecovery.v3` | Production recovery over an enumerated image: `PersistentRecoveries.runDualWal()` (remount + `recover()` + resulting bytes), `PersistentWalRecoveryProperty` (acknowledgement contract as a checkable property) and `PersistentWalHistoryProperty`/`PersistentWalAfterImage` (the same contract over a multi-transaction history in one mount per image), `PersistentImageBackend` + `PersistentAllocatorProperty` (mount an image as a `PWRegion`), `PersistentAllocatorInvariants` (memory-order/free-list/used-state walk returning the first violation); `PersistentImageMounts` (array vs recording-PMEM containers), `recordDualWalRecovery()`/`recordPWRegionRecovery()`/`checkCrashDuringRecovery()` for the bounded two-crash profile; `InjectedFailureRegion` + `PersistentRecoveryFailureProperty`/`PersistentAllocatorFailureProperty` for failed recovery/mount boundaries |
 | `X86_64TxnBackend.v3` | `FileMmapRegion`, `PmemMmapRegion`, `FdMmapRegion`; `RegionFileIO`; `X86_64Backends` factory |
+| `X86_64DirectIoBackend.v3` | Direct-I/O backend: `DirectIoRegion` (anonymous staging buffer loaded at `create()`; provider `clwb()` marks 4 KiB units, every fence `pwrite`s the marked units then `fdatasync`s once; same trace as `PmemMmapRegion`), `DirectIoOperations`/`DirectIoStagingOperations`, `DirectIoBackend(path, FILE \| BLOCK_DEVICE)` with the O_DIRECT behaviour probe, `O_EXCL` device open and foreign-signature refusal; `DirectIoFileIO`. The elided-writeback mutant works unchanged on it, and a plain `SIGKILL` discriminates it (process death discards unwritten staging data) |
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, `ImmixPWRegion` |
 | `X86_64SingleTxnWal.v3` | Single-transaction in-region WAL — superseded, **not wired in**; kept as a reference implementation (see `docs/wal-comparison.md`) |
 | `X86_64PWRegion.v3` | Thin x86-64 convenience wrappers (`X86_64PWMemRegion`, `X86_64PWNVRegion`, `X86_64PWBlockDeviceRegion`, Immix variants) |
@@ -128,12 +130,13 @@ PWRegion (block allocator)
 | `test/unittest/x86-64-linux/PersistentExplorerTest.v3` | Crash-image enumeration and property-check tests (image counts per cut, reduction agrees with full search, budget truncation, counterexample emission) |
 | `test/unittest/x86-64-linux/PersistentRecoveryTest.v3` | Production recovery over enumerated crash images (acknowledged survival, no invented state, idempotence, counterexample emission) |
 | `test/unittest/x86-64-linux/PersistentAllocatorTest.v3` | Allocator invariants over enumerated crash images (split alloc, coalescing free, walker self-check) |
+| `test/unittest/x86-64-linux/DirectIoRegionTest.v3` | Direct-I/O backend tests: marking/coalescing/drain/failure mechanics, device and size rejections, allocator roundtrip and `SIGKILL` cases (unwritten staging lost; mutant loses an acknowledged commit), trace identity with the PMEM backend, and an exact per-line check that the file after every real `fdatasync` is an image the PMEM crash model admits. Region files go in `/tmp`, falling back to `bin/` when `/tmp` does not honour O_DIRECT |
 | `test/unittest/x86-64-linux/MultiTxnWalTest.v3` | `MultiTxnWal` unit tests (comparison implementation) |
 | `test/unittest/x86-64-linux/PWSieve.v3` | Resumable segmented Sieve of Eratosthenes over `PWRegion` — the workload driver (not engine code); root chunk at `userRoot`, one chunk per live segment, retirement + leak reclamation, `checkInvariants()` |
 | `test/unittest/x86-64-linux/PWSieveTest.v3` | Sieve workload tests (mount/resume, prime counts, invariants, retirement, remount) |
 | `test/unittest/x86-64-linux/PersistentSieveTest.v3` | Sieve through the crash-image explorer; `PersistentSieveProperty` mounts an image, recovers, reattaches and checks the workload's invariants |
-| `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve; selectable file or PMEM backend, reserves its own region file in a caller-assigned directory (`make pwsieve` / `make pwsieve-pmem`, `PWSIEVE_ARGS` / `PWASM_PMEM_TEST_DIR`) |
-| `test/pwreboot.main.v3` | Stage 2c warm-reboot harness: a flushed-against-unflushed cache-line probe, and the sieve armed with the production provider or the elided-writeback mutant, verified after a `sysrq` reboot on a `memmap` host (`make bin/pwreboot.x86-64-linux`); an optional inherited `/proc/sysrq-trigger` descriptor lets `probe-arm`/`arm` reset the machine themselves with no window after the last store, which is the form that discriminates (Stage 2c done 2026-09-24: ordinary `SURVIVED` 3/3, mutant `LOST` 3/3) |
+| `test/pwsieve.main.v3` | Random-timer `SIGKILL` crash loop over the sieve; selectable file, PMEM or direct-I/O backend (`direct`, or `direct-device=<dev>` on a raw device), requires every acknowledged step to survive (the child publishes its acknowledged cursor in a shared page; a shortfall is a `LOST` restart), runs the elided-writeback mutant in the children only, reserves its own region file in a caller-assigned directory (`make pwsieve` / `make pwsieve-pmem`, `PWSIEVE_ARGS` / `PWASM_PMEM_TEST_DIR`) |
+| `test/pwreboot.main.v3` | Stage 2c warm-reboot harness (also accepts `direct` for setup/arm/verify, where exit is the crash and no reboot is needed): a flushed-against-unflushed cache-line probe, and the sieve armed with the production provider or the elided-writeback mutant, verified after a `sysrq` reboot on a `memmap` host (`make bin/pwreboot.x86-64-linux`); an optional inherited `/proc/sysrq-trigger` descriptor lets `probe-arm`/`arm` reset the machine themselves with no window after the last store, which is the form that discriminates (Stage 2c done 2026-09-24: ordinary `SURVIVED` 3/3, mutant `LOST` 3/3) |
 | `scripts/stage2c.sh` | Stage 2c operator script (`doctor`/`probe`/`probe-now`/`sieve`/`sieve-now`/`verify`); refuses to arm while the firmware's memory-overwrite request is set; host setup, runbook and cross-machine hand-off in `docs/stage2c-handoff.md` |
 
 ### On-region layout
@@ -166,6 +169,9 @@ The superseded protocols are retained for comparison, **not wired in** — `Sing
 - `ImmixPWRegion` line marks are explicitly transient: mark/reset bypass the WAL and persistence boundaries, so callers must rebuild them after a crash. They are also the only remaining direct stores in the allocator — every other persistent store on the active path goes through the `PersistentOperations` seam
 - `RegionTransaction.clear()` allocates a new `HashMap` on every commit (GC pressure)
 - `RegionTransaction` is aligned-access only — mixed-width overlapping reads cause silent cache misses
+- `DirectIoRegion` holds the whole region in DRAM, reads it all at mount, and is limited to regions under 2 GiB (`FdMmapRegion` forges its range with `int.!`). Its kill-loop sensitivity is 4 KiB-granular: a missing writeback for a line sharing a unit with a flushed one goes unnoticed
+- On Magpie, `/home` (every `file-block`/`direct-block` figure) is behind a MegaRAID SAS3508 that reports write-through: `fdatasync` sends no flush and the boundary is the controller's acknowledgement; whether that is power-safe is not established
+- At 4 KiB blocks the WAL header and both record slots share one 4 KiB write unit, so slot independence on block media rests on the device being old-or-new per 512-byte sector (pinned by `direct_io:record_write_rewrites_whole_log_unit`)
 
 ## Coding Conventions
 

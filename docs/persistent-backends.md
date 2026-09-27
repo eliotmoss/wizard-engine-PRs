@@ -1,6 +1,6 @@
 # Persistent Backends: Design and Implementation
 
-This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX or file-backed mmap) with crash-consistent allocation via a write-ahead log (WAL). See [PMEM Emulation](pmem-emulation.md) for the supported emulated-PMEM development environment and validation limits, and [PMEM Crash Model](pmem-crash-model.md) for the proposed store/`CLWB`/`SFENCE` trace explorer.
+This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX, file-backed mmap, or explicit direct I/O to a file or raw block device) with crash-consistent allocation via a write-ahead log (WAL). See [PMEM Emulation](pmem-emulation.md) for the supported emulated-PMEM development environment and validation limits, and [PMEM Crash Model](pmem-crash-model.md) for the proposed store/`CLWB`/`SFENCE` trace explorer.
 
 ---
 
@@ -16,11 +16,172 @@ The system is organised into four layers that sit between raw storage media and 
 ├─────────────────────────────────────────────┤
 │  Write-ahead log    (DualTxnWal)             │  two-slot redo log + recovery
 ├─────────────────────────────────────────────┤
-│  Backend region     (BackendRegion)          │  storage abstraction: memory / file / PMEM
+│  Backend region     (BackendRegion)          │  storage abstraction: memory / file / PMEM / direct I/O
 └─────────────────────────────────────────────┘
 ```
 
 All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live under `src/engine/x86-64/`.
+
+---
+
+## The direct-I/O backend (added 2026-09-24, measured 2026-09-27)
+
+`DirectIoRegion` (`src/engine/x86-64/X86_64DirectIoBackend.v3`) is the third
+persistent backend. The region lives in a process-private anonymous mapping, the
+*staging buffer*; `create()` reads the whole region into it, and write-back is
+explicit: `pwrite` of whole 4 KiB units on an `O_DIRECT` descriptor, then one
+`fdatasync` per boundary. The target is either a preallocated regular file
+(`direct`) or a raw block device (`direct-device`).
+
+Why a third one. `FileMmapRegion` is a page-cache backend: the kernel owns
+writeback, may write any dirty page at any time, and keeps dirty data across
+the death of the process. Here nothing reaches the device unless the region
+writes it, and nothing survives the process unless it was written. Process death
+therefore discards unwritten data the way a reset discards unflushed cache
+lines, which is what makes an ordinary `SIGKILL` loop sensitive to missing
+writebacks on this backend and on no other (see [crash behaviour](#crash-behaviour-process-death-is-the-crash)).
+
+**How it sits on the seam.** The boundary methods mirror `PmemMmapRegion`
+exactly: `prepareChangedRange` issues one `clwb()` per 64-byte line through the
+region's provider, and `persistChanges`/`persistRange` one `sfence()`. The
+provider, `DirectIoOperations`, forwards every call to an inner provider and, on
+`clwb()`, marks the line's 4 KiB unit dirty instead of executing CLWB. At the
+fence the region writes every marked unit back (adjacent units in one `pwrite`)
+and then calls `fdatasync` once. `persistRange` drains every marked unit, not
+only its own range, because the `SFENCE` that ends a PMEM `persistRange`
+completes every outstanding CLWB. Two consequences:
+
+- The recorded `STORE`/`CLWB`/`SFENCE` trace of a history over this backend is
+  the PMEM backend's trace of the same history (`direct_io:trace_matches_pmem_region`,
+  at 2 KiB and 4 KiB blocks). No conditional above the seam depends on the
+  backend.
+- Because the dirty marking lives in the provider, the elided-writeback mutant
+  works unchanged: its no-op `clwb()` leaves nothing to write back.
+
+**Safeguards.** Setting `O_DIRECT` proves little, so `create()` checks behaviour:
+a misaligned one-byte `pwrite` must fail with `EINVAL`. That refuses tmpfs (which
+accepts `O_DIRECT` and buffers anyway from kernel 6.6), ext4 with `data=journal`,
+and a flag mistranslated by an emulator; the probe writes back the byte it has
+just read, so a descriptor that accepts it changes nothing. A block device is
+opened once with `O_EXCL`, which fails with `EBUSY` while it is mounted or
+claimed; its logical block size must divide 4096; and a fresh format is refused
+if the first 128 KiB carry a known partition-table, filesystem, LVM, LUKS or
+swap signature, before the region is zeroed. Both refusals were checked on
+sean-tan-PC against a mounted root partition and an ext4 signature.
+
+**What it costs elsewhere.** DRAM equal to the region; a mount reads the whole
+region before `PWRegion` can read its header; regions below 2 GiB, because
+`FdMmapRegion` forges its range with `int.!`.
+
+### Cost: the same seam call, a different persistence point
+
+`pwbench` at 512 × 4096 = 2 MiB, 8 entries, 20,000 commits after 2,000 warm-up,
+medians of per-run medians over three repetitions. The `pwrite` and `fdatasync`
+halves are means (totals over boundaries), from the timing region's split.
+
+| Host | Target | What Linux reports | `direct` boundary | `pwrite` | `fdatasync` | `file` backend, same filesystem |
+|---|---|---|---|---|---|---|
+| Magpie | ext4 on LVM on `sda`, behind a Broadcom MegaRAID SAS3508 | rotational, `write through`, no FUA | **128.7 µs** | ~144 µs | **~1.7 µs** | 136.6 µs |
+| sean-tan-PC | ext4 on Solidigm NVMe `nvme1n1` | `write back`, FUA, volatile write cache present (VWC 0x7), atomic write unit 512 B | **241.4 µs** | ~23 µs | **~233 µs** | 237.3 µs |
+| sean-tan-PC | raw `/dev/pmem0` (memmap-reserved DRAM, pmem driver, no BTT) | `write back`, no FUA | 0.66 µs | 0.52 µs | 0.14 µs | — |
+
+Results: `results/20260927T074301Z-magpie`,
+`results/20260927T080050Z-magpie-bs2048-4096`,
+`results/20260927T083305Z-sean-tan-PC-direct-nvme`.
+Every direct run measured exactly 1.000 boundaries per commit and one 8 KiB write
+per boundary: the record's unit and the scratch data's unit are adjacent, so
+they coalesce.
+
+**1. Where the cost sits depends on where the device puts its persistence
+point, and the interface shows neither.** On Magpie the kernel sees a
+write-through device, so `fdatasync` has no flush to send and returns in about
+1.7 µs, and the write carries 99 % of the boundary. On the PC the NVMe has a
+volatile write cache, the write takes about 23 µs, and the flush carries 91 %.
+The code, the seam call and the WAL's single boundary per commit are identical.
+
+**2. Magpie's block numbers are the latency to a RAID controller's
+acknowledgement, not to a disk.** `sda` reports itself as a 7,200 rpm drive,
+whose average rotational latency alone is about 4 ms; a write acknowledged in
+~130 µs has not reached a platter. `sda` sits behind the MegaRAID controller,
+which reports `write through` and no FUA, so the durability point Linux sees is
+the controller's acknowledgement. This applies to every `file-block` figure on
+this page, not only to the direct backend. Whether that acknowledgement is
+power-safe depends on how the controller exposes `sda` — a virtual drive with a
+battery- or flash-backed cache, or a pass-through drive whose own volatile cache
+is hidden from Linux — and has not been determined (`storcli /c0/v0 show all`,
+needs an administrator). The regime switches of the
+[block-media configuration](#the-block-media-configuration-is-not-a-controlled-measurement-here)
+are consistent with the controller's cache state changing between sittings; that
+is a candidate, not a finding.
+
+**3. Bypassing the page cache changes little on either host.** At 2 MiB the
+direct and file backends are within 8 % of each other at every size, and in
+opposite directions on the two hosts: direct is 2–6 % cheaper on Magpie
+(127–135 µs against 134–137 µs) and 0–8 % more expensive on the PC
+(241–258 µs against 237–243 µs). Whole commits follow: 180.3 µs against
+192.3 µs per commit on Magpie, 270.0 µs against 264.6 µs on the PC. The device
+side dominates both.
+
+**4. The page cache's hidden cost is a fault per dirtied page per commit.** The
+mmap backends take a write-protect fault the first time a page is stored to
+after each writeback: exactly 2 extra minor faults per commit for `file-block`
+(the WAL page and the data page), on both hosts, and none for `direct`. On DAX
+the count is **1 per commit at 2 MiB and 2 at 1 MiB**: at 2 MiB both dirtied
+pages sit under one 2 MiB DAX entry, so one fault re-dirties both. That is
+independent, root-free corroboration of the
+[region-size mechanism](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries);
+the `fs_dax:dax_writeback_one` confirmation is still pending. At these device
+latencies the faults are negligible.
+
+**5. The 1 MiB penalty on Magpie is below the page cache.** At 512 × 2048 both
+block configurations are slower than at 512 × 4096 (direct 149–176 µs, file
+157–168 µs, against 129–137 µs), and on the direct path the difference is all in
+the write: 178 µs against 144 µs per 8 KiB `pwrite`, with `fdatasync` unchanged
+at ~1.8 µs. The only difference in what is written is its file offset, 0 rather
+than 4096. Earlier campaigns saw the opposite sign for `file-block`, so the
+geometry effect stays withdrawn; what this adds is that, whatever it is, it is
+not the page cache.
+
+**6. The raw block path costs well under a microsecond.** Over DRAM-backed
+`/dev/pmem0` the whole direct boundary is 0.66 µs, so the software path — the
+block layer, `O_DIRECT`, the region's write-back scan — is not where the
+130–250 µs on the other two targets goes. (This is not a media comparison: the
+pmem driver over memmap DRAM persists nothing across power loss, and without
+BTT it is not sector-atomic.)
+
+### Crash behaviour: process death is the crash
+
+| Host, target | Harness | Ordinary provider | Elided-writeback mutant |
+|---|---|---|---|
+| Magpie, `/home` (file) | `pwreboot` setup → arm → verify | `SURVIVED`, `REPLAYED`, cursor 162,560 = acknowledged | **`LOST`**, `CLEAN`, cursor 65,024 = setup's |
+| Magpie, `/home` (file) | `pwsieve`, 20 random kills | `OK`, 8 acknowledged-step checks, 0 lost | **`LOST`**, 8 of 8 lost |
+| sean-tan-PC, `$HOME` (file) | `pwreboot` | `SURVIVED` | **`LOST`** |
+| sean-tan-PC, `$HOME` (file) | `pwsieve`, 20 random kills | `OK`, 17 checks, 0 lost | **`LOST`**, 19 of 19 lost |
+| sean-tan-PC, raw `/dev/pmem0` | `pwsieve`, 20 random kills | `OK`, 7 checks, 0 lost; table full, 376,256 primes below 5,429,504 | **`LOST`**, 20 of 20 lost; 696 steps acknowledged, none durable |
+| Magpie, DAX (`pmem` backend, for contrast) | `pwsieve`, 20 random kills | `OK`, 11 checks, 0 lost | `OK`, 13 checks, 0 lost |
+
+Results: `results/20260927T073911Z-magpie` (direct-control),
+`results/20260927T074021Z-magpie` (the PMEM control rerun),
+`results/20260927T081826Z-sean-tan-PC`,
+`results/20260927T083305Z-sean-tan-PC-direct-nvme`.
+
+The pwreboot pair reproduces the Stage 2c warm-reset outcome and its cursor
+values with no reboot and no host setup. The pwsieve pairs add what Stage 2c
+cannot: the discrimination at random crash points. The PMEM row is the
+contrast: the same mutant, under the same stricter acknowledgement check, is
+invisible to a kill loop on DAX, as the negative control documents.
+
+What these runs show and do not. They show that the production placement of
+write-back requests — every `prepareChangedRange`/`persistRange` the allocator,
+the WAL and the sieve issue — is necessary, at arbitrary crash points, on real
+hardware, under a crash that discards exactly what was never handed to the
+kernel. The sensitivity is coarse: write-back is in 4 KiB units and every fence
+drains everything marked, so a missing request for a line that shares a unit
+with a requested one goes unnoticed; the explorer remains the fine-grained
+check. They say nothing about `CLWB`/`SFENCE` on real PMEM (Stage 2c's job) or
+about the device under power loss: a killed process never takes the device's
+cache with it. The relation of this backend's crash images to the PMEM model is
+stated in [PMEM Crash Model](pmem-crash-model.md#the-direct-backend-is-a-restriction-of-the-pmem-model).
 
 ---
 
@@ -47,6 +208,11 @@ comparisons that follow.
 | 1 | `pmem` | DAX `/mnt/pmem0.0` | `CLWB` loop + `SFENCE` | **`SFENCE` 11 ns** (26 cycles) | 13.7 µs | 3.3 % |
 | 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 µs local / 1,147 µs cross-socket** | 939–1,160 µs | 98.8 % |
 | 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133–181 µs** (see caveat) | 188–240 µs | 71–86 % |
+
+**Configuration 3 is not a disk (established 2026-09-27).** `/home` is LVM on
+`sda`, behind a MegaRAID SAS3508 that reports `write through`: `fdatasync`
+sends no flush, and the figure is the latency to the controller's
+acknowledgement. See [the direct-I/O backend](#cost-the-same-seam-call-a-different-persistence-point).
 
 Figures are medians over the runs of each configuration in `results/`
 (five campaigns × three repetitions × four transaction sizes), at 8 entries
@@ -569,6 +735,14 @@ so the direction depends on geometry. The matched-geometry campaign confirms
 the reversal within one sitting: 31–33× faster at 1 MiB. `/home` is a shared LVM volume whose other
 traffic is neither controlled nor visible in a CPU load average.
 
+**What `/home` is (2026-09-27).** The volume sits on `sda` behind a Broadcom
+MegaRAID SAS3508. Linux sees `write through` and no FUA, so `fdatasync` never
+sends a flush: the direct backend's split puts it at ~1.7 µs, with the write
+taking the rest. The "queued block device" above is therefore a RAID
+controller, and every figure in this section is the latency to its
+acknowledgement. Its cache state changing between sittings is a candidate for
+the two regimes; nothing has tested it.
+
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
 
@@ -673,6 +847,10 @@ one medium is not wrong on the other, merely pointless.
 - **`fdatasync` on DAX has two costs**, socket-local and cross-socket, differing
   by 23.9 %. Unpinned runs draw one at random. Every figure for configuration 2
   on this page is the socket-local one unless stated.
+- **The block-media configuration measures a RAID controller**, not a disk:
+  `/home` is behind a MegaRAID SAS3508 that reports write-through, so its
+  `fdatasync` sends no flush (2026-09-27). Whether its acknowledgement is
+  power-safe is not established.
 - **The block-media configuration has not reproduced**: at 2 MiB it has two
   regimes, flat at ~133 µs and falling 196 → 165 µs, which differ in shape as
   well as level. It has now switched between them within one day, on a
@@ -744,13 +922,15 @@ retains typed `STORE`/`CLWB`/`SFENCE` events for deterministic tests.
 | `VolatileRegion` | `Array<byte>` (GC'd) | no-op | no-op | no-op |
 | `FileMmapRegion` | file + `mmap(MAP_SHARED)` | sets `hasDirtyChanges` | `fdatasync()` if dirty | page-aligned `msync()` |
 | `PmemMmapRegion` | file + `mmap(MAP_SHARED_VALIDATE\|MAP_SYNC)` | cache-line flush; sets `hasPendingWriteback` | store fence | flush range + store fence |
+| `DirectIoRegion` | anonymous staging buffer + `O_DIRECT` file or block device | provider `clwb()` per line marks its 4 KiB unit; sets `hasPendingWriteback` | fence, `pwrite` marked units, `fdatasync` | as `persistChanges`, after marking the range: drains every marked unit |
 
-`FileMmapRegion` and `PmemMmapRegion` both extend `FdMmapRegion`, which holds the `Mapping` and `fd` and handles `destroy()`.
+`FileMmapRegion`, `PmemMmapRegion` and `DirectIoRegion` all extend `FdMmapRegion`, which holds the `Mapping` and `fd` and handles `destroy()`. For `DirectIoRegion` the `Mapping` is the anonymous staging buffer, not a mapping of the `fd`.
 
 ```
 FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
   ├── FileMmapRegion   (disk durability via msync/fdatasync)
-  └── PmemMmapRegion   (PMEM durability via clflush + sfence)
+  ├── PmemMmapRegion   (PMEM durability via clflush + sfence)
+  └── DirectIoRegion   (explicit pwrite + O_DIRECT from a private staging buffer, then fdatasync)
 ```
 
 `MmapRegionUtils.flushCacheLine()` selects `CLWB`, `CLFLUSHOPT`, or `CLFLUSH`
@@ -765,8 +945,9 @@ CPUID/writeback/fence path are covered by `PersistentOperationsTest.v3`.
 | `VolatileBackend` (singleton via `Backends.getVolatile()`) | `VolatileRegion` |
 | `FileMmapBackend` | `FileMmapRegion` |
 | `PmemMmapBackend` | `PmemMmapRegion` |
+| `DirectIoBackend(path, FILE \| BLOCK_DEVICE)` | `DirectIoRegion` |
 
-`X86_64Backends` is the platform-level component that dispatches among these three.
+`X86_64Backends` is the platform-level component that dispatches among the first three; `DirectIoBackend` is constructed directly by its callers, and its `makeDirectRegion()` factory hook is what the test and timing subclasses override.
 
 ### File I/O (`RegionFileIO`)
 
