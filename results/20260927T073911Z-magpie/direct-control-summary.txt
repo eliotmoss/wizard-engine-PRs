@@ -1,0 +1,9 @@
+
+---- direct backend: process death as cache loss (/home/users/u7599095, ext4)
+run                                          verdict   exit
+pwreboot ordinary   (expected SURVIVED, 0)   SURVIVED  0
+pwreboot elide-clwb (expected LOST, 1)       LOST      1
+pwsieve  ordinary   (expected OK, 0)         OK        0
+pwsieve  elide-clwb (expected LOST, 1)       LOST      1
+  pwsieve ordinary   acknowledged-step checks 8, lost 0, children confirmed wiring 10
+  pwsieve elide-clwb acknowledged-step checks 8, lost 8, children confirmed wiring 13

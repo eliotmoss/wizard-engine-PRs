@@ -1,0 +1,7 @@
+region /home/users/u7599095/wizard-pwreboot-u7599095-p126637-0.region
+backend direct
+blocks 512
+block_size 4096
+setup_steps 2
+setup_cursor 65024
+setup_count 6495
