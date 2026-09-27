@@ -1,0 +1,34 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a raw block device [MUTANT in the children: cache-line writeback elided]
+region file /dev/pmem0
+region 512 blocks of 4096 bytes
+segment span 32512, capacity 167 segments
+kill delay up to 20000 us
+iteration 0: LOST acknowledged cursor 455168, durable cursor 0
+iteration 1: LOST acknowledged cursor 32512, durable cursor 0
+iteration 2: LOST acknowledged cursor 520192, durable cursor 0
+iteration 3: LOST acknowledged cursor 1950720, durable cursor 0
+iteration 4: LOST acknowledged cursor 1267968, durable cursor 0
+iteration 5: LOST acknowledged cursor 260096, durable cursor 0
+iteration 6: LOST acknowledged cursor 1885696, durable cursor 0
+iteration 7: LOST acknowledged cursor 357632, durable cursor 0
+iteration 8: LOST acknowledged cursor 3023616, durable cursor 0
+iteration 9: LOST acknowledged cursor 1332992, durable cursor 0
+iteration 10: LOST acknowledged cursor 1528064, durable cursor 0
+iteration 11: LOST acknowledged cursor 130048, durable cursor 0
+iteration 12: LOST acknowledged cursor 1267968, durable cursor 0
+iteration 13: LOST acknowledged cursor 1267968, durable cursor 0
+iteration 14: LOST acknowledged cursor 1235456, durable cursor 0
+iteration 15: LOST acknowledged cursor 1137920, durable cursor 0
+iteration 16: LOST acknowledged cursor 552704, durable cursor 0
+iteration 17: LOST acknowledged cursor 2535936, durable cursor 0
+iteration 18: LOST acknowledged cursor 260096, durable cursor 0
+iteration 19: LOST acknowledged cursor 1625600, durable cursor 0
+iterations 20 of 20 requested, seed 1
+advanced 0, replayed a record 0, child finished early 0
+acknowledged-step checks 20, lost 20, children confirmed wiring 20
+steps acknowledged by children 696 over 20 iterations
+leaked extents reclaimed at mount: 0
+final cursor 0, primes 0
+reference check passed: 0 primes
+LOST
+retained region image: /dev/pmem0

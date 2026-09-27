@@ -1,0 +1,4 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a raw block device
+region file /dev/pmem0
+FAIL: DirectIoBackend.create failed: refusing to format: the device carries a ext2/3/4 signature
+retained region image: /dev/pmem0

@@ -1,0 +1,4 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a raw block device
+region file /dev/nvme1n1p3
+FAIL: DirectIoBackend.create failed: the device is in use (mounted or claimed)
+retained region image: /dev/nvme1n1p3

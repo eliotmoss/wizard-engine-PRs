@@ -1,0 +1,6 @@
+raw image: 2097152 bytes, 5419 nonzero
+recovery: CLEAN
+durable cursor 65024, primes 6495, leaked extents reclaimed 0
+setup cursor 65024, acknowledged cursor 162560, acknowledged primes 14891
+verdict LOST
+reason every acknowledged step was lost

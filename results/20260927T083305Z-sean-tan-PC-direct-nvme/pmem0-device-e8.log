@@ -1,0 +1,19 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a raw block device
+region file /dev/pmem0
+region 512 blocks of 4096 bytes, scratch 1 blocks
+commits measured 20000, entries per commit 8
+persist boundaries 20000, prepare calls 180000
+boundaries per commit x1000 1000, clwb lines 0
+tsc cycles per microsecond 3417
+boundary cycles: min 2153 median 2246 p90 2322
+boundary cycles: p99 2683 max 21074
+boundary ns: min 630 median 657 p90 679
+boundary ns: p99 785 max 6167
+total boundary cycles 45376178
+total prepare cycles 0
+measured wall ns 62709152, boundary share x1000 211
+wall ns per commit 3135
+minor faults 1642 during the measured commits
+direct io: writes 20000, bytes 163840000, syncs 20000
+direct io: write cycles 35534481, sync cycles 9841697
+OK

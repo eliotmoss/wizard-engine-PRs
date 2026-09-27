@@ -1,0 +1,14 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a raw block device
+region file /dev/pmem0
+region 512 blocks of 4096 bytes
+segment span 32512, capacity 167 segments
+kill delay up to 20000 us
+stopping at iteration 6: the segment table is full
+iterations 7 of 20 requested, seed 1
+advanced 7, replayed a record 7, child finished early 1
+acknowledged-step checks 7, lost 0, children confirmed wiring 7
+steps acknowledged by children 167 over 7 iterations
+leaked extents reclaimed at mount: 1
+final cursor 5429504, primes 376256
+reference check passed: 376256 primes
+OK

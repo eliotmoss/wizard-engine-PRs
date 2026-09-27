@@ -1,0 +1,24 @@
+commit 4e5a346fc055f21a9f6d45b642d1cf5fab03af4e  dirty no
+kernel Linux 7.0.0-31-generic x86_64 GNU/Linux
+2026-09-27T08:33:46+00:00
+home: ext4 /dev/nvme1n1p3 rw,relatime
+== nvme1n1
+  rotational                   0
+  logical_block_size           512
+  physical_block_size          512
+  write_cache                  write back
+  fua                          1
+  atomic_write_unit_min_bytes  512
+  atomic_write_unit_max_bytes  512
+== pmem0
+  rotational                   0
+  logical_block_size           512
+  physical_block_size          4096
+  write_cache                  write back
+  fua                          0
+  atomic_write_unit_min_bytes  0
+  atomic_write_unit_max_bytes  0
+vwci      : 0
+vwc       : 0x7
+awun      : 0
+awupf     : 0

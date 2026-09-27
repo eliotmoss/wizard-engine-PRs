@@ -1,0 +1,13 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+region file /home/sean-tan/wizard-pwsieve-u1000-p10695-0.region
+region 512 blocks of 4096 bytes
+segment span 32512, capacity 167 segments
+kill delay up to 20000 us
+iterations 20 of 20 requested, seed 1
+advanced 18, replayed a record 19, child finished early 0
+acknowledged-step checks 17, lost 0, children confirmed wiring 19
+steps acknowledged by children 66 over 20 iterations
+leaked extents reclaimed at mount: 7
+final cursor 2340864, primes 172270
+reference check passed: 172270 primes
+OK
