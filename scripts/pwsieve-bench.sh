@@ -358,6 +358,8 @@ summary() {
             if (("pmem-auto" in wall) && ("pmem-none" in wall) && wall["pmem-auto"] > 0) {
                 d = wall["pmem-auto"] - wall["pmem-none"]
                 printf "writebacks by removal: pmem-auto - pmem-none = %.0f ns per step (%.1f %% of pmem-auto)\n", d, 100 * d / wall["pmem-auto"]
+                print "  (pmem-none issues no writeback instruction, but its dirty lines still reach memory when they"
+                print "  are evicted, possibly during another phase: this is the instructions'"'"' cost, not the traffic'"'"'s)"
             }
             if (("pmem-auto" in wall) && ("pmem-clflushopt" in wall) && wall["pmem-auto"] > 0) {
                 d = wall["pmem-clflushopt"] - wall["pmem-auto"]

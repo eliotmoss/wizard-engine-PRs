@@ -845,6 +845,76 @@ here (Magpie never ran `CLFLUSHOPT` batched), so without the per-entry
 placement the campaign cannot discriminate eviction in the workload; the
 probe's load row can.
 
+### A real workload: what a sieve step costs, and how much is persistence
+
+pwbench measures one transaction shape the harness chooses: a fixed number of
+u64 entries. `test/pwsievebench.main.v3` measures a program's: the resumable
+sieve (`PWSieve`) through the production allocator and WAL. A step computes a
+segment in DRAM, allocates a chunk (its own commit), writes the bitmap directly
+and persists it (one boundary), publishes the descriptor and root counters (one
+commit of about seven fields sharing lines), and retires the segment leaving the
+retention window (one commit). PWSieve reports the end of each phase through an
+optional `onPhase` hook. Each run is 20 rounds, each a freshly formatted 1 MiB
+region (256 × 4 KiB), 8 unmeasured steps, then the 159 steps its descriptor table
+has left, verified afterwards against an independent reference sieve: 3,180
+measured steps per run. `scripts/pwsieve-bench.sh` interleaves the
+configurations and repeats them.
+
+Measured 2026-09-28 on sean-tan-PC, with the caveats of the Raptor Lake
+subsection above: DRAM stands in for PMEM (`memmap`), and each core type is one
+core of a hybrid CPU. Governor `performance`, idle machine, block storage the NVMe
+root (ext4). `results/20260928T100258Z-sean-tan-PC-pwsieve-bench-cpus2` (P-core,
+five repetitions) and `…T100404Z-…-cpus20` (E-core, fifteen). Wall time per step,
+median over repetitions:
+
+| Configuration | P-core step | of which compute | persistence phases | E-core step | persistence phases |
+|---|---|---|---|---|---|
+| `pmem`, production (`CLWB`) | 166.9 µs | 151.8 µs | 15.1 µs (9.1 %) | 312 µs | 26.3 µs (8.4 %) |
+| `pmem`, `CLFLUSHOPT` | 167.1 µs | 151.6 µs | 15.5 µs (9.2 %) | 307 µs | 26.6 µs (8.7 %) |
+| `pmem`, no writeback | 168.3 µs | 153.7 µs | 14.5 µs (8.6 %) | 312 µs | 25.7 µs (8.3 %) |
+| `file` on DAX | 181.6 µs | 153.8 µs | 27.7 µs (15.3 %) | 329 µs | 46.0 µs (14.0 %) |
+| `file` on NVMe | 1,097 µs | 158.1 µs | 938 µs (85.6 %) | 1,265 µs | 1,000 µs (79.1 %) |
+| `direct` on NVMe | 1,125 µs | 158.4 µs | 968 µs (86.0 %) | 1,277 µs | 1,007 µs (78.9 %) |
+
+On the P-core the repetitions' wall ranges are 0.3–0.5 % wide; on the E-core
+about 6 %, and almost all of that is in the compute phase, while its persistence
+phases stay within ±1.5 %. The per-run CPU effect seen in pwbench on this core
+type lives in computation, not in the persistence path.
+
+- **On PMEM a step is computation.** The four persistence phases are 9 % of a
+  step on both core types: on the P-core 3.4 µs to allocate, 6.2 µs to write and
+  persist the 4 KiB bitmap, 2.3 µs to publish and 3.2 µs to retire. The publish
+  commit, about seven fields, costs what pwbench's 8-entry commit does (2.1 µs).
+  On the file backend on DAX the same work is 1.8× as long (27.7 µs, 15 % of a
+  step), with 12.8 minor faults per step against 2.1, the write-protect faults
+  after each `fdatasync` described above. On the NVMe, persistence is 79–86 % of
+  a step.
+- **Four boundaries per step on every backend**, as designed: three commits and
+  the bitmap's `persistRange()`, which on the file backend is an `msync`. On the
+  NVMe each costs about 235 µs (P-core), close to the 237 µs pwbench records for
+  this machine's file-backend boundary. The direct backend is 2.6 % slower than the file backend
+  there, the direction pwbench shows on this machine (241 against 237 µs per
+  boundary).
+- **The writeback instructions cost almost nothing, and removing them does not
+  make the step faster.** On the P-core, no writeback is 0.8 % *slower* than
+  production, in every repetition and outside both ranges. The phases say where:
+  the persistence phases are 0.57 µs shorter without the instructions, and the
+  compute phase is 1.9 µs longer, in every repetition. A plausible reading is
+  that lines `CLWB` would have cleaned are instead written back when they are
+  evicted, during the next computation; that is untested. So `writeback=none`
+  bounds what the instructions cost a step (0.57 µs, 0.34 %), not what getting
+  the data to memory costs. On the E-core the difference is inside the noise.
+- **`CLFLUSHOPT` in place of `CLWB` changes the step by 0.1 % on the P-core**,
+  inside both ranges; its persistence phases are 0.3 µs longer, consistently.
+  With the batched apply a transaction stores into each line before writing it
+  back, so an invalidating writeback leaves little reuse to penalise.
+- What this cannot show: the batched apply against the per-entry one on this
+  workload, since the per-entry placement is gone, and the price of persistence
+  on real PMEM. On Magpie a miss and a writeback cost Optane latency, and the
+  persistence share should grow; that campaign is pending (`PWSB_BLOCK_DIR` on
+  `/home` there adds the block configurations, behind the write-through RAID
+  controller).
+
 ### Region size at fixed block size, and the NUMA penalty at 1 MiB
 
 Measured 2026-09-23 on Magpie, two campaigns back to back, 1, 8 and 24 entries,
