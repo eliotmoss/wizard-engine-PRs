@@ -79,8 +79,14 @@ component MmapRegionUtils {
 		return true;
 	}
 
-	// Platform-specific cache flush. Prefer CLWB because it preserves the cache
-	// line; use the architecturally supported fallbacks on older processors.
+	// Write one cache line back. CLWB is preferred because the architecture
+	// allows it to leave the line cached, which CLFLUSHOPT and CLFLUSH do not;
+	// whether it does is the core's choice. Measured (docs/persistent-backends.md):
+	// on Cascade Lake it evicts exactly as CLFLUSHOPT does, and on Raptor Lake a
+	// re-load after it costs ~12-14 ns against ~53 ns after CLFLUSHOPT. So a
+	// store into a line just written back may miss either way, which is why a
+	// transaction's after-images are all stored before any line is written back.
+	// Falls back to CLFLUSHOPT, then CLFLUSH, on processors without CLWB.
 	def flushCacheLine(addr: Pointer) {
 		def rawAddr = addr - Pointer.NULL;
 		def instruction = writebackInstruction();
