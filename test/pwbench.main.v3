@@ -34,8 +34,16 @@
 // then one fdatasync -- behind DirectIoRegion.writeUnits()/syncDevice(), and
 // both are timed together as one boundary sample.
 //
-// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks]
+// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>]
 //        pwbench.x86-64-linux <device> direct-device=<device> [commits] ...
+//
+// writeback= (pmem only) replaces the cache-line writeback instruction inside
+// the timing provider, for the CLWB-eviction experiment
+// (scripts/clwb-eviction.sh): auto (the default, and the production path --
+// CPUID-selected, CLWB first), clwb, clflushopt, clflush, or none. none issues
+// no writeback at all, so the region is NOT durable; it exists to measure what
+// the writebacks cost the work around them, and its run ends with a line other
+// than a bare OK, so the cost campaign's parser refuses it.
 //
 // A raw device is overwritten from offset 0 for the region's length. Its path
 // has to be given twice, as the first argument and inside the mode word, so a
@@ -60,6 +68,17 @@ enum BenchBackend(arg: string, label: string) {
         DIRECT_DEVICE("direct-device", "direct (pwrite + O_DIRECT + fdatasync) on a raw block device")
 }
 
+// The writeback the PMEM timing provider issues per cache line. AUTO is
+// MmapRegionUtils.flushCacheLine(), unchanged; the others bypass its CPUID
+// selection to hold the instruction fixed.
+enum BenchWriteback(arg: string, label: string) {
+        AUTO("auto", "auto (production CPUID selection)"),
+        CLWB("clwb", "CLWB"),
+        CLFLUSHOPT("clflushopt", "CLFLUSHOPT"),
+        CLFLUSH("clflush", "CLFLUSH"),
+        NONE("none", "none -- no writeback, timing only, the region is NOT durable")
+}
+
 // Cap the retained sample set. Percentiles over this many commits are stable
 // and the vector stays far away from the region under test.
 def MAX_SAMPLES = 200000;
@@ -73,6 +92,7 @@ component BenchConfig {
         def var warmup = 2000;
         def var blocks = 512u64;
         def var blockSize = 4096u64;
+        def var writeback = BenchWriteback.AUTO;
 
         def backendName() -> string {
                 return backend.label;
@@ -236,7 +256,14 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
                         System.error("PersistentOperationError", "invalid cache-line writeback offset");
                 }
                 def c0 = Target.rdtsc();
-                MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+                def line = Pointer.atElement(range, int.!(cacheLine));
+                match (BenchConfig.writeback) {
+                        AUTO => MmapRegionUtils.flushCacheLine(line);
+                        CLWB => Target.clwb(line - Pointer.NULL);
+                        CLFLUSHOPT => Target.clflushOpt(line - Pointer.NULL);
+                        CLFLUSH => Target.clflush(line - Pointer.NULL);
+                        NONE => ;       // still counted, so lines per commit stays checkable
+                }
                 timer.notePrepare(Target.rdtsc() - c0);
                 timer.clwbLines++;
         }
@@ -495,7 +522,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 2 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks]\n");
+                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|none>]\n");
                 System.puts("       pwbench.x86-64-linux <device> direct-device=<device> [commits] [entries] [warmup] [blockSize] [blocks]\n");
                 return 2;
         }
@@ -519,6 +546,26 @@ def main(args: Array<string>) -> int {
         if (args.length > 4) BenchConfig.warmup = int.!(parseU64(args[4], 2000));
         if (args.length > 5) BenchConfig.blockSize = parseU64(args[5], 4096);
         if (args.length > 6) BenchConfig.blocks = parseU64(args[6], 512);
+        if (args.length > 7 && !parseWriteback(args[7])) {
+                System.puts("the eighth argument must be writeback=<auto|clwb|clflushopt|clflush|none>\n");
+                return 2;
+        }
+        if (args.length > 8) {
+                System.puts("too many arguments\n");
+                return 2;
+        }
+        // The file and direct boundaries issue no writeback through the timing
+        // provider, so a selector there would be recorded and have no effect.
+        if (BenchConfig.writeback != BenchWriteback.AUTO && BenchConfig.backend != BenchBackend.PMEM) {
+                System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        def missing = unsupportedWriteback();
+        if (missing != null) {
+                System.puts(missing);
+                System.puts(" is not supported by this CPU\n");
+                return 2;
+        }
         if (BenchConfig.commits < 1 || BenchConfig.entries < 1) {
                 System.puts("commits and entries must be positive\n");
                 return 2;
@@ -541,6 +588,10 @@ def main(args: Array<string>) -> int {
         BenchClock.calibrate();
         Trace.OUT.put1("backend %s", BenchConfig.backendName()).ln();
         Trace.OUT.put1("region file %s", BenchConfig.path).ln();
+        if (BenchConfig.backend == BenchBackend.PMEM) {
+                Trace.OUT.put2("writeback %s, CPUID selects %s",
+                        BenchConfig.writeback.label, cpuidWriteback()).ln();
+        }
 
         def timer = BoundaryTimer.new();
         def region = openRegion(timer);
@@ -569,7 +620,9 @@ def main(args: Array<string>) -> int {
                 return fail(mismatch);
         }
         // This is an ordinary build. The elided-writeback mutant must not be
-        // anywhere near a cost measurement.
+        // anywhere near a cost measurement. (writeback=none elides the
+        // instruction inside the timing provider instead, and is labelled in
+        // the log and on the last line so no cost figure can absorb it.)
         if (ElidedWritebackOperations.?(region.backendRegion.persistentOperations())) {
                 region.deallocate();
                 return fail("an elided-writeback provider is installed; this must be an ordinary build");
@@ -628,6 +681,42 @@ def main(args: Array<string>) -> int {
                 System.puts("Could not remove the region file printed above.\n");
                 return 2;
         }
-        System.puts("OK\n");
+        if (BenchConfig.writeback == BenchWriteback.NONE) {
+                System.puts("OK timing-only: writeback=none, the region was never durable\n");
+        } else {
+                System.puts("OK\n");
+        }
         return 0;
+}
+
+def parseWriteback(arg: string) -> bool {
+        if (arg == null || !Strings.startsWith(arg, "writeback=")) return false;
+        def name = Arrays.range(arg, 10, arg.length);
+        if (Strings.equal(name, BenchWriteback.AUTO.arg)) BenchConfig.writeback = BenchWriteback.AUTO;
+        else if (Strings.equal(name, BenchWriteback.CLWB.arg)) BenchConfig.writeback = BenchWriteback.CLWB;
+        else if (Strings.equal(name, BenchWriteback.CLFLUSHOPT.arg)) BenchConfig.writeback = BenchWriteback.CLFLUSHOPT;
+        else if (Strings.equal(name, BenchWriteback.CLFLUSH.arg)) BenchConfig.writeback = BenchWriteback.CLFLUSH;
+        else if (Strings.equal(name, BenchWriteback.NONE.arg)) BenchConfig.writeback = BenchWriteback.NONE;
+        else return false;
+        return true;
+}
+
+// The name of an explicitly selected instruction the CPU lacks, or null.
+// Executing it would fault; refusing it here names the reason.
+def unsupportedWriteback() -> string {
+        match (BenchConfig.writeback) {
+                CLWB => if (!Target.supportsClwb()) return "CLWB";
+                CLFLUSHOPT => if (!Target.supportsClflushOpt()) return "CLFLUSHOPT";
+                CLFLUSH => if (!Target.supportsClflush()) return "CLFLUSH";
+                _ => ;
+        }
+        return null;
+}
+
+// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+def cpuidWriteback() -> string {
+        if (Target.supportsClwb()) return "CLWB";
+        if (Target.supportsClflushOpt()) return "CLFLUSHOPT";
+        if (Target.supportsClflush()) return "CLFLUSH";
+        return "nothing";
 }
