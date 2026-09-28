@@ -417,7 +417,13 @@ against 6,669×, 2,050× and 767× at 2 MiB.
 
 At 1 MiB and eight entries, the file backend on DAX is only **1.27×** slower per
 commit than the PMEM backend, against 71× at 2 MiB, and at 24 entries it is
-**1.29× faster**. The boundary is not the reason. Outside its boundary, a PMEM
+**1.29× faster**. (**Corrected 2026-09-28:** the crossover was the PMEM
+backend's per-entry writeback placement, not the media or the primitive. With
+the batched apply the PMEM backend commits in 22.1 µs at 24 entries against
+29.3 µs for the file backend in the same sitting, and it is faster at every
+measured size: 2.8×, 1.8× and 1.3× at 1, 8 and 24 entries. See
+[`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).)
+The boundary is not the reason. Outside its boundary, a PMEM
 commit costs 4.3, 13.0 and 36.1 µs at 1, 8 and 24 entries, against 7.4, 12.0 and
 23.8 µs for the file backend at 1 MiB. That is about 1.44 µs per entry against
 0.74 µs, on the same media, for the same record-construction code. What makes
@@ -570,10 +576,46 @@ production recovery: exhaustive over every cut of the batched apply, bounded
 over the commit that reclaims its slot. Each of four deliberately broken
 variants fails at least one of them: a merged range left unprepared, the
 commit's drain removed, `persistAppliedData()`'s drain removed, and the facade
-skipping `prepareApplied()`. The full suite passes (2,004 tests). The cost is
-**not yet measured**: pwbench's `apply=entry` restores the old placement for a
-same-sitting comparison, and it is the default campaign of
-`scripts/clwb-eviction.sh`.
+skipping `prepareApplied()`. The full suite passes (2,004 tests). pwbench's
+`apply=entry` restores the old placement for a same-sitting comparison.
+
+**Measured.** `results/20260928T045134Z-magpie-clwb-eviction`, at `380ca7d3`,
+same geometry and protocol, all eight configurations in one sitting. Wall time
+per commit, median of three:
+
+| Entries | batched, stride 8 | per entry, stride 8 | none, stride 8 | batched, stride 64 | per entry, stride 64 | `file`, batched | `file`, per entry |
+|---|---|---|---|---|---|---|---|
+| 1 | 4,496 ns | 4,445 ns | 3,819 ns | 4,487 ns | 4,437 ns | 12,635 ns | 12,602 ns |
+| 8 | 9,601 ns | 13,530 ns | 8,684 ns | 10,526 ns | 10,360 ns | 17,520 ns | 17,301 ns |
+| 24 | 22,083 ns | 37,859 ns | 21,392 ns | 23,426 ns | 22,665 ns | 30,039 ns | 29,321 ns |
+| slope per entry | 765 ns | 1,453 ns | 764 ns | 823 ns | 793 ns | 757 ns | 727 ns |
+
+- **The batched apply removes the cost.** At stride 8 it is **29 % and 42 %
+  faster** than the per-entry apply at 8 and 24 entries, and its slope equals
+  no writeback's (765 against 764 ns per entry). The writebacks now cost
+  0.7–0.9 µs per commit, 3 % of a 24-entry commit, against 16.5 µs (43 %)
+  before. It beats deferral to the fence at every size (4,496, 9,601 and
+  22,083 ns against 4,923, 9,837 and 24,984 ns in `20260928T024904Z`), and the
+  per-entry configuration reproduces the earlier production figure (37,859
+  against 37,617–37,741 ns).
+- **Where there is nothing to coalesce it was slightly slower**, outside every
+  repetition's spread: +0.17 and +0.76 µs at stride 64, and +0.22 and +0.72 µs
+  on the file backend, at 8 and 24 entries. The same regression on two
+  backends that share nothing below the WAL pointed at CPU work, and the
+  binary confirmed it. The merge loop's `lineOf()` compiled to a 64-bit `divq`:
+  the optimiser rewrites `/ 64` as a shift only for a value it can prove
+  non-negative, even for an unsigned type. It ran twice per extent, and every
+  extent also went through non-inlined `Vector` accessors. The bookkeeping now
+  uses two plain arrays and shifts, and skips the sort when extents arrive in
+  address order; the disassembly shows no `divq` and no per-element call on the
+  path. **The fix is not yet measured.**
+- Allocator transactions store their after-images out of address order: a
+  mutant that skips the sort fails the sieve and direct-I/O suites. The sort is
+  needed in production, not only in the tests.
+- `validEntryFields()` also compiles to three `divq`, and it runs for every
+  entry in both `append()` and the apply. That cost is the same in both
+  placements, so it takes no part in the comparison; it is a separate, small
+  saving still available.
 
 **The boundary figures on this page do not measure what the writebacks cost.**
 Each writeback is bracketed with `rdtsc`, which is not ordered with `CLWB`, so

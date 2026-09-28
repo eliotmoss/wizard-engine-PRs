@@ -79,9 +79,13 @@ class DualTxnWal {
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
         // [start, end) of after-images stored by storeUpdate() and not yet
-        // prepared. Reset with resize(0), never clear(): clear() zeroes the
-        // whole backing array on every call.
-        private def appliedExtents = Vector<(u64, u64)>.new();
+        // prepared, as parallel arrays grown by doubling: no allocation per
+        // commit and no call per element (a Vector's accessors are not inlined,
+        // and on Magpie that per-entry overhead cost ~0.7 us at 24 entries).
+        private var extentStarts = Array<u64>.new(16);
+        private var extentEnds = Array<u64>.new(16);
+        private var extentCount = 0;
+        private var extentsSorted = true;       // starts ascending in the order stored
         private var recoveryRequired = false;   // Persistence work left this mount unable to continue safely
         def var openOk = false;
 
@@ -190,8 +194,20 @@ class DualTxnWal {
                 if (recoveryRequired) return false;
                 if (!validEntryFields(offset, width)) return false;
                 writeAfterImage(offset, value, width);
-                appliedExtents.put((offset, offset + u64.view(width)));
+                noteExtent(offset, offset + u64.view(width));
                 return true;
+        }
+
+        private def noteExtent(start: u64, end: u64) {
+                def n = extentCount;
+                if (n == extentStarts.length) {
+                        extentStarts = Arrays.grow(extentStarts, 2 * n);
+                        extentEnds = Arrays.grow(extentEnds, 2 * n);
+                }
+                if (n > 0 && start < extentStarts[n - 1]) extentsSorted = false;
+                extentStarts[n] = start;
+                extentEnds[n] = end;
+                extentCount = n + 1;
         }
 
         // Prepare every range stored by storeUpdate() since the last call, each
@@ -204,23 +220,27 @@ class DualTxnWal {
         // the obligation structural rather than the caller's.
         def prepareApplied() -> bool {
                 if (recoveryRequired) return false;
-                def n = appliedExtents.length;
+                def n = extentCount;
                 if (n == 0) return true;
-                sortAppliedExtents();
-                def first = appliedExtents[0];
-                var start = first.0, end = first.1;
+                if (!extentsSorted) sortExtents();
+                def starts = extentStarts, ends = extentEnds;
+                var start = starts[0], end = ends[0];
                 for (i = 1; i < n; i++) {
-                        def next = appliedExtents[i];
-                        if (lineOf(next.0) <= lineOf(end - 1u64) + 1u64) {
-                                if (next.1 > end) end = next.1;
+                        def next = starts[i];
+                        // Lines are DualTxnWalConstants.ALIGNMENT (64) bytes. Shifts,
+                        // not "/ 64": on a u64 the compiler cannot prove
+                        // non-negative, that division is a 64-bit divq.
+                        if ((next >> 6) <= ((end - 1u64) >> 6) + 1u64) {
+                                if (ends[i] > end) end = ends[i];
                         } else {
                                 if (!prepareAppliedRange(start, end)) return false;
-                                start = next.0;
-                                end = next.1;
+                                start = next;
+                                end = ends[i];
                         }
                 }
                 if (!prepareAppliedRange(start, end)) return false;
-                appliedExtents.resize(0);
+                extentCount = 0;
+                extentsSorted = true;
                 return true;
         }
 
@@ -232,23 +252,22 @@ class DualTxnWal {
                 return true;
         }
 
-        // In place, no allocation per commit. Insertion sort: a transaction's
-        // extents number at most one slot's entries, and callers that write in
-        // address order hand it an already-sorted vector.
-        private def sortAppliedExtents() {
-                for (i = 1; i < appliedExtents.length; i++) {
-                        def e = appliedExtents[i];
+        // In place, by start. Insertion sort: a transaction's extents number at
+        // most one slot's entries, and it runs only when they were stored out
+        // of address order.
+        private def sortExtents() {
+                def starts = extentStarts, ends = extentEnds;
+                for (i = 1; i < extentCount; i++) {
+                        def s = starts[i], e = ends[i];
                         var j = i - 1;
-                        while (j >= 0 && appliedExtents[j].0 > e.0) {
-                                appliedExtents[j + 1] = appliedExtents[j];
+                        while (j >= 0 && starts[j] > s) {
+                                starts[j + 1] = starts[j];
+                                ends[j + 1] = ends[j];
                                 j--;
                         }
-                        appliedExtents[j + 1] = e;
+                        starts[j + 1] = s;
+                        ends[j + 1] = e;
                 }
-        }
-
-        private def lineOf(offset: u64) -> u64 {
-                return offset / DualTxnWalConstants.ALIGNMENT;
         }
 
         // Explicit boundary: complete durability for all after-images applied
