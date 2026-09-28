@@ -1,0 +1,37 @@
+---- revision
+commit 79473c8b5104c88748345e3cb9905c6b1a1331fd
+subject  perf(pwregion): batched apply without a divide or per-element calls; record its measurement
+dirty    no
+---- host
+hostname magpie.gpu
+kernel   Linux 6.8.0-137-generic x86_64 GNU/Linux
+started  2026-09-28T05:18:04+00:00
+load     0.02 0.12 0.09
+---- cpu
+CPU(s):                                  96
+Model name:                              Intel(R) Xeon(R) Gold 6252N CPU @ 2.30GHz
+Model:                                   85
+Thread(s) per core:                      2
+Stepping:                                7
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cdp_l3 intel_ppin ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm mpx rdt_a avx512f avx512dq rdseed adx smap clflushopt clwb intel_pt avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts vnmi pku ospke avx512_vnni md_clear flush_l1d arch_capabilities ibpb_exit_to_user
+L1d cache:                               1.5 MiB (48 instances)
+L2 cache:                                48 MiB (48 instances)
+L3 cache:                                71.5 MiB (2 instances)
+microcode	: 0x5003901
+---- dax
+/mnt/pmem0.0/sean
+  source  /dev/pmem0
+  options rw,relatime,dax=always
+  node    0
+pinned to node 0
+---- perf
+unavailable: perf cannot count this user's own events (perf_event_paranoid=4; needs 2 or lower)
+---- parameters
+reps 3
+sizes 1 8 24
+geometry 512x2048
+commits 20000 120000
+warmup 2000
+configs pmem-auto pmem-auto-entry pmem-none file-dax file-dax-entry pmem-auto-s64 pmem-auto-entry-s64 pmem-none-s64
+finished 2026-09-28T05:21:01+00:00
+load     0.94 0.51 0.25
