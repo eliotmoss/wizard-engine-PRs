@@ -860,8 +860,8 @@ has left, verified afterwards against an independent reference sieve: 3,180
 measured steps per run. `scripts/pwsieve-bench.sh` interleaves the
 configurations and repeats them.
 
-Measured 2026-09-28 on sean-tan-PC, with the caveats of the Raptor Lake
-subsection above: DRAM stands in for PMEM (`memmap`), and each core type is one
+Measured 2026-09-28 on sean-tan-PC first, and then on Magpie (below). On
+sean-tan-PC the caveats of the Raptor Lake subsection above apply: DRAM stands in for PMEM (`memmap`), and each core type is one
 core of a hybrid CPU. Governor `performance`, idle machine, block storage the NVMe
 root (ext4). `results/20260928T100258Z-sean-tan-PC-pwsieve-bench-cpus2` (P-core,
 five repetitions) and `…T100404Z-…-cpus20` (E-core, fifteen). Wall time per step,
@@ -909,11 +909,83 @@ type lives in computation, not in the persistence path.
   With the batched apply a transaction stores into each line before writing it
   back, so an invalidating writeback leaves little reuse to penalise.
 - What this cannot show: the batched apply against the per-entry one on this
-  workload, since the per-entry placement is gone, and the price of persistence
-  on real PMEM. On Magpie a miss and a writeback cost Optane latency, and the
-  persistence share should grow; that campaign is pending (`PWSB_BLOCK_DIR` on
-  `/home` there adds the block configurations, behind the write-through RAID
-  controller).
+  workload, since the per-entry placement is gone.
+
+**On Magpie, with Optane, the step is still computation.** Same geometry and
+protocol, pinned to the namespace's node 0, five repetitions, idle host
+(`results/20260928T102833Z-magpie-pwsieve-bench`). Block storage is `/home`,
+ext4 on LVM behind the write-through RAID controller. Wall time per step,
+median; every PMEM and DAX range is under 0.7 % wide:
+
+| Configuration | Step | of which compute | persistence phases |
+|---|---|---|---|
+| `pmem`, production (`CLWB`) | 479.4 µs | 425.1 µs | 54.3 µs (11.3 %) |
+| `pmem`, `CLFLUSHOPT` | 479.2 µs | 426.9 µs | 52.4 µs (10.9 %) |
+| `pmem`, no writeback | 475.1 µs | 426.1 µs | 49.0 µs (10.3 %) |
+| `file` on DAX | 520.9 µs | 426.7 µs | 94.3 µs (18.1 %) |
+| `file` on `/home` | 2,446 µs | 1,104 µs | 1,335 µs (54.6 %) |
+| `direct` on `/home` | 2,675 µs | 1,151 µs | 1,526 µs (57.0 %) |
+
+- **Optane raises the persistence phases 3.6×, and the share only from 9 % to
+  11 %.** They are 54.3 µs against the Raptor Lake P-core's 15.1 µs (alloc
+  12.8, bitmap 20.2, publish 9.2, retire 12.1 µs), but Magpie's cores also
+  compute 2.8× slower. The publish commit again costs what pwbench's 8-entry
+  commit does there (9.4 µs), and the file backend on DAX again spends about
+  1.7× PMEM's persistence time.
+- **Here the writeback instructions are a measurable saving.** Without them the
+  step is 4.3 µs (0.9 %) faster, in every repetition and outside both ranges.
+  The persistence phases shrink by 5.3 µs and the compute phase again grows,
+  by 1.0 µs, the same direction as on Raptor Lake but now a net saving.
+- **`CLFLUSHOPT` gives the same step as `CLWB`** (−0.03 %), as it should where
+  `CLWB` evicts. Its persistence phases are 1.9 µs shorter, consistently, and
+  its compute phase longer; unexplained, and small.
+
+**On block storage, blocking costs clock speed, and no boundary figure shows
+it.** Computing a segment is the same DRAM work on every backend, yet on
+Magpie's block configurations it takes 1,104 and 1,151 µs, 2.6–2.7× the PMEM
+figure, in every repetition. Four observations locate the cause:
+
+| compute phase per step | Raptor Lake, `performance` | Raptor Lake, `powersave` | Magpie |
+|---|---|---|---|
+| `pmem` (never blocks) | 151.8 µs | 155.0 µs | 425.0 µs |
+| `file` on block storage | 158.1 µs (1.04×) | 516.7 µs (3.3×) | 1,104 µs (2.6×) |
+| `direct` on block storage | 158.4 µs (1.04×) | 462.3 µs (3.0×) | 1,151 µs (2.7×) |
+
+- It is not scheduler migration: pinned to one CPU
+  (`results/20260928T104138Z-magpie-pwsieve-bench-cpus2`) the figures are
+  unchanged (1,104 and 1,150 µs).
+- It is not the syscalls or the faults: the file backend on DAX makes the same
+  `fdatasync` and `msync` calls and takes the same 12.8 write-protect faults
+  per step, and its compute phase is normal (427 µs). What differs is that on
+  block storage the thread blocks for 180–680 µs in each of them.
+- A utilisation-driven frequency policy reproduces it: on the Raptor Lake
+  P-core under `powersave` (`…T105045Z-sean-tan-PC-pwsieve-bench-cpus2-powersave`,
+  three repetitions) the block configurations' computation is 3.0–3.3× PMEM's,
+  and under `performance` it is 1.04×. There a `file`-on-NVMe step costs 42 %
+  more under `powersave` (1,558 against 1,097 µs), most of it outside the
+  persistence phases.
+- Magpie has no cpufreq driver at all (`/sys/devices/system/cpu/cpu*/cpufreq`
+  is absent), so its clock is set by the platform, outside the OS; `intel_idle`
+  offers C1, C1E and C6, all enabled. A core idle in `fdatasync` can reach C1E,
+  which runs at the lowest frequency, and C6, which also empties its private
+  caches.
+
+The frequency policy is therefore the likely cause on Magpie, **inferred, not
+observed**: confirming it needs `turbostat`, which needs root. Either way the
+consequence stands. On block storage a durable step costs more than its
+boundaries: the 55–57 % persistence share on Magpie understates what blocking
+costs the program, and pwbench, which issues boundaries back to back with
+almost no computation between them, cannot see it.
+
+**Still open: Magpie's per-boundary pattern.** On `/home` the sieve's boundaries
+cost 180–680 µs against pwbench's back-to-back median of 150–176 µs on the same
+directory (`20260923T052859Z`, `20260927T080050Z`). On the file backend the two
+boundaries that follow a stretch of computation (alloc 430 µs, publish 410 µs)
+cost about 1.7× the two that follow another boundary (bitmap and retire, 247–248
+µs). On the direct backend alloc is 466 µs and the bitmap boundary 680 µs, while
+publish and retire are 186–194 µs. Raptor Lake under `powersave` shows neither:
+all four of its boundaries are 248–283 µs. That points at Magpie's storage path
+(LVM, then the write-through controller) rather than the CPU; untested.
 
 ### Region size at fixed block size, and the NUMA penalty at 1 MiB
 
