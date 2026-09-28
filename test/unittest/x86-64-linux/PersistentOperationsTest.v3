@@ -566,8 +566,7 @@ def test_persistent_dual_wal_boundaries_drain_unprepared_after_images(tc: Persis
 
 // Through the allocator's transaction facade: eleven u64 writes over three
 // lines -- a full line, the line after it, and a line two further on -- are
-// written back as three line writebacks, after all eleven stores. The
-// benchmark-only per-entry switch restores one writeback per write.
+// written back as three line writebacks, after all eleven stores.
 def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperationsTester) {
 	def backend = TracePWRegionBackend.new();
 	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
@@ -591,7 +590,7 @@ def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperat
 	recorder.clear();
 	for (i < writes.length) region.txn.writeU64(writes[i], 0x1000u64 + u64.!(i));
 	tc.t.assertz(true, region.txn.commit());
-	var fence = tc.firstFence(recorder.events);
+	def fence = tc.firstFence(recorder.events);
 	tc.t.assertz(true, fence > 0);
 	var stores = 0, clwbs = 0;
 	for (i = fence + 1; i < recorder.events.length; i++) {
@@ -606,17 +605,6 @@ def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperat
 	}
 	tc.t.assert_eq(writes.length, stores);
 	tc.t.assert_eq(expectedLines.length, clwbs);
-
-	region.txn.perEntryWriteback = true;
-	recorder.clear();
-	for (i < writes.length) region.txn.writeU64(writes[i], 0x2000u64 + u64.!(i));
-	tc.t.assertz(true, region.txn.commit());
-	fence = tc.firstFence(recorder.events);
-	clwbs = 0;
-	for (i = fence + 1; i < recorder.events.length; i++) {
-		if (recorder.events[i].kind == PersistentEventKind.CLWB) clwbs++;
-	}
-	tc.t.assert_eq(writes.length, clwbs);
 	tc.assertSequences(recorder.events);
 	region.deallocate();
 }

@@ -34,10 +34,10 @@
 // then one fdatasync -- behind DirectIoRegion.writeUnits()/syncDevice(), and
 // both are timed together as one boundary sample.
 //
-// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>] [stride=<bytes>] [apply=<batch|entry>]
+// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>] [stride=<bytes>]
 //        pwbench.x86-64-linux <device> direct-device=<device> [commits] ...
 //
-// Three keyword arguments, in any order after the positional ones, exist for
+// Two keyword arguments, in any order after the positional ones, exist for
 // the CLWB-eviction experiment (scripts/clwb-eviction.sh):
 //
 // writeback= (pmem only) changes how the timing provider writes lines back:
@@ -55,12 +55,6 @@
 // stride= (default 8) spaces the transaction's u64 entries that many bytes
 // apart. 64 puts each entry on its own cache line, which keeps the number of
 // writebacks per commit while removing every same-line store after one.
-//
-// apply= (any backend) selects where RegionTransaction prepares the
-// after-images: batch (the default, and production since 2026-09-28) stores
-// them all and then prepares each line once; entry restores the earlier
-// placement, each after-image prepared as it is stored, through
-// RegionTransaction.perEntryWriteback.
 //
 // A raw device is overwritten from offset 0 for the region's length. Its path
 // has to be given twice, as the first argument and inside the mode word, so a
@@ -112,7 +106,6 @@ component BenchConfig {
         def var blockSize = 4096u64;
         def var writeback = BenchWriteback.AUTO;
         def var stride = 8u64;          // bytes between consecutive entries
-        def var perEntryApply = false;  // apply=entry
 
         def backendName() -> string {
                 return backend.label;
@@ -570,7 +563,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 2 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|deferred|none>] [stride=<bytes>] [apply=<batch|entry>]\n");
+                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|deferred|none>] [stride=<bytes>]\n");
                 System.puts("       pwbench.x86-64-linux <device> direct-device=<device> [commits] [entries] [warmup] [blockSize] [blocks]\n");
                 return 2;
         }
@@ -596,7 +589,7 @@ def main(args: Array<string>) -> int {
         if (args.length > 6) BenchConfig.blocks = parseU64(args[6], 512);
         for (i = 7; i < args.length; i++) {
                 if (!parseKeyword(args[i])) {
-                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|clflush|deferred|none>, stride=<bytes> or apply=<batch|entry>\n");
+                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|clflush|deferred|none> or stride=<bytes>\n");
                         return 2;
                 }
         }
@@ -678,10 +671,6 @@ def main(args: Array<string>) -> int {
                 return fail("an elided-writeback provider is installed; this must be an ordinary build");
         }
 
-        // Set before the scratch allocation's commit, so every measured and
-        // warm-up commit uses the placement asked for.
-        region.txn.perEntryWriteback = BenchConfig.perEntryApply;
-
         // One chunk to write into, so the commits touch real allocated space
         // without the allocator's own variable work entering the measurement.
         def span = u64.!(BenchConfig.entries) * BenchConfig.stride;
@@ -707,7 +696,10 @@ def main(args: Array<string>) -> int {
         // Not matched by either experiment script's parser as a figure; the
         // CLWB-eviction script checks it to confirm the stride it asked for.
         Trace.OUT.put1("entry stride %d bytes", BenchConfig.stride).ln();
-        Trace.OUT.put1("apply %s", if(BenchConfig.perEntryApply, "entry", "batch")).ln();
+        // The placement is fixed since the per-entry one was removed; the line
+        // stays so a log names the placement that produced it (logs from before
+        // apply= existed ran per entry and name none).
+        Trace.OUT.puts("apply batch").ln();
 
         if (!runCommits(region, base, BenchConfig.warmup, timer)) {
                 def ceiling = maxEntriesEstimate(BenchConfig.blockSize);
@@ -749,14 +741,6 @@ def main(args: Array<string>) -> int {
 
 def parseKeyword(arg: string) -> bool {
         if (arg == null) return false;
-        if (Strings.equal(arg, "apply=batch")) {
-                BenchConfig.perEntryApply = false;
-                return true;
-        }
-        if (Strings.equal(arg, "apply=entry")) {
-                BenchConfig.perEntryApply = true;
-                return true;
-        }
         if (Strings.startsWith(arg, "stride=")) {
                 def text = Arrays.range(arg, 7, arg.length);
                 BenchConfig.stride = parseU64(text, 0);

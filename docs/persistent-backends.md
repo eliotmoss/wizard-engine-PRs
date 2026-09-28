@@ -578,7 +578,10 @@ over the commit that reclaims its slot. Each of four deliberately broken
 variants fails at least one of them: a merged range left unprepared, the
 commit's drain removed, `persistAppliedData()`'s drain removed, and the facade
 skipping `prepareApplied()`. The full suite passes (2,004 tests). pwbench's
-`apply=entry` restores the old placement for a same-sitting comparison.
+`apply=entry` restored the old placement for the same-sitting comparisons below
+and on Raptor Lake; it and `RegionTransaction.perEntryWriteback` were removed
+on 2026-09-28 once those were recorded. `scripts/clwb-eviction.sh` still
+rebuilds and summarises the `-entry` directories and refuses new `-entry` runs.
 
 **Measured.** `results/20260928T045134Z-magpie-clwb-eviction`, at `380ca7d3`,
 same geometry and protocol, all eight configurations in one sitting. Wall time

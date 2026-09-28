@@ -32,7 +32,9 @@
 #                    stride=64): the same writebacks, no same-line store after one
 #   <config>-entry   (before any -s<n>) the per-entry after-image placement used
 #                    until 2026-09-28, each after-image prepared as it is stored
-#                    (pwbench apply=entry); without it, the production batched
+#                    (pwbench apply=entry, since removed): accepted by rebuild
+#                    and summary for the directories that used it, refused for
+#                    new runs. Every new run has the production batched
 #                    placement: every store, then each line prepared once
 #
 # The first campaign (results/20260928T001505Z-magpie-clwb-eviction) ran
@@ -40,8 +42,14 @@
 # evicts and that the writebacks account for the whole per-entry gap. The
 # follow-ups (20260928T022934Z, 20260928T024904Z) ran "pmem-auto pmem-deferred
 # pmem-none file-dax" at strides 8 and 64 and showed the cost is the store into
-# a just-evicted line within the commit. The default is now the placement
-# comparison: production's batched apply against the per-entry one it replaced.
+# a just-evicted line within the commit. The placement comparisons
+# (20260928T045134Z and T051804Z on Magpie; the sean-tan-PC runs of the same day
+# on a Raptor Lake P-core and E-core) set production's batched apply against the
+# per-entry one it replaced, which pwbench no longer offers. The default is the
+# first campaign's set, under the batched apply. Under it the two instructions
+# gave the same commit even where CLWB keeps the line (Raptor Lake), so the
+# campaign no longer tells a retaining CLWB from an evicting one; the probe's
+# load row does.
 #
 # Every configuration runs at two commit counts, and a perf counter's value per
 # commit is the difference between the two runs divided by the difference in
@@ -80,7 +88,7 @@ SIZES="${PWCLWB_SIZES:-1 8 24}"
 GEOMETRY="${PWCLWB_GEOMETRY:-512x2048}"
 COMMITS="${PWCLWB_COMMITS:-20000 120000}"
 WARMUP="${PWCLWB_WARMUP:-2000}"
-CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-auto-entry pmem-none file-dax file-dax-entry pmem-auto-s64 pmem-auto-entry-s64 pmem-none-s64}"
+CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-clflushopt pmem-none file-dax}"
 CC_BIN="${PWCLWB_CC:-cc}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CPU_TAG=
@@ -333,8 +341,10 @@ probe_summary() {
 
 # config -> "<backend> stride=<n> apply=<batch|entry> [writeback=...]". A
 # trailing -s<n> sets the stride (default 8, one u64 after another); an -entry
-# before it selects the per-entry after-image placement used until 2026-09-28
-# (default batch, production since).
+# before it names the per-entry after-image placement used until 2026-09-28
+# (default batch, production since). apply= is never passed to pwbench, which
+# no longer takes it; record_run checks it against the log's "apply" line, and
+# campaign refuses apply=entry.
 config_args() {
     local base=$1 stride=8 apply=batch
     if [[ "$base" =~ ^(.*)-s([0-9]+)$ ]]; then base=${BASH_REMATCH[1]}; stride=${BASH_REMATCH[2]}; fi
@@ -392,7 +402,9 @@ run_one() {
     local log="$OUT/run-$config-e$entries-c$commits-r$rep.log" perf_out="$OUT/run-$config-e$entries-c$commits-r$rep.perf"
     local args; read -r -a args <<< "$(config_args "$config")"
     local load; load=$(loadavg | cut -d' ' -f1)
-    local cmd=("$BENCH_BIN" "$PWASM_PMEM_TEST_DIR" "${args[0]}" "$commits" "$entries" "$WARMUP" "$bs" "$blocks" "${args[@]:1}")
+    local word bench_args=()
+    for word in "${args[@]:1}"; do [[ "$word" == apply=* ]] || bench_args+=("$word"); done
+    local cmd=("$BENCH_BIN" "$PWASM_PMEM_TEST_DIR" "${args[0]}" "$commits" "$entries" "$WARMUP" "$bs" "$blocks" "${bench_args[@]}")
     say "  $config entries=$entries commits=$commits rep=$rep"
     if [ "$PERF_OK" = 1 ]; then
         "${PIN_BENCH[@]}" perf stat -x, -e "$EVENTS" -o "$perf_out" -- "${cmd[@]}" > "$log" 2>&1 ||
@@ -458,7 +470,11 @@ campaign() {
     make "$BENCH_BIN" >/dev/null || die "could not build $BENCH_BIN"
     grep -q 'writeback=' "$BENCH_BIN" 2>/dev/null || die "$BENCH_BIN predates the writeback= argument; rebuild it (make $BENCH_BIN)"
     case "$GEOMETRY" in *x*) ;; *) die "PWCLWB_GEOMETRY is not <blocks>x<blockSize>: $GEOMETRY" ;; esac
-    local c; for c in $CONFIGS; do config_args "$c" >/dev/null; done
+    local c a; for c in $CONFIGS; do
+        read -r -a a <<< "$(config_args "$c")"
+        [ "$(config_value apply "${a[@]}")" != entry ] ||
+            die "$c: the per-entry placement was removed from pwbench on 2026-09-28; -entry configurations only rebuild and summarise the directories that used them"
+    done
     local lo hi; read -r lo hi _ <<< "$COMMITS"
     [ -n "${hi:-}" ] && [ "$hi" -gt "$lo" ] || die "PWCLWB_COMMITS needs two counts, the second larger: $COMMITS"
     resolve_pinning
