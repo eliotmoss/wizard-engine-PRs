@@ -139,8 +139,8 @@ Two findings that arrived unplanned and are better material than the headline:
   small.** At 1 MiB and 24 entries the file backend on DAX committed *faster*
   than the PMEM backend (28.9 µs against 37.3 µs) — **an artefact of the PMEM
   backend's writeback placement, corrected 2026-09-28**: with the batched apply
-  the PMEM backend is faster at every size again (22.1 against 29.3 µs at 24
-  entries, 1.3×). The crossover arose because the PMEM backend's
+  the PMEM backend is faster at every size again (21.6 against 29.3 µs at 24
+  entries, 1.4×). The crossover arose because the PMEM backend's
   non-boundary work grows about twice as fast per entry on the same media and
   the same record-construction code. **Cause found in part (2026-09-28):** on
   Cascade Lake `CLWB` evicts the line exactly as `CLFLUSHOPT` does (probe:
@@ -157,11 +157,13 @@ Two findings that arrived unplanned and are better material than the headline:
   recovers 27–34 % of the commit at 8–24 entries but loses 11–22 % where there
   is no reuse, so placement matters as much as count. Writing each line back
   once at the end of the apply loop is now production (2026-09-28), covered by
-  crash-explorer and mutation-checked tests, and measured: 29 % and 42 % faster
-  at 8 and 24 entries, the writebacks down from 43 % to 3 % of a 24-entry
-  commit, the slope equal to no writeback's. A 0.2–0.8 µs regression where
-  nothing coalesces was CPU bookkeeping (a compiled 64-bit divide, non-inlined
-  vector calls), since removed; the removal is not yet measured.
+  crash-explorer and mutation-checked tests, and measured: 31 % and 43 % faster
+  at 8 and 24 entries, the writebacks down from 43 % to under 4 % of a
+  24-entry commit, the slope equal to no writeback's. A first version's
+  0.2–0.8 µs regression where nothing coalesces was CPU bookkeeping (a
+  compiled 64-bit divide, non-inlined vector calls); removing it cleared the
+  file backend entirely and left 0.34 µs (1.5 %) at stride 64 and 24 entries,
+  which is placement — writebacks issued back to back — not software.
   Worth a paragraph in Chapter 6: the same instruction, on the same media,
   costs 7 % or 43 % of a commit depending on where the protocol issues it and
   how the caller lays out its writes, which the abstraction neither shows nor

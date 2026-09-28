@@ -419,9 +419,10 @@ At 1 MiB and eight entries, the file backend on DAX is only **1.27×** slower pe
 commit than the PMEM backend, against 71× at 2 MiB, and at 24 entries it is
 **1.29× faster**. (**Corrected 2026-09-28:** the crossover was the PMEM
 backend's per-entry writeback placement, not the media or the primitive. With
-the batched apply the PMEM backend commits in 22.1 µs at 24 entries against
+the batched apply the PMEM backend commits in 21.6 µs at 24 entries against
 29.3 µs for the file backend in the same sitting, and it is faster at every
-measured size: 2.8×, 1.8× and 1.3× at 1, 8 and 24 entries. See
+measured size: 2.8×, 1.8× and 1.4× at 1, 8 and 24 entries
+(`20260928T051804Z`). See
 [`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).)
 The boundary is not the reason. Outside its boundary, a PMEM
 commit costs 4.3, 13.0 and 36.1 µs at 1, 8 and 24 entries, against 7.4, 12.0 and
@@ -545,7 +546,7 @@ lines. The in-window boundary shows the first part: 4.0 µs against 1.3 µs for
 production at stride 64, with the same 38 lines. That reading is an
 interpretation of timing, not a measurement of the cause.
 
-**What this points to — implemented 2026-09-28, not yet measured.** The better
+**What this points to — implemented and measured 2026-09-28.** The better
 placement is between the two:
 write back each distinct after-image line once, at the end of the apply loop.
 That keeps deferral's benefits (no same-line store after a writeback, one
@@ -608,7 +609,34 @@ per commit, median of three:
   extent also went through non-inlined `Vector` accessors. The bookkeeping now
   uses two plain arrays and shifts, and skips the sort when extents arrive in
   address order; the disassembly shows no `divq` and no per-element call on the
-  path. **The fix is not yet measured.**
+  path.
+- **Measured with the fix** (`results/20260928T051804Z-magpie-clwb-eviction`,
+  at `79473c8b`, same protocol). Wall time per commit, median of three:
+
+  | Entries | batched, stride 8 | per entry, stride 8 | none, stride 8 | batched, stride 64 | per entry, stride 64 | `file`, batched | `file`, per entry |
+  |---|---|---|---|---|---|---|---|
+  | 1 | 4,472 ns | 4,437 ns | 3,813 ns | 4,459 ns | 4,433 ns | 12,666 ns | 12,588 ns |
+  | 8 | 9,412 ns | 13,562 ns | 8,514 ns | 10,426 ns | 10,485 ns | 17,269 ns | 17,304 ns |
+  | 24 | 21,639 ns | 37,751 ns | 20,858 ns | 23,086 ns | 22,747 ns | 29,327 ns | 29,451 ns |
+
+  The file backend's regression is gone: at 24 entries the two placements'
+  repetitions overlap (29,301–29,466 against 29,285–29,492 ns). Both batched
+  PMEM configurations are ~0.5 µs faster at 24 entries than before the fix,
+  with and without writebacks, which is the bookkeeping removed. Production
+  is now **31 % and 43 % faster** than the per-entry apply at 8 and 24 entries,
+  and the writebacks cost 0.66–0.90 µs per commit (3.6 % at 24 entries).
+- **What remains is placement, where nothing coalesces.** At stride 64 and 24
+  entries the batched apply is still 0.34 µs (1.5 %) slower, outside the
+  repetitions' spread (23,047–23,091 against 22,713–22,785 ns); at 8 entries it
+  is 0.6 % faster. It is not bookkeeping — the file backend shows none, and at
+  stride 64 the batched path does less software work, one merged range where
+  the per-entry path makes 24 preparations. It is the 24 writebacks being
+  issued back to back after the stores rather than one after each: the
+  deferred placement's cost, much reduced. With reuse the batched apply saves
+  16 µs of a 24-entry commit; without it, it costs 0.34 µs.
+- The in-window boundary at one entry rose from 143 to ~325 ns with the fix,
+  in every repetition, while the wall time stayed within 1 % — one more
+  instance of that figure not being a cost.
 - Allocator transactions store their after-images out of address order: a
   mutant that skips the sort fails the sieve and direct-I/O suites. The sort is
   needed in production, not only in the tests.
