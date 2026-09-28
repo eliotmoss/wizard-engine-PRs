@@ -172,10 +172,22 @@ resolve_pinning() {
     PIN_NODE="node $node"
 }
 
+# Whether a directory's filesystem is mounted with DAX on every file: "dax" or
+# "dax=always". dax=inode leaves it to a per-file flag, so it does not count.
+is_dax_dir() {
+    local opts; opts=$(findmnt -no OPTIONS -T "$1" 2>/dev/null) || return 1
+    [[ ",$opts," == *",dax,"* || ",$opts," == *",dax=always,"* ]]
+}
+
+# Refused rather than warned about, with no override: off a DAX mount the pmem
+# configurations and the probe fail, but file-dax runs -- on whatever
+# filesystem this is -- and would be recorded as a DAX result.
 require_dax_dir() {
     [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name your writable directory on the fsdax mount"
     [ -d "$PWASM_PMEM_TEST_DIR" ] && [ -w "$PWASM_PMEM_TEST_DIR" ] ||
         die "PWASM_PMEM_TEST_DIR is not a writable directory: $PWASM_PMEM_TEST_DIR"
+    is_dax_dir "$PWASM_PMEM_TEST_DIR" ||
+        die "PWASM_PMEM_TEST_DIR ($PWASM_PMEM_TEST_DIR) is on $(source_of "$PWASM_PMEM_TEST_DIR"), options '$(findmnt -no OPTIONS -T "$PWASM_PMEM_TEST_DIR" 2>/dev/null)': not a dax or dax=always mount, so file-dax would not be DAX"
 }
 
 require_clean_tree() {
@@ -619,6 +631,8 @@ doctor() {
         printf '%s\n  source  %s\n  options %s\n  node    %s\n  writable %s\n' "$PWASM_PMEM_TEST_DIR" \
             "$(source_of "$PWASM_PMEM_TEST_DIR")" "$(findmnt -no OPTIONS -T "$PWASM_PMEM_TEST_DIR" 2>/dev/null)" \
             "$(numa_node_of "$PWASM_PMEM_TEST_DIR")" "$([ -w "$PWASM_PMEM_TEST_DIR" ] && echo yes || echo NO)"
+        is_dax_dir "$PWASM_PMEM_TEST_DIR" ||
+            warn "  NOT a DAX mount (no dax or dax=always option) -- probe, campaign and all refuse to run"
     fi
     printf 'hybrid %s\n' "$(hybrid_topology)"
     [[ "$(hybrid_topology)" == "not hybrid" ]] ||
