@@ -1,0 +1,636 @@
+// Sieve-step cost: the resumable sieve (PWSieve) through the production
+// allocator and WAL, timed.
+//
+// pwbench measures one controlled transaction shape: a fixed number of u64
+// entries, written by the harness itself. This measures a workload whose
+// transactions the harness does not choose. A sieve step computes a segment in
+// DRAM, allocates a chunk (its own commit), writes the bitmap directly and
+// persists it (one boundary), publishes the descriptor and the root counters
+// (one commit of several fields sharing lines, which is where the batched
+// after-image apply coalesces), and retires the segment leaving the retention
+// window (one commit). PWSieve reports the end of each of those five phases
+// through its onPhase hook, so a step's time splits without reimplementing it.
+//
+// A region holds a fixed descriptor table, so it supports a fixed number of
+// steps: (blockSize - chunk header - root) / descriptor, 167 at 4 KiB blocks.
+// Each round therefore formats a fresh region, runs the warm-up steps unmeasured,
+// times every remaining step until the table is full, and then verifies the
+// sieve outside the timed window: PWSieve.checkInvariants() and a prime count
+// against an independent reference sieve. A round that does not verify fails
+// the run.
+//
+// Backends and instrumentation follow pwbench (test/pwbench.main.v3), from
+// which the timing backends are duplicated rather than shared, so pwbench's own
+// code, and with it its code layout, is untouched: code layout alone moved
+// pwbench's per-commit time by 1-2 % (docs/persistent-backends.md). On PMEM a
+// timing provider counts every fence and writeback, and writeback= swaps the
+// instruction: auto (production), clwb, clflushopt, or none, which issues no
+// writeback at all, so the region is NOT durable and the run ends on a labelled
+// line. PWSieve's bitmap writer resolves the installed provider, so none
+// removes the bitmap's writebacks as well as the log's. On the file and direct
+// backends the boundary is timed in the region.
+//
+// Times are rdtsc cycles converted with a calibrated TSC frequency, reported
+// with the frequency. rdtsc is not ordered with CLWB, but every step ends in a
+// commit's fence and lasts microseconds, so the step and phase figures are
+// wall time, not in-window figures like pwbench's "boundary" ones.
+//
+// Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>]
+
+def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def RUSAGE_SELF = 0;
+def RU_MINFLT_OFFSET = 64;      // struct rusage: two timevals, then longs
+def RUSAGE_SIZE = 144;
+
+// The retention window the crash loop uses, so the churn is the same.
+def LIVE_SEGMENTS = 2u64;
+// The reference sieve is a plain array in DRAM; refuse an unreasonably large one.
+def MAX_REFERENCE = 64000000u64;
+def MAX_SAMPLES = 200000;
+def PHASES = 5;
+
+enum SieveBenchBackend(arg: string, label: string) {
+        FILE("file", "file (mmap + msync/fdatasync)"),
+        PMEM("pmem", "pmem (MAP_SYNC + CLWB/SFENCE)"),
+        DIRECT("direct", "direct (pwrite + O_DIRECT + fdatasync) on a file")
+}
+
+enum SieveBenchWriteback(arg: string, label: string) {
+        AUTO("auto", "auto (production CPUID selection)"),
+        CLWB("clwb", "CLWB"),
+        CLFLUSHOPT("clflushopt", "CLFLUSHOPT"),
+        NONE("none", "none -- no writeback, timing only, the region is NOT durable")
+}
+
+component SieveBenchConfig {
+        def var directory: string;
+        def var path: string;
+        def var backend = SieveBenchBackend.FILE;
+        def var rounds = 20;
+        def var warmup = 8;
+        def var blocks = 256u64;
+        def var blockSize = 4096u64;
+        def var writeback = SieveBenchWriteback.AUTO;
+
+        // Reserve a private, uniquely named region file, exactly as pwbench
+        // and pwsieve do: O_EXCL so an earlier run's artifact is never
+        // silently replaced, and removal only of the file this run created.
+        def reservePath(dir: string) -> bool {
+                directory = dir;
+                def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+                def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                for (attempt < 100) {
+                        path = StringBuilder.new()
+                                .puts(directory)
+                                .puts("/wizard-pwsievebench-u")
+                                .putd(uid)
+                                .puts("-p")
+                                .putd(pid)
+                                .puts("-")
+                                .putd(attempt)
+                                .puts(".region")
+                                .toString();
+                        def fd = RegionFileIO.createExclusive(path);
+                        if (fd >= 0) {
+                                RegionFileIO.close(fd);
+                                return true;
+                        }
+                        if (fd != -LinuxConst.EEXIST) {
+                                path = null;
+                                return false;
+                        }
+                }
+                path = null;
+                return false;
+        }
+}
+
+// ---------------------------------------------------------------- clock
+
+component BenchClock {
+        def var cyclesPerUs = 0u64;
+
+        def nanos() -> long {
+                def ts = Array<long>.new(2);
+                Linux.syscall(LinuxConst.SYS_clock_gettime,
+                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                return ts[0] * 1000000000L + ts[1];
+        }
+
+        def sleepNanos(ns: long) {
+                def ts = Array<long>.new(2);
+                ts[0] = ns / 1000000000L;
+                ts[1] = ns % 1000000000L;
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
+        }
+
+        // As pwbench: the tree has no invariant-TSC check, so the derived
+        // frequency is reported rather than assumed.
+        def calibrate() {
+                def c0 = Target.rdtsc();
+                def t0 = nanos();
+                sleepNanos(100000000L);         // 100 ms
+                def c1 = Target.rdtsc();
+                def t1 = nanos();
+                def elapsedNs = t1 - t0;
+                if (elapsedNs <= 0) return;
+                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesToNanos(cycles: u64) -> u64 {
+                if (cyclesPerUs == 0) return 0;
+                return (cycles * 1000u64) / cyclesPerUs;
+        }
+}
+
+// ------------------------------------------------------------ accumulator
+
+// Shared by the backend, the region, the provider and the sieve's phase hook.
+class StepTimer {
+        def var recording = false;      // off during format, warm-up and verification
+        def var persistCalls = 0;       // SFENCE / fdatasync / direct write-back
+        def var prepareCalls = 0;       // CLWB loop / dirty-flag set
+        def var clwbLines = 0;
+        def var steps = 0;
+        def var stepCycles = 0u64;
+        def phaseCycles = Array<u64>.new(PHASES);
+        def stepSamples = Vector<u64>.new();
+        def var wallNs = 0L;            // clock_gettime over the measured loops only
+        def var faults = 0L;            // minor faults over the measured loops only
+        def var faultsKnown = true;
+        var mark = 0u64;
+
+        def notePersist() {
+                if (recording) persistCalls++;
+        }
+
+        def notePrepare() {
+                if (recording) prepareCalls++;
+        }
+
+        def noteLine() {
+                if (recording) clwbLines++;
+        }
+
+        // Starts a step's phase clock; returns its start, for the step total.
+        def startStep() -> u64 {
+                mark = Target.rdtsc();
+                return mark;
+        }
+
+        // PWSieve.onPhase: charge the time since the previous mark to {p}.
+        def onPhase(p: PWSievePhase) {
+                def now = Target.rdtsc();
+                if (recording) phaseCycles[p.tag] += now - mark;
+                mark = now;
+        }
+
+        def noteStep(cycles: u64) {
+                if (!recording) return;
+                steps++;
+                stepCycles += cycles;
+                if (stepSamples.length < MAX_SAMPLES) stepSamples.put(cycles);
+        }
+}
+
+// -------------------------------------------------- PMEM instrumentation
+
+// pwbench's TimingPersistentOperations, less its deferred and CLFLUSH modes:
+// the production bodies, with the instruction selectable and each fence and
+// line counted. Counted, not timed -- the step's wall time is the measure.
+class CountingPersistentOperations extends X86_64PersistentOperations {
+        def timer: StepTimer;
+
+        new(range: Range<byte>, timer: StepTimer) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                def line = Pointer.atElement(range, int.!(cacheLine));
+                match (SieveBenchConfig.writeback) {
+                        AUTO => MmapRegionUtils.flushCacheLine(line);
+                        CLWB => Target.clwb(line - Pointer.NULL);
+                        CLFLUSHOPT => Target.clflushOpt(line - Pointer.NULL);
+                        NONE => ;       // still counted, so lines per step stays checkable
+                }
+                timer.noteLine();
+        }
+
+        def sfence() {
+                MmapRegionUtils.storeFence();
+                timer.notePersist();
+        }
+}
+
+// Installs the provider inside create(), as pwbench does: PWRegion, DualTxnWal
+// and PWSieve's bitmap writer each resolve it once, so a later swap would miss.
+class CountingPmemBackend extends PmemMmapBackend {
+        def timer: StepTimer;
+
+        new(path: string, timer: StepTimer) super(path) { }
+
+        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+                if (newMapping == null) return null;
+                def region = PmemMmapRegion.new(newMapping, fd);
+                region.setPersistentOperations(CountingPersistentOperations.new(region.range, timer));
+                return region;
+        }
+}
+
+// -------------------------------------------------- file instrumentation
+
+class CountingFileRegion extends FileMmapRegion {
+        def timer: StepTimer;
+
+        new(mapping: Mapping, fd: int, timer: StepTimer) super(mapping, fd) { }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                timer.notePrepare();
+        }
+
+        def syncFileData() -> bool {
+                def success = RegionFileIO.fdatasync(fd);
+                timer.notePersist();
+                return success;
+        }
+
+        // persistRange() -- the sieve's bitmap -- syncs with msync(MS_SYNC)
+        // here rather than fdatasync, so it is a boundary too.
+        def syncMappedRange(offset: u64, size: u64) -> bool {
+                def success = Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
+                timer.notePersist();
+                return success;
+        }
+}
+
+class CountingFileBackend extends FileMmapBackend {
+        def timer: StepTimer;
+
+        new(path: string, timer: StepTimer) super(path) { }
+
+        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+                if (newMapping == null) return null;
+                return CountingFileRegion.new(newMapping, fd, timer);
+        }
+}
+
+// ------------------------------------------------ direct instrumentation
+
+class CountingDirectRegion extends DirectIoRegion {
+        def timer: StepTimer;
+
+        new(mapping: Mapping, fd: int, blockDevice: bool, timer) super(mapping, fd, blockDevice) { }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                timer.notePrepare();
+        }
+
+        def syncDevice() -> bool {
+                def success = performSync();
+                timer.notePersist();
+                return success;
+        }
+}
+
+class CountingDirectBackend extends DirectIoBackend {
+        def timer: StepTimer;
+
+        new(path: string, timer: StepTimer) super(path, DirectIoTarget.FILE) { }
+
+        def makeDirectRegion(mapping: Mapping, fd: int, blockDevice: bool) -> DirectIoRegion {
+                return CountingDirectRegion.new(mapping, fd, blockDevice, timer);
+        }
+}
+
+// Minor page faults so far in this process, or -1 (as pwbench).
+def minorFaults() -> long {
+        def buf = Array<byte>.new(RUSAGE_SIZE);
+        if (Linux.syscall(LinuxConst.SYS_getrusage, (RUSAGE_SELF, Pointer.atContents(buf))).0 != 0) return -1;
+        var v = 0L;
+        for (i < 8) v |= long.view(u64.view(buf[RU_MINFLT_OFFSET + i]) << u6.view(8 * i));
+        return v;
+}
+
+// ---------------------------------------------------------------- stats
+
+class Percentiles(sorted: Array<u64>) {
+        def at(p: int) -> u64 {
+                if (sorted.length == 0) return 0;
+                var i = (p * (sorted.length - 1)) / 100;
+                if (i < 0) i = 0;
+                if (i >= sorted.length) i = sorted.length - 1;
+                return sorted[i];
+        }
+}
+
+// ---------------------------------------------------------------- run
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        if (SieveBenchConfig.path != null) {
+                System.puts("retained region image: ");
+                System.puts(SieveBenchConfig.path);
+                System.ln();
+        }
+        return 1;
+}
+
+var directBackend: CountingDirectBackend;
+
+def openRegion(timer: StepTimer) -> PWRegion {
+        var backend: TxnRegionBackend;
+        def path = SieveBenchConfig.path;
+        match (SieveBenchConfig.backend) {
+                PMEM => backend = CountingPmemBackend.new(path, timer);
+                FILE => backend = CountingFileBackend.new(path, timer);
+                DIRECT => backend = directBackend = CountingDirectBackend.new(path, timer);
+        }
+        return PWRegion.new(backend, SieveBenchConfig.blocks,
+                Array<Ref<MetaDataDesc>>.new(0), SieveBenchConfig.blockSize, true);
+}
+
+// The anti-fallback check pwbench and pwsieve make: a file mapping reported as
+// a PMEM result would invert the comparison, and so would the mutant provider.
+def wiringError(got: BackendRegion) -> string {
+        if (got == null) return "the backend region could not be created";
+        match (SieveBenchConfig.backend) {
+                PMEM => if (!PmemMmapRegion.?(got)) return "pmem mode did not produce a PmemMmapRegion";
+                FILE => if (!FileMmapRegion.?(got)) return "file mode did not produce a FileMmapRegion";
+                DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) {
+                        return "direct mode did not produce a file-backed DirectIoRegion";
+                }
+        }
+        if (ElidedWritebackOperations.?(got.persistentOperations())) {
+                return "an elided-writeback provider is installed; this must be an ordinary build";
+        }
+        return null;
+}
+
+// An independent sieve of [0, limit), as pwsieve's: unrelated to PWSieve's own
+// segmented implementation.
+def referenceCount(limit: u64) -> u64 {
+        if (limit < 2u64) return 0;
+        def n = int.!(limit);
+        def composite = Array<bool>.new(n);
+        var count: u64 = 0;
+        for (p = 2; p < n; p++) {
+                if (composite[p]) continue;
+                count++;
+                if (p > n / p) continue;        // p*p is past the end (and would overflow)
+                var m = p * p;
+                while (m < n) {
+                        composite[m] = true;
+                        m += p;
+                }
+        }
+        return count;
+}
+
+// Removes this run's own region file when there is no image worth keeping:
+// the region could not be created, or it is not the backend asked for.
+def discardReserved() {
+        if (SieveBenchConfig.path != null && RegionFileIO.unlink(SieveBenchConfig.path)) {
+                SieveBenchConfig.path = null;
+        }
+}
+
+// One round: a fresh region, warm-up, every remaining step timed, then the
+// sieve verified with the timer off. Returns null, or why the round failed.
+def runRound(round: int, timer: StepTimer) -> string {
+        if (!SieveBenchConfig.reservePath(SieveBenchConfig.directory)) {
+                return "could not reserve a unique region file in the supplied directory";
+        }
+        def region = openRegion(timer);
+        if (region == null || region.backendRegion == null) {
+                discardReserved();
+                if (SieveBenchConfig.backend == SieveBenchBackend.PMEM) {
+                        return "PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
+                }
+                if (directBackend != null && directBackend.lastError != null) {
+                        return Strings.format1("DirectIoBackend.create failed: %s", directBackend.lastError);
+                }
+                return "could not create the region file";
+        }
+        def wiring = wiringError(region.backendRegion);
+        if (wiring != null) {
+                region.deallocate();
+                discardReserved();
+                return wiring;
+        }
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        sieve.onPhase = timer.onPhase;
+        if (!sieve.open()) {
+                region.deallocate();
+                return "PWSieve.open() failed on a fresh region";
+        }
+        def capacity = sieve.segmentCapacity();
+        if (u64.!(SieveBenchConfig.warmup) >= capacity) {
+                region.deallocate();
+                return Strings.format2("warmup %d leaves no step to measure; the descriptor table holds %d",
+                        SieveBenchConfig.warmup, capacity);
+        }
+        if (sieve.segmentSpan() * capacity > MAX_REFERENCE) {
+                region.deallocate();
+                return "the reference sieve for this geometry would exceed 64M integers; lower blockSize";
+        }
+        if (round == 0) {
+                Trace.OUT.put3("segment span %d integers, capacity %d segments, live segments %d",
+                        sieve.segmentSpan(), capacity, LIVE_SEGMENTS).ln();
+                Trace.OUT.put2("steps per round: warmup %d, measured %d",
+                        SieveBenchConfig.warmup, capacity - u64.!(SieveBenchConfig.warmup)).ln();
+        }
+        for (w < SieveBenchConfig.warmup) {
+                if (!sieve.step()) {
+                        region.deallocate();
+                        return "a warm-up step failed";
+                }
+        }
+
+        // Exactly the steps the descriptor table has left, so no measured call
+        // is the one that finds the table full.
+        def measured = capacity - sieve.numSegments();
+        def f0 = minorFaults();
+        def t0 = BenchClock.nanos();
+        timer.recording = true;
+        for (s = 0u64; s < measured; s++) {
+                def c0 = timer.startStep();
+                def ok = sieve.step();
+                def c1 = Target.rdtsc();
+                if (!ok) {
+                        timer.recording = false;
+                        region.deallocate();
+                        return Strings.format1("measured step %d failed (region full or a persistence failure)",
+                                sieve.numSegments());
+                }
+                timer.noteStep(c1 - c0);
+        }
+        timer.recording = false;
+        def t1 = BenchClock.nanos();
+        def f1 = minorFaults();
+        timer.wallNs += t1 - t0;
+        if (f0 >= 0 && f1 >= 0) timer.faults += f1 - f0;
+        else timer.faultsKnown = false;
+
+        def invariant = sieve.checkInvariants();
+        if (invariant != null) {
+                region.deallocate();
+                return Strings.format1("the sieve failed its invariants: %s", invariant);
+        }
+        def expected = referenceCount(sieve.cursor());
+        if (sieve.count() != expected) {
+                region.deallocate();
+                return Strings.format2("the sieve counted %d primes where the reference counts %d",
+                        sieve.count(), expected);
+        }
+        if (round == 0) {
+                Trace.OUT.put2("primes below %d: %d (reference sieve agrees)",
+                        sieve.cursor(), sieve.count()).ln();
+        }
+        region.deallocate();
+        if (!RegionFileIO.unlink(SieveBenchConfig.path)) return "could not remove the region file";
+        SieveBenchConfig.path = null;
+        return null;
+}
+
+def perStepX1000(total: long, steps: int) -> long {
+        if (steps <= 0) return 0;
+        return (1000L * total) / long.!(steps);
+}
+
+def report(timer: StepTimer) {
+        def sorted = Arrays.sort(timer.stepSamples.copy(), 0, timer.stepSamples.length, u64.<=);
+        def p = Percentiles.new(sorted);
+        def steps = timer.steps;
+        Trace.OUT.put1("steps measured %d", steps).ln();
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        if (steps > 0 && timer.wallNs > 0) {
+                Trace.OUT.put1("wall ns per step %d", timer.wallNs / long.!(steps)).ln();
+        }
+        // The same steps by rdtsc: agrees with the wall figure when the TSC
+        // calibration is right, and differs by the loop's own overhead.
+        if (steps > 0) {
+                Trace.OUT.put1("step ns: mean %d", BenchClock.cyclesToNanos(timer.stepCycles) / u64.!(steps)).ln();
+        }
+        Trace.OUT.put3("step ns: min %d median %d p90 %d",
+                BenchClock.cyclesToNanos(p.at(0)),
+                BenchClock.cyclesToNanos(p.at(50)),
+                BenchClock.cyclesToNanos(p.at(90))).ln();
+        Trace.OUT.put2("step ns: p99 %d max %d",
+                BenchClock.cyclesToNanos(p.at(99)),
+                BenchClock.cyclesToNanos(p.at(100))).ln();
+        // Means per step; the five sum to the step, less the call and return.
+        def names = ["compute", "alloc", "bitmap", "publish", "retire"];
+        for (i < PHASES) {
+                def ns = if(steps > 0, BenchClock.cyclesToNanos(timer.phaseCycles[i]) / u64.!(steps), 0u64);
+                Trace.OUT.put2("phase %s ns per step %d", names[i], ns).ln();
+        }
+        Trace.OUT.put1("boundaries per step x1000 %d", perStepX1000(timer.persistCalls, steps)).ln();
+        Trace.OUT.put1("prepare calls per step x1000 %d", perStepX1000(timer.prepareCalls, steps)).ln();
+        Trace.OUT.put1("clwb lines per step x1000 %d", perStepX1000(timer.clwbLines, steps)).ln();
+        if (timer.faultsKnown) Trace.OUT.put1("minor faults per step x1000 %d", perStepX1000(timer.faults, steps)).ln();
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var v: u64 = 0;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                v = v * 10u64 + u64.!(c - '0');
+        }
+        return v;
+}
+
+def parseWriteback(arg: string) -> bool {
+        if (arg == null || !Strings.startsWith(arg, "writeback=")) return false;
+        def name = Arrays.range(arg, 10, arg.length);
+        if (Strings.equal(name, SieveBenchWriteback.AUTO.arg)) SieveBenchConfig.writeback = SieveBenchWriteback.AUTO;
+        else if (Strings.equal(name, SieveBenchWriteback.CLWB.arg)) SieveBenchConfig.writeback = SieveBenchWriteback.CLWB;
+        else if (Strings.equal(name, SieveBenchWriteback.CLFLUSHOPT.arg)) SieveBenchConfig.writeback = SieveBenchWriteback.CLFLUSHOPT;
+        else if (Strings.equal(name, SieveBenchWriteback.NONE.arg)) SieveBenchConfig.writeback = SieveBenchWriteback.NONE;
+        else return false;
+        return true;
+}
+
+// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+def cpuidWriteback() -> string {
+        if (Target.supportsClwb()) return "CLWB";
+        if (Target.supportsClflushOpt()) return "CLFLUSHOPT";
+        if (Target.supportsClflush()) return "CLFLUSH";
+        return "nothing";
+}
+
+def usage() -> int {
+        System.puts("Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>]\n");
+        return 2;
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 2 || args[0] == null || args[0].length == 0) return usage();
+        // Rejected rather than defaulted: a file run reported as a PMEM one
+        // would invert the comparison this program exists to make.
+        if (Strings.equal(args[1], "pmem")) SieveBenchConfig.backend = SieveBenchBackend.PMEM;
+        else if (Strings.equal(args[1], "direct")) SieveBenchConfig.backend = SieveBenchBackend.DIRECT;
+        else if (!Strings.equal(args[1], "file")) {
+                System.puts("backend must be \"file\", \"pmem\" or \"direct\"\n");
+                return 2;
+        }
+        if (args.length > 2) SieveBenchConfig.rounds = int.!(parseU64(args[2], 20));
+        if (args.length > 3) SieveBenchConfig.warmup = int.!(parseU64(args[3], 8));
+        if (args.length > 4) SieveBenchConfig.blocks = parseU64(args[4], 256);
+        if (args.length > 5) SieveBenchConfig.blockSize = parseU64(args[5], 4096);
+        for (i = 6; i < args.length; i++) {
+                if (!parseWriteback(args[i])) {
+                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|none>\n");
+                        return 2;
+                }
+        }
+        if (SieveBenchConfig.writeback != SieveBenchWriteback.AUTO && SieveBenchConfig.backend != SieveBenchBackend.PMEM) {
+                System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        if ((SieveBenchConfig.writeback == SieveBenchWriteback.CLWB && !Target.supportsClwb()) ||
+                (SieveBenchConfig.writeback == SieveBenchWriteback.CLFLUSHOPT && !Target.supportsClflushOpt())) {
+                System.puts(SieveBenchConfig.writeback.label);
+                System.puts(" is not supported by this CPU\n");
+                return 2;
+        }
+        if (SieveBenchConfig.rounds < 1) {
+                System.puts("rounds must be positive\n");
+                return 2;
+        }
+        // The root, the live segments and one in flight, plus the header, the
+        // WAL and the metadata block, with room to spare.
+        if (SieveBenchConfig.blocks < 16) {
+                System.puts("blocks must be at least 16\n");
+                return 2;
+        }
+        SieveBenchConfig.directory = args[0];
+
+        BenchClock.calibrate();
+        Trace.OUT.put1("backend %s", SieveBenchConfig.backend.label).ln();
+        Trace.OUT.put1("directory %s", SieveBenchConfig.directory).ln();
+        if (SieveBenchConfig.backend == SieveBenchBackend.PMEM) {
+                Trace.OUT.put2("writeback %s, CPUID selects %s",
+                        SieveBenchConfig.writeback.label, cpuidWriteback()).ln();
+        }
+        Trace.OUT.put3("region %d blocks of %d bytes, rounds %d",
+                SieveBenchConfig.blocks, SieveBenchConfig.blockSize, SieveBenchConfig.rounds).ln();
+
+        def timer = StepTimer.new();
+        for (r < SieveBenchConfig.rounds) {
+                def err = runRound(r, timer);
+                if (err != null) return fail(err);
+        }
+        report(timer);
+        if (SieveBenchConfig.writeback == SieveBenchWriteback.NONE) {
+                System.puts("OK timing-only: writeback=none, the region was never durable\n");
+        } else {
+                System.puts("OK\n");
+        }
+        return 0;
+}

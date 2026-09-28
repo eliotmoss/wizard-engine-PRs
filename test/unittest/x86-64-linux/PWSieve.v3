@@ -32,6 +32,18 @@ component PWSieveConst {
         def MAGIC = 0x53_49_45_56_45_52_30_31u64;       // "SIEVER01"
 }
 
+// The phases of one step(), for a timing harness (test/pwsievebench.main.v3).
+// A mark charges the time since the previous one to the phase it names, so
+// COMPUTE is two stretches: sieving the segment, and counting it once the
+// bitmap is durable.
+enum PWSievePhase {
+        COMPUTE,        // sieve the segment in DRAM; count its primes
+        ALLOC,          // allocChunk(), its own commit
+        BITMAP,         // the direct bitmap stores and their persistRange()
+        PUBLISH,        // descriptor and root counters, one commit
+        RETIRE          // free the segment leaving the window, one commit (or none)
+}
+
 layout SieveRoot {
         +0      magic:          u64;    // identity, so a foreign root is rejected rather than parsed
         +8      cursor:         u64;    // every integer below this has been decided
@@ -64,6 +76,9 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
         private var basePrimes: Array<u64>;
         private var basePrimeLimit: u64;
         private var reclaimed: int;
+        // Called as each phase of step() ends; null except under the timing
+        // harness, so the crash loop and the tests run exactly as before.
+        var onPhase: PWSievePhase -> void;
 
         new() {
                 if (region != null && region.backendRegion != null) {
@@ -189,19 +204,23 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                 def hi = lo + span;
 
                 def bits = buildSegment(lo, hi);
+                if (onPhase != null) onPhase(PWSievePhase.COMPUTE);
 
                 def chunk = region.allocChunk(1u32);
                 if (chunk.isNull()) return false;
                 def chunkOffset = region.offsetInRegion(chunk.addr);
+                if (onPhase != null) onPhase(PWSievePhase.ALLOC);
 
                 // Durable before published. A crash between the allocation and
                 // the publishing commit below leaks this chunk -- it stays
                 // marked used with nothing naming it -- because allocChunk()
                 // commits on its own. A leak, not an inconsistency.
                 if (!writeBitmap(chunkOffset, bits)) return false;
+                if (onPhase != null) onPhase(PWSievePhase.BITMAP);
 
                 def primes = popcountBits(bits);
                 def highest = highestSetBit(bits, lo);
+                if (onPhase != null) onPhase(PWSievePhase.COMPUTE);
 
                 // One transaction publishes the descriptor and advances the
                 // root counters. The descriptor and the root are separate
@@ -215,8 +234,11 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                 rootPut(SieveRoot.count.offset, rootGet(SieveRoot.count.offset) + primes);
                 if (highest != 0) rootPut(SieveRoot.lastPrime.offset, highest);
                 if (!region.txn.commit()) return false;
+                if (onPhase != null) onPhase(PWSievePhase.PUBLISH);
 
-                return retire();
+                def retired = retire();
+                if (onPhase != null) onPhase(PWSievePhase.RETIRE);
+                return retired;
         }
 
         // Frees the bitmap chunks of segments that have fallen out of the

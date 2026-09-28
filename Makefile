@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsieve-direct pwsieve-direct-mutant pwsieve-device
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsievebench-pmem pwsieve-direct pwsieve-direct-mutant pwsieve-device
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -33,6 +33,7 @@ PMEMTEST_X86_64_LINUX=test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 te
 PWSIEVE_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsieve.main.v3
 PWREBOOT_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwreboot.main.v3
 PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbench.main.v3
+PWSIEVEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsievebench.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -202,6 +203,20 @@ pwbench-device: bin/pwbench.x86-64-linux
 
 bin/pwbench.x86-64-linux: $(ENGINE) $(PWBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwbench x86-64-linux
+
+# Sieve-step cost through the production allocator and WAL (scripts/pwsieve-bench.sh
+# runs the campaign). One PMEM run on the DAX mount; PWSIEVEBENCH_ARGS overrides
+# rounds, warmup and geometry.
+PWSIEVEBENCH_ARGS ?= 20 8 256 4096
+pwsievebench-pmem: bin/pwsievebench.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name your writable directory on the fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pwsievebench.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" pmem $(PWSIEVEBENCH_ARGS)
+
+bin/pwsievebench.x86-64-linux: $(ENGINE) $(PWSIEVEBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pwsievebench x86-64-linux
 
 # Stage 2c warm-reboot harness; driven by scripts/stage2c.sh, see
 # docs/stage2c-handoff.md.
