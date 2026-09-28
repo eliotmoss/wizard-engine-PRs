@@ -300,7 +300,10 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
                         }
                         timer.notePrepare(Target.rdtsc() - c1);
                         timer.clwbLines += pending.length;
-                        pending.clear();
+                        // Not clear(): that zeroes the whole backing array,
+                        // which format()'s region-wide writeback grows to
+                        // ~16k lines, and cost ~55 us per fence on Magpie.
+                        pending.resize(0);
                 }
                 def c0 = Target.rdtsc();
                 MmapRegionUtils.storeFence();
