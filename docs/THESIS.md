@@ -164,17 +164,29 @@ Two findings that arrived unplanned and are better material than the headline:
   compiled 64-bit divide, non-inlined vector calls); removing it cleared the
   file backend entirely and left 0.34 µs (1.5 %) at stride 64 and 24 entries,
   which is placement — writebacks issued back to back — not software.
+  **The eviction is Cascade Lake's; the mechanism is not (2026-09-28).** On
+  both core types of a Raptor Lake i7-14700KF, with DRAM standing in for PMEM,
+  `CLWB` does not evict: a re-load costs +12–14 ns after it against +53–54 ns
+  after `CLFLUSHOPT`. The same-line store is still 76–94 % of the per-entry
+  placement's writeback cost there (the stride-64 split), at ~21–30 ns per
+  store against ~775 ns on Magpie, so the batched apply is 7–8 % faster
+  instead of 43 %. Caveats: emulated media, so the price of a miss is DRAM's,
+  and one core of each type of a hybrid CPU.
   Worth a paragraph in Chapter 6: the same instruction, on the same media,
   costs 7 % or 43 % of a commit depending on where the protocol issues it and
   how the caller lays out its writes, which the abstraction neither shows nor
-  controls.
+  controls — and whether it evicts at all depends on the core it runs on.
 - **On PMEM the fence is not the cost — but the writebacks are (corrected
   2026-09-28).** The earlier form of this finding, "byte-at-a-time `zeroBytes`
   and `computeRecordChecksum` outweigh the durability boundary by 28×, so the
   WAL's protocol-level optimisation is optimising 3 % of the problem", counted
   only the cycles inside `rdtsc`-bracketed `CLWB` calls. `rdtsc` is not ordered
   with `CLWB`, and measured by removing them the writebacks cost 14 %, 36 % and
-  43 % of a commit at 1, 8 and 24 entries. `SFENCE` is still 11–13 ns, so
+  43 % of a commit at 1, 8 and 24 entries. Those are Cascade Lake's figures
+  with the per-entry placement, where `CLWB` evicts. The batched apply brings
+  them to 3.6 % at 24 entries there. On Raptor Lake, where `CLWB` does not
+  evict, the batched apply's writebacks cost at most 3.6 % at any size
+  (DRAM-emulated media). `SFENCE` is still 11–13 ns, so
   removing a *boundary* is still noise; what the protocol decides about *when*
   to write lines back is not.
 - **The headline ratio is size-dependent and must never be quoted bare.** Both

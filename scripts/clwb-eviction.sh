@@ -302,7 +302,12 @@ probe() {
 
 # Median over repetitions of each row's median, then the verdict: CLWB counts
 # as evicting when its re-access is closer to CLFLUSHOPT's than to no
-# writeback's. The raw rows are in probe.log for anyone who disagrees.
+# writeback's. A store row whose CLFLUSHOPT excess is under half the same
+# medium's load-row excess cannot tell the two apart: on Raptor Lake a store
+# after CLFLUSHOPT shows +33-56 cycles against a load's ~+180 (Magpie's store
+# rows show at least the load's), so it is labelled as not discriminating
+# rather than given the nearer neighbour. The raw rows are in probe.log for
+# anyone who disagrees.
 probe_summary() {
     awk '
         $2 == "load" || $2 == "store" { key = $1 " " $2; v[key " " $3] = v[key " " $3] " " $7; keys[key] = 1 }
@@ -317,7 +322,10 @@ probe_summary() {
                 a = med(v[k " none"]); b = med(v[k " clwb"]); c = med(v[k " clflushopt"])
                 d1 = b - a; d2 = c - b; if (d1 < 0) d1 = -d1; if (d2 < 0) d2 = -d2
                 verdict = (c - a < 20) ? "undecided (clflushopt is no slower than none)" : (d2 < d1 ? "EVICTED (clwb ~ clflushopt)" : "cached (clwb ~ none)")
-                split(k, kk, " "); printf "%-12s %8s %8s %11s   %s\n", kk[1] "/" kk[2], a, b, c, verdict }
+                split(k, kk, " ")
+                if (kk[2] == "load") miss[kk[1]] = c - a
+                else if ((kk[1] in miss) && 2 * (c - a) < miss[kk[1]]) verdict = "not discriminating (a store hides the miss; read the load row)"
+                printf "%-12s %8s %8s %11s   %s\n", kk[1] "/" kk[2], a, b, c, verdict }
         }' "$1"
 }
 

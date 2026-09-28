@@ -672,6 +672,161 @@ the re-dirtying-fault reading above — each `fdatasync` write-protects the
 dirtied pages and the next commit faults them back — without proving the faults
 are where the time goes.
 
+#### On Raptor Lake `CLWB` does not evict, and the same-line store is still the cost
+
+Measured 2026-09-28 on sean-tan-PC, an i7-14700KF (Raptor Lake: family 6,
+model 183, stepping 1, microcode 0x133), with the same script, geometry and
+protocol as on Magpie. Two differences bound what the result says:
+
+- **The media is DRAM.** `memmap=1G!8G` reserves DRAM as `/dev/pmem0`, with
+  ext4 `dax=always` on it, so a miss costs a DRAM access (~54 ns in the probe),
+  not an Optane one (~620 ns). This measures the CPU-side property — whether
+  `CLWB` keeps the line — and not what either outcome costs on real PMEM.
+- **The CPU is hybrid.** CPUs 0–15 are performance cores (`cpu_core`, Raptor
+  Cove) and 16–27 efficiency cores (`cpu_atom`, Gracemont). Each type was
+  measured on one core, CPU 2 and CPU 20 (`PWCLWB_CPUS`); CPU 20 shares its L2
+  with 21–23, which were idle.
+
+No counters (`perf_event_paranoid` is 4), governor `performance` except where
+noted. The load at each start was 0.17–0.23, or 0.59–0.65 for the sittings
+that began straight after another (the one-minute average of the benchmark just
+finished; the machine was otherwise idle). All directories are
+`results/20260928T<time>-sean-tan-PC-clwb-eviction-cpus<N>`:
+
+| Time | Core | Configurations | Repetitions |
+|---|---|---|---|
+| `075258Z` | P | stride 8: `CLWB`/`CLFLUSHOPT` × batched/per entry, no writeback, file | 3 |
+| `075458Z` | E | the same | 3 — too noisy to use, superseded |
+| `075906Z` | E | the same | 15 |
+| `083750Z` | P | the five PMEM configurations at strides 8 and 64 | 3 |
+| `083851Z` | E | the same | 15 |
+| `082812Z`, `082916Z` | P, E | replicate of the two above, under `powersave` after a reboot; in the E-core's last repetition the governor was changed (119 of 900 runs, excluded where used) | 3, 15 |
+
+Figures are medians with both commit counts pooled, each run being its own
+measured window: 6 samples per cell on the P-core, 30 on the E-core.
+
+**The probe: `CLWB` leaves the line within reach on both core types.** Median
+TSC cycles (3.417 GHz), three repetitions agreeing within ±2 cycles and across
+all five sittings. The DRAM and "PMEM" rows agree, as they must here:
+
+| | no writeback | `CLWB` | `CLFLUSHOPT` |
+|---|---|---|---|
+| P-core load / store | 33 / 50 | 73 / 77 | 216–219 / 83 |
+| E-core load / store | 63 / 61 | 111 / 97–99 | 243–244 / 117 |
+
+A load after `CLWB` costs +40 cycles (P) and +48 (E), about 12–14 ns; after
+`CLFLUSHOPT` it costs +183–186 and +180, a DRAM access. The line is neither
+held at hit cost nor evicted; where it is held cannot be told without counters.
+**The store row does not discriminate on these cores.** A store after
+`CLFLUSHOPT` shows only +33 (P) and +56 (E) cycles, a fraction of the load's
+miss, so its `EVICTED` label came from the nearest-neighbour rule, not from an
+eviction. Adding `LFENCE` after the store window's `MFENCE` (the SDM's
+`MFENCE; LFENCE` before `RDTSC`), tested on a scratch copy of the probe, shifts
+the row by a constant and leaves it otherwise unchanged, so the window is not
+closing early. A plausible reading is that these cores let a store become
+globally visible before its data arrives and Cascade Lake did not; that is
+untested. The summary now labels such a row "not discriminating".
+
+**The campaign agrees with the load row.** Stride 8, wall time per commit in
+ns; the percentage is the per-entry apply's excess over the batched one with
+the same instruction:
+
+| Entries | no writeback | `CLWB`, batched | `CLWB`, per entry | `CLFLUSHOPT`, batched | `CLFLUSHOPT`, per entry | `file` on DAX |
+|---|---|---|---|---|---|---|
+| P, 1 | 914 | 947 | 936 | 978 | 972 | 3,469 |
+| P, 8 | 2,075 | 2,118 | 2,270 (+7.2 %) | 2,108 | 2,667 (+26.5 %) | 4,632 |
+| P, 24 | 5,213 | 5,252 | 5,706 (+8.7 %) | 5,258 | 6,748 (+28.3 %) | 7,674 |
+| E, 1 | 1,922 | 1,962 | 1,962 | 1,991 | 1,984 | 5,820 |
+| E, 8 | 4,306 | 4,366 | 4,533 (+3.8 %) | 4,372 | 4,908 (+12.3 %) | 8,168 |
+| E, 24 | 10,606 | 10,474 | 11,230 (+7.2 %) | 10,678 | 12,290 (+15.1 %) | 14,490 |
+
+- **`CLWB` is not `CLFLUSHOPT` here.** On Magpie the two gave the same commit
+  to within 1–2 %. Here, per entry at 24 entries, `CLFLUSHOPT` costs 18 % (P)
+  and 9 % (E) more than `CLWB`: 52–53 ns per re-stored line on both cores, with
+  the same placement and writebacks, against the probe's 39–43 ns load
+  difference. On the P-core every cited difference separates all six samples
+  from all six (IQR ≤0.6 %).
+- **Neither prediction holds exactly.** "Keeps the line" predicted the
+  per-entry apply within a few percent of the batched one with `CLWB`; it is
+  7–9 % slower on the P-core and 4–7 % on the E-core. "Evicts" predicted `CLWB`
+  ≈ `CLFLUSHOPT`, which fails. `CLWB` costs about a third of `CLFLUSHOPT`'s
+  per-entry penalty (0.27–0.31 P, 0.31–0.47 E).
+- **The batched apply still pays, much less.** It is 8.0 % (P) and 6.7 % (E)
+  faster than the per-entry apply at 24 entries, against 43 % on Magpie; with
+  `CLFLUSHOPT` it would be 22 % and 13 %. Its writebacks cost at most 3.6 % of
+  a commit over no writeback on either core type (0.7 % at 24 entries on the
+  P-core), and under it the two instructions are indistinguishable at 8 and 24
+  entries.
+- At one entry `CLFLUSHOPT` is 3.3 % (P, six of six samples) and 1.5 % (E)
+  slower than `CLWB` in both placements. Unexplained.
+- The PMEM backend is faster than the file backend on DAX at every size on both
+  core types.
+
+**The E-core is noisier, and the noise is per run.** Every configuration, no
+writeback included, has a second mode about 10 % faster than its main one. It
+appears in single runs scattered through the campaign, not in bursts, with
+identical fault counts; its cause is not known. With three repetitions
+(`075458Z`) the per-entry apply even came out 3.9 % faster at 24 entries.
+Fifteen repetitions settle the ordering — no writeback ≈ batched with either
+instruction < `CLWB` per entry < `CLFLUSHOPT` per entry — and it holds within
+each mode. A rank test puts `CLFLUSHOPT` per entry above batched in 98–99 % of
+cross pairs, and `CLWB` per entry above batched in 77–84 %: real, but
+overlapping.
+
+**`CLWB`'s remaining per-entry cost is the same-line store, as on Magpie.** At
+stride 8 the per-entry apply differs from the batched one in two ways at once:
+20 of 24 after-image stores land in a line just written back (re-access), and
+the commit issues 38 writebacks instead of 18 (traffic). At stride 64 the
+per-entry apply keeps the 38 writebacks and has no re-access. So the excess
+over no writeback at stride 64 is the traffic, and the stride-8 excess minus
+the stride-64 one is the re-access. Same sitting (`083750Z`, `083851Z`), wall
+time per commit, 90 % bootstrap intervals:
+
+| `CLWB`, per entry | P, 8 entries | P, 24 | E, 8 | E, 24 † |
+|---|---|---|---|---|
+| excess over no writeback, stride 8 | +217 ns | +454 ns | +226 ns | +690 ns |
+| excess over no writeback, stride 64 (traffic) | +52 ns | +28 ns | +54 ns | +85 ns |
+| re-access per re-stored line (6 at 8 entries, 20 at 24) | 27.4 ns [24.4, 38.9] | 21.4 ns [17.2, 23.9] | 28.6 ns [24.8, 33.2] | 30.2 ns [26.7, 33.3] |
+| re-access share | 76 % | 94 % | 76 % | 88 % |
+
+† Upper quartile, not median: at 24 entries the E-core's medians sit on the
+boundary between its two modes, and the median estimate is uninformative
+(25.2 ns per line, [−9.5, 38.5]). The upper quartile lies in the main mode of
+every configuration. The `powersave` replicates agree: 26.8 and 22.5 ns per
+line on the P-core (medians), 31.2 and 29.0 ns on the E-core (upper quartile,
+runs before the governor change only). Stride alone moves no writeback by
+1.3 % (P) and 1.8 % (E) at 24 entries, which the subtraction removes.
+
+- The same-line store is 76–94 % of `CLWB`'s per-entry cost on both core
+  types, against ~95 % on Magpie; the writebacks themselves cost a few
+  nanoseconds each. The mechanism is the one found on Magpie. Its price per
+  store is ~21–30 ns here, against ~775 ns there.
+- A store right after its line's `CLWB` costs about twice the probe's fenced
+  re-load (21–30 against 12–14 ns). Magpie showed the same direction (775
+  against 620 ns), and the same untested reason fits both: the workload's store
+  follows the writeback by nanoseconds.
+- Where nothing coalesces (stride 64, 24 entries) the batched apply is 171 ns
+  (3.2 %) slower than per entry on the P-core, interval [111, 194]; Magpie
+  showed 0.34 µs (1.5 %). On the E-core it is 62 ns (0.6 %, [36, 80]) by the
+  upper quartile and inside the noise by the median.
+- For `CLFLUSHOPT`, stride 64 is not a traffic-only control: every line it
+  invalidates misses on the next commit. Per entry at stride 64 it costs +943
+  ns (P) and +869 ns (E) over no writeback at 24 entries, against +197 and +183
+  batched, so interleaving an invalidating writeback with each store costs
+  ~0.7 µs even without reuse within the commit. Mechanism untested.
+
+**What generalises.** Cascade Lake's eviction does not: on both Raptor Lake
+core types `CLWB` keeps the line out of memory. The mechanism does: storing
+into a line just written back is what the per-entry placement cost on both
+machines, and the batched apply removes it on both. What changes is the price.
+This machine cannot give that price for real PMEM on a CPU that retains the
+line. The line is retained here, so the store does not reach the medium, but
+whether the ~20–30 ns grows with Optane's writeback latency behind it is not
+measured. Under the batched apply the two instructions give the same commit
+here (Magpie never ran `CLFLUSHOPT` batched), so without the per-entry
+placement the campaign cannot discriminate eviction in the workload; the
+probe's load row can.
+
 ### Region size at fixed block size, and the NUMA penalty at 1 MiB
 
 Measured 2026-09-23 on Magpie, two campaigns back to back, 1, 8 and 24 entries,
