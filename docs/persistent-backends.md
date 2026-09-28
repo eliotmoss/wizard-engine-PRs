@@ -209,6 +209,11 @@ comparisons that follow.
 | 2 | `file` | DAX `/mnt/pmem0.0` | `fdatasync` | **927 µs local / 1,147 µs cross-socket** | 939–1,160 µs | 98.8 % |
 | 3 | `file` | ext4 on LVM, `/home` | `fdatasync` | **133–181 µs** (see caveat) | 188–240 µs | 71–86 % |
 
+**The PMEM boundary share is a timing-window figure (2026-09-28).** It counts
+the cycles inside `rdtsc`-bracketed `CLWB` calls, which is not what the
+writebacks cost the commit: at eight entries that is about 36 %, not 3.3 %. See
+[`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
+
 **Configuration 3 is not a disk (established 2026-09-27).** `/home` is LVM on
 `sda`, behind a MegaRAID SAS3508 that reports `write through`: `fdatasync`
 sends no flush, and the figure is the latency to the controller's
@@ -230,7 +235,10 @@ An `SFENCE` costs 11 ns, so the design note's claim holds. But on PMEM the
 boundary's *prepare* side — the `CLWB` loop, 14 cache lines per commit at eight
 entries — costs about 20.4 M cycles against the fence's 0.52 M, **39× more**.
 The expensive half of a PMEM boundary is the cache-line writeback, not the
-fence. The note is correct and argues for the wrong reason.
+fence. The note is correct and argues for the wrong reason. (2026-09-28: the
+writeback costs the commit far more than these prepare cycles, and most of it
+lands outside the timed window; see
+[`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).)
 
 ### Isolating the two variables
 
@@ -314,7 +322,8 @@ rejects two of them:
 
 The arithmetic agrees: 927 µs over 32,768 lines is 28.3 ns, or 65 cycles, per
 line, against 72.0–73.5 cycles per line for the user-space `CLWB` loop measured
-on the PMEM backend. The mechanism also accounts for the earlier findings that
+on the PMEM backend (an in-window figure rather than a cost, as established
+later; the order of magnitude is what the comparison needs). The mechanism also accounts for the earlier findings that
 had no explanation: the cost is **flat in transaction size** because the flush
 is the whole entry whatever was written, and the NUMA penalty is a **constant
 +24 % at every transaction size** because every `fdatasync` runs the same
@@ -412,18 +421,107 @@ commit than the PMEM backend, against 71× at 2 MiB, and at 24 entries it is
 commit costs 4.3, 13.0 and 36.1 µs at 1, 8 and 24 entries, against 7.4, 12.0 and
 23.8 µs for the file backend at 1 MiB. That is about 1.44 µs per entry against
 0.74 µs, on the same media, for the same record-construction code. What makes
-the PMEM backend's non-boundary work grow twice as fast is **not established**.
-One candidate: on this CPU generation (Cascade Lake), `CLWB` is reported to
-evict the line it writes back, so the next commit's writes to the same WAL and
-scratch lines would miss to PMEM. That is untested, and the per-entry numbers
-do not fit it cleanly. The file backend's extra fixed ~3 µs at one entry is
-consistent with re-dirtying write faults after each `fdatasync` write-protects
-the pages, also untested.
+the PMEM backend's non-boundary work grow twice as fast was **not established**
+when this was written. It is now, in part: the PMEM backend's own writebacks
+account for the whole gap, because `CLWB` evicts on Cascade Lake; see
+[below](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
+The candidate first recorded here — that the *next* commit's writes miss — is
+not supported. The file backend's extra fixed ~3 µs at one entry is consistent
+with re-dirtying write faults after each `fdatasync` write-protects the pages;
+the fault counts below now support that.
 
 This refines the earlier "record construction outweighs the boundary by 29×"
 finding: record construction dominates the PMEM commit, but above about eight
 entries part of that cost is specific to the PMEM backend, because the file
-backend runs the same construction code faster.
+backend runs the same construction code faster. (The 29× itself is superseded
+by the section below.)
+
+### `CLWB` evicts on Cascade Lake, and the writebacks cost far more than the boundary shows
+
+Measured 2026-09-28 on Magpie (`results/20260928T001505Z-magpie-clwb-eviction`,
+`scripts/clwb-eviction.sh`), pinned to node 0, 1 MiB region (512 × 2048), 1, 8
+and 24 entries, three repetitions interleaved, each at 20,000 and 120,000
+commits. **There are no hardware counters**: `perf_event_paranoid` is 4 and
+the experiment has no root, so every conclusion here rests on timing. The
+campaign script's writeback-label check rejected all 18 `pmem-clflushopt` runs
+by comparing `clflushopt` against the label `CLFLUSHOPT`. The runs themselves
+are valid; `runs.csv` was rebuilt from the logs (`runs.csv.orig` is the
+campaign's own) and the check is fixed.
+
+**`CLWB` evicts the line it writes back.** `scripts/clwbprobe.c`, which is
+independent of the engine, dirties a line, writes it back, fences, and times
+one re-access. Median TSC cycles, three repetitions agreeing within ~4 %:
+
+| | no writeback | `CLWB` | `CLFLUSHOPT` |
+|---|---|---|---|
+| DRAM load / store | 48 / 48 | 176 / 256 | 176 / 256 |
+| PMEM load / store | 32 / 48 | 1,426 / 1,442 | 1,424 / 1,448 |
+
+A line re-accessed after `CLWB` misses exactly as it does after `CLFLUSHOPT`,
+which always invalidates: about 620 ns on PMEM.
+
+**The writebacks account for the whole per-entry gap.** pwbench's
+`writeback=` argument changes the instruction inside the timing provider;
+`none` issues no writeback (timing only, never durable). Wall time per commit,
+median of three:
+
+| Entries | `pmem`, `CLWB` | `pmem`, `CLFLUSHOPT` | `pmem`, no writeback | `file` on DAX |
+|---|---|---|---|---|
+| 1 | 4,414 ns | 4,359 ns | 3,803 ns | 12,586 ns |
+| 8 | 13,444 ns | 13,234 ns | 8,661 ns | 17,229 ns |
+| 24 | 37,617 ns | 37,258 ns | 21,331 ns | 29,243 ns |
+| slope per entry | 1,444 ns | 1,430 ns | 762 ns | 724 ns |
+
+`CLFLUSHOPT` in place of `CLWB` changes the commit by 1–2 %. Removing the
+writebacks takes the slope from 1,444 to 762 ns per entry, the file backend's
+rate: the writebacks cost **681 ns per entry**, about one PMEM miss each. This
+reproduces the 1.44 against 0.74 µs finding above and accounts for it.
+
+**The candidate as first stated is not supported.** It said the *next*
+commit's writes miss because the lines were evicted. The file backend's lines
+are written back between commits too — `fdatasync` on DAX writes back each
+dirty page, with `CLWB` on x86 — yet its slope equals the no-writeback slope,
+so a miss on the next commit's stores costs next to nothing per entry
+(plausibly because the record is written sequentially and the prefetchers
+cover it). What the PMEM backend does and the file backend does not is write
+back *within* the commit: `DualTxnWal.applyUpdate()` stores one after-image and
+immediately prepares its line, which on PMEM is a `CLWB`, and pwbench's entries
+are consecutive u64s. So seven of every eight after-image stores land in a line
+the previous entry's writeback has just evicted, a miss nothing can prefetch.
+That fits the magnitude but is **untested**. The per-entry excess also grows,
+from ~600 to ~750 ns between 8 and 24 entries, which a count of such misses does
+not predict, and removing the writebacks also removes their write traffic to
+Optane. The script's follow-up configurations separate these: `stride=64` puts
+each entry on its own line (the same writebacks, no same-line store after one),
+and `writeback=deferred` writes each distinct line back once, just before the
+fence, which leaves durability unchanged.
+
+**The boundary figures on this page do not measure what the writebacks cost.**
+Each writeback is bracketed with `rdtsc`, which is not ordered with `CLWB`, so
+the prepare cycles are what lands inside the window, not the instruction's cost
+to the commit. At 24 entries the same commit reports 1,222 ns of boundary with
+`CLWB`, 437 ns with `CLFLUSHOPT`, and 369 ns with no writeback at all — the loop
+and `rdtsc` overhead — while the wall times are 37.6, 37.3 and 21.3 µs. Per line
+inside the window that is 73, 26 and 21 cycles. The writebacks' cost is the
+wall-time difference from no writeback: **14 %, 36 % and 43 % of the commit** at
+1, 8 and 24 entries, against a measured boundary share of 3.2 %. Consequently:
+
+- "`CLWB` linear at 72.0–73.5 cycles per line" still reproduces, but it is an
+  in-window figure, not a cost.
+- "The boundary is ~3 % of a PMEM commit" and "record construction outweighs the
+  boundary by 29×" are **superseded**. At eight entries the commit without
+  writebacks is 64 % of the commit with them; the writebacks and their side
+  effects are the other 36 %.
+- The fence is unaffected: `SFENCE` is 11–13 ns, and removing a boundary on PMEM
+  is still noise. What is not noise is how the after-images are written back.
+
+**The file backend's fixed cost has a measured candidate.** pwbench counts minor
+faults over the measured commits: 2.01–2.24 per commit for the file backend on
+DAX, 0.014 for PMEM. The file backend's extra fixed cost at one entry, 7.4
+against 3.8 µs outside the boundary, is about 1.8 µs per fault. That supports
+the re-dirtying-fault reading above — each `fdatasync` write-protects the
+dirtied pages and the next commit faults them back — without proving the faults
+are where the time goes.
 
 ### Region size at fixed block size, and the NUMA penalty at 1 MiB
 
@@ -527,6 +625,14 @@ boundary, **record construction outweighs the entire durability boundary by
 29×**. Optimising the boundary further on PMEM would be effort spent on 3 % of
 the cost; the byte-at-a-time loops are where the time goes. That is a
 consequence of the measurement, not a planned change.
+
+**Correction (2026-09-28).** The 3 % and the 29× count only the cycles inside
+`rdtsc`-bracketed `CLWB` calls. Measured by removing the writebacks, they cost
+14–43 % of a PMEM commit at 1–24 entries (36 % at eight), because on Cascade
+Lake `CLWB` evicts the line and the after-image loop stores into lines it has
+just written back. The fence is still cheap and a boundary is still noise; the
+writebacks are not. See
+[`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
 
 ### Reproducing these numbers
 
@@ -763,7 +869,11 @@ Two clean results:
   much it is fencing.
 - **`CLWB` is linear**, at **72.0–73.5 cycles (~31.6 ns) per cache line** across
   a 21× range in line count and all 24 PMEM runs. The whole PMEM boundary therefore scales with the
-  record, and it scales entirely through its prepare side.
+  record, and it scales entirely through its prepare side. **Caveat
+  (2026-09-28):** this is what lands inside the `rdtsc` window, not what a
+  `CLWB` costs the commit. `CLFLUSHOPT` measures 26 cycles per line in the same
+  window, and an empty loop 21, for the same wall time as `CLWB`; see
+  [`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
 
 The line count is exactly predictable. A record is a 64-byte header, a 48-byte
 trailer and one 32-byte `LogEntry` per buffered write, aligned up to 64, and
@@ -778,6 +888,8 @@ PMEM runs exactly.
 
 Boundary share stays between 2.9 % and 3.4 % at every size, because record
 construction scales with record length for the same reason the `CLWB` loop does.
+(As an in-window share it understates the writebacks tenfold at eight entries;
+see the caveat above.)
 
 ### `fdatasync` is flat too, so the headline ratio is size-dependent
 
@@ -832,9 +944,11 @@ the two media — whole-commit cost per entry:
 Batching 1 → 56 entries is worth **60× on a file over DAX, 35× over block
 storage, and 2.9× on PMEM**, and on PMEM it has essentially plateaued by eight
 entries. The reason is structural: on a file the flat boundary is most of the
-commit and divides down across entries, while on PMEM the boundary is ~3 % and
-both it and record construction scale with the record, so there is little fixed
-cost left to amortise.
+commit and divides down across entries, while on PMEM the boundary is ~3 % (as
+measured inside the timing window; the writebacks' real cost is larger, see
+[`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows))
+and both it and record construction scale with the record, so there is little
+fixed cost left to amortise.
 
 An earlier note here speculated that the optimal transaction size would run in
 *opposite* directions on the two media. The measurement does not support that
@@ -862,7 +976,7 @@ one medium is not wrong on the other, merely pointless.
 - What *has* reproduced, across all 381 runs in `results/`: exactly 1.000
   boundaries per commit, `SFENCE` at 11–13 ns, the DAX boundary primitives flat
   in transaction size at every geometry, `CLWB` linear at 72.0–73.5 cycles per
-  line, `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size, the
+  line inside the timing window, `lines/commit = ceil((112 + 32n)/64) + n` exactly at every size, the
   socket-local 2 MiB `fdatasync`-on-DAX figure to within 0.2 % once pinned, the
   1 MiB figure at ~5.0 µs across three campaigns and both 1 MiB geometries, and
   the PMEM boundary identical on both sockets.
@@ -873,14 +987,19 @@ one medium is not wrong on the other, merely pointless.
   yet observed in the kernel (`fs_dax:dax_writeback_one`, needs root). Every
   configuration-2 figure is specific to regions mapped with 2 MiB entries unless
   a 1 MiB region is named.
-- **Unexplained:** what selects the block configuration's regime at 2 MiB, and
-  why the PMEM backend's non-boundary commit work grows at about twice the file
-  backend's rate per entry. The block configuration's apparent 8–14 % geometry
-  effect is withdrawn: the sign reversed when the 2 MiB figure changed regime.
+- **Unexplained:** what selects the block configuration's regime at 2 MiB. The
+  PMEM backend's faster per-entry growth is now attributed to its writebacks
+  (`CLWB` evicts on Cascade Lake, 2026-09-28), but which of their effects costs
+  the time — stores into just-evicted lines within the commit, or write traffic
+  — is not yet separated, and there are no hardware counters to say. The block
+  configuration's apparent 8–14 % geometry effect is withdrawn: the sign
+  reversed when the 2 MiB figure changed regime.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
   `CLOCK_MONOTONIC` (2294 cycles/µs on every run here). There is no invariant-TSC
   check in the tree, so that conversion is an assumption, stated rather than
-  hidden.
+  hidden. `rdtsc` is also not ordered with `CLWB`, so a timed writeback reports
+  what lands inside its window, not what it costs; only wall-time differences
+  measure the writebacks (2026-09-28).
 - The absolute `fdatasync` figures are properties of this host's storage stack,
   not of the design. The ratios are the portable result.
 

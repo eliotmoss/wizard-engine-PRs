@@ -139,13 +139,28 @@ Two findings that arrived unplanned and are better material than the headline:
   small.** At 1 MiB and 24 entries the file backend on DAX commits *faster*
   than the PMEM backend (28.9 µs against 37.3 µs), because the PMEM backend's
   non-boundary work grows about twice as fast per entry on the same media and
-  the same record-construction code. The cause is not established; a candidate
-  is `CLWB` evicting the written-back lines on Cascade Lake. Worth a paragraph
-  in Chapter 6 as an open finding, not a claim.
-- **On PMEM the boundary is not the cost.** Byte-at-a-time `zeroBytes` and
-  `computeRecordChecksum` outweigh the entire durability boundary by 28×, so the
-  protocol-level optimisation the WAL is built around is, on that medium,
-  optimising 3 % of the problem.
+  the same record-construction code. **Cause found in part (2026-09-28):** on
+  Cascade Lake `CLWB` evicts the line exactly as `CLFLUSHOPT` does (probe:
+  ~620 ns re-access on PMEM after either), and removing the PMEM backend's
+  writebacks brings its slope from 1,444 to 762 ns per entry, the file
+  backend's 724. The first candidate, misses on the *next* commit, is not
+  supported: the file backend's lines are written back between commits too and
+  it pays nothing per entry. The likely mechanism is within the commit — each
+  after-image is written back as soon as it is stored, so the next entry's
+  store into the same line misses — but that is untested (no hardware counters
+  without root; a stride-64 and a deferred-writeback campaign would test it).
+  Worth a paragraph in Chapter 6: the same instruction, on the same media,
+  costs a third of a commit or nothing depending on where the protocol issues
+  it, which the abstraction neither shows nor controls.
+- **On PMEM the fence is not the cost — but the writebacks are (corrected
+  2026-09-28).** The earlier form of this finding, "byte-at-a-time `zeroBytes`
+  and `computeRecordChecksum` outweigh the durability boundary by 28×, so the
+  WAL's protocol-level optimisation is optimising 3 % of the problem", counted
+  only the cycles inside `rdtsc`-bracketed `CLWB` calls. `rdtsc` is not ordered
+  with `CLWB`, and measured by removing them the writebacks cost 14 %, 36 % and
+  43 % of a commit at 1, 8 and 24 entries. `SFENCE` is still 11–13 ns, so
+  removing a *boundary* is still noise; what the protocol decides about *when*
+  to write lines back is not.
 - **The headline ratio is size-dependent and must never be quoted bare.** Both
   boundary primitives are flat in transaction size; only PMEM's `CLWB` loop
   scales, which moves the gap from ~6,700× at one entry to ~340× at fifty-six.
@@ -297,7 +312,7 @@ cannot be written around missing numbers.
 | Item | Estimate | Why it survives triage |
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
-| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29×, `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
+| ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29× (**corrected 2026-09-28**: an in-window figure; the writebacks cost 14–43 % of a commit once `CLWB`'s eviction on Cascade Lake is counted), `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
 | File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
 | ~~Third backend: direct I/O~~ | done 2026-09-24, hardware 2026-09-27 | **Added after the plan, before the freeze.** `DirectIoRegion`: private staging buffer, `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a file or a raw block device. Same trace as the PMEM backend; every post-`fdatasync` file image checked exactly against the PMEM model; kill-loop mutant `LOST` / ordinary `OK` on Magpie and the PC; and the finding that Magpie's block storage is a write-through RAID controller, so every `file-block` figure is a controller round trip. See "Where the persistence point is" above. |
 | ~~Stage 2c — reserved-DRAM warm reboot~~ | done 2026-09-24 | **Complete, the experiment discriminates.** Ordinary build `SURVIVED` and mutant `LOST` (every acknowledged step) in 3 of 3 pairs, with the reset issued from inside the process. On the way, two host facts that the write-up needs: the firmware wipes RAM after a `sysrq` reset unless the kernel's memory-overwrite request is cleared, and a seconds-long window before the reset lets every unflushed line reach memory. |

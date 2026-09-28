@@ -14,13 +14,28 @@
 #   scripts/clwb-eviction.sh all        probe, then campaign, in one directory
 #   scripts/clwb-eviction.sh summary <results-dir>
 #                                       recompute the summary from a finished run
+#   scripts/clwb-eviction.sh rebuild <results-dir>
+#                                       re-derive runs.csv from the run logs (and
+#                                       .perf files), then the summary; the old
+#                                       runs.csv is kept as runs.csv.orig
 #
 # Campaign configurations, all on the DAX mount (PWASM_PMEM_TEST_DIR):
 #
 #   pmem-auto        the production path (CPUID selects CLWB on Cascade Lake)
 #   pmem-clflushopt  the same, with CLFLUSHOPT, which always invalidates
+#   pmem-deferred    each distinct line written back once, at the next fence
+#                    (durability unchanged): no entry stores into a line the
+#                    previous entry's writeback just evicted
 #   pmem-none        no writeback at all -- timing only, never durable
 #   file-dax         the file backend; its fdatasync writes back in the kernel
+#   <config>-s64     any of the above with one entry per cache line (pwbench
+#                    stride=64): the same writebacks, no same-line store after one
+#
+# The first campaign (results/20260928T001505Z-magpie-clwb-eviction) ran
+# "pmem-auto pmem-clflushopt pmem-none file-dax" and established that CLWB
+# evicts and that the writebacks account for the whole per-entry gap. The
+# default is now the follow-up, which asks whether the cost is the store into a
+# just-evicted line within the commit (see the reading guide in the summary).
 #
 # Every configuration runs at two commit counts, and a perf counter's value per
 # commit is the difference between the two runs divided by the difference in
@@ -37,7 +52,7 @@
 # Overrides: PWASM_PMEM_TEST_DIR (required), PWCLWB_REPS (3), PWCLWB_SIZES
 # ("1 8 24"), PWCLWB_GEOMETRY (512x2048, the geometry of the finding),
 # PWCLWB_COMMITS ("20000 120000"), PWCLWB_WARMUP (2000), PWCLWB_CONFIGS (all
-# four), PWCLWB_NUMA_NODE (auto | none | <n>), PWCLWB_OUT (results/<stamp>-
+# the follow-up set), PWCLWB_NUMA_NODE (auto | none | <n>), PWCLWB_OUT (results/<stamp>-
 # <host>-clwb-eviction), PWCLWB_ALLOW_DIRTY (0), PWCLWB_CC (cc), PWCLWB_EVENTS
 # (a comma-separated perf event list replacing the discovered one).
 
@@ -51,7 +66,7 @@ SIZES="${PWCLWB_SIZES:-1 8 24}"
 GEOMETRY="${PWCLWB_GEOMETRY:-512x2048}"
 COMMITS="${PWCLWB_COMMITS:-20000 120000}"
 WARMUP="${PWCLWB_WARMUP:-2000}"
-CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-clflushopt pmem-none file-dax}"
+CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-deferred pmem-none file-dax pmem-auto-s64 pmem-deferred-s64 pmem-none-s64 file-dax-s64}"
 CC_BIN="${PWCLWB_CC:-cc}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${PWCLWB_OUT:-$REPO/results/$STAMP-$(hostname -s)-clwb-eviction}"
@@ -235,14 +250,15 @@ probe_summary() {
 
 # ------------------------------------------------------------ 2+3. campaign
 
-config_args() {         # config -> "<backend> [writeback=...]"
-    case "$1" in
-        pmem-auto)       echo "pmem writeback=auto" ;;
-        pmem-clwb)       echo "pmem writeback=clwb" ;;
-        pmem-clflushopt) echo "pmem writeback=clflushopt" ;;
-        pmem-clflush)    echo "pmem writeback=clflush" ;;
-        pmem-none)       echo "pmem writeback=none" ;;
-        file-dax)        echo "file" ;;
+# config -> "<backend> stride=<n> [writeback=...]". A trailing -s<n> sets the
+# stride; without one it is pwbench's default of 8, one u64 after another.
+config_args() {
+    local base=$1 stride=8
+    if [[ "$base" =~ ^(.*)-s([0-9]+)$ ]]; then base=${BASH_REMATCH[1]}; stride=${BASH_REMATCH[2]}; fi
+    case "$base" in
+        pmem-auto|pmem-clwb|pmem-clflushopt|pmem-clflush|pmem-deferred|pmem-none)
+                  echo "pmem stride=$stride writeback=${base#pmem-}" ;;
+        file-dax) echo "file stride=$stride" ;;
         *) die "unknown configuration: $1" ;;
     esac
 }
@@ -285,10 +301,8 @@ run_one() {
     local config=$1 entries=$2 commits=$3 rep=$4 blocks=${GEOMETRY%%x*} bs=${GEOMETRY#*x}
     local log="$OUT/run-$config-e$entries-c$commits-r$rep.log" perf_out="$OUT/run-$config-e$entries-c$commits-r$rep.perf"
     local args; read -r -a args <<< "$(config_args "$config")"
-    local backend=${args[0]} wb=${args[1]:-}
     local load; load=$(loadavg | cut -d' ' -f1)
-    local cmd=("$BENCH_BIN" "$PWASM_PMEM_TEST_DIR" "$backend" "$commits" "$entries" "$WARMUP" "$bs" "$blocks")
-    [ -n "$wb" ] && cmd+=("$wb")
+    local cmd=("$BENCH_BIN" "$PWASM_PMEM_TEST_DIR" "${args[0]}" "$commits" "$entries" "$WARMUP" "$bs" "$blocks" "${args[@]:1}")
     say "  $config entries=$entries commits=$commits rep=$rep"
     if [ "$PERF_OK" = 1 ]; then
         "${PIN_BENCH[@]}" perf stat -x, -e "$EVENTS" -o "$perf_out" -- "${cmd[@]}" > "$log" 2>&1 ||
@@ -296,20 +310,40 @@ run_one() {
     else
         "${PIN_BENCH[@]}" "${cmd[@]}" > "$log" 2>&1 || { warn "    FAILED -- see $log"; tail -3 "$log" >&2; return 1; }
     fi
-    # pmem-none ends on its own labelled line, never a bare OK; accept exactly
-    # the line its configuration must produce.
+    record_run "$config" "$entries" "$commits" "$rep" "$load" "$log" "$perf_out"
+}
+
+# Check one finished run's log against what its configuration must produce and
+# append its row. Shared by the campaign and by rebuild, so a rebuilt runs.csv
+# applies exactly the checks a fresh one does.
+record_run() {
+    local config=$1 entries=$2 commits=$3 rep=$4 load=$5 log=$6 perf_out=$7
+    local args; read -r -a args <<< "$(config_args "$config")"
+    local stride=${args[1]#stride=} wb=${args[2]:-}
+    # writeback=none ends on its own labelled line, never a bare OK; accept
+    # exactly the line its configuration must produce.
     local want='^OK$'
-    [ "$config" = pmem-none ] && want='^OK timing-only: writeback=none'
+    [ "$wb" = writeback=none ] && want='^OK timing-only: writeback=none'
     grep -qE "$want" "$log" || { warn "    no expected final line in $log"; return 1; }
-    case "$config" in
-        pmem-*) grep -q "^writeback ${wb#writeback=}" "$log" || { warn "    $log does not name writeback ${wb#writeback=}"; return 1; } ;;
-    esac
+    # pwbench prints the instruction's label (CLFLUSHOPT), not the argument
+    # (clflushopt): match case-insensitively, up to the label's end, so clflush
+    # cannot pass for CLFLUSHOPT.
+    if [ -n "$wb" ]; then
+        grep -qiE "^writeback ${wb#writeback=}([ ,]|$)" "$log" ||
+            { warn "    $log does not name writeback ${wb#writeback=}"; return 1; }
+    fi
+    # Logs from before stride= existed name no stride; they ran at 8.
+    if grep -q '^entry stride' "$log"; then
+        grep -q "^entry stride $stride bytes" "$log" || { warn "    $log does not name stride $stride"; return 1; }
+    elif [ "$stride" != 8 ]; then
+        warn "    $log names no stride but $config needs $stride"; return 1
+    fi
 
     local bench; bench=$(parse_bench "$log")
     [[ "$bench" != *,,* && "$bench" != ,* && "$bench" != *, ]] ||
         { warn "    could not parse $log -- pwbench's output format has moved: $bench"; return 1; }
     local events=
-    if [ "$PERF_OK" = 1 ]; then
+    if [ -f "$perf_out" ]; then
         events=$(parse_perf "$perf_out") ||
             { warn "    unusable counters in $perf_out: $events"
               warn "    (multiplexed: set PWCLWB_EVENTS to fewer events, or ask for the NMI watchdog to be off)"; return 1; }
@@ -346,6 +380,35 @@ campaign() {
     printf 'finished %s\nload     %s\n' "$(date -uIseconds)" "$(loadavg)" >> "$OUT/provenance.txt"
     campaign_summary "$OUT" | tee "$OUT/campaign-summary.txt"
     [ "$failures" -eq 0 ] || die "$failures run(s) failed; the logs are retained in $OUT"
+}
+
+# Re-derive runs.csv from a finished directory's logs. The load average is not
+# in the logs, so it is carried over from the old runs.csv where that has the
+# row, and written as NA where it does not.
+rebuild() {
+    local dir=$1 f name config entries commits rep load
+    [ -d "$dir" ] || die "not a directory: $dir"
+    ls "$dir"/run-*.log >/dev/null 2>&1 || die "no run logs in $dir"
+    [ -f "$dir/runs.csv" ] && [ ! -f "$dir/runs.csv.orig" ] && cp "$dir/runs.csv" "$dir/runs.csv.orig"
+    OUT=$dir
+    csv_header
+    local failures=0
+    for f in "$dir"/run-*.log; do
+        name=${f##*/run-}; name=${name%.log}
+        [[ "$name" =~ ^(.+)-e([0-9]+)-c([0-9]+)-r([0-9]+)$ ]] ||
+            { warn "    unrecognised log name: $f"; failures=$((failures + 1)); continue; }
+        config=${BASH_REMATCH[1]} entries=${BASH_REMATCH[2]} commits=${BASH_REMATCH[3]} rep=${BASH_REMATCH[4]}
+        load=NA
+        [ -f "$dir/runs.csv.orig" ] && load=$(awk -F, -v k="$config,$entries,$commits,$rep" \
+            'index($0, k ",") == 1 { print $13; exit }' "$dir/runs.csv.orig")
+        record_run "$config" "$entries" "$commits" "$rep" "${load:-NA}" "$f" "${f%.log}.perf" ||
+            failures=$((failures + 1))
+    done
+    say "rebuilt $CSV from $(ls "$dir"/run-*.log | wc -l | tr -d ' ') logs ($failures rejected)"
+    [ -f "$dir/provenance.txt" ] && printf 'rebuilt  %s from the run logs by scripts/clwb-eviction.sh at %s; runs.csv.orig is the campaign'"'"'s own\n' \
+        "$(date -uIseconds)" "$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)" >> "$dir/provenance.txt"
+    campaign_summary "$dir" | tee "$dir/campaign-summary.txt"
+    [ "$failures" -eq 0 ] || die "$failures log(s) rejected; see the messages above"
 }
 
 # Per configuration and size, the median over repetitions of:
@@ -404,7 +467,8 @@ campaign_summary() {
                 for (x = 1; x <= nv; x++) printf " %12.3f", (V[cfg, e1, x] - V[cfg, e0, x]) / d; printf "\n" }
             if (nv == 0) print "\n(no perf counters in this run: only the timing half of steps 2+3 is available)"
         }' "$dir/runs.csv"
-    cat <<'EOF'
+    local cfgs; cfgs=$(awk -F, 'NR > 1 { print $1 }' "$dir/runs.csv" | sort -u | tr '\n' ' ')
+    if [[ " $cfgs" == *" pmem-clflushopt "* ]]; then cat <<'EOF'
 
 ---- how to read it (docs/persistent-backends.md: outside-slope ~1440 ns/entry pmem, ~740 file)
  A. pmem-clflushopt ~ pmem-auto in every column  -> CLWB behaves as an evicting
@@ -417,6 +481,25 @@ campaign_summary() {
     with CLWB too), so eviction cannot be what separates them, even if B holds.
  Eviction explains the gap only if A, B and not-C all hold.
 EOF
+    fi
+    if [[ " $cfgs" == *" pmem-deferred"* || " $cfgs" == *"-s64 "* ]]; then cat <<'EOF'
+
+---- how to read the follow-up (first campaign: pmem-auto ~1440 ns/entry, pmem-none ~760, file-dax ~720)
+ D. pmem-auto-s64 ~ pmem-none-s64 (slope): with every entry on its own line the
+    writebacks are the same in number (compare "lines") but no store lands in a
+    line just written back, and the excess is gone -> the cost is the store into
+    a just-evicted line within the commit. If pmem-auto-s64 stays well above
+    pmem-none-s64, the cost is per writeback (write traffic) or the next
+    commit's misses, not the same-line store.
+ E. pmem-deferred ~ pmem-none (slope) at stride 8 -> writing each line back once
+    at the fence removes the cost; a candidate production change (durability is
+    unchanged: every writeback still precedes its fence). Its "lines" is lower
+    than pmem-auto's because each distinct line is written back once, so E alone
+    cannot separate "fewer writebacks" from "no same-line store after one": D can.
+ F. pmem-deferred-s64 ~ pmem-auto-s64 -> where in the commit the writebacks are
+    issued does not matter once no same-line store follows one.
+EOF
+    fi
 }
 
 # ------------------------------------------------------------ doctor
@@ -461,6 +544,8 @@ case "${1:-doctor}" in
     probe)    probe ;;
     campaign) campaign ;;
     all)      probe; campaign ;;
+    rebuild)  [ -n "${2:-}" ] || die "rebuild needs a results directory"
+              rebuild "$2" ;;
     summary)  [ -n "${2:-}" ] || die "summary needs a results directory"
               { [ -f "$2/probe.log" ] && probe_summary "$2/probe.log"; } || true
               campaign_summary "$2" ;;

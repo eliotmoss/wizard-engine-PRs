@@ -35,3 +35,4 @@ warmup 2000
 configs pmem-auto pmem-clflushopt pmem-none file-dax
 finished 2026-09-28T00:16:49+00:00
 load     0.76 0.27 0.10
+rebuilt  2026-09-28T01:23:16+00:00 from the run logs by scripts/clwb-eviction.sh at a6e899d4; runs.csv.orig is the campaign's own

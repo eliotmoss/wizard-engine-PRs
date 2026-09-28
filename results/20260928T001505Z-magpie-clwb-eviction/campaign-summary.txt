@@ -1,20 +1,24 @@
 ---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
 config            ent   wall_ns  bound_ns   outside  lines
-pmem-auto           1      4414       140      4274    4.0
-pmem-auto           8     13444       460     12984   14.0
-pmem-auto          24     37617      1222     36395   38.0
-pmem-none           1      3803        48      3755    4.0
-pmem-none           8      8661       139      8522   14.0
-pmem-none          24     21331       369     20962   38.0
 file-dax            1     12586      5196      7390    0.0
 file-dax            8     17229      5089     12168    0.0
 file-dax           24     29243      5037     24149    0.0
+pmem-auto           1      4414       140      4274    4.0
+pmem-auto           8     13444       460     12984   14.0
+pmem-auto          24     37617      1222     36395   38.0
+pmem-clflushopt     1      4359        61      4298    4.0
+pmem-clflushopt     8     13234       172     13062   14.0
+pmem-clflushopt    24     37258       437     36820   38.0
+pmem-none           1      3803        48      3755    4.0
+pmem-none           8      8661       139      8522   14.0
+pmem-none          24     21331       369     20962   38.0
 
 ---- slope per entry, 1 -> 24 entries
 config             wall_ns  bound_ns   outside
-pmem-auto           1443.6      47.0    1396.6
-pmem-none            762.1      13.9     748.1
 file-dax             724.2      -6.9     728.7
+pmem-auto           1443.6      47.0    1396.6
+pmem-clflushopt     1430.4      16.3    1414.0
+pmem-none            762.1      13.9     748.1
 
 (no perf counters in this run: only the timing half of steps 2+3 is available)
 

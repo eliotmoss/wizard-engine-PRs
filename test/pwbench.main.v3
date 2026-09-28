@@ -34,16 +34,27 @@
 // then one fdatasync -- behind DirectIoRegion.writeUnits()/syncDevice(), and
 // both are timed together as one boundary sample.
 //
-// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>]
+// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>] [stride=<bytes>]
 //        pwbench.x86-64-linux <device> direct-device=<device> [commits] ...
 //
-// writeback= (pmem only) replaces the cache-line writeback instruction inside
-// the timing provider, for the CLWB-eviction experiment
-// (scripts/clwb-eviction.sh): auto (the default, and the production path --
-// CPUID-selected, CLWB first), clwb, clflushopt, clflush, or none. none issues
-// no writeback at all, so the region is NOT durable; it exists to measure what
-// the writebacks cost the work around them, and its run ends with a line other
-// than a bare OK, so the cost campaign's parser refuses it.
+// Two keyword arguments, in either order after the positional ones, exist for
+// the CLWB-eviction experiment (scripts/clwb-eviction.sh):
+//
+// writeback= (pmem only) changes how the timing provider writes lines back:
+// auto (the default, and the production path -- CPUID-selected, CLWB first),
+// clwb, clflushopt, clflush, deferred, or none. deferred records each
+// requested line and, at the next fence, writes back each distinct line once
+// (with the auto instruction) before fencing; every writeback still precedes
+// the fence the protocol relies on, so the durability guarantee is unchanged,
+// but no entry's store lands in a line the previous entry's writeback just
+// evicted. none issues no writeback at all, so the region is NOT durable; it
+// exists to measure what the writebacks cost the work around them, and its
+// run ends with a line other than a bare OK, so the cost campaign's parser
+// refuses it.
+//
+// stride= (default 8) spaces the transaction's u64 entries that many bytes
+// apart. 64 puts each entry on its own cache line, which keeps the number of
+// writebacks per commit while removing every same-line store after one.
 //
 // A raw device is overwritten from offset 0 for the region's length. Its path
 // has to be given twice, as the first argument and inside the mode word, so a
@@ -76,6 +87,7 @@ enum BenchWriteback(arg: string, label: string) {
         CLWB("clwb", "CLWB"),
         CLFLUSHOPT("clflushopt", "CLFLUSHOPT"),
         CLFLUSH("clflush", "CLFLUSH"),
+        DEFERRED("deferred", "deferred (distinct lines, auto instruction, at the next fence)"),
         NONE("none", "none -- no writeback, timing only, the region is NOT durable")
 }
 
@@ -93,6 +105,7 @@ component BenchConfig {
         def var blocks = 512u64;
         def var blockSize = 4096u64;
         def var writeback = BenchWriteback.AUTO;
+        def var stride = 8u64;          // bytes between consecutive entries
 
         def backendName() -> string {
                 return backend.label;
@@ -247,6 +260,9 @@ class BoundaryTimer {
 // duplicate and no risk of drifting from production behaviour.
 class TimingPersistentOperations extends X86_64PersistentOperations {
         def timer: BoundaryTimer;
+        // writeback=deferred only: the distinct lines requested since the last
+        // fence. A few dozen per commit, so a linear scan is the cheap choice.
+        def pending = Vector<u64>.new();
 
         new(range: Range<byte>, timer: BoundaryTimer) super(range) { }
 
@@ -256,22 +272,44 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
                         System.error("PersistentOperationError", "invalid cache-line writeback offset");
                 }
                 def c0 = Target.rdtsc();
+                if (BenchConfig.writeback == BenchWriteback.DEFERRED) {
+                        deferLine(cacheLine);
+                        timer.notePrepare(Target.rdtsc() - c0);
+                        return;
+                }
                 def line = Pointer.atElement(range, int.!(cacheLine));
                 match (BenchConfig.writeback) {
                         AUTO => MmapRegionUtils.flushCacheLine(line);
                         CLWB => Target.clwb(line - Pointer.NULL);
                         CLFLUSHOPT => Target.clflushOpt(line - Pointer.NULL);
                         CLFLUSH => Target.clflush(line - Pointer.NULL);
+                        DEFERRED => ;   // handled above
                         NONE => ;       // still counted, so lines per commit stays checkable
                 }
                 timer.notePrepare(Target.rdtsc() - c0);
                 timer.clwbLines++;
         }
 
+        // Every fence the region issues comes through here, so draining the
+        // deferred lines first keeps each writeback ahead of its fence.
         def sfence() {
+                if (pending.length > 0) {
+                        def c1 = Target.rdtsc();
+                        for (i < pending.length) {
+                                MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(pending[i])));
+                        }
+                        timer.notePrepare(Target.rdtsc() - c1);
+                        timer.clwbLines += pending.length;
+                        pending.clear();
+                }
                 def c0 = Target.rdtsc();
                 MmapRegionUtils.storeFence();
                 timer.notePersist(Target.rdtsc() - c0);
+        }
+
+        private def deferLine(cacheLine: u64) {
+                for (i < pending.length) if (pending[i] == cacheLine) return;
+                pending.put(cacheLine);
         }
 }
 
@@ -438,7 +476,7 @@ def openRegion(timer: BoundaryTimer) -> PWRegion {
 def runCommits(region: PWRegion, base: u64, count: int, timer: BoundaryTimer) -> bool {
         for (i < count) {
                 for (e < BenchConfig.entries) {
-                        region.txn.writeU64(base + u64.!(e * 8), u64.!(i) + 0x5A5A0000u64);
+                        region.txn.writeU64(base + u64.!(e) * BenchConfig.stride, u64.!(i) + 0x5A5A0000u64);
                 }
                 if (!region.txn.commit()) return false;
         }
@@ -522,7 +560,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 2 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|none>]\n");
+                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|deferred|none>] [stride=<bytes>]\n");
                 System.puts("       pwbench.x86-64-linux <device> direct-device=<device> [commits] [entries] [warmup] [blockSize] [blocks]\n");
                 return 2;
         }
@@ -546,12 +584,14 @@ def main(args: Array<string>) -> int {
         if (args.length > 4) BenchConfig.warmup = int.!(parseU64(args[4], 2000));
         if (args.length > 5) BenchConfig.blockSize = parseU64(args[5], 4096);
         if (args.length > 6) BenchConfig.blocks = parseU64(args[6], 512);
-        if (args.length > 7 && !parseWriteback(args[7])) {
-                System.puts("the eighth argument must be writeback=<auto|clwb|clflushopt|clflush|none>\n");
-                return 2;
+        for (i = 7; i < args.length; i++) {
+                if (!parseKeyword(args[i])) {
+                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|clflush|deferred|none> or stride=<bytes>\n");
+                        return 2;
+                }
         }
-        if (args.length > 8) {
-                System.puts("too many arguments\n");
+        if (BenchConfig.stride < 8 || BenchConfig.stride % 8 != 0 || BenchConfig.stride > 4096) {
+                System.puts("stride must be a multiple of 8 between 8 and 4096\n");
                 return 2;
         }
         // The file and direct boundaries issue no writeback through the timing
@@ -630,7 +670,7 @@ def main(args: Array<string>) -> int {
 
         // One chunk to write into, so the commits touch real allocated space
         // without the allocator's own variable work entering the measurement.
-        def span = u64.!(BenchConfig.entries * 8);
+        def span = u64.!(BenchConfig.entries) * BenchConfig.stride;
         def needed = (span + u64.!(ChunkHeader.size) + BenchConfig.blockSize - 1u64) / BenchConfig.blockSize;
         def SCRATCH_BLOCKS = u32.!(needed);
         def chunk = region.allocChunk(SCRATCH_BLOCKS);
@@ -650,6 +690,9 @@ def main(args: Array<string>) -> int {
         }
         Trace.OUT.put3("region %d blocks of %d bytes, scratch %d blocks",
                 BenchConfig.blocks, BenchConfig.blockSize, SCRATCH_BLOCKS).ln();
+        // Not matched by either experiment script's parser as a figure; the
+        // CLWB-eviction script checks it to confirm the stride it asked for.
+        Trace.OUT.put1("entry stride %d bytes", BenchConfig.stride).ln();
 
         if (!runCommits(region, base, BenchConfig.warmup, timer)) {
                 def ceiling = maxEntriesEstimate(BenchConfig.blockSize);
@@ -689,13 +732,20 @@ def main(args: Array<string>) -> int {
         return 0;
 }
 
-def parseWriteback(arg: string) -> bool {
-        if (arg == null || !Strings.startsWith(arg, "writeback=")) return false;
+def parseKeyword(arg: string) -> bool {
+        if (arg == null) return false;
+        if (Strings.startsWith(arg, "stride=")) {
+                def text = Arrays.range(arg, 7, arg.length);
+                BenchConfig.stride = parseU64(text, 0);
+                return text.length > 0;
+        }
+        if (!Strings.startsWith(arg, "writeback=")) return false;
         def name = Arrays.range(arg, 10, arg.length);
         if (Strings.equal(name, BenchWriteback.AUTO.arg)) BenchConfig.writeback = BenchWriteback.AUTO;
         else if (Strings.equal(name, BenchWriteback.CLWB.arg)) BenchConfig.writeback = BenchWriteback.CLWB;
         else if (Strings.equal(name, BenchWriteback.CLFLUSHOPT.arg)) BenchConfig.writeback = BenchWriteback.CLFLUSHOPT;
         else if (Strings.equal(name, BenchWriteback.CLFLUSH.arg)) BenchConfig.writeback = BenchWriteback.CLFLUSH;
+        else if (Strings.equal(name, BenchWriteback.DEFERRED.arg)) BenchConfig.writeback = BenchWriteback.DEFERRED;
         else if (Strings.equal(name, BenchWriteback.NONE.arg)) BenchConfig.writeback = BenchWriteback.NONE;
         else return false;
         return true;
