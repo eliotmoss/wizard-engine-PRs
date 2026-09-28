@@ -1,0 +1,14 @@
+Hot functions on the pwbench commit path at or after DualTxnWal.validEntryFields, by build.
+fix moves everything after validEntryFields 24 bytes down; pad restores base's addresses.
+
+function                                        base       fix       pad  base%64 fix%64
+DualTxnWal.validEntryFields                  820c498   820c498   820c498       24     24
+DualTxnWal.writeAfterImage                   820c610   820c5f8   820c610       16     56
+DualTxnWal.noteExtent                        820c720   820c708   820c720       32      8
+TimingPersistentOperations.sfence            820d0a8   820d090   820d0a8       40     16
+TimingPersistentOperations.clwb              820ed78   820ed60   820ed78       56     32
+DualTxnWal.storeUpdate                       8209d88   8209d88   8209d88        8      8
+RegionTransaction.applyToRegion              8206538   8206538   8206538       56     56
+DualTxnWal.prepareApplied                    8208e18   8208e18   8208e18       24     24
+
+functions at a different address, fix vs base: 2291; pad vs base: 0

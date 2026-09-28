@@ -1,0 +1,25 @@
+---- what
+Paired A/B of DualTxnWal.validEntryFields() without its three 64-bit divq, on pwbench.
+  base  src/engine/x86-64/X86_64DualTxnWal.v3 at b6923e41 (three divq in validEntryFields)
+  base2 a byte-identical copy of base (A/A control, ab-rotated-aa.csv only)
+  fix   the working-tree change: a mask for 'offset % size' and shifts for the two '/ 64' (0 divq)
+  pad   fix + one redundant check (pad.diff) that restores base's code layout exactly: every
+        function at base's address, bodies identical except validEntryFields (0 divq) and
+        data-address constants 8 bytes lower (ab-layout-control.csv only)
+sha256:
+  21e431bdc555e3f513ea42bc2f47aa991f8f37ce3a75dba51246cc06c5b7ed36  pwbench-base
+  0344dc7d818027479239ae66cbda0c79406b9a512a7e38b4e53fe70495d1df7a  pwbench-fix
+  66bc5dc677050d3c4a3fd08a8a95a7b7b4c75dd60b23905205a6e2b3e03cece8  pwbench-pad
+---- host
+hostname sean-tan-PC
+kernel   Linux 7.0.0-34-generic x86_64
+cpu       Intel(R) Core(TM) i7-14700KF (all runs pinned to CPU 2, cpu_core, except the CPU 20 rows of ab-first.csv, cpu_atom)
+governor performance 
+dax      /mnt/pmem0/clwb on /dev/pmem0 rw,relatime,dax=always (memmap=1G!8G: DRAM, not Optane)
+perf     unavailable (perf_event_paranoid=4)
+---- protocol
+pwbench <dir> <pmem|file> 120000 <1|8|24> 2000 2048 512 (1 MiB region), figure: 'wall ns per commit'
+ab-first.csv          base then fix in every pair; CPU 2 x5 reps, CPU 20 x11
+ab-rotated-aa.csv     base, fix, base2 in rotating order; CPU 2 x8
+ab-layout-control.csv base, fix, pad as a Latin square (each position 3x per binary); CPU 2 x9
+logs/                 every run's pwbench output (divq-*, abba-*, pad-* respectively)

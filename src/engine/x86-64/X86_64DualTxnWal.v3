@@ -596,14 +596,19 @@ class DualTxnWal {
                 if (width != 1u8 && width != 2u8 && width != 4u8 && width != 8u8) return false;
                 if (backendRegion == null) return false;
                 def size = u64.view(width);
-                if (offset % size != 0u64) return false;
+                // A mask, not "% size": size is a power of two (checked above),
+                // and a variable divisor compiles to a 64-bit divq. This runs for
+                // every entry in both append() and the apply.
+                if ((offset & (size - 1u64)) != 0u64) return false;
                 def regionSize = u64.!(backendRegion.range.length);
                 if (offset > regionSize || size > regionSize - offset) return false;
                 def end = offset + size;
                 // Natural alignment makes this impossible for 1/2/4/8-byte stores in
                 // the 64-byte-line model, but keep the supported contract explicit.
-                if (offset / DualTxnWalConstants.ALIGNMENT !=
-                        (end - 1u64) / DualTxnWalConstants.ALIGNMENT) return false;
+                // Lines are DualTxnWalConstants.ALIGNMENT (64) bytes. Shifts, not
+                // "/ 64": on a u64 the compiler cannot prove non-negative, that
+                // division is a 64-bit divq.
+                if ((offset >> 6) != ((end - 1u64) >> 6)) return false;
                 def walStart = logChunkOffset;
                 def walEnd = logChunkOffset + logChunkSize;
                 if (offset < walEnd && walStart < end) return false;

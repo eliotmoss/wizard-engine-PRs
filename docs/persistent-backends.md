@@ -643,10 +643,25 @@ per commit, median of three:
 - Allocator transactions store their after-images out of address order: a
   mutant that skips the sort fails the sieve and direct-I/O suites. The sort is
   needed in production, not only in the tests.
-- `validEntryFields()` also compiles to three `divq`, and it runs for every
+- `validEntryFields()` also compiled to three `divq`, and it runs for every
   entry in both `append()` and the apply. That cost is the same in both
-  placements, so it takes no part in the comparison; it is a separate, small
-  saving still available.
+  placements, so it took no part in the comparison. **Removed 2026-09-28** (a
+  mask for `offset % size`, whose divisor is a checked power of two, and shifts
+  for the two `/ 64`); the disassembly shows no `divq`. **It is not a measured
+  saving on Raptor Lake** (`results/20260928T092723Z-sean-tan-PC-divq-layout`,
+  P-core, pwbench, paired runs). As built, the change made pwbench 1–2 %
+  *slower* per commit on both backends (+36 ns at 8 entries, +67 ns at 24,
+  every pair): shrinking the function by 24 bytes moved the 2,291 functions
+  after it, among them `writeAfterImage`, `noteExtent` and the timing
+  provider's `clwb`/`sfence`, which lost their alignment. A control build
+  padded back to the old layout, with every function at its old address and
+  still no `divq`, is 48–75 ns faster than the fix and 11 ns (0.5 %) faster
+  than the original at 8 entries, 0 ns at 24. So on this core out-of-order
+  execution hid the divides almost entirely, and a 24-byte layout shift
+  outweighs them. An A/A control (two identical binaries) differed by at most
+  0.2 %. The E-core is too noisy to resolve it, and Cascade Lake, whose 64-bit
+  divide is much slower, is unmeasured. The fix stays for its simplicity; the
+  1–2 % is placement, which the next unrelated change will reshuffle.
 
 **The boundary figures on this page do not measure what the writebacks cost.**
 Each writeback is bracketed with `rdtsc`, which is not ordered with `CLWB`, so

@@ -1,0 +1,10 @@
+--- a/src/engine/x86-64/X86_64DualTxnWal.v3 (the fix)
++++ b/src/engine/x86-64/X86_64DualTxnWal.v3 (the fix + layout pad, experiment only, never committed)
+@@ -600,6 +600,7 @@
+                 // and a variable divisor compiles to a 64-bit divq. This runs for
+                 // every entry in both append() and the apply.
+                 if ((offset & (size - 1u64)) != 0u64) return false;
++                if (size > 8u64) return false;   // LAYOUT PAD (experiment only)
+                 def regionSize = u64.!(backendRegion.range.length);
+                 if (offset > regionSize || size > regionSize - offset) return false;
+                 def end = offset + size;
