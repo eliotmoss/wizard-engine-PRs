@@ -1,0 +1,19 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+region file /mnt/pmem0.0/sean/wizard-pwbench-u7599095-p133514-0.region
+writeback none -- no writeback, timing only, the region is NOT durable, CPUID selects CLWB
+region 512 blocks of 2048 bytes, scratch 1 blocks
+entry stride 64 bytes
+commits measured 120000, entries per commit 24
+persist boundaries 120000, prepare calls 4560000
+boundaries per commit x1000 1000, clwb lines 4560000
+tsc cycles per microsecond 2294
+boundary cycles: min 24 median 28 p90 34
+boundary cycles: p99 36 max 4344
+boundary ns: min 10 median 12 p90 14
+boundary ns: p99 15 max 1893
+total boundary cycles 3393906
+total prepare cycles 99073540
+measured wall ns 2535574929, boundary share x1000 17
+wall ns per commit 21129
+minor faults 28680 during the measured commits
+OK timing-only: writeback=none, the region was never durable

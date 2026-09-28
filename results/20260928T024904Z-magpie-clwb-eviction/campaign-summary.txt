@@ -1,0 +1,46 @@
+---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
+config            ent   wall_ns  bound_ns   outside  lines
+pmem-auto           1      4439       144      4295    4.0
+pmem-auto           8     13445       471     12974   14.0
+pmem-auto          24     37741      1259     36483   38.0
+pmem-deferred       1      4923       198      4725    4.0
+pmem-deferred       8      9837       512      9326    8.0
+pmem-deferred      24     24984      1568     23411   18.0
+pmem-none           1      3791        50      3741    4.0
+pmem-none           8      8696       145      8551   14.0
+pmem-none          24     21501       374     21127   38.0
+pmem-auto-s64       1      4434       143      4291    4.0
+pmem-auto-s64       8     10472       471     10001   14.0
+pmem-auto-s64      24     22609      1260     21350   38.0
+pmem-deferred-s64    1      4979       198      4780    4.0
+pmem-deferred-s64    8     12749      1293     11458   14.0
+pmem-deferred-s64   24     26361      4038     22326   38.0
+pmem-none-s64       1      3794        50      3744    4.0
+pmem-none-s64       8      8804       145      8658   14.0
+pmem-none-s64      24     21125       374     20750   38.0
+
+---- slope per entry, 1 -> 24 entries
+config             wall_ns  bound_ns   outside
+pmem-auto           1447.9      48.5    1399.5
+pmem-deferred        872.2      59.5     812.4
+pmem-none            770.0      14.1     755.9
+pmem-auto-s64        790.2      48.6     741.7
+pmem-deferred-s64     929.7     166.9     762.8
+pmem-none-s64        753.5      14.1     739.4
+
+(no perf counters in this run: only the timing half of steps 2+3 is available)
+
+---- how to read the follow-up (first campaign: pmem-auto ~1440 ns/entry, pmem-none ~760, file-dax ~720)
+ D. pmem-auto-s64 ~ pmem-none-s64 (slope): with every entry on its own line the
+    writebacks are the same in number (compare "lines") but no store lands in a
+    line just written back, and the excess is gone -> the cost is the store into
+    a just-evicted line within the commit. If pmem-auto-s64 stays well above
+    pmem-none-s64, the cost is per writeback (write traffic) or the next
+    commit's misses, not the same-line store.
+ E. pmem-deferred ~ pmem-none (slope) at stride 8 -> writing each line back once
+    at the fence removes the cost; a candidate production change (durability is
+    unchanged: every writeback still precedes its fence). Its "lines" is lower
+    than pmem-auto's because each distinct line is written back once, so E alone
+    cannot separate "fewer writebacks" from "no same-line store after one": D can.
+ F. pmem-deferred-s64 ~ pmem-auto-s64 -> where in the commit the writebacks are
+    issued does not matter once no same-line store follows one.
