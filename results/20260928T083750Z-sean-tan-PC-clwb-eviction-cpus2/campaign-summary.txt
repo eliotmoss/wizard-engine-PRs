@@ -1,0 +1,73 @@
+---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
+config            ent   wall_ns  bound_ns   outside  lines
+pmem-auto           1       948        36       912    4.0
+pmem-auto           8      2113        66      2046    8.0
+pmem-auto          24      5251       137      5114   18.0
+pmem-auto-entry     1       935        53       882    4.0
+pmem-auto-entry     8      2274       135      2139   14.0
+pmem-auto-entry    24      5703       328      5375   38.0
+pmem-clflushopt     1       978        34       944    4.0
+pmem-clflushopt     8      2117        66      2049    8.0
+pmem-clflushopt    24      5250       134      5116   18.0
+pmem-clflushopt-entry    1       973        37       936    4.0
+pmem-clflushopt-entry    8      2719       107      2612   14.0
+pmem-clflushopt-entry   24      6807       292      6510   38.0
+pmem-none           1       914        34       881    4.0
+pmem-none           8      2072        59      2013    8.0
+pmem-none          24      5294       119      5175   18.0
+pmem-auto-s64       1       950        36       914    4.0
+pmem-auto-s64       8      2254       106      2148   14.0
+pmem-auto-s64      24      5521       270      5251   38.0
+pmem-auto-entry-s64    1       936        53       882    4.0
+pmem-auto-entry-s64    8      2212       129      2083   14.0
+pmem-auto-entry-s64   24      5360       367      4993   38.0
+pmem-clflushopt-s64    1       977        34       943    4.0
+pmem-clflushopt-s64    8      2261       106      2158   14.0
+pmem-clflushopt-s64   24      5556       256      5300   38.0
+pmem-clflushopt-entry-s64    1       976        37       939    4.0
+pmem-clflushopt-entry-s64    8      2464       120      2340   14.0
+pmem-clflushopt-entry-s64   24      6163       325      5838   38.0
+pmem-none-s64       1       915        33       882    4.0
+pmem-none-s64       8      2197        93      2104   14.0
+pmem-none-s64      24      5330       231      5098   38.0
+
+---- slope per entry, 1 -> 24 entries
+config             wall_ns  bound_ns   outside
+pmem-auto            187.1       4.4     182.7
+pmem-auto-entry      207.3      12.0     195.3
+pmem-clflushopt      185.7       4.4     181.4
+pmem-clflushopt-entry     253.7      11.1     242.4
+pmem-none            190.4       3.7     186.7
+pmem-auto-s64        198.7      10.2     188.5
+pmem-auto-entry-s64     192.3      13.7     178.7
+pmem-clflushopt-s64     199.1       9.7     189.4
+pmem-clflushopt-entry-s64     225.5      12.5     213.0
+pmem-none-s64        192.0       8.6     183.3
+
+(no perf counters in this run: only the timing half of steps 2+3 is available)
+
+---- how to read it (docs/persistent-backends.md: outside-slope ~1440 ns/entry pmem, ~740 file)
+ A. pmem-clflushopt ~ pmem-auto in every column  -> CLWB behaves as an evicting
+    writeback in the real workload (agrees with step 1 if step 1 said EVICTED).
+ B. pmem-none's outside-slope falls toward file-dax's, and its load.local_pmm /
+    rfo.pmm per commit fall toward 0 -> the writebacks' side effect on the next
+    commit is the cause. If B's slope does not fall, the writeback is not the cause.
+ C. file-dax's rfo.pmm / load.local_pmm slope per entry is close to pmem-auto's
+    -> both backends' lines are evicted (the kernel's fdatasync on DAX writes back
+    with CLWB too), so eviction cannot be what separates them, even if B holds.
+ Eviction explains the gap only if A, B and not-C all hold.
+
+---- how to read the placement comparison (per-entry at stride 8 ~1,448 ns/entry,
+     per-entry at stride 64 ~790, no writeback ~770; 20260928T024904Z)
+ G. pmem-auto (batched) slope near pmem-auto-s64's and pmem-none's, well below
+    pmem-auto-entry's -> storing the whole transaction before preparing it
+    removes the same-line misses in production, without changing the layout.
+ H. pmem-auto-s64 ~ pmem-auto-entry-s64 -> where there is no reuse, preparing at
+    the end of the apply loop costs nothing; unlike deferral to the fence, it
+    does not bunch the writebacks against the fence and the next store.
+ I. file-dax ~ file-dax-entry -> the file backend, whose preparation is a flag,
+    is unaffected.
+ "lines" should drop from ceil((112+32n)/64)+n per commit to the record's lines
+ plus the distinct data lines -- ceil(n/8), or one more because pwbench's
+ entries are 8-byte but not line aligned (4, 8, 18 at 1, 8, 24 entries) -- and
+ be unchanged at stride 64.

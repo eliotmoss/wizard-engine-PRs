@@ -1,0 +1,42 @@
+---- probe rep 1, load 0.59
+cpu family 6 model 183 stepping 1 clwb yes clflushopt yes
+dram  load  none       p10    33 median    35 p90    36
+pmem  load  none       p10    33 median    34 p90    36
+dram  load  clwb       p10    66 median    75 p90    89
+pmem  load  clwb       p10    64 median    74 p90    87
+dram  load  clflushopt p10   212 median   218 p90   382
+pmem  load  clflushopt p10   185 median   216 p90   696
+dram  store none       p10    49 median    50 p90    52
+pmem  store none       p10    49 median    50 p90    52
+dram  store clwb       p10    69 median    77 p90    91
+pmem  store clwb       p10    67 median    77 p90    89
+dram  store clflushopt p10    75 median    83 p90    96
+pmem  store clflushopt p10    75 median    83 p90    97
+---- probe rep 2, load 0.59
+cpu family 6 model 183 stepping 1 clwb yes clflushopt yes
+dram  load  none       p10    32 median    33 p90    34
+pmem  load  none       p10    32 median    33 p90    34
+dram  load  clwb       p10    64 median    73 p90    87
+pmem  load  clwb       p10    63 median    73 p90    85
+dram  load  clflushopt p10   212 median   220 p90   405
+pmem  load  clflushopt p10   184 median   214 p90   443
+dram  store none       p10    49 median    50 p90    52
+pmem  store none       p10    49 median    50 p90    52
+dram  store clwb       p10    67 median    77 p90    89
+pmem  store clwb       p10    67 median    77 p90    89
+dram  store clflushopt p10    75 median    83 p90    97
+pmem  store clflushopt p10    75 median    83 p90    97
+---- probe rep 3, load 0.59
+cpu family 6 model 183 stepping 1 clwb yes clflushopt yes
+dram  load  none       p10    32 median    33 p90    34
+pmem  load  none       p10    32 median    33 p90    34
+dram  load  clwb       p10    65 median    75 p90    87
+pmem  load  clwb       p10    63 median    73 p90    85
+dram  load  clflushopt p10   212 median   219 p90   366
+pmem  load  clflushopt p10   185 median   216 p90   696
+dram  store none       p10    49 median    50 p90    52
+pmem  store none       p10    49 median    50 p90    52
+dram  store clwb       p10    68 median    77 p90    89
+pmem  store clwb       p10    67 median    77 p90    89
+dram  store clflushopt p10    75 median    85 p90    97
+pmem  store clflushopt p10    75 median    83 p90    97

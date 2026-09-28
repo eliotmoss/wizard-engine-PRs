@@ -1,0 +1,40 @@
+---- revision
+commit ab478893fa22fdb86dbecdecdf888b7c9d4cca9f
+subject  results(pmem): clwb-eviction on a Raptor Lake P-core and E-core, emulated pmem
+dirty    no
+---- host
+hostname sean-tan-PC
+kernel   Linux 7.0.0-34-generic x86_64 GNU/Linux
+started  2026-09-28T08:38:59+00:00
+load     0.65 0.73 0.45
+---- cpu
+CPU(s):                                  28
+Model name:                              Intel(R) Core(TM) i7-14700KF
+Model:                                   183
+Thread(s) per core:                      2
+Stepping:                                1
+CPU(s) scaling MHz:                      72%
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities
+L1d cache:                               768 KiB (20 instances)
+L2 cache:                                28 MiB (11 instances)
+L3 cache:                                33 MiB (1 instance)
+microcode	: 0x133
+hybrid   cpu_core=0-15 cpu_atom=16-27 
+governor  28 performance;
+---- dax
+/mnt/pmem0/clwb
+  source  /dev/pmem0
+  options rw,relatime,dax=always
+  node    0
+pinned   cpus 20 (cpu_atom)
+---- perf
+unavailable: perf cannot count this user's own events (perf_event_paranoid=4; needs 2 or lower)
+---- parameters
+reps 15
+sizes 1 8 24
+geometry 512x2048
+commits 20000 120000
+warmup 2000
+configs pmem-auto pmem-auto-entry pmem-clflushopt pmem-clflushopt-entry pmem-none pmem-auto-s64 pmem-auto-entry-s64 pmem-clflushopt-s64 pmem-clflushopt-entry-s64 pmem-none-s64
+finished 2026-09-28T08:47:03+00:00
+load     0.77 0.80 0.61

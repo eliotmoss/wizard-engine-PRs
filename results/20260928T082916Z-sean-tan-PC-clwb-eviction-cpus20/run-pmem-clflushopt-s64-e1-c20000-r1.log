@@ -1,0 +1,20 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+region file /mnt/pmem0/clwb/wizard-pwbench-u1000-p8837-0.region
+writeback CLFLUSHOPT, CPUID selects CLWB
+region 512 blocks of 2048 bytes, scratch 1 blocks
+entry stride 64 bytes
+apply batch
+commits measured 20000, entries per commit 1
+persist boundaries 20000, prepare calls 80000
+boundaries per commit x1000 1000, clwb lines 80000
+tsc cycles per microsecond 3417
+boundary cycles: min 22 median 25 p90 28
+boundary cycles: p99 57 max 99
+boundary ns: min 6 median 7 p90 8
+boundary ns: p99 16 max 28
+total boundary cycles 527913
+total prepare cycles 3125902
+measured wall ns 37675976, boundary share x1000 28
+wall ns per commit 1883
+minor faults 275 during the measured commits
+OK
