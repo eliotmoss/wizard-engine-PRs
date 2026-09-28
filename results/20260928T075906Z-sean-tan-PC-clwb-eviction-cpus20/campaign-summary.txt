@@ -1,0 +1,57 @@
+---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
+config            ent   wall_ns  bound_ns   outside  lines
+pmem-auto           1      1961        55      1906    4.0
+pmem-auto           8      4373       103      4270    8.0
+pmem-auto          24     10233       223     10009   18.0
+pmem-auto-entry     1      1965        55      1910    4.0
+pmem-auto-entry     8      4548       180      4366   14.0
+pmem-auto-entry    24     11214       492     10701   38.0
+pmem-clflushopt     1      1998        51      1946    4.0
+pmem-clflushopt     8      4372        89      4283    8.0
+pmem-clflushopt    24     10660       192     10468   18.0
+pmem-clflushopt-entry    1      1991        49      1942    4.0
+pmem-clflushopt-entry    8      4904       163      4726   14.0
+pmem-clflushopt-entry   24     12260       406     11844   38.0
+pmem-none           1      1922        41      1881    4.0
+pmem-none           8      4314        72      4242    8.0
+pmem-none          24     10425       152     10273   18.0
+file-dax            1      5892      1520      4377    0.0
+file-dax            8      8222      1529      6629    0.0
+file-dax           24     14328      1591     12721    0.0
+
+---- slope per entry, 1 -> 24 entries
+config             wall_ns  bound_ns   outside
+pmem-auto            359.7       7.3     352.3
+pmem-auto-entry      402.1      19.0     382.2
+pmem-clflushopt      376.6       6.1     370.5
+pmem-clflushopt-entry     446.5      15.5     430.5
+pmem-none            369.7       4.8     364.9
+file-dax             366.8       3.1     362.8
+
+(no perf counters in this run: only the timing half of steps 2+3 is available)
+
+---- how to read it (docs/persistent-backends.md: outside-slope ~1440 ns/entry pmem, ~740 file)
+ A. pmem-clflushopt ~ pmem-auto in every column  -> CLWB behaves as an evicting
+    writeback in the real workload (agrees with step 1 if step 1 said EVICTED).
+ B. pmem-none's outside-slope falls toward file-dax's, and its load.local_pmm /
+    rfo.pmm per commit fall toward 0 -> the writebacks' side effect on the next
+    commit is the cause. If B's slope does not fall, the writeback is not the cause.
+ C. file-dax's rfo.pmm / load.local_pmm slope per entry is close to pmem-auto's
+    -> both backends' lines are evicted (the kernel's fdatasync on DAX writes back
+    with CLWB too), so eviction cannot be what separates them, even if B holds.
+ Eviction explains the gap only if A, B and not-C all hold.
+
+---- how to read the placement comparison (per-entry at stride 8 ~1,448 ns/entry,
+     per-entry at stride 64 ~790, no writeback ~770; 20260928T024904Z)
+ G. pmem-auto (batched) slope near pmem-auto-s64's and pmem-none's, well below
+    pmem-auto-entry's -> storing the whole transaction before preparing it
+    removes the same-line misses in production, without changing the layout.
+ H. pmem-auto-s64 ~ pmem-auto-entry-s64 -> where there is no reuse, preparing at
+    the end of the apply loop costs nothing; unlike deferral to the fence, it
+    does not bunch the writebacks against the fence and the next store.
+ I. file-dax ~ file-dax-entry -> the file backend, whose preparation is a flag,
+    is unaffected.
+ "lines" should drop from ceil((112+32n)/64)+n per commit to the record's lines
+ plus the distinct data lines -- ceil(n/8), or one more because pwbench's
+ entries are 8-byte but not line aligned (4, 8, 18 at 1, 8, 24 entries) -- and
+ be unchanged at stride 64.
