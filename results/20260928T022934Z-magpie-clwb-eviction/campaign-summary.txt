@@ -1,0 +1,54 @@
+---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
+config            ent   wall_ns  bound_ns   outside  lines
+pmem-auto           1      4456       143      4313    4.0
+pmem-auto           8     13568       469     13099   14.0
+pmem-auto          24     37616      1257     36359   38.0
+pmem-deferred       1     59030       203     58827    4.0
+pmem-deferred       8     64349       520     63828    8.0
+pmem-deferred      24     77813      1571     76242   18.0
+pmem-none           1      3810        50      3760    4.0
+pmem-none           8      8711       145      8566   14.0
+pmem-none          24     21450       394     21053   38.0
+file-dax            1     12575      5172      7411    0.0
+file-dax            8     17236      5043     12203    0.0
+file-dax           24     29253      5057     24205    0.0
+pmem-auto-s64       1      4437       142      4295    4.0
+pmem-auto-s64       8     10439       470      9970   14.0
+pmem-auto-s64      24     22580      1256     21324   38.0
+pmem-deferred-s64    1     59050       206     58844    4.0
+pmem-deferred-s64    8     65376      1306     64068   14.0
+pmem-deferred-s64   24     79811      4033     75778   38.0
+pmem-none-s64       1      3820        50      3770    4.0
+pmem-none-s64       8      8812       145      8667   14.0
+pmem-none-s64      24     21087       391     20696   38.0
+file-dax-s64        1     12600      5179      7421    0.0
+file-dax-s64        8     18168      5220     12967    0.0
+file-dax-s64       24     28469      4644     23843    0.0
+
+---- slope per entry, 1 -> 24 entries
+config             wall_ns  bound_ns   outside
+pmem-auto           1441.7      48.4    1393.3
+pmem-deferred        816.7      59.5     757.1
+pmem-none            767.0      15.0     751.9
+file-dax             725.1      -5.0     730.2
+pmem-auto-s64        788.8      48.4     740.4
+pmem-deferred-s64     902.7     166.4     736.2
+pmem-none-s64        750.7      14.8     735.9
+file-dax-s64         690.0     -23.3     714.0
+
+(no perf counters in this run: only the timing half of steps 2+3 is available)
+
+---- how to read the follow-up (first campaign: pmem-auto ~1440 ns/entry, pmem-none ~760, file-dax ~720)
+ D. pmem-auto-s64 ~ pmem-none-s64 (slope): with every entry on its own line the
+    writebacks are the same in number (compare "lines") but no store lands in a
+    line just written back, and the excess is gone -> the cost is the store into
+    a just-evicted line within the commit. If pmem-auto-s64 stays well above
+    pmem-none-s64, the cost is per writeback (write traffic) or the next
+    commit's misses, not the same-line store.
+ E. pmem-deferred ~ pmem-none (slope) at stride 8 -> writing each line back once
+    at the fence removes the cost; a candidate production change (durability is
+    unchanged: every writeback still precedes its fence). Its "lines" is lower
+    than pmem-auto's because each distinct line is written back once, so E alone
+    cannot separate "fewer writebacks" from "no same-line store after one": D can.
+ F. pmem-deferred-s64 ~ pmem-auto-s64 -> where in the commit the writebacks are
+    issued does not matter once no same-line store follows one.
