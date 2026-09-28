@@ -1,0 +1,54 @@
+---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
+config            ent   wall_ns  bound_ns   outside  lines
+pmem-auto           1      4496       139      4357    4.0
+pmem-auto           8      9601       271      9330    8.0
+pmem-auto          24     22083       598     21482   18.0
+pmem-auto-entry     1      4445       140      4305    4.0
+pmem-auto-entry     8     13530       464     13066   14.0
+pmem-auto-entry    24     37859      1241     36618   38.0
+pmem-none           1      3819        50      3769    4.0
+pmem-none           8      8684        83      8601    8.0
+pmem-none          24     21392       172     21217   18.0
+file-dax            1     12635      5172      7441    0.0
+file-dax            8     17520      5062     12424    0.0
+file-dax           24     30039      5151     24899    0.0
+file-dax-entry      1     12602      5151      7451    0.0
+file-dax-entry      8     17301      5064     12237    0.0
+file-dax-entry     24     29321      5046     24272    0.0
+pmem-auto-s64       1      4487       138      4348    4.0
+pmem-auto-s64       8     10526       464     10062   14.0
+pmem-auto-s64      24     23426      1239     22185   38.0
+pmem-auto-entry-s64    1      4437       140      4297    4.0
+pmem-auto-entry-s64    8     10360       464      9897   14.0
+pmem-auto-entry-s64   24     22665      1239     21425   38.0
+pmem-none-s64       1      3811        50      3761    4.0
+pmem-none-s64       8      8984       136      8848   14.0
+pmem-none-s64      24     21593       350     21243   38.0
+
+---- slope per entry, 1 -> 24 entries
+config             wall_ns  bound_ns   outside
+pmem-auto            764.7      20.0     744.6
+pmem-auto-entry     1452.8      47.8    1404.9
+pmem-none            764.0       5.3     758.6
+file-dax             756.7      -0.9     759.0
+file-dax-entry       726.9      -4.6     731.4
+pmem-auto-s64        823.4      47.8     775.5
+pmem-auto-entry-s64     792.5      47.8     744.7
+pmem-none-s64        773.1      13.1     760.1
+
+(no perf counters in this run: only the timing half of steps 2+3 is available)
+
+---- how to read the placement comparison (per-entry at stride 8 ~1,448 ns/entry,
+     per-entry at stride 64 ~790, no writeback ~770; 20260928T024904Z)
+ G. pmem-auto (batched) slope near pmem-auto-s64's and pmem-none's, well below
+    pmem-auto-entry's -> storing the whole transaction before preparing it
+    removes the same-line misses in production, without changing the layout.
+ H. pmem-auto-s64 ~ pmem-auto-entry-s64 -> where there is no reuse, preparing at
+    the end of the apply loop costs nothing; unlike deferral to the fence, it
+    does not bunch the writebacks against the fence and the next store.
+ I. file-dax ~ file-dax-entry -> the file backend, whose preparation is a flag,
+    is unaffected.
+ "lines" should drop from ceil((112+32n)/64)+n per commit to the record's lines
+ plus the distinct data lines -- ceil(n/8), or one more because pwbench's
+ entries are 8-byte but not line aligned (4, 8, 18 at 1, 8, 24 entries) -- and
+ be unchanged at stride 64.
