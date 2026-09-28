@@ -539,7 +539,8 @@ lines. The in-window boundary shows the first part: 4.0 µs against 1.3 µs for
 production at stride 64, with the same 38 lines. That reading is an
 interpretation of timing, not a measurement of the cause.
 
-**What this points to (untested).** The better placement is between the two:
+**What this points to — implemented 2026-09-28, not yet measured.** The better
+placement is between the two:
 write back each distinct after-image line once, at the end of the apply loop.
 That keeps deferral's benefits (no same-line store after a writeback, one
 writeback per line) and keeps production's spacing: a whole record
@@ -555,6 +556,24 @@ artificial one: any transaction that writes several fields of one line — a
 block-table entry, a chunk header — pays the same miss on this CPU. The line
 formula above already shows the redundancy: it counts `n` after-image
 writebacks for `ceil(n / 8)` distinct lines.
+
+It is now production. `DualTxnWal.storeUpdate()` stores an after-image and
+records its extent; `prepareApplied()` sorts the extents and prepares each line
+once, merging adjacent lines into one range; `RegionTransaction.applyToRegion()`
+stores the whole transaction and then calls it. The obligation is structural,
+not the caller's: every boundary that advances `dataDurableSeq` — the commit
+point, `persistAppliedData()` and recovery — prepares any extent still
+outstanding first. `applyUpdate()` keeps the per-entry behaviour for recovery
+replay and for the tests that pin it. Seven unit tests cover the change, among
+them a crash-explorer check of a three-transaction batched history against
+production recovery: exhaustive over every cut of the batched apply, bounded
+over the commit that reclaims its slot. Each of four deliberately broken
+variants fails at least one of them: a merged range left unprepared, the
+commit's drain removed, `persistAppliedData()`'s drain removed, and the facade
+skipping `prepareApplied()`. The full suite passes (2,004 tests). The cost is
+**not yet measured**: pwbench's `apply=entry` restores the old placement for a
+same-sitting comparison, and it is the default campaign of
+`scripts/clwb-eviction.sh`.
 
 **The boundary figures on this page do not measure what the writebacks cost.**
 Each writeback is bracketed with `rdtsc`, which is not ordered with `CLWB`, so
@@ -938,7 +957,9 @@ Two clean results:
 
 The line count is exactly predictable. A record is a 64-byte header, a 48-byte
 trailer and one 32-byte `LogEntry` per buffered write, aligned up to 64, and
-each after-image is prepared separately, so
+each after-image was prepared separately (until 2026-09-28; since then each
+distinct data line is prepared once, so the `+ n` term becomes the number of
+data lines the transaction touched), so
 
 ```
 lines/commit = ceil((112 + 32n) / 64) + n
@@ -1252,7 +1273,9 @@ failures:
   means **unacknowledged**, not aborted. Any complete valid record that reached
   durable storage may be replayed.
 - If preparing an acknowledged transaction's applied after-image fails,
-  `applyUpdate()` returns `false` and latches recovery-required. Recovery uses
+  `applyUpdate()` — or, on the batched path, `prepareApplied()` or the drain
+  inside the next boundary — returns `false` and latches recovery-required,
+  without advancing `dataDurableSeq`. Recovery uses
   the same rule: it returns `PERSIST_FAILED` without issuing `persistChanges()`
   or advancing `dataDurableSeq`.
 - If either ordered write during fresh-header initialization fails, the new WAL
@@ -1330,7 +1353,8 @@ commit()
 The committing transaction's applied after-images are recoverable from its durable slot, but their direct data persistence is deferred. The next commit's single phase-B boundary persists those pending ranges together with the next record. `flush()` calls `wal.persistAppliedData()` when an idle/unmount boundary is required, and `PWRegion.deallocate()` reaches the same operation through `wal.close()`.
 
 `DualTxnWal.applyUpdate()` now returns `false` and latches recovery-required if
-range preparation fails. `RegionTransaction.applyToRegion()` surfaces that
+range preparation fails, and so do `storeUpdate()`/`prepareApplied()`, the
+batched pair `RegionTransaction` uses since 2026-09-28. `RegionTransaction.applyToRegion()` surfaces that
 result without clearing buffered writes. `RegionTransaction.requiresRecovery()`
 delegates to the WAL, and `PWRegion.requiresRecovery()` exposes it to allocator
 callers; allocation and free entry points reject work after the latch is set.

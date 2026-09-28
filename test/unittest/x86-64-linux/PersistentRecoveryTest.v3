@@ -18,6 +18,7 @@ def PRTX = [
 	PRT("three_commits_reclaim_the_oldest_slot", test_recovery_three_commits_reclaim_the_oldest_slot),
 	PRT("overwrite_guard_keeps_acknowledged_data", test_recovery_overwrite_guard_keeps_acknowledged_data),
 	PRT("crash_during_three_commit_recovery_recovers", test_recovery_crash_during_three_commit_recovery_recovers),
+	PRT("batched_apply_keeps_acknowledged_data", test_recovery_batched_apply_keeps_acknowledged_data),
 	()
 ];
 
@@ -44,6 +45,20 @@ class PersistentRecoveryTester(t: Tester) {
 	var trace: PersistentTrace;
 	var slotOffsets = Array<u64>.new(2);	// region-relative address of each record slot
 	var thirdCommitStart: int;		// event index at which the third transaction begins
+
+	// The batched-apply scenario: transaction 1 writes four after-images, two
+	// sharing a line, one on the next line and one on a line of its own, and
+	// applies them as RegionTransaction does -- every store, then each line
+	// prepared once. Transaction 2 is one more after-image, so transaction 1's
+	// data has to ride a real piggybacked boundary; transaction 3 commits into
+	// slot 1 and destroys transaction 1's record, so from then on a line the
+	// batched apply failed to write back is lost rather than replayed.
+	def BATCH_OFFSETS = [400u64, 256u64, 200u64, 192u64];	// stored in this order
+	def BATCH_B_OFFSET = 448u64;
+	def BATCH_C_OFFSET = 512u64;
+	var batchAckStart: int;			// first cut at which transaction 1 is acknowledged
+	var batchApplyEnd: int;			// cut after transaction 1's last writeback
+	var batchThirdStart: int;		// first event of transaction 3
 
 	// Record one real commit -- append, commit, no apply -- through the
 	// production WAL on a trace-recording PMEM region.
@@ -98,6 +113,59 @@ class PersistentRecoveryTester(t: Tester) {
 		ok = ok && trace.validate().ok();
 		region.destroy();
 		return ok;
+	}
+
+	def batchValue(offset: u64) -> u64 {
+		return 0xB0B0_0000_0000_0000_u64 | offset;
+	}
+
+	def recordBatchedApply() -> bool {
+		def mapping = Mmap.reserve(REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return false;
+		def region = PmemMmapRegion.new(mapping, -1);
+		def recorder = RecordingPersistentOperations.new(region.range);
+		region.setPersistentOperations(recorder);
+
+		def base = u64.view(Pointer.atElement(region.range, 0));
+		def wal = DualTxnWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, true);
+		for (i < 2) slotOffsets[i] = wal.slotAddr(i) - base;
+		mounted = Array<byte>.new(region.range.length);
+		for (i < mounted.length) mounted[i] = region.range[i];
+
+		recorder.clear();
+		var ok = true;
+		for (o in BATCH_OFFSETS) ok = ok && wal.append(o, batchValue(o), 8u8);
+		ok = ok && wal.commit() == 1u64;
+		batchAckStart = recorder.events.length;
+		for (o in BATCH_OFFSETS) ok = ok && wal.storeUpdate(o, batchValue(o), 8u8);
+		ok = ok && wal.prepareApplied();
+		batchApplyEnd = recorder.events.length;
+		ok = ok && wal.append(BATCH_B_OFFSET, batchValue(BATCH_B_OFFSET), 8u8);
+		ok = ok && wal.commit() == 2u64;
+		ok = ok && wal.storeUpdate(BATCH_B_OFFSET, batchValue(BATCH_B_OFFSET), 8u8);
+		ok = ok && wal.prepareApplied();
+		batchThirdStart = recorder.events.length;
+		ok = ok && wal.append(BATCH_C_OFFSET, batchValue(BATCH_C_OFFSET), 8u8);
+		ok = ok && wal.commit() == 3u64;
+		ok = ok && wal.storeUpdate(BATCH_C_OFFSET, batchValue(BATCH_C_OFFSET), 8u8);
+		ok = ok && wal.prepareApplied();
+		trace = recorder.snapshot("dual_wal_batched_apply");
+		ok = ok && trace.validate().ok();
+		region.destroy();
+		return ok;
+	}
+
+	def batchedProperty(name: string, ackA: bool, ackB: bool, ackC: bool) -> PersistentImageProperty {
+		def n = BATCH_OFFSETS.length;
+		def images = Array<PersistentWalAfterImage>.new(n + 2);
+		for (i < n) {
+			def o = BATCH_OFFSETS[i];
+			images[i] = PersistentWalAfterImage.new(o, 8, batchValue(o), ackA);
+		}
+		images[n] = PersistentWalAfterImage.new(BATCH_B_OFFSET, 8, batchValue(BATCH_B_OFFSET), ackB);
+		images[n + 1] = PersistentWalAfterImage.new(BATCH_C_OFFSET, 8, batchValue(BATCH_C_OFFSET), ackC);
+		return PersistentWalHistoryProperty.new(LOG_OFFSET, LOG_SIZE, images)
+			.property(name, slotOffsets[1], 64);
 	}
 
 	// One transaction as RegionTransaction drives it: buffer the after-image,
@@ -497,4 +565,58 @@ def test_recovery_crash_during_three_commit_recovery_recovers(tc: PersistentReco
 	// with three transactions of history behind it.
 	tc.t.assertz(true, result.exhaustive());
 	tc.t.assertz(true, result.imagesChecked > 1);
+}
+
+// The batched apply keeps the acknowledgement contract. From transaction 1's
+// commit point it is acknowledged, so every image of every cut through its
+// apply -- some of its four stores reached the region and some did not, a
+// shared line torn between them, some lines written back and others still
+// dirty -- must recover all four after-images. Those cuts are checked
+// exhaustively. Transaction 3 then destroys transaction 1's record, so its
+// cuts are where a line the apply failed to write back would be lost; they
+// and transaction 2's are swept with a bound, as the other multi-commit tests
+// do, because the records are written byte by byte.
+def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTester) {
+	if (!tc.recordBatchedApply()) {
+		tc.t.fail("could not record a batched-apply WAL history");
+		return;
+	}
+	def apply = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchAckStart,
+		tc.batchApplyEnd, 0,
+		tc.batchedProperty("a batched apply never loses its acknowledged transaction", true, false, false));
+	if (!apply.ok()) tc.t.fail(apply.toArtifact());
+	tc.t.assertz(false, apply.truncated);
+	// Four stores and three writebacks, eight cuts, and more than one image at
+	// cuts between the first store and the last writeback: the model had real
+	// freedom here, so passing is evidence.
+	tc.t.asserti(8, tc.batchApplyEnd - tc.batchAckStart + 1);
+	tc.t.assertz(true, apply.imagesChecked > 2 * (tc.batchApplyEnd - tc.batchAckStart + 1));
+
+	def second = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchApplyEnd,
+		tc.batchThirdStart, 8,
+		tc.batchedProperty("the next commit keeps the batched transaction", true, false, false));
+	if (!second.ok()) tc.t.fail(second.toArtifact());
+
+	// From transaction 3's first event, transactions 1 and 2 are acknowledged
+	// and transaction 1's record is about to be destroyed: only the lines the
+	// batched apply wrote back can keep it.
+	def reclaim = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchThirdStart,
+		tc.trace.length(), 8,
+		tc.batchedProperty("reclaiming the batched transaction's slot loses nothing", true, true, false));
+	if (!reclaim.ok()) tc.t.fail(reclaim.toArtifact());
+
+	def atEnd = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+		tc.batchedProperty("all three transactions survive the third commit", true, true, true));
+	if (!atEnd.ok()) tc.t.fail(atEnd.toArtifact());
+	tc.t.assertz(true, atEnd.exhaustive());
+
+	// Nothing required, whole trace: no cut recovers a value never committed.
+	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 4,
+		tc.batchedProperty("a batched apply never invents state", false, false, false));
+	if (!sweep.ok()) tc.t.fail(sweep.toArtifact());
+
+	// The check can fail: transaction 2 is not yet committed at the first cut.
+	def unmet = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.batchAckStart, 0,
+		tc.batchedProperty("an uncommitted transaction is not required to survive", true, true, false));
+	tc.t.assertz(false, unmet.ok());
 }

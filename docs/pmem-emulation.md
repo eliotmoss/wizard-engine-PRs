@@ -470,7 +470,8 @@ The mutant fails differently from the explorer's counterexample, as predicted:
 all at once, because a 2 MiB region stays in the cache for the few
 milliseconds the armed steps take. The ordinary image matching the crash-free
 one also shows where the ordinary build's writebacks happen: `CLWB` is issued
-as each after-image is applied, and only the `SFENCE` waits for the next
+as each after-image is applied (as it was then; since 2026-09-28 each line is
+written back once, after all of the transaction's stores), and only the `SFENCE` waits for the next
 commit, so by the reset those writebacks had completed. That is one of the
 images the model permits.
 

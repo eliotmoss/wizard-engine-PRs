@@ -30,12 +30,18 @@
 #   file-dax         the file backend; its fdatasync writes back in the kernel
 #   <config>-s64     any of the above with one entry per cache line (pwbench
 #                    stride=64): the same writebacks, no same-line store after one
+#   <config>-entry   (before any -s<n>) the per-entry after-image placement used
+#                    until 2026-09-28, each after-image prepared as it is stored
+#                    (pwbench apply=entry); without it, the production batched
+#                    placement: every store, then each line prepared once
 #
 # The first campaign (results/20260928T001505Z-magpie-clwb-eviction) ran
 # "pmem-auto pmem-clflushopt pmem-none file-dax" and established that CLWB
 # evicts and that the writebacks account for the whole per-entry gap. The
-# default is now the follow-up, which asks whether the cost is the store into a
-# just-evicted line within the commit (see the reading guide in the summary).
+# follow-ups (20260928T022934Z, 20260928T024904Z) ran "pmem-auto pmem-deferred
+# pmem-none file-dax" at strides 8 and 64 and showed the cost is the store into
+# a just-evicted line within the commit. The default is now the placement
+# comparison: production's batched apply against the per-entry one it replaced.
 #
 # Every configuration runs at two commit counts, and a perf counter's value per
 # commit is the difference between the two runs divided by the difference in
@@ -66,7 +72,7 @@ SIZES="${PWCLWB_SIZES:-1 8 24}"
 GEOMETRY="${PWCLWB_GEOMETRY:-512x2048}"
 COMMITS="${PWCLWB_COMMITS:-20000 120000}"
 WARMUP="${PWCLWB_WARMUP:-2000}"
-CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-deferred pmem-none file-dax pmem-auto-s64 pmem-deferred-s64 pmem-none-s64 file-dax-s64}"
+CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-auto-entry pmem-none file-dax file-dax-entry pmem-auto-s64 pmem-auto-entry-s64 pmem-none-s64}"
 CC_BIN="${PWCLWB_CC:-cc}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${PWCLWB_OUT:-$REPO/results/$STAMP-$(hostname -s)-clwb-eviction}"
@@ -250,17 +256,26 @@ probe_summary() {
 
 # ------------------------------------------------------------ 2+3. campaign
 
-# config -> "<backend> stride=<n> [writeback=...]". A trailing -s<n> sets the
-# stride; without one it is pwbench's default of 8, one u64 after another.
+# config -> "<backend> stride=<n> apply=<batch|entry> [writeback=...]". A
+# trailing -s<n> sets the stride (default 8, one u64 after another); an -entry
+# before it selects the per-entry after-image placement used until 2026-09-28
+# (default batch, production since).
 config_args() {
-    local base=$1 stride=8
+    local base=$1 stride=8 apply=batch
     if [[ "$base" =~ ^(.*)-s([0-9]+)$ ]]; then base=${BASH_REMATCH[1]}; stride=${BASH_REMATCH[2]}; fi
+    if [[ "$base" =~ ^(.*)-entry$ ]]; then base=${BASH_REMATCH[1]}; apply=entry; fi
     case "$base" in
         pmem-auto|pmem-clwb|pmem-clflushopt|pmem-clflush|pmem-deferred|pmem-none)
-                  echo "pmem stride=$stride writeback=${base#pmem-}" ;;
-        file-dax) echo "file stride=$stride" ;;
+                  echo "pmem stride=$stride apply=$apply writeback=${base#pmem-}" ;;
+        file-dax) echo "file stride=$stride apply=$apply" ;;
         *) die "unknown configuration: $1" ;;
     esac
+}
+
+# The value of key=... among the words of config_args' output, or empty.
+config_value() {
+    local key=$1 word; shift
+    for word in "$@"; do [[ "$word" == "$key="* ]] && { echo "${word#"$key"=}"; return; }; done
 }
 
 CSV=
@@ -319,18 +334,29 @@ run_one() {
 record_run() {
     local config=$1 entries=$2 commits=$3 rep=$4 load=$5 log=$6 perf_out=$7
     local args; read -r -a args <<< "$(config_args "$config")"
-    local stride=${args[1]#stride=} wb=${args[2]:-}
+    local stride wb apply
+    stride=$(config_value stride "${args[@]}")
+    wb=$(config_value writeback "${args[@]}")
+    apply=$(config_value apply "${args[@]}")
     # writeback=none ends on its own labelled line, never a bare OK; accept
     # exactly the line its configuration must produce.
     local want='^OK$'
-    [ "$wb" = writeback=none ] && want='^OK timing-only: writeback=none'
+    [ "$wb" = none ] && want='^OK timing-only: writeback=none'
     grep -qE "$want" "$log" || { warn "    no expected final line in $log"; return 1; }
     # pwbench prints the instruction's label (CLFLUSHOPT), not the argument
     # (clflushopt): match case-insensitively, up to the label's end, so clflush
     # cannot pass for CLFLUSHOPT.
     if [ -n "$wb" ]; then
-        grep -qiE "^writeback ${wb#writeback=}([ ,]|$)" "$log" ||
-            { warn "    $log does not name writeback ${wb#writeback=}"; return 1; }
+        grep -qiE "^writeback $wb([ ,]|$)" "$log" ||
+            { warn "    $log does not name writeback $wb"; return 1; }
+    fi
+    # Logs from before apply= existed name no placement. They ran per entry,
+    # the only placement there was, under the configuration names of the time,
+    # so a rebuild of an old directory accepts them as they are.
+    if grep -q '^apply ' "$log"; then
+        grep -q "^apply $apply\$" "$log" || { warn "    $log does not name apply $apply"; return 1; }
+    elif [ "$apply" = entry ]; then
+        warn "    $log names no placement but $config needs apply=entry"; return 1
     fi
     # Logs from before stride= existed name no stride; they ran at 8.
     if grep -q '^entry stride' "$log"; then
@@ -482,7 +508,25 @@ campaign_summary() {
  Eviction explains the gap only if A, B and not-C all hold.
 EOF
     fi
-    if [[ " $cfgs" == *" pmem-deferred"* || " $cfgs" == *"-s64 "* ]]; then cat <<'EOF'
+    if [[ " $cfgs" == *"-entry"* ]]; then cat <<'EOF'
+
+---- how to read the placement comparison (per-entry at stride 8 ~1,448 ns/entry,
+     per-entry at stride 64 ~790, no writeback ~770; 20260928T024904Z)
+ G. pmem-auto (batched) slope near pmem-auto-s64's and pmem-none's, well below
+    pmem-auto-entry's -> storing the whole transaction before preparing it
+    removes the same-line misses in production, without changing the layout.
+ H. pmem-auto-s64 ~ pmem-auto-entry-s64 -> where there is no reuse, preparing at
+    the end of the apply loop costs nothing; unlike deferral to the fence, it
+    does not bunch the writebacks against the fence and the next store.
+ I. file-dax ~ file-dax-entry -> the file backend, whose preparation is a flag,
+    is unaffected.
+ "lines" should drop from ceil((112+32n)/64)+n per commit to the record's lines
+ plus the distinct data lines -- ceil(n/8), or one more because pwbench's
+ entries are 8-byte but not line aligned (4, 8, 18 at 1, 8, 24 entries) -- and
+ be unchanged at stride 64.
+EOF
+    fi
+    if [[ " $cfgs" == *" pmem-deferred"* ]]; then cat <<'EOF'
 
 ---- how to read the follow-up (first campaign: pmem-auto ~1440 ns/entry, pmem-none ~760, file-dax ~720)
  D. pmem-auto-s64 ~ pmem-none-s64 (slope): with every entry on its own line the

@@ -10,9 +10,12 @@ def POTX = [
 	POT("dual_wal_phase_b_trace", test_persistent_dual_wal_phase_b_trace),
 	POT("dual_wal_two_transaction_trace", test_persistent_dual_wal_two_transaction_trace),
 	POT("dual_wal_recovery_trace", test_persistent_dual_wal_recovery_trace),
+	POT("dual_wal_batched_apply_writes_each_line_back_once", test_persistent_dual_wal_batched_apply_writes_each_line_back_once),
+	POT("dual_wal_boundaries_drain_unprepared_after_images", test_persistent_dual_wal_boundaries_drain_unprepared_after_images),
 	POT("pwregion_format_trace", test_persistent_pwregion_format_trace),
 	POT("pwregion_format_descriptor_trace", test_persistent_pwregion_format_descriptor_trace),
 	POT("pwregion_alloc_applies_after_commit_boundary", test_persistent_pwregion_alloc_applies_after_commit_boundary),
+	POT("pwregion_txn_writes_each_line_back_once", test_persistent_pwregion_txn_writes_each_line_back_once),
 	POT("immix_line_marks_emit_no_events", test_persistent_immix_line_marks_emit_no_events),
 	()
 ];
@@ -111,6 +114,25 @@ class PersistentOperationsTester(t: Tester) {
 			for (b < int.view(e.width)) covered[int.!(e.offset) + b] = true;
 		}
 		return covered;
+	}
+
+	def firstFence(events: Vector<PersistentTraceEvent>) -> int {
+		for (i < events.length) if (events[i].kind == PersistentEventKind.SFENCE) return i;
+		return -1;
+	}
+
+	// Whether a CLWB of {line} was recorded at or after {from} and before the
+	// last fence in the trace.
+	def clwbBeforeLastFence(recorder: RecordingPersistentOperations, from: int, line: u64) -> bool {
+		var lastFence = -1;
+		for (i < recorder.events.length) {
+			if (recorder.events[i].kind == PersistentEventKind.SFENCE) lastFence = i;
+		}
+		for (i = from; i < lastFence; i++) {
+			def e = recorder.events[i];
+			if (e.kind == PersistentEventKind.CLWB && e.offset == line) return true;
+		}
+		return false;
 	}
 
 	def assertCovered(covered: Array<bool>, start: u64, len: u64, expected: bool) {
@@ -460,6 +482,143 @@ def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTeste
 	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistentEventKind.CLWB);
 	tc.assertSequences(recorder.events);
 	region.destroy();
+}
+
+// storeUpdate() writes an after-image and nothing else; prepareApplied() then
+// writes each touched line back once, in ascending order, after every store.
+// The after-images are stored out of address order to exercise the sort; 192
+// and 200 share a line, 256 is on the next line (merged into one range), and
+// 400 is on a line of its own.
+def test_persistent_dual_wal_batched_apply_writes_each_line_back_once(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("batched-apply trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def offsets = [400u64, 256u64, 200u64, 192u64];
+	for (o in offsets) tc.t.assertz(true, wal.append(o, o + 1u64, 8u8));
+	tc.t.assert_eq(1u64, wal.commit());
+	def afterCommit = recorder.events.length;
+
+	for (o in offsets) tc.t.assertz(true, wal.storeUpdate(o, o + 1u64, 8u8));
+	tc.t.assert_eq(afterCommit + offsets.length, recorder.events.length);
+	for (i < offsets.length) {
+		def e = recorder.events[afterCommit + i];
+		tc.assertStore(e, e.seq, offsets[i], 8u8, offsets[i] + 1u64);
+	}
+
+	tc.t.assertz(true, wal.prepareApplied());
+	def expectedLines = [192u64, 256u64, 384u64];
+	def firstClwb = afterCommit + offsets.length;
+	tc.t.assert_eq(firstClwb + expectedLines.length, recorder.events.length);
+	for (i < expectedLines.length) {
+		def e = recorder.events[firstClwb + i];
+		tc.t.assertz(true, e.kind == PersistentEventKind.CLWB);
+		tc.t.assert_eq(expectedLines[i], e.offset);
+	}
+	// Nothing left to prepare: a second call adds no events, and the explicit
+	// boundary contributes only its fence.
+	tc.t.assertz(true, wal.prepareApplied());
+	tc.t.assert_eq(firstClwb + expectedLines.length, recorder.events.length);
+	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assert_eq(firstClwb + expectedLines.length + 1, recorder.events.length);
+	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistentEventKind.SFENCE);
+	tc.t.assert_eq(1u64, wal.dataDurableSeq);
+	tc.assertSequences(recorder.events);
+	region.destroy();
+}
+
+// The preparation is the applier's to place but not its to forget: an
+// after-image stored and never prepared is written back by the next boundary
+// that claims it -- the next commit's, or persistAppliedData()'s -- before
+// that boundary's fence.
+def test_persistent_dual_wal_boundaries_drain_unprepared_after_images(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("drain trace mapping allocation failed");
+		return;
+	}
+	def recorder = tc.recorderOf(region);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	recorder.clear();
+
+	tc.t.assertz(true, wal.append(200u64, 0x11u64, 8u8));
+	tc.t.assert_eq(1u64, wal.commit());
+	tc.t.assertz(true, wal.storeUpdate(200u64, 0x11u64, 8u8));
+	def storedFirst = recorder.events.length;
+	tc.t.assertz(true, wal.append(264u64, 0x22u64, 8u8));
+	tc.t.assert_eq(2u64, wal.commit());
+	tc.t.assert_eq(1u64, wal.dataDurableSeq);
+	tc.t.assertz(true, tc.clwbBeforeLastFence(recorder, storedFirst, 192u64));
+
+	tc.t.assertz(true, wal.storeUpdate(264u64, 0x22u64, 8u8));
+	def storedSecond = recorder.events.length;
+	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assert_eq(2u64, wal.dataDurableSeq);
+	tc.t.assertz(true, tc.clwbBeforeLastFence(recorder, storedSecond, 256u64));
+	tc.assertSequences(recorder.events);
+	region.destroy();
+}
+
+// Through the allocator's transaction facade: eleven u64 writes over three
+// lines -- a full line, the line after it, and a line two further on -- are
+// written back as three line writebacks, after all eleven stores. The
+// benchmark-only per-entry switch restores one writeback per write.
+def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperationsTester) {
+	def backend = TracePWRegionBackend.new();
+	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
+		TracePWRegions.BLOCK_SIZE, true);
+	if (backend.region == null) {
+		tc.t.fail("txn trace mapping allocation failed");
+		return;
+	}
+	def chunk = region.allocChunk(1u32);
+	tc.t.assertz(false, chunk.isNull());
+	def line0 = (chunk.addr + u64.!(ChunkHeader.size) + 63u64) & ~63u64;
+	def writes = Vector<u64>.new();
+	for (i < 8) writes.put(line0 + u64.!(i * 8));
+	writes.put(line0 + 64u64);
+	writes.put(line0 + 192u64);
+	writes.put(line0 + 200u64);
+	def regionStart = region.txn.regionStart;
+	def expectedLines = [line0 - regionStart, line0 + 64u64 - regionStart, line0 + 192u64 - regionStart];
+	def recorder = backend.recorder();
+
+	recorder.clear();
+	for (i < writes.length) region.txn.writeU64(writes[i], 0x1000u64 + u64.!(i));
+	tc.t.assertz(true, region.txn.commit());
+	var fence = tc.firstFence(recorder.events);
+	tc.t.assertz(true, fence > 0);
+	var stores = 0, clwbs = 0;
+	for (i = fence + 1; i < recorder.events.length; i++) {
+		def e = recorder.events[i];
+		if (e.kind == PersistentEventKind.STORE) {
+			tc.t.assert_eq(0, clwbs);	// every store precedes every writeback
+			stores++;
+		} else if (e.kind == PersistentEventKind.CLWB) {
+			tc.t.assert_eq(expectedLines[clwbs], e.offset);
+			clwbs++;
+		}
+	}
+	tc.t.assert_eq(writes.length, stores);
+	tc.t.assert_eq(expectedLines.length, clwbs);
+
+	region.txn.perEntryWriteback = true;
+	recorder.clear();
+	for (i < writes.length) region.txn.writeU64(writes[i], 0x2000u64 + u64.!(i));
+	tc.t.assertz(true, region.txn.commit());
+	fence = tc.firstFence(recorder.events);
+	clwbs = 0;
+	for (i = fence + 1; i < recorder.events.length; i++) {
+		if (recorder.events[i].kind == PersistentEventKind.CLWB) clwbs++;
+	}
+	tc.t.assert_eq(writes.length, clwbs);
+	tc.assertSequences(recorder.events);
+	region.deallocate();
 }
 
 // The store audit's core regression: PWRegion.format() builds the entire region

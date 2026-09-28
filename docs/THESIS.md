@@ -152,8 +152,10 @@ Two findings that arrived unplanned and are better material than the headline:
   excess falls from 678 to 37 ns per entry, and the writebacks cost 7 % of a
   24-entry commit instead of 43 %. Deferring every writeback to the fence
   recovers 27–34 % of the commit at 8–24 entries but loses 11–22 % where there
-  is no reuse, so placement matters as much as count; writing each line back
-  once at the end of the apply loop is the untested candidate for production.
+  is no reuse, so placement matters as much as count. Writing each line back
+  once at the end of the apply loop is now production (2026-09-28), covered by
+  crash-explorer and mutation-checked tests; its cost on Magpie is not yet
+  measured.
   Worth a paragraph in Chapter 6: the same instruction, on the same media,
   costs 7 % or 43 % of a commit depending on where the protocol issues it and
   how the caller lays out its writes, which the abstraction neither shows nor

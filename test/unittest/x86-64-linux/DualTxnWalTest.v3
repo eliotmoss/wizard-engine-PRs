@@ -44,6 +44,9 @@ def DWTX = [
 	DWT("shadow_partial_copy_then_fail", test_shadow_partial_copy_then_fail),
 	DWT("failed_prepare_then_crash_is_clean", test_dual_failed_prepare_then_crash_is_clean),
 	DWT("apply_prepare_failure_requires_reopen", test_dual_apply_prepare_failure_requires_reopen),
+	DWT("batched_prepare_failure_requires_reopen", test_dual_batched_prepare_failure_requires_reopen),
+	DWT("boundary_drain_failure_requires_reopen", test_dual_boundary_drain_failure_requires_reopen),
+	DWT("unprepared_after_image_survives_slot_reclaim", test_dual_unprepared_after_image_survives_slot_reclaim),
 	DWT("recovery_prepare_failure_requires_reopen", test_dual_recovery_prepare_failure_requires_reopen),
 	DWT("failed_persist_before_copy_then_crash_is_clean", test_dual_failed_persist_before_copy_then_crash_is_clean),
 	DWT("indeterminate_persist_record_replays", test_dual_indeterminate_persist_record_replays),
@@ -1088,6 +1091,80 @@ def test_dual_failed_prepare_then_crash_is_clean(tc: DualTxnWalTester) {
 // Once an acknowledged transaction's live after-image cannot be prepared for
 // the next boundary, the WAL must not claim or attempt further durability on
 // this instance. The retained record restores the update after reopen.
+// The batched apply fails as the per-entry one does: a failed preparation
+// latches the instance, nothing further reaches the region's persistence API,
+// and after a crash the durable record replays both after-images.
+def test_dual_batched_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assertz(true, tc.wal.append(200u64, 0x67u64, 1u8));
+	tc.t.assertz(true, tc.wal.append(201u64, 0x68u64, 1u8));
+	tc.t.assert_eq(1u64, tc.wal.commit());
+	tc.t.assertz(true, tc.wal.storeUpdate(200u64, 0x67u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeUpdate(201u64, 0x68u64, 1u8));
+	tc.shadowRegion.failNextPrepareChangedRange = true;
+	tc.t.assertz(false, tc.wal.prepareApplied());
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+
+	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
+	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	tc.t.assertz(false, tc.wal.storeUpdate(202u64, 0x69u64, 1u8));
+	tc.t.assertz(false, tc.wal.prepareApplied());
+	tc.t.assertz(false, tc.wal.persistAppliedData());
+	tc.t.assert_eq(0u8, tc.data[202]);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
+	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assert_eq(0u8, tc.data[200]);
+	tc.t.assert_eq(0u8, tc.data[201]);
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x67u8, tc.data[200]);
+	tc.t.assert_eq(0x68u8, tc.data[201]);
+	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
+}
+
+// A preparation failing inside the next commit -- with an after-image still
+// outstanding, it is the drain's -- latches the instance, and the commit fails
+// without claiming transaction 1's data durable. The durable record replays it.
+// (Whether the drain happens at all is what the next test establishes.)
+def test_dual_boundary_drain_failure_requires_reopen(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeUpdate(200u64, 0x67u64, 1u8));
+	tc.shadowRegion.failNextPrepareChangedRange = true;
+	tc.t.assertz(true, tc.wal.append(300u64, 0x77u64, 1u8));
+	tc.t.assert_eq(0u64, tc.wal.commit());
+	tc.t.assertz(true, tc.wal.requiresRecovery());
+	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
+	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x67u8, tc.data[200]);
+	tc.t.assert_eq(0u8, tc.data[300]);
+	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
+}
+
+// An after-image stored and never prepared must still be durable once the
+// next commit has returned, because that commit advances dataDurableSeq and
+// the one after it may destroy the record. Transaction 3 reclaims transaction
+// 1's slot, so after the crash nothing but a drained writeback can supply
+// transaction 1's byte: the shadow region makes only prepared ranges durable.
+def test_dual_unprepared_after_image_survives_slot_reclaim(tc: DualTxnWalTester) {
+	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeUpdate(200u64, 0x67u64, 1u8));
+	tc.t.assert_eq(2u64, tc.writeTxn(300u64, 0x77u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeUpdate(300u64, 0x77u64, 1u8));
+	tc.t.assert_eq(3u64, tc.writeTxn(301u64, 0x78u64, 1u8));
+	tc.t.assert_eq(3u64, tc.wal.slotSeqs[1]);	// transaction 1's record is gone
+	tc.t.assert_eq(2u64, tc.wal.dataDurableSeq);
+
+	var reopened = tc.crashAndReopen();
+	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assert_eq(0x67u8, tc.data[200]);
+	tc.t.assert_eq(0x77u8, tc.data[300]);
+	tc.t.assert_eq(0x78u8, tc.data[301]);
+}
+
 def test_dual_apply_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
 	tc.shadowRegion.failNextPrepareChangedRange = true;

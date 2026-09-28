@@ -16,7 +16,11 @@
 // previous transaction's applied after-images, via prepareChangedRange(record)
 // + persistChanges(). The committing transaction's own after-images are
 // applied to the region afterwards and ride the NEXT commit's boundary, an
-// explicit persistAppliedData(), or close(). Correctness by induction: a
+// explicit persistAppliedData(), or close(). They are stored with
+// storeUpdate() and prepared together by prepareApplied(), one preparation per
+// cache line rather than one per after-image; every boundary that advances
+// dataDurableSeq first prepares whatever is still outstanding, so no stored
+// after-image can miss the boundary that claims it. Correctness by induction: a
 // valid record N+1 on-region implies the boundary at its commit completed, so
 // txn N's data is durable; replaying the <=2 valid records always restores
 // the latest acknowledged state. Recovery = validate both slots -> replay
@@ -74,6 +78,10 @@ class DualTxnWal {
         def var slotSeqs = Array<u64>.new(2);   // txnSeq of the valid record in each slot (0 = empty/unknown)
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
+        // [start, end) of after-images stored by storeUpdate() and not yet
+        // prepared. Reset with resize(0), never clear(): clear() zeroes the
+        // whole backing array on every call.
+        private def appliedExtents = Vector<(u64, u64)>.new();
         private var recoveryRequired = false;   // Persistence work left this mount unable to continue safely
         def var openOk = false;
 
@@ -130,8 +138,9 @@ class DualTxnWal {
         // sentinel is unambiguous.
         //
         // CONTRACT: the caller must apply a committed transaction's entries
-        // (applyUpdate) before committing the next transaction; the boundary
-        // here only covers after-images that have already been applied.
+        // (storeUpdate, then prepareApplied; or applyUpdate) before committing
+        // the next transaction; the boundary here only covers after-images that
+        // have already been applied.
         def commit() -> u64 {
                 if (recoveryRequired) return 0u64;
                 def txnSeq = appendCommittedRecord(pendingEntries);
@@ -168,6 +177,80 @@ class DualTxnWal {
                 return true;
         }
 
+        // Apply one acknowledged after-image without preparing its range; the
+        // range is recorded for prepareApplied(). A transaction's after-images
+        // are stored first and prepared together because on PMEM a preparation
+        // is a CLWB, which on Cascade Lake evicts the line: preparing each one
+        // as it is stored made the next store into the same line miss to the
+        // medium -- about 95 % of the per-entry cost of the writebacks, as
+        // measured on Magpie (docs/persistent-backends.md, "CLWB evicts on
+        // Cascade Lake"). The durable slot remains the source of truth until
+        // the next boundary, exactly as with applyUpdate().
+        def storeUpdate(offset: u64, value: u64, width: u8) -> bool {
+                if (recoveryRequired) return false;
+                if (!validEntryFields(offset, width)) return false;
+                writeAfterImage(offset, value, width);
+                appliedExtents.put((offset, offset + u64.view(width)));
+                return true;
+        }
+
+        // Prepare every range stored by storeUpdate() since the last call, each
+        // cache line once: ranges are sorted by start and merged while the next
+        // begins in, or immediately after, the current run's last line, so each
+        // merged range covers exactly the lines that were written. Called by
+        // the applier once it has stored the whole transaction -- a record
+        // construction ahead of the fence and of the next store to these lines
+        // -- and by every boundary that advances dataDurableSeq, which makes
+        // the obligation structural rather than the caller's.
+        def prepareApplied() -> bool {
+                if (recoveryRequired) return false;
+                def n = appliedExtents.length;
+                if (n == 0) return true;
+                sortAppliedExtents();
+                def first = appliedExtents[0];
+                var start = first.0, end = first.1;
+                for (i = 1; i < n; i++) {
+                        def next = appliedExtents[i];
+                        if (lineOf(next.0) <= lineOf(end - 1u64) + 1u64) {
+                                if (next.1 > end) end = next.1;
+                        } else {
+                                if (!prepareAppliedRange(start, end)) return false;
+                                start = next.0;
+                                end = next.1;
+                        }
+                }
+                if (!prepareAppliedRange(start, end)) return false;
+                appliedExtents.resize(0);
+                return true;
+        }
+
+        private def prepareAppliedRange(start: u64, end: u64) -> bool {
+                if (!backendRegion.prepareChangedRange(start, end - start)) {
+                        recoveryRequired = true;
+                        return false;
+                }
+                return true;
+        }
+
+        // In place, no allocation per commit. Insertion sort: a transaction's
+        // extents number at most one slot's entries, and callers that write in
+        // address order hand it an already-sorted vector.
+        private def sortAppliedExtents() {
+                for (i = 1; i < appliedExtents.length; i++) {
+                        def e = appliedExtents[i];
+                        var j = i - 1;
+                        while (j >= 0 && appliedExtents[j].0 > e.0) {
+                                appliedExtents[j + 1] = appliedExtents[j];
+                                j--;
+                        }
+                        appliedExtents[j + 1] = e;
+                }
+        }
+
+        private def lineOf(offset: u64) -> u64 {
+                return offset / DualTxnWalConstants.ALIGNMENT;
+        }
+
         // Explicit boundary: complete durability for all after-images applied
         // so far. In phase B the per-commit data persist is piggybacked onto
         // the next commit's boundary, so this is only needed for unmount/idle
@@ -179,6 +262,7 @@ class DualTxnWal {
         // callers must reopen and recover.
         def persistAppliedData() -> bool {
                 if (recoveryRequired) return false;
+                if (!prepareApplied()) return false;
                 if (!backendRegion.persistChanges()) {
                         recoveryRequired = true;
                         return false;
@@ -240,12 +324,14 @@ class DualTxnWal {
 
                 // The transaction commit point: one boundary persists the new
                 // record together with the previous transaction's applied
-                // after-images (their ranges were prepared by applyUpdate). On
+                // after-images (their ranges were prepared by prepareApplied or
+                // applyUpdate; any still outstanding are prepared here). On
                 // PMEM that is one SFENCE over all flushed lines; on a file
                 // backend one fdatasync subsumes both. The sequence is
                 // deliberately not burned on failure. A failed persistence
                 // result is unacknowledged, so this instance is latched until
                 // the durable image is reopened and recovered.
+                if (!prepareApplied()) return 0u64;
                 if (!backendRegion.prepareChangedRange(absStart - regionStart, recordLen64)) {
                         recoveryRequired = true;
                         return 0u64;
@@ -309,6 +395,7 @@ class DualTxnWal {
                 // The replay is published only once the redone data is durable.
                 // On failure the slots stay valid and the overwrite guard keeps
                 // them from being destroyed, so a later mount replays them again.
+                if (!prepareApplied()) return DualWalRecovery.PERSIST_FAILED;
                 if (!backendRegion.persistChanges()) {
                         recoveryRequired = true;
                         return DualWalRecovery.PERSIST_FAILED;

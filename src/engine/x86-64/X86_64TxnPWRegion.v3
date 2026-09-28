@@ -416,6 +416,11 @@ class RegionTransaction {
         private def addrs = Vector<u64>.new();
         private def wal: DualTxnWal;
         def regionStart: u64;
+        // Benchmark-only (pwbench apply=entry, scripts/clwb-eviction.sh): true
+        // restores the placement used until 2026-09-28, each after-image
+        // prepared as it is applied, so the two can be measured in one sitting.
+        // Remove once that comparison is recorded.
+        var perEntryWriteback = false;
 
         new(wal, regionStart) {
                 cache = HashMap<u64, CachedUpdate>.new(hash, u64.==);
@@ -524,13 +529,24 @@ class RegionTransaction {
                 );
         }
 
+        // Store every after-image, then prepare their lines once each. On PMEM
+        // a preparation is a CLWB, and on Cascade Lake a CLWB evicts the line,
+        // so preparing each after-image as it is stored made the next store
+        // into the same line miss to the medium. Preparing here, rather than
+        // at the next boundary, keeps a whole record construction between each
+        // writeback and both the fence and the next store to its line.
         private def applyToRegion() -> bool {
                 for (i < addrs.length) {
                         def addr = addrs[i];
                         def c: CachedUpdate = cache[addr];
-                        if (!wal.applyUpdate(addr - regionStart, c.value, c.size)) return false;
+                        def offset = addr - regionStart;
+                        if (perEntryWriteback) {
+                                if (!wal.applyUpdate(offset, c.value, c.size)) return false;
+                        } else if (!wal.storeUpdate(offset, c.value, c.size)) {
+                                return false;
+                        }
                 }
-                return true;
+                return perEntryWriteback || wal.prepareApplied();
         }
 
         // Hash function: Convert u64 -> i32
