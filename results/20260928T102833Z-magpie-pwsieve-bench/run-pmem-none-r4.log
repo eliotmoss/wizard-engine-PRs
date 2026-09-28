@@ -1,0 +1,23 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+directory /mnt/pmem0.0/sean/
+writeback none -- no writeback, timing only, the region is NOT durable, CPUID selects CLWB
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+wall ns per step 475577
+step ns: mean 475679
+step ns: min 436923 median 476327 p90 490931
+step ns: p99 514388 max 1013467
+phase compute ns per step 426679
+phase alloc ns per step 11317
+phase bitmap ns per step 18381
+phase publish ns per step 8677
+phase retire ns per step 10609
+boundaries per step x1000 4000
+prepare calls per step x1000 0
+clwb lines per step x1000 94584
+minor faults per step x1000 2143
+OK timing-only: writeback=none, the region was never durable

@@ -1,0 +1,25 @@
+---- per step, median over repetitions (ns unless noted; steps per run in the log)
+config           reps      wall    wall range    median  compute    alloc   bitmap  publish   retire  persist  bound   lines faults
+pmem-auto           5    479361 478688-481738    480327   425054    12781    20179     9240    12108    54308   4.00    94.6   2.14
+pmem-clflushopt     5    479209 477043-480031    479924   426896    12560    18873     9063    11898    52394   4.00    94.6   2.14
+pmem-none           5    475057 474765-475577    475678   426054    11317    18415     8690    10608    49030   4.00    94.6   2.14
+file-dax            5    520862 518700-522048    520911   426702    29472    19936    21019    23872    94299   4.00     0.0  12.81
+file-block          5   2446398 2434631-2454240   2436725  1104549   430029   247457   409971   247609  1335066   4.00     0.0  12.81
+direct-block        5   2675389 2668829-2692988   2642223  1151486   465981   680011   186040   194208  1526240   4.00     0.0   2.14
+
+---- shares
+pmem-auto        persistence phases (alloc+bitmap+publish+retire)  11.3 % of a step
+pmem-clflushopt  persistence phases (alloc+bitmap+publish+retire)  10.9 % of a step
+pmem-none        persistence phases (alloc+bitmap+publish+retire)  10.3 % of a step
+file-dax         persistence phases (alloc+bitmap+publish+retire)  18.1 % of a step
+file-block       persistence phases (alloc+bitmap+publish+retire)  54.6 % of a step
+direct-block     persistence phases (alloc+bitmap+publish+retire)  57.0 % of a step
+writebacks by removal: pmem-auto - pmem-none = 4304 ns per step (0.9 % of pmem-auto)
+  (pmem-none issues no writeback instruction, but its dirty lines still reach memory when they
+  are evicted, possibly during another phase: this is the instructions' cost, not the traffic's)
+instruction: pmem-clflushopt - pmem-auto = -152 ns per step (-0.0 %)
+
+Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median
+step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence
+boundaries per step; lines = cache-line writebacks per step (pmem only); faults = minor faults
+per step. A difference of a few percent is real only outside the wall range of both.
