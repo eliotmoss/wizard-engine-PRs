@@ -145,13 +145,19 @@ Two findings that arrived unplanned and are better material than the headline:
   writebacks brings its slope from 1,444 to 762 ns per entry, the file
   backend's 724. The first candidate, misses on the *next* commit, is not
   supported: the file backend's lines are written back between commits too and
-  it pays nothing per entry. The likely mechanism is within the commit — each
-  after-image is written back as soon as it is stored, so the next entry's
-  store into the same line misses — but that is untested (no hardware counters
-  without root; a stride-64 and a deferred-writeback campaign would test it).
+  it pays nothing per entry. The mechanism is within the commit, **established
+  by intervention** (timing only; no counters without root): each after-image
+  is written back as soon as it is stored, so the next entry's store into the
+  same line misses. With one entry per line and the same 38 writebacks, the
+  excess falls from 678 to 37 ns per entry, and the writebacks cost 7 % of a
+  24-entry commit instead of 43 %. Deferring every writeback to the fence
+  recovers 27–34 % of the commit at 8–24 entries but loses 11–22 % where there
+  is no reuse, so placement matters as much as count; writing each line back
+  once at the end of the apply loop is the untested candidate for production.
   Worth a paragraph in Chapter 6: the same instruction, on the same media,
-  costs a third of a commit or nothing depending on where the protocol issues
-  it, which the abstraction neither shows nor controls.
+  costs 7 % or 43 % of a commit depending on where the protocol issues it and
+  how the caller lays out its writes, which the abstraction neither shows nor
+  controls.
 - **On PMEM the fence is not the cost — but the writebacks are (corrected
   2026-09-28).** The earlier form of this finding, "byte-at-a-time `zeroBytes`
   and `computeRecordChecksum` outweigh the durability boundary by 28×, so the

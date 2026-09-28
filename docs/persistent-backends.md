@@ -422,8 +422,10 @@ commit costs 4.3, 13.0 and 36.1 µs at 1, 8 and 24 entries, against 7.4, 12.0 an
 23.8 µs for the file backend at 1 MiB. That is about 1.44 µs per entry against
 0.74 µs, on the same media, for the same record-construction code. What makes
 the PMEM backend's non-boundary work grow twice as fast was **not established**
-when this was written. It is now, in part: the PMEM backend's own writebacks
-account for the whole gap, because `CLWB` evicts on Cascade Lake; see
+when this was written. It is now: `CLWB` evicts on Cascade Lake, and the PMEM
+backend writes each after-image back as soon as it is stored, so the next
+entry's store into the same line misses. That accounts for about 95 % of the
+gap; see
 [below](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
 The candidate first recorded here — that the *next* commit's writes miss — is
 not supported. The file backend's extra fixed ~3 µs at one entry is consistent
@@ -446,7 +448,13 @@ the experiment has no root, so every conclusion here rests on timing. The
 campaign script's writeback-label check rejected all 18 `pmem-clflushopt` runs
 by comparing `clflushopt` against the label `CLFLUSHOPT`. The runs themselves
 are valid; `runs.csv` was rebuilt from the logs (`runs.csv.orig` is the
-campaign's own) and the check is fixed.
+campaign's own) and the check is fixed. Two follow-up campaigns the same day,
+same geometry and protocol, test the mechanism:
+`results/20260928T022934Z-magpie-clwb-eviction` (stride 64; its deferred rows
+are invalid, see below) and `results/20260928T024904Z-magpie-clwb-eviction`
+(the deferred rerun, with production and no-writeback controls from the same
+sitting). The production configuration reproduced across all three campaigns
+to within 0.4 % at 24 entries (37,617, 37,616 and 37,741 ns).
 
 **`CLWB` evicts the line it writes back.** `scripts/clwbprobe.c`, which is
 independent of the engine, dirties a line, writes it back, fences, and times
@@ -488,13 +496,65 @@ back *within* the commit: `DualTxnWal.applyUpdate()` stores one after-image and
 immediately prepares its line, which on PMEM is a `CLWB`, and pwbench's entries
 are consecutive u64s. So seven of every eight after-image stores land in a line
 the previous entry's writeback has just evicted, a miss nothing can prefetch.
-That fits the magnitude but is **untested**. The per-entry excess also grows,
-from ~600 to ~750 ns between 8 and 24 entries, which a count of such misses does
-not predict, and removing the writebacks also removes their write traffic to
-Optane. The script's follow-up configurations separate these: `stride=64` puts
-each entry on its own line (the same writebacks, no same-line store after one),
-and `writeback=deferred` writes each distinct line back once, just before the
-fence, which leaves durability unchanged.
+Removing the writebacks cannot tell that apart from their write traffic to
+Optane; separating the entries can.
+
+**The within-commit store is the cost.** pwbench's `stride=64` puts each entry
+on its own cache line. That keeps the writebacks exactly as they were — 38 per
+commit at 24 entries at both strides — and removes every store into a line that
+was just written back. `writeback=deferred` instead records each requested line
+and writes each distinct line back once, immediately before the fence, which
+leaves durability unchanged. Wall time per commit, median of three, all six
+from one sitting (`20260928T024904Z`):
+
+| Entries | production, stride 8 | production, stride 64 | deferred, stride 8 | deferred, stride 64 | none, stride 8 | none, stride 64 |
+|---|---|---|---|---|---|---|
+| 1 | 4,439 ns | 4,434 ns | 4,923 ns | 4,979 ns | 3,791 ns | 3,794 ns |
+| 8 | 13,445 ns | 10,472 ns | 9,837 ns | 12,749 ns | 8,696 ns | 8,804 ns |
+| 24 | 37,741 ns | 22,609 ns | 24,984 ns | 26,361 ns | 21,501 ns | 21,125 ns |
+| slope per entry | 1,448 ns | 790 ns | 872 ns | 930 ns | 770 ns | 754 ns |
+| writebacks per commit at 24 | 38 | 38 | 18 | 38 | — | — |
+
+With the same writebacks and no same-line store after one, the excess over no
+writeback falls from **678 to 37 ns per entry**. About 95 % of the per-entry cost
+is the store into a just-evicted line; the writebacks themselves, with their
+write traffic, cost 0.6–1.7 µs per commit at stride 64 (1.5 µs, 7 %, at 24
+entries, against 16.2 µs, 43 %, at stride 8). Stride moves the no-writeback
+configuration's slope by 2 % and the file backend's by 2 % outside the boundary
+(5 % in wall time, `20260928T022934Z`), so it is not a confound.
+Per such store the cost is about 775 ns (678 ns over seven stores in eight),
+somewhat above the probe's ~620 ns re-access. A plausible reason is that the
+store follows its line's writeback by nanoseconds, while the probe fences first;
+that is untested.
+
+**Deferring the writebacks to the fence helps only where lines are reused.** At
+stride 8, deferral is the fastest durable configuration at 8 and 24 entries,
+**27 % and 34 % faster** than production, because it removes the same-line
+stores and writes each line back once (18 lines instead of 38 at 24 entries).
+But it is 11 % *slower* than production at one entry, and at stride 64, where
+there is no reuse to remove, it is 12–22 % slower at every size. What deferral
+adds is concentration. The writebacks run back to back just before the fence,
+and just before the next commit's after-images store into those same data
+lines. The in-window boundary shows the first part: 4.0 µs against 1.3 µs for
+production at stride 64, with the same 38 lines. That reading is an
+interpretation of timing, not a measurement of the cause.
+
+**What this points to (untested).** The better placement is between the two:
+write back each distinct after-image line once, at the end of the apply loop.
+That keeps deferral's benefits (no same-line store after a writeback, one
+writeback per line) and keeps production's spacing: a whole record
+construction separates each writeback from the fence and from the next store to
+its line. It predicts production at stride 8 approaching the stride-64 residual
+(~1.5 µs at 24 entries rather than 16.2). This is a change to
+`RegionTransaction.applyToRegion()` and `DualTxnWal.applyUpdate()`, not to the
+benchmark. The crash model permits it — every writeback still precedes the same
+fence — but it reorders the recorded `STORE`/`CLWB` events, so the explorer and
+trace tests that pin that order need updating and rerunning. The layout
+pwbench uses, consecutive u64s, is the benchmark's worst case, but not an
+artificial one: any transaction that writes several fields of one line — a
+block-table entry, a chunk header — pays the same miss on this CPU. The line
+formula above already shows the redundancy: it counts `n` after-image
+writebacks for `ceil(n / 8)` distinct lines.
 
 **The boundary figures on this page do not measure what the writebacks cost.**
 Each writeback is bracketed with `rdtsc`, which is not ordered with `CLWB`, so
@@ -630,7 +690,8 @@ consequence of the measurement, not a planned change.
 `rdtsc`-bracketed `CLWB` calls. Measured by removing the writebacks, they cost
 14–43 % of a PMEM commit at 1–24 entries (36 % at eight), because on Cascade
 Lake `CLWB` evicts the line and the after-image loop stores into lines it has
-just written back. The fence is still cheap and a boundary is still noise; the
+just written back; with one entry per line the same writebacks cost 7 % at 24
+entries. The fence is still cheap and a boundary is still noise; the
 writebacks are not. See
 [`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
 
@@ -988,10 +1049,12 @@ one medium is not wrong on the other, merely pointless.
   configuration-2 figure is specific to regions mapped with 2 MiB entries unless
   a 1 MiB region is named.
 - **Unexplained:** what selects the block configuration's regime at 2 MiB. The
-  PMEM backend's faster per-entry growth is now attributed to its writebacks
-  (`CLWB` evicts on Cascade Lake, 2026-09-28), but which of their effects costs
-  the time — stores into just-evicted lines within the commit, or write traffic
-  — is not yet separated, and there are no hardware counters to say. The block
+  PMEM backend's faster per-entry growth is explained (2026-09-28): stores into
+  lines the previous after-image's `CLWB` just evicted, about 95 % of it,
+  established by a stride intervention on timing alone, since there are no
+  hardware counters. Why the per-store cost (~775 ns) exceeds the probe's
+  re-access (~620 ns), and why deferring writebacks to the fence costs time
+  where there is no reuse, are interpretations, not measurements. The block
   configuration's apparent 8–14 % geometry effect is withdrawn: the sign
   reversed when the 2 MiB figure changed regime.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
