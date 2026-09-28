@@ -1,0 +1,22 @@
+backend file (mmap + msync/fdatasync)
+directory /mnt/pmem0/clwb
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 335060
+step ns: mean 335076
+step ns: min 284101 median 325369 p90 408354
+step ns: p99 432466 max 614007
+phase compute ns per step 289050
+phase alloc ns per step 13440
+phase bitmap ns per step 11713
+phase publish ns per step 8921
+phase retire ns per step 11939
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12807
+OK

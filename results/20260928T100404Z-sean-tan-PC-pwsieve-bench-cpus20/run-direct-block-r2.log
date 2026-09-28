@@ -1,0 +1,22 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/sean-tan/research/wizard-engine-PRs/bin/pwsieve-bench-block
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 1284338
+step ns: mean 1284476
+step ns: min 1197460 median 1275192 p90 1325444
+step ns: p99 1511136 max 8029309
+phase compute ns per step 271790
+phase alloc ns per step 259173
+phase bitmap ns per step 268811
+phase publish ns per step 246619
+phase retire ns per step 238060
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 2142
+OK

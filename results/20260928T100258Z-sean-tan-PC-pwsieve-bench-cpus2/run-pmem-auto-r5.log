@@ -1,0 +1,23 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+directory /mnt/pmem0/clwb
+writeback auto (production CPUID selection), CPUID selects CLWB
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 166673
+step ns: mean 166682
+step ns: min 146940 median 164269 p90 179910
+step ns: p99 191385 max 217626
+phase compute ns per step 151571
+phase alloc ns per step 3363
+phase bitmap ns per step 6213
+phase publish ns per step 2345
+phase retire ns per step 3183
+boundaries per step x1000 4000
+prepare calls per step x1000 0
+clwb lines per step x1000 94584
+minor faults per step x1000 2141
+OK
