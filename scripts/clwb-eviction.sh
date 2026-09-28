@@ -60,7 +60,15 @@
 # PWCLWB_COMMITS ("20000 120000"), PWCLWB_WARMUP (2000), PWCLWB_CONFIGS (all
 # the follow-up set), PWCLWB_NUMA_NODE (auto | none | <n>), PWCLWB_OUT (results/<stamp>-
 # <host>-clwb-eviction), PWCLWB_ALLOW_DIRTY (0), PWCLWB_CC (cc), PWCLWB_EVENTS
-# (a comma-separated perf event list replacing the discovered one).
+# (a comma-separated perf event list replacing the discovered one), PWCLWB_CPUS
+# (a taskset CPU list, e.g. 2 or 16-19: pins the probe and every pwbench run to
+# those CPUs instead of a NUMA node, and names them in the default output
+# directory).
+#
+# Hybrid CPUs (Intel Alder Lake and later) mix two microarchitectures, and
+# whether CLWB keeps the line is a property of the core, so set PWCLWB_CPUS to
+# CPUs of one type; doctor lists them. An unpinned run can migrate between core
+# types mid-campaign.
 
 set -euo pipefail
 
@@ -75,7 +83,9 @@ WARMUP="${PWCLWB_WARMUP:-2000}"
 CONFIGS="${PWCLWB_CONFIGS:-pmem-auto pmem-auto-entry pmem-none file-dax file-dax-entry pmem-auto-s64 pmem-auto-entry-s64 pmem-none-s64}"
 CC_BIN="${PWCLWB_CC:-cc}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="${PWCLWB_OUT:-$REPO/results/$STAMP-$(hostname -s)-clwb-eviction}"
+CPU_TAG=
+[ -n "${PWCLWB_CPUS:-}" ] && CPU_TAG="-cpus${PWCLWB_CPUS//,/_}"
+OUT="${PWCLWB_OUT:-$REPO/results/$STAMP-$(hostname -s)-clwb-eviction$CPU_TAG}"
 
 BENCH_BIN=bin/pwbench.x86-64-linux
 PROBE_SRC=scripts/clwbprobe.c
@@ -108,15 +118,58 @@ numa_node_of() {
 PIN_BENCH=()
 PIN_PROBE=()
 PIN_NODE=none
+# Intel hybrid parts list each core type's CPUs here; other CPUs have neither.
+hybrid_topology() {
+    local t out=
+    for t in cpu_core cpu_atom; do
+        [ -r "/sys/devices/$t/cpus" ] && out="$out$t=$(cat "/sys/devices/$t/cpus") "
+    done
+    echo "${out:-not hybrid}"
+}
+
+# One CPU number per line from a list such as 0-3,8.
+expand_cpus() {
+    local part
+    local -a parts
+    IFS=, read -ra parts <<< "$1"
+    for part in "${parts[@]}"; do
+        if [[ "$part" == *-* ]]; then seq "${part%-*}" "${part#*-}"; else echo "$part"; fi
+    done
+}
+
+# The core types a CPU list covers: cpu_core, cpu_atom, both, or "not hybrid".
+core_types_of() {
+    local t cpu members found=
+    for t in cpu_core cpu_atom; do
+        [ -r "/sys/devices/$t/cpus" ] || continue
+        members=" $(expand_cpus "$(cat "/sys/devices/$t/cpus")" | tr '\n' ' ')"
+        for cpu in $(expand_cpus "$1"); do
+            if [[ "$members" == *" $cpu "* ]]; then found="$found${found:+ + }$t"; break; fi
+        done
+    done
+    echo "${found:-not hybrid}"
+}
+
 resolve_pinning() {
     local want=${PWCLWB_NUMA_NODE:-auto} node
+    if [ -n "${PWCLWB_CPUS:-}" ]; then
+        [[ "$PWCLWB_CPUS" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] ||
+            die "PWCLWB_CPUS is not a CPU list such as 2 or 16-19,24: $PWCLWB_CPUS"
+        have taskset || die "PWCLWB_CPUS needs taskset (util-linux)"
+        local types; types=$(core_types_of "$PWCLWB_CPUS")
+        [[ "$types" == *" + "* ]] && warn "PWCLWB_CPUS=$PWCLWB_CPUS spans both core types; the timings will mix two microarchitectures"
+        PIN_BENCH=(taskset -c "$PWCLWB_CPUS")
+        PIN_PROBE=(taskset -c "$PWCLWB_CPUS")
+        PIN_NODE="cpus $PWCLWB_CPUS ($types)"
+        return
+    fi
     if [ "$want" = none ]; then PIN_NODE="disabled"; return; fi
     have numactl || { PIN_NODE="unavailable (no numactl)"; return; }
     if [ "$want" = auto ]; then node=$(numa_node_of "$PWASM_PMEM_TEST_DIR"); else node=$want; fi
     case "$node" in ''|*[!0-9]*) PIN_NODE="undetermined ($node)"; return ;; esac
     PIN_BENCH=(numactl "--cpunodebind=$node" --)
     PIN_PROBE=(numactl "--cpunodebind=$node" "--membind=$node" --)
-    PIN_NODE=$node
+    PIN_NODE="node $node"
 }
 
 require_dax_dir() {
@@ -189,12 +242,14 @@ write_provenance() {
         rule "cpu"
         if have lscpu; then lscpu | grep -Ei 'model name|^model:|stepping|^cpu\(s\)|thread|l1d|l2|l3' || true; fi
         grep -m1 -E '^microcode' /proc/cpuinfo 2>/dev/null || true
+        printf 'hybrid   %s\n' "$(hybrid_topology)"
+        printf 'governor %s\n' "$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c | tr -s ' ' | tr '\n' ';' || true)"
         rule "dax"
         printf '%s\n  source  %s\n  options %s\n  node    %s\n' "$PWASM_PMEM_TEST_DIR" \
             "$(source_of "$PWASM_PMEM_TEST_DIR")" \
             "$(findmnt -no OPTIONS -T "$PWASM_PMEM_TEST_DIR" 2>/dev/null || echo unknown)" \
             "$(numa_node_of "$PWASM_PMEM_TEST_DIR")"
-        printf 'pinned to node %s\n' "$PIN_NODE"
+        printf 'pinned   %s\n' "$PIN_NODE"
         rule "perf"
         if [ "$PERF_OK" = 1 ]; then
             printf 'version  %s\nparanoid %s\nevents   %s\nnotes   %s\n' "$(perf --version 2>/dev/null)" \
@@ -391,7 +446,7 @@ campaign() {
     mkdir -p "$OUT"
     write_provenance
     csv_header
-    say "results -> $OUT (node $PIN_NODE, perf $([ $PERF_OK = 1 ] && echo "$EVENTS" || echo off))"
+    say "results -> $OUT (pinned $PIN_NODE, perf $([ $PERF_OK = 1 ] && echo "$EVENTS" || echo off))"
 
     local failures=0 rep entries n
     for rep in $(seq 1 "$REPS"); do
@@ -565,7 +620,11 @@ doctor() {
             "$(source_of "$PWASM_PMEM_TEST_DIR")" "$(findmnt -no OPTIONS -T "$PWASM_PMEM_TEST_DIR" 2>/dev/null)" \
             "$(numa_node_of "$PWASM_PMEM_TEST_DIR")" "$([ -w "$PWASM_PMEM_TEST_DIR" ] && echo yes || echo NO)"
     fi
+    printf 'hybrid %s\n' "$(hybrid_topology)"
+    [[ "$(hybrid_topology)" == "not hybrid" ]] ||
+        warn "hybrid CPU: set PWCLWB_CPUS to CPUs of one core type (cpu_core = performance, cpu_atom = efficiency)"
     rule "tools"
+    printf 'taskset          %s\n' "$(have taskset && echo present || echo 'absent -- PWCLWB_CPUS unavailable')"
     printf 'C compiler (%s)  %s\n' "$CC_BIN" "$(have "$CC_BIN" && echo present || echo 'ABSENT -- probe unavailable')"
     printf 'numactl          %s\n' "$(have numactl && echo present || echo 'absent -- runs are unpinned')"
     printf 'pwbench          %s\n' "$([ -x "$BENCH_BIN" ] && { grep -q 'writeback=' "$BENCH_BIN" && echo 'present, has writeback=' || echo 'present but STALE -- rebuild'; } || echo 'absent (campaign builds it)')"
