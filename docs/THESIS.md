@@ -109,7 +109,9 @@ less precisely specifiable side.
 
 Phase B of `DualTxnWal` exists to reduce the protocol to one persistence
 boundary per commit in steady state. **Measured on Magpie, 2026-09-18**, the
-same design decision is worth 80–99 % of a commit on a file and 3.4 % on PMEM —
+same design decision is worth 95–99 % of a commit on a file over DAX, 52–86 % on
+a file over block storage (falling as the transaction grows), and 3.4 % on PMEM
+(an in-window figure; a fence is still noise there, see the correction below) —
 the WAL's central optimisation has a completely different value per backend, and
 now a number rather than an assertion.
 
@@ -306,22 +308,42 @@ under 0.7 %. On the Raptor Lake E-core the shares are 8 %, 14 % and 79 %; its
   `/home` it takes 2.6–2.7× its PMEM time, in every repetition. It is not
   migration (unchanged pinned to one CPU), and not the system calls or faults:
   the file backend on DAX makes the same calls, takes the same write-protect
-  faults and computes normally. Raptor Lake reproduces it under `powersave`
-  (3.0–3.3×) and not under `performance` (1.04×). Magpie has no cpufreq driver,
-  so its clock is set by the platform, and a core idle in `fdatasync` can reach
-  C1E or C6. The frequency policy is the likely cause, **inferred, not
-  observed**: confirming it needs `turbostat`, which needs root.
+  faults and computes normally. **Observed without root on 2026-09-29**, with a
+  probe that times a chain of dependent register operations at each of the
+  step's marks: on Magpie a thread that blocks comes back at 1.0 GHz against
+  3.6 GHz busy, and reaches only 1.7–1.8 GHz by the end of the ~1.1 ms sieve,
+  in all five repetitions. The computation's 2.5–2.7× falls between the clock
+  ratios at the sieve's start (3.6×) and end (2.0–2.1×). A 250 µs sleep drops
+  the clock just as far, so it is idleness, not storage. The PMEM and DAX paths
+  never leave full speed, and there is no sign of emptied caches.
 
 The last finding belongs beside the NUMA one, and it has the same shape. The
 PMEM backend is immune because nothing on its path blocks, and the cost falls
-outside the persistence path altogether, in the computation after a boundary. So the 55–57 % persistence share on `/home` understates what
-durability costs the program, and pwbench cannot see it. Chapter 6 must say so
+outside the persistence path altogether, in the computation after a boundary.
+So the 55–57 % persistence share on `/home` understates what durability costs
+the program, and pwbench cannot see it. It is also the thesis's theme once
+more: the backend beneath the interface decides whether the thread blocks, and
+blocking hands the clock to a policy the interface cannot see.
+
+Chapter 6 should present it as a control. On Raptor Lake the cause is
+established by intervention: under `powersave` the clock after a block-storage
+boundary is 29–33 % of busy and the computation 2.9–3.2× PMEM's, and changing
+only the governor to `performance` keeps the clock at 100 % and the slowdown at
+1.02×. On Magpie, which has no OS frequency control to change, it is observed,
+not intervened on. Two limits must be stated: which idle state Magpie's core
+enters is not shown (the 1.0 GHz floor fits C1E, but could be the platform's own
+choice, and only `turbostat` would separate them), and the probe itself makes
+the computation it measures up to 3.6 % faster under `powersave`, because its
+busy time raises the utilisation the governor sees. Chapter 6 must say all this
 wherever it quotes a Magpie block figure for a workload that computes between
 boundaries, and should take Raptor Lake's block figures from the `performance`
-runs. One pattern is still open and should be stated as open: on `/home` the
-sieve's boundaries cost 180–680 µs against pwbench's 150–176 µs, with
-boundaries that follow computation ~1.7× the others. That points at LVM and
-the write-through controller, and is untested.
+runs.
+
+One pattern is still open and should be stated as open: on `/home` the sieve's
+boundaries cost 180–680 µs against pwbench's 150–176 µs, with boundaries that
+follow computation ~1.7× the others. The clock does not explain it (the slow
+boundaries start at the higher clock), which leaves LVM and the write-through
+controller, untested.
 
 Full numbers, per-phase splits and result directories are in
 [persistent-backends.md](persistent-backends.md#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence).
@@ -409,7 +431,7 @@ cannot be written around missing numbers.
 | ~~Third backend: direct I/O~~ | done 2026-09-24, hardware 2026-09-27 | **Added after the plan, before the freeze.** `DirectIoRegion`: private staging buffer, `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a file or a raw block device. Same trace as the PMEM backend; every post-`fdatasync` file image checked exactly against the PMEM model; kill-loop mutant `LOST` / ordinary `OK` on Magpie and the PC; and the finding that Magpie's block storage is a write-through RAID controller, so every `file-block` figure is a controller round trip. See "Where the persistence point is" above. |
 | ~~Stage 2c — reserved-DRAM warm reboot~~ | done 2026-09-24 | **Complete, the experiment discriminates.** Ordinary build `SURVIVED` and mutant `LOST` (every acknowledged step) in 3 of 3 pairs, with the reset issued from inside the process. On the way, two host facts that the write-up needs: the firmware wipes RAM after a `sysrq` reset unless the kernel's memory-overwrite request is cleared, and a seconds-long window before the reset lets every unflushed line reach memory. |
 | ~~`CLWB` eviction and the batched apply~~ | done 2026-09-28 | **Added after the plan, before the freeze; the one production change since the triage.** Follows up the PMEM backend's unexplained per-entry slope. On Cascade Lake `CLWB` evicts, and the within-commit store into a just-written-back line was ~95 % of the writebacks' cost (established by intervention, timing only). Writing each after-image line back once at the end of the apply is now production, with 7 new tests and four mutants each caught: 43 % faster at 24 entries on Magpie, 7–8 % on Raptor Lake, where `CLWB` does not evict. See "Boundary cost" above. |
-| ~~Sieve-step cost (`pwsievebench`)~~ | done 2026-09-28 | **Added after the plan, before the freeze.** The only cost measurement of a program rather than a harness-chosen transaction: persistence is 9–11 % of a step on PMEM and 55–86 % on block storage, and blocking costs the computation after it clock speed. See "What a program pays" above. |
+| ~~Sieve-step cost (`pwsievebench`)~~ | done 2026-09-28 | **Added after the plan, before the freeze.** The only cost measurement of a program rather than a harness-chosen transaction: persistence is 9–11 % of a step on PMEM and 55–86 % on block storage, and blocking costs the computation after it clock speed, observed without root on 2026-09-29 with a clock probe added before the freeze. See "What a program pays" above. |
 
 ### Out of scope for the thesis
 
@@ -614,7 +636,13 @@ Seven, and they need real hours budgeted.
    has two points. On PMEM the persistence segment is a sliver (9–11 %). On
    Magpie's block storage the *computation* segment is 2.6–2.7× taller than on
    PMEM, which is the clock-speed cost no boundary figure shows. State the 1 MiB
-   geometry on the figure, as for figure 6.
+   geometry on the figure, as for figure 6. A second panel explains the tall
+   segment (2026-09-29): the probed clock at each mark of a step, as a share of
+   busy, one line per block-storage configuration, for Raptor Lake under
+   `performance` and `powersave` and for Magpie (the three `…-clock` result
+   directories). Magpie's line drops to 28 % after every boundary and climbs to
+   47–50 % by the end of the sieve; `powersave` sits flat at 29–33 %;
+   `performance` stays at 100 %.
 7. **Negative control, 2×3** — {ordinary build, elided-writeback mutant} ×
    {Magpie crash loop, layer-1b explorer, Stage 2c warm reset}. **Data in hand
    as of 2026-09-24:** the mutant reports `OK` on Magpie with a durable answer
@@ -655,6 +683,7 @@ Figure 7 is the whole argument in one picture.
 - Make every root request one `sudo` sitting on Magpie.
   [`scripts/magpie-root-checks.sh`](../scripts/magpie-root-checks.sh) already
   collects the controller and drive queries, a block trace of `fdatasync` on
-  `/home`, and the `fs_dax:dax_writeback_one` granularity. It does not yet run
-  `turbostat` during a sieve run on `/home`, which is what would turn the
-  clock-speed finding from inferred to observed.
+  `/home`, and the `fs_dax:dax_writeback_one` granularity. The clock-speed
+  finding no longer needs root: the probe observed it on 2026-09-29. `turbostat`
+  during a sieve run on `/home` would add only which idle state the core
+  enters, so ask for it only if it costs nothing extra in the same sitting.

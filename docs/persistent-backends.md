@@ -970,12 +970,71 @@ figure, in every repetition. Four observations locate the cause:
   which runs at the lowest frequency, and C6, which also empties its private
   caches.
 
-The frequency policy is therefore the likely cause on Magpie, **inferred, not
-observed**: confirming it needs `turbostat`, which needs root. Either way the
-consequence stands. On block storage a durable step costs more than its
-boundaries: the 55–57 % persistence share on Magpie understates what blocking
-costs the program, and pwbench, which issues boundaries back to back with
-almost no computation between them, cannot see it.
+**Observed without root (2026-09-29): it is the clock.** `pwsievebench
+clock=probe` reads the core clock at each of a step's six marks (after the
+sieve, each of the four boundaries, and the short count between the bitmap and
+the publish) by timing 4,096 dependent register operations between
+`lfence`-ordered `rdtsc` reads. The probe touches no memory, so its time depends
+on the clock alone; corrected for its fixed ~1.4 % overhead, every reading on
+both hosts is a whole number of 100 MHz steps. Two references go with it: the
+clock after 200 ms of busy probing, and just after a 250 µs `nanosleep`, which
+blocks with no storage behind it. Every configuration ran plain and probed,
+interleaved, five repetitions, pinned to CPU 2
+(`results/20260929T025219Z-magpie-pwsieve-bench-cpus2-clock`,
+`…T025351Z-sean-tan-PC-pwsieve-bench-cpus2-clock-powersave`,
+`…T031445Z-sean-tan-PC-pwsieve-bench-cpus2-clock-performance`). The clock as a
+share of the busy reference (3.55 GHz implied on Magpie, 5.43 GHz on the
+P-core), medians over repetitions:
+
+| | Raptor Lake, `performance` | Raptor Lake, `powersave` | Magpie |
+|---|---|---|---|
+| `pmem` and `file` on DAX, at every mark | 100 % | 100 % | 100 % |
+| block storage, after each boundary | 100 % | 29–33 % | 28 % (1.0 GHz) |
+| block storage, at the end of the sieve | 100 % | 29–33 % | 47–50 % (1.7–1.8 GHz) |
+| after a 250 µs sleep, no storage | 100 % | 35–36 % | 28 % |
+| computation on block storage ÷ PMEM, probed runs | 1.02× | 2.87–3.16× | 2.53–2.66× |
+| clock ratio to PMEM, sieve start / end | 1.00× / 1.00× | 3.06–3.44× / same | 3.60× / 2.00–2.12× |
+
+- **On Magpie a thread that blocks comes back at the lowest frequency**, 1.0 GHz
+  against 3.6 GHz busy, and reaches only 1.7–1.8 GHz by the end of the ~1.1 ms
+  sieve. The sieve and boundary medians agree to within 1 MHz across all five
+  repetitions. The computation's 2.53× (file) and 2.66× (direct) falls between
+  the clock ratios at the sieve's start and end; if the clock rose steadily
+  between the two readings, the mean would predict 2.57× and 2.67×. The shape
+  of the climb is not observed, so that agreement is consistency, not proof.
+- **Idleness lowers the clock, not storage.** The 250 µs sleep leaves Magpie's
+  core at 1.0 GHz on every sample. Nothing on the PMEM or DAX paths blocks long
+  enough to matter.
+- **Raptor Lake under `powersave` holds one low clock through the whole step**,
+  1.6–1.8 GHz, rather than dropping and climbing, and the computation's
+  2.87–3.16× is just below the clock ratios of 3.06–3.44×, as expected where
+  part of the work waits on memory. Under `performance` the clock stays at
+  5.43 GHz everywhere, and the slowdown shrinks to 1.02–1.03× (1.04× on
+  2026-09-28). That residual is outside the ranges, is not the clock, and is not
+  explained; the file backend on DAX, which also enters the kernel at every
+  boundary, computes 1.8 % faster than PMEM in the plain runs.
+- **Cold caches are not supported.** The first probe of each pair exceeds the
+  second by at most 4 ticks (about 1 ns) anywhere, including after the direct
+  backend's 620 µs bitmap boundary on Magpie. That covers only the probe's own
+  instructions, but the clock leaves little of the slowdown to explain.
+- **The probe's own effect is small and measured.** With the clock pinned
+  (`performance`) probed runs differ from plain ones by −0.8 to +1.2 %, of both
+  signs, which bounds the probe's residue. Under `powersave` the probed block
+  runs compute 3.3–3.6 % faster, outside both ranges: the probe's ~30 µs of busy
+  time per step raises the utilisation the governor sees, so there its readings
+  slightly overstate the unprobed clock. On Magpie the difference is 1.5 %, at
+  the edge of the ranges.
+
+On Raptor Lake the cause is therefore established by intervention: changing
+only the governor removes both the clock drop and the slowdown. On Magpie, which
+has no OS control to change, it is observed rather than intervened on. Which
+idle state Magpie's core enters is still not shown: the 1.0 GHz floor fits
+C1E, but could equally be the platform's own frequency choice, and only
+`turbostat` (root) would separate them. The consequence stands as before. On
+block storage a durable step costs more than its boundaries: the 55–57 %
+persistence share on Magpie understates what blocking costs the program, and
+pwbench, which issues boundaries back to back with almost no computation between
+them, cannot see it.
 
 **Still open: Magpie's per-boundary pattern.** On `/home` the sieve's boundaries
 cost 180–680 µs against pwbench's back-to-back median of 150–176 µs on the same
@@ -985,7 +1044,12 @@ cost about 1.7× the two that follow another boundary (bitmap and retire, 247–
 µs). On the direct backend alloc is 466 µs and the bitmap boundary 680 µs, while
 publish and retire are 186–194 µs. Raptor Lake under `powersave` shows neither:
 all four of its boundaries are 248–283 µs. That points at Magpie's storage path
-(LVM, then the write-through controller) rather than the CPU; untested.
+(LVM, then the write-through controller) rather than the CPU; untested. The
+clock does not explain it. The pattern reproduces in the clock campaign (file:
+alloc 396 and publish 375 µs against bitmap 226 and retire 253 µs), and the two
+slow boundaries are the ones that start at the higher clock, after the sieve
+(1.8 GHz) and after the count (1.5 GHz), while the fast two start at 1.0 GHz:
+the opposite of what a clock cause would predict.
 
 ### Region size at fixed block size, and the NUMA penalty at 1 MiB
 
