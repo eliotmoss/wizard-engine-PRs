@@ -1,0 +1,32 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/sean-tan/research/wizard-engine-PRs/bin/pwsieve-bench-block
+region 256 blocks of 4096 bytes, rounds 20
+clock probe on: 4096 dependent single-cycle operations per probe; references busy and after a 250000 ns sleep
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 1488736
+step ns: mean 1488916
+step ns: min 1080443 median 1518348 p90 1614419
+step ns: p99 1888754 max 8341520
+phase compute ns per step 442427
+phase alloc ns per step 266732
+phase bitmap ns per step 283718
+phase publish ns per step 246287
+phase retire ns per step 249717
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 2202
+clock busy: ticks median 2577 p10 2571 p90 2581, implied MHz 5431, x1000 of busy 1000, first-probe excess ticks 0, samples 1000
+clock after sleep: ticks median 7080 p10 2575 p90 12905, implied MHz 1976, x1000 of busy 363, first-probe excess ticks 4, samples 200
+clock after sieve: ticks median 7875 p10 4565 p90 8354, implied MHz 1777, x1000 of busy 327, first-probe excess ticks 0, samples 3180
+clock after alloc: ticks median 7875 p10 4569 p90 8354, implied MHz 1777, x1000 of busy 327, first-probe excess ticks 0, samples 3180
+clock after bitmap: ticks median 7876 p10 4573 p90 8356, implied MHz 1777, x1000 of busy 327, first-probe excess ticks 0, samples 3180
+clock after count: ticks median 7877 p10 4573 p90 8356, implied MHz 1776, x1000 of busy 327, first-probe excess ticks 0, samples 3180
+clock after publish: ticks median 7880 p10 4570 p90 8836, implied MHz 1776, x1000 of busy 327, first-probe excess ticks 0, samples 3180
+clock after retire: ticks median 7879 p10 4580 p90 8362, implied MHz 1776, x1000 of busy 327, first-probe excess ticks 0, samples 3180
+clock probe ns per step 27041 (removed from the figures above)
+OK

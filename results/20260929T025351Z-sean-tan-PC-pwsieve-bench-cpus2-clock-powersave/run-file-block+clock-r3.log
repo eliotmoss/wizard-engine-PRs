@@ -1,0 +1,32 @@
+backend file (mmap + msync/fdatasync)
+directory /home/sean-tan/research/wizard-engine-PRs/bin/pwsieve-bench-block
+region 256 blocks of 4096 bytes, rounds 20
+clock probe on: 4096 dependent single-cycle operations per probe; references busy and after a 250000 ns sleep
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 1520013
+step ns: mean 1520185
+step ns: min 1054233 median 1562580 p90 1644002
+step ns: p99 1884529 max 7936628
+phase compute ns per step 486651
+phase alloc ns per step 266684
+phase bitmap ns per step 255782
+phase publish ns per step 256728
+phase retire ns per step 254297
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12871
+clock busy: ticks median 2575 p10 2571 p90 2581, implied MHz 5435, x1000 of busy 1000, first-probe excess ticks 0, samples 1000
+clock after sleep: ticks median 7454 p10 2573 p90 12881, implied MHz 1877, x1000 of busy 345, first-probe excess ticks 2, samples 200
+clock after sieve: ticks median 8858 p10 4727 p90 9460, implied MHz 1580, x1000 of busy 290, first-probe excess ticks 0, samples 3180
+clock after alloc: ticks median 8859 p10 4737 p90 9460, implied MHz 1579, x1000 of busy 290, first-probe excess ticks 0, samples 3180
+clock after bitmap: ticks median 8862 p10 4737 p90 9461, implied MHz 1579, x1000 of busy 290, first-probe excess ticks 0, samples 3180
+clock after count: ticks median 8862 p10 4877 p90 9461, implied MHz 1579, x1000 of busy 290, first-probe excess ticks 0, samples 3180
+clock after publish: ticks median 8862 p10 4882 p90 9461, implied MHz 1579, x1000 of busy 290, first-probe excess ticks 0, samples 3180
+clock after retire: ticks median 8860 p10 4883 p90 9461, implied MHz 1579, x1000 of busy 290, first-probe excess ticks 0, samples 3180
+clock probe ns per step 29988 (removed from the figures above)
+OK
