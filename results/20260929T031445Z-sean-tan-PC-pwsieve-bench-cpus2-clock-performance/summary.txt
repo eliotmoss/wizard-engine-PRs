@@ -1,0 +1,59 @@
+---- per step, median over repetitions (ns unless noted; steps per run in the log)
+config               reps      wall    wall range    median  compute    alloc   bitmap  publish   retire  persist  bound   lines faults
+pmem-auto               5    166536 166255-166577    164485   152063     3224     5996     2274     3006    14500   4.00    94.6   2.14
+pmem-auto+clock         5    166368 166082-166544    164192   151984     3204     5899     2278     3010    14391   4.00    94.6   2.21
+file-dax                5    176404 176195-177164    172734   149280     8025     6432     5151     7530    27138   4.00     0.0  12.81
+file-dax+clock          5    178241 178124-178436    175326   151006     8038     6473     5192     7515    27218   4.00     0.0  12.87
+file-block              5   1083738 1083042-1086776   1066769   155028   236535   228609   228957   233804   927905   4.00     0.0  12.81
+file-block+clock        5   1089240 1087902-1089632   1081184   155451   239567   226423   236919   229972   932881   4.00     0.0  12.87
+direct-block            5   1111060 1109636-1117048   1101697   156133   243158   257051   224497   231596   956302   4.00     0.0   2.14
+direct-block+clock      5   1108276 1104630-1111024   1106128   154909   243490   253769   226705   229434   953398   4.00     0.0   2.21
+
+---- shares
+pmem-auto            persistence phases (alloc+bitmap+publish+retire)   8.7 % of a step
+pmem-auto+clock      persistence phases (alloc+bitmap+publish+retire)   8.7 % of a step
+file-dax             persistence phases (alloc+bitmap+publish+retire)  15.4 % of a step
+file-dax+clock       persistence phases (alloc+bitmap+publish+retire)  15.3 % of a step
+file-block           persistence phases (alloc+bitmap+publish+retire)  85.6 % of a step
+file-block+clock     persistence phases (alloc+bitmap+publish+retire)  85.6 % of a step
+direct-block         persistence phases (alloc+bitmap+publish+retire)  86.1 % of a step
+direct-block+clock   persistence phases (alloc+bitmap+publish+retire)  86.0 % of a step
+
+Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median
+step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence
+boundaries per step; lines = cache-line writebacks per step (pmem only); faults = minor faults
+per step. A difference of a few percent is real only outside the wall range of both.
+
+---- clock (+clock runs): implied MHz where each point falls, median over repetitions
+config                  busy   sleep   sieve   alloc  bitmap   count publish  retire
+pmem-auto+clock         5435    5431    5431    5431    5431    5431    5431    5431
+file-dax+clock          5431    5431    5431    5431    5431    5431    5431    5431
+file-block+clock        5431    5431    5431    5431    5431    5431    5431    5431
+direct-block+clock      5431    5431    5431    5431    5431    5431    5431    5431
+
+---- the same as x1000 of the busy reference, with the repetitions' range at the end of the sieve
+config                  busy   sleep   sieve   alloc  bitmap   count publish  retire sieve range
+pmem-auto+clock         1000     999     999     999     999     999     999     999   999-1000 
+file-dax+clock          1000    1000    1000    1000    1000    1000    1000    1000   999-1000 
+file-block+clock        1000    1000    1000    1000    1000    1000    1000    1000   999-1000 
+direct-block+clock      1000    1000    1000    1000    1000    1000    1000    1000   999-1000 
+
+---- first probe's excess over the second, ticks (cold private caches or a clock still changing)
+config                  busy   sleep   sieve   alloc  bitmap   count publish  retire
+pmem-auto+clock            0       2       0       0       0       0       0       0
+file-dax+clock             0       2       0       0       0       0       0       0
+file-block+clock           0       1       0       0       0       0       0       0
+direct-block+clock         0       2       0       0       0       0       0       0
+
+---- does the clock account for the computation? against pmem-auto+clock
+config               compute ns    ratio  clock ratio  clock ratio
+                                          sieve start    sieve end
+pmem-auto+clock          151984     1.00         1.00         1.00
+file-dax+clock           151006     0.99         1.00         1.00
+file-block+clock         155451     1.02         1.00         1.00
+direct-block+clock       154909     1.02         1.00         1.00
+
+ratio = this configuration's compute phase over the reference's; clock ratio = the reference's
+clock over this one's where the sieve starts (after retire, the last boundary) and ends (after
+sieve). The computation is partly memory-bound, so a clock that accounts for its slowdown gives
+a ratio at or somewhat below the clock ratios; a ratio well above them points past the clock.
