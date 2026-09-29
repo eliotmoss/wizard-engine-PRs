@@ -5,6 +5,12 @@
 > thesis claims, which remaining roadmap items are in scope, and what is
 > explicitly cut. It is the scope authority for the rest of the project: where
 > it and [Roadmap](ROADMAP.md) disagree about priority, this document wins.
+>
+> **As of 2026-09-29 every in-scope experiment is complete**, together with
+> three that were added after the plan (the direct-I/O backend, the `CLWB`
+> eviction work with its batched apply, and the sieve-step cost). What remains
+> before the 2026-10-02 freeze is housekeeping; what remains after it is
+> writing.
 
 See [Persistent Backends](persistent-backends.md) for the design being written
 up, [PMEM Crash Model](pmem-crash-model.md) for the verification method, and
@@ -263,6 +269,63 @@ fault per dirtied page per commit (none for the direct backend); on DAX it is
 one per commit at 2 MiB but two at 1 MiB, because both dirtied pages sit under a
 single 2 MiB entry — root-free corroboration of the region-size mechanism above.
 
+### What a program pays
+
+Every figure above is pwbench's: one transaction shape, boundaries back to back.
+Measured 2026-09-28, `pwsievebench` times the resumable sieve instead, through
+the production allocator and WAL. A step computes a segment in DRAM, allocates a
+chunk, persists its 4 KiB bitmap, publishes it and retires an old segment: four
+boundaries per step on every backend, as designed. Wall time per step, median
+over repetitions, 1 MiB regions (256 × 4 KiB):
+
+| Configuration | Raptor Lake P-core, step (persistence share) | Magpie, step (persistence share) |
+|---|---|---|
+| `pmem`, production | 167 µs (9 %) | 479 µs (11 %) |
+| `file` on DAX | 182 µs (15 %) | 521 µs (18 %) |
+| `file` on block storage | 1,097 µs (86 %), NVMe | 2,446 µs (55 %), `/home` |
+| `direct` on block storage | 1,125 µs (86 %), NVMe | 2,675 µs (57 %), `/home` |
+
+The P-core's repetition ranges are 0.3–0.5 % wide, Magpie's PMEM and DAX ranges
+under 0.7 %. On the Raptor Lake E-core the shares are 8 %, 14 % and 79 %; its
+~6 % spread is almost all in computation. Raptor Lake's PMEM is DRAM under
+`memmap`, as in every Raptor Lake figure.
+
+- **On byte-addressable media a step is computation.** Optane makes the
+  persistence phases 3.6× Raptor Lake's (54 against 15 µs), but Magpie's cores
+  also compute 2.8× slower, so the share moves only from 9 % to 11 %. Between
+  the two DAX configurations the step differs by 1.05–1.09×; block storage costs
+  4–7×. The sieve's region is 1 MiB, so the file backend on DAX is in its cheap
+  4 KiB-entry regime, and its figures carry that geometry just as figure 6 does.
+- **With the batched apply, the writeback instructions are under 1 % of a
+  step.** Removing them makes the Raptor Lake P-core step 0.8 % *slower* (the
+  persistence phases lose 0.57 µs, the computation gains 1.9 µs, in every
+  repetition) and Magpie's 0.9 % faster. The per-entry placement is gone, so
+  the sieve cannot show what the batched apply bought on this workload.
+- **On block storage, blocking costs clock speed, and no boundary figure shows
+  it.** The computation is the same DRAM work on every backend, yet on Magpie's
+  `/home` it takes 2.6–2.7× its PMEM time, in every repetition. It is not
+  migration (unchanged pinned to one CPU), and not the system calls or faults:
+  the file backend on DAX makes the same calls, takes the same write-protect
+  faults and computes normally. Raptor Lake reproduces it under `powersave`
+  (3.0–3.3×) and not under `performance` (1.04×). Magpie has no cpufreq driver,
+  so its clock is set by the platform, and a core idle in `fdatasync` can reach
+  C1E or C6. The frequency policy is the likely cause, **inferred, not
+  observed**: confirming it needs `turbostat`, which needs root.
+
+The last finding belongs beside the NUMA one, and it has the same shape. The
+PMEM backend is immune because nothing on its path blocks, and the cost falls
+outside the persistence path altogether, in the computation after a boundary. So the 55–57 % persistence share on `/home` understates what
+durability costs the program, and pwbench cannot see it. Chapter 6 must say so
+wherever it quotes a Magpie block figure for a workload that computes between
+boundaries, and should take Raptor Lake's block figures from the `performance`
+runs. One pattern is still open and should be stated as open: on `/home` the
+sieve's boundaries cost 180–680 µs against pwbench's 150–176 µs, with
+boundaries that follow computation ~1.7× the others. That points at LVM and
+the write-through controller, and is untested.
+
+Full numbers, per-phase splits and result directories are in
+[persistent-backends.md](persistent-backends.md#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence).
+
 ### Verifiability
 
 The two media are not interchangeable for validation, and this is the axis that
@@ -327,8 +390,9 @@ available evidence that the workload-level invariants are not vacuous:
 ## Scope triage
 
 Six weeks to submission. The implementation is over-delivered for Honours
-already — 286 implementation tests across fifteen files (260 at the
-2026-09-01 audit, then the negative control's 4 and the direct backend's 22), a working crash-image
+already — 293 implementation tests across fifteen files (260 at the
+2026-09-01 audit, then the negative control's 4, the direct backend's 22 and
+the batched apply's 7), a working crash-image
 explorer, and validation on real fsdax hardware. The risk from here is an
 unwritten thesis, not a thin contribution. Experiments are triaged accordingly.
 
@@ -341,9 +405,11 @@ cannot be written around missing numbers.
 |---|---|---|
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
 | ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29× (**corrected 2026-09-28**: an in-window figure; the writebacks cost 14–43 % of a commit once `CLWB`'s eviction on Cascade Lake is counted), `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
-| File-backed crash model, stated | ~half day, analysis | Chapter 4 and 5 both need the file backend's model written down; see below. No code. |
+| ~~File-backed crash model, stated~~ | done 2026-09-18 | **Complete, no code.** Written in [PMEM Crash Model](pmem-crash-model.md#the-file-backed-model-is-simpler-but-not-trivial): pre-boundary cuts still fan out, the asynchronous-flush dimension disappears, the unit is a page, the atomicity contract names the filesystem. The direct backend's model, a checked restriction of the PMEM one, followed on 2026-09-24. See below. |
 | ~~Third backend: direct I/O~~ | done 2026-09-24, hardware 2026-09-27 | **Added after the plan, before the freeze.** `DirectIoRegion`: private staging buffer, `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a file or a raw block device. Same trace as the PMEM backend; every post-`fdatasync` file image checked exactly against the PMEM model; kill-loop mutant `LOST` / ordinary `OK` on Magpie and the PC; and the finding that Magpie's block storage is a write-through RAID controller, so every `file-block` figure is a controller round trip. See "Where the persistence point is" above. |
 | ~~Stage 2c — reserved-DRAM warm reboot~~ | done 2026-09-24 | **Complete, the experiment discriminates.** Ordinary build `SURVIVED` and mutant `LOST` (every acknowledged step) in 3 of 3 pairs, with the reset issued from inside the process. On the way, two host facts that the write-up needs: the firmware wipes RAM after a `sysrq` reset unless the kernel's memory-overwrite request is cleared, and a seconds-long window before the reset lets every unflushed line reach memory. |
+| ~~`CLWB` eviction and the batched apply~~ | done 2026-09-28 | **Added after the plan, before the freeze; the one production change since the triage.** Follows up the PMEM backend's unexplained per-entry slope. On Cascade Lake `CLWB` evicts, and the within-commit store into a just-written-back line was ~95 % of the writebacks' cost (established by intervention, timing only). Writing each after-image line back once at the end of the apply is now production, with 7 new tests and four mutants each caught: 43 % faster at 24 entries on Magpie, 7–8 % on Raptor Lake, where `CLWB` does not evict. See "Boundary cost" above. |
+| ~~Sieve-step cost (`pwsievebench`)~~ | done 2026-09-28 | **Added after the plan, before the freeze.** The only cost measurement of a program rather than a harness-chosen transaction: persistence is 9–11 % of a step on PMEM and 55–86 % on block storage, and blocking costs the computation after it clock speed. See "What a program pays" above. |
 
 ### Out of scope for the thesis
 
@@ -484,8 +550,8 @@ and the thesis should say so explicitly.
 
 | Week | Dates | Writing | Experiments |
 |---|---|---|---|
-| 1 | Sep 18–25 | Skeleton; Ch.3 Design | Negative control; cost measurement; begin Stage 2c host setup |
-| 2 | Sep 26–Oct 2 | Ch.5 Verification | Stage 2c run; **code freeze Oct 2**; related-work reading (2 days, hard stop) |
+| 1 | Sep 18–25 | Skeleton; Ch.3 Design | ~~Negative control~~; ~~cost measurement~~; ~~Stage 2c host setup~~ (all done) |
+| 2 | Sep 26–Oct 2 | Ch.5 Verification | ~~Stage 2c run~~ (done 2026-09-24); **code freeze Oct 2**; related-work reading (2 days, hard stop) |
 | 3 | Oct 3–9 | Ch.2 Background and related work; Ch.4 Leaks | — |
 | 4 | Oct 10–16 | Ch.6 Evaluation; Ch.1 Introduction | — |
 | 5 | Oct 17–23 | Ch.7; **complete draft to supervisors** | — |
@@ -541,6 +607,14 @@ Seven, and they need real hours budgeted.
    2 MiB entry / proportional to mapping / fixed per call) overlaid. Log y-axis.
    The step at 2 MiB is the mechanism behind figure 6's DAX-versus-block
    direction.
+6e. What a sieve step costs (2026-09-28): one stacked bar per configuration,
+   computation beneath the four persistence phases, Raptor Lake P-core
+   (`results/20260928T100258Z-sean-tan-PC-pwsieve-bench-cpus2`) beside Magpie
+   (`results/20260928T102833Z-magpie-pwsieve-bench`). Linear axis. The figure
+   has two points. On PMEM the persistence segment is a sliver (9–11 %). On
+   Magpie's block storage the *computation* segment is 2.6–2.7× taller than on
+   PMEM, which is the clock-speed cost no boundary figure shows. State the 1 MiB
+   geometry on the figure, as for figure 6.
 7. **Negative control, 2×3** — {ordinary build, elided-writeback mutant} ×
    {Magpie crash loop, layer-1b explorer, Stage 2c warm reset}. **Data in hand
    as of 2026-09-24:** the mutant reports `OK` on Magpie with a durable answer
@@ -578,3 +652,9 @@ Figure 7 is the whole argument in one picture.
   already shown are controller round trips. Ask whoever administers Magpie for
   `storcli /c0/v0 show all` and the cache module's status, which decide whether
   those acknowledgements are power-safe.
+- Make every root request one `sudo` sitting on Magpie.
+  [`scripts/magpie-root-checks.sh`](../scripts/magpie-root-checks.sh) already
+  collects the controller and drive queries, a block trace of `fdatasync` on
+  `/home`, and the `fs_dax:dax_writeback_one` granularity. It does not yet run
+  `turbostat` during a sieve run on `/home`, which is what would turn the
+  clock-speed finding from inferred to observed.
