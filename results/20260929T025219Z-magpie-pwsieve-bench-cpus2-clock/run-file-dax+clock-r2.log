@@ -1,0 +1,32 @@
+backend file (mmap + msync/fdatasync)
+directory /mnt/pmem0.0/sean
+region 256 blocks of 4096 bytes, rounds 20
+clock probe on: 4096 dependent single-cycle operations per probe; references busy and after a 250000 ns sleep
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+wall ns per step 522596
+step ns: mean 522710
+step ns: min 478941 median 522099 p90 540123
+step ns: p99 568560 max 1219728
+phase compute ns per step 429017
+phase alloc ns per step 29100
+phase bitmap ns per step 20068
+phase publish ns per step 20817
+phase retire ns per step 23677
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12873
+clock busy: ticks median 2646 p10 2644 p90 2646, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 1000
+clock after sleep: ticks median 9524 p10 9520 p90 9528, implied MHz 986, x1000 of busy 277, first-probe excess ticks 2, samples 200
+clock after sieve: ticks median 2646 p10 2644 p90 2648, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after alloc: ticks median 2646 p10 2644 p90 2648, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after bitmap: ticks median 2646 p10 2644 p90 2648, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after count: ticks median 2646 p10 2644 p90 2646, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after publish: ticks median 2646 p10 2644 p90 2648, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after retire: ticks median 2646 p10 2644 p90 2648, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock probe ns per step 14477 (removed from the figures above)
+OK

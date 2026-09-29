@@ -1,0 +1,32 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/users/u7599095
+region 256 blocks of 4096 bytes, rounds 20
+clock probe on: 4096 dependent single-cycle operations per probe; references busy and after a 250000 ns sleep
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+wall ns per step 2620400
+step ns: mean 2620971
+step ns: min 1480816 median 2551748 p90 3144101
+step ns: p99 3852159 max 50466320
+phase compute ns per step 1141296
+phase alloc ns per step 457531
+phase bitmap ns per step 638680
+phase publish ns per step 168934
+phase retire ns per step 214430
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 2211
+clock busy: ticks median 2646 p10 2644 p90 2646, implied MHz 3551, x1000 of busy 1000, first-probe excess ticks 0, samples 1000
+clock after sleep: ticks median 9524 p10 9520 p90 9528, implied MHz 986, x1000 of busy 277, first-probe excess ticks 2, samples 200
+clock after sieve: ticks median 5604 p10 2646 p90 6802, implied MHz 1676, x1000 of busy 472, first-probe excess ticks 0, samples 3180
+clock after alloc: ticks median 9522 p10 3528 p90 9528, implied MHz 986, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock after bitmap: ticks median 9524 p10 9518 p90 9530, implied MHz 986, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock after count: ticks median 9522 p10 3528 p90 9528, implied MHz 986, x1000 of busy 277, first-probe excess ticks 2, samples 3180
+clock after publish: ticks median 9522 p10 3528 p90 9528, implied MHz 986, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock after retire: ticks median 9522 p10 3812 p90 9528, implied MHz 986, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock probe ns per step 42020 (removed from the figures above)
+OK
