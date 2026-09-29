@@ -35,7 +35,13 @@
 // commit's fence and lasts microseconds, so the step and phase figures are
 // wall time, not in-window figures like pwbench's "boundary" ones.
 //
-// Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>]
+// clock=probe reads the core clock, without root, where each phase ends: a
+// machine-code stub times a chain of dependent register operations that
+// touches no memory, so its TSC ticks depend on the core clock alone. The
+// probes' own time is removed from every step, phase and wall figure. See the
+// clock probe section below.
+//
+// Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [clock=probe]
 
 def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
 def RUSAGE_SELF = 0;
@@ -48,6 +54,13 @@ def LIVE_SEGMENTS = 2u64;
 def MAX_REFERENCE = 64000000u64;
 def MAX_SAMPLES = 200000;
 def PHASES = 5;
+def PHASE_NAMES = ["compute", "alloc", "bitmap", "publish", "retire"];
+// PWSieve.step()'s marks in order: COMPUTE is two stretches, sieving the
+// segment and, after the bitmap is durable, counting it. Clock probe points
+// follow the marks, not the phases.
+def MARK_PHASES = [PWSievePhase.COMPUTE, PWSievePhase.ALLOC, PWSievePhase.BITMAP,
+        PWSievePhase.COMPUTE, PWSievePhase.PUBLISH, PWSievePhase.RETIRE];
+def MARK_NAMES = ["sieve", "alloc", "bitmap", "count", "publish", "retire"];
 
 enum SieveBenchBackend(arg: string, label: string) {
         FILE("file", "file (mmap + msync/fdatasync)"),
@@ -143,6 +156,115 @@ component BenchClock {
         }
 }
 
+// ---------------------------------------------------------- clock probe
+
+// clock=probe: how fast the core runs where each phase ends, without root.
+// On a block device the sieve's computation takes 2.6-3.3x its PMEM time
+// (docs/persistent-backends.md); the candidates are a lower clock after the
+// thread blocks, or private caches emptied in a deep idle state. A probe
+// separates them: it times a chain of dependent add/xor register operations,
+// each one cycle of latency on every x86 core, between two lfence-ordered
+// rdtsc reads. It touches no data memory, so its ticks depend on the core
+// clock alone: at half the clock a probe takes twice the ticks. The chain is
+// machine code rather than a Virgil loop because Virgil keeps a loop's
+// variables on the stack, which would put store forwarding in every iteration.
+//
+// Each probe point runs two probes back to back. The second is the reading;
+// the first can also pay for a cold instruction cache or a clock still
+// changing, so its excess over the second is reported apart from the clock.
+// Implied MHz assumes one cycle per operation and includes the fences and
+// rdtsc (tens of cycles), so it reads a few percent low; ratios between
+// points and between configurations are the measure.
+
+def PROBE_OPS_PER_ITERATION = 16;
+def PROBE_ITERATIONS = 256;
+def PROBE_OPS = PROBE_OPS_PER_ITERATION * PROBE_ITERATIONS;
+def PROBE_BUSY_WARM_NS = 200000000L;    // 200 ms of back-to-back probes first
+def PROBE_BUSY_SAMPLES = 1000;
+def PROBE_SLEEP_NS = 250000L;           // about one block-storage boundary
+def PROBE_SLEEP_SAMPLES = 200;
+
+// The V3 convention passes the closure in RDI and the first parameter, the
+// iteration count, in RSI, and returns in RAX. Only those registers and RCX
+// and RDX, all caller-saved, are written.
+def genClockProbe(ic: X86_64InterpreterCode, w: DataWriter) {
+        def RAX = X86_64Regs.RAX;
+        def RCX = X86_64Regs.RCX;
+        def RDX = X86_64Regs.RDX;
+        def RSI = X86_64Regs.RSI;
+        def RDI = X86_64Regs.RDI;
+        def asm = X86_64Assemblers.create64(w);
+        asm.lfence();                   // earlier work completes before the first read
+        asm.rdtsc();
+        asm.shl_r_i(RDX, 32);
+        asm.or_r_r(RAX, RDX);
+        asm.movq_r_r(RDI, RAX);         // start
+        asm.movq_r_r(RCX, RAX);         // the chain's seed
+        asm.lfence();                   // the chain starts after the first read
+        def loop = asm.newLabel();
+        asm.bind(loop);
+        for (i < PROBE_OPS_PER_ITERATION / 2) {
+                asm.add_r_r(RCX, RDI);
+                asm.xor_r_r(RCX, RDX);
+        }
+        asm.sub_r_i(RSI, 1);
+        asm.jc_rel_near(X86_64Conds.NZ, loop);
+        asm.lfence();                   // the second read waits for the chain
+        asm.rdtsc();
+        asm.shl_r_i(RDX, 32);
+        asm.or_r_r(RAX, RDX);
+        asm.sub_r_r(RAX, RDI);
+        asm.ret();
+}
+
+component ClockProbe {
+        def var enabled = false;
+        var stub: X86_64PreGenFunc<long, u64>;
+        var probe: long -> u64;
+
+        // Called first in main, before anything generates the pregenerated
+        // stubs, so this one is generated with them. Installed in every run,
+        // so the generated code is the same with and without clock=probe.
+        def install() {
+                stub = X86_64PreGenFunc<long, u64>.new("pwsievebench-clock-probe", null, genClockProbe);
+        }
+        // A stub registered after generation would have no code to call.
+        def generated() -> bool {
+                probe = stub.get();
+                return stub.offsets.end > stub.offsets.start;
+        }
+        def ticks() -> u64 {
+                return probe(long.!(PROBE_ITERATIONS));
+        }
+}
+
+// One probe point: the second probe's ticks, and the first's excess over it.
+class ClockPoint {
+        def ticks = Vector<u64>.new();
+        def excess = Vector<long>.new();
+
+        def measure() {
+                def first = ClockProbe.ticks();
+                def second = ClockProbe.ticks();
+                if (ticks.length >= MAX_SAMPLES) return;
+                ticks.put(second);
+                excess.put(long.view(first) - long.view(second));
+        }
+}
+
+// The references the phase points are read against: the clock after a stretch
+// of back-to-back probes, and just after a short sleep, which blocks the thread
+// with no storage behind it.
+def clockReferences(busy: ClockPoint, slept: ClockPoint) {
+        def warmUntil = BenchClock.nanos() + PROBE_BUSY_WARM_NS;
+        while (BenchClock.nanos() < warmUntil) ClockProbe.ticks();
+        for (i < PROBE_BUSY_SAMPLES) busy.measure();
+        for (i < PROBE_SLEEP_SAMPLES) {
+                BenchClock.sleepNanos(PROBE_SLEEP_NS);
+                slept.measure();
+        }
+}
+
 // ------------------------------------------------------------ accumulator
 
 // Shared by the backend, the region, the provider and the sieve's phase hook.
@@ -158,7 +280,16 @@ class StepTimer {
         def var wallNs = 0L;            // clock_gettime over the measured loops only
         def var faults = 0L;            // minor faults over the measured loops only
         def var faultsKnown = true;
+        def clockPoints = Array<ClockPoint>.new(MARK_PHASES.length);   // at each mark
+        def var probeCycles = 0u64;     // clock probes in the measured steps, removed from every figure
+        def var marksChanged = false;   // a step's marks were not MARK_PHASES
+        var stepProbeCycles = 0u64;
+        var markIndex = 0;
         var mark = 0u64;
+
+        new() {
+                for (i < clockPoints.length) clockPoints[i] = ClockPoint.new();
+        }
 
         def notePersist() {
                 if (recording) persistCalls++;
@@ -174,22 +305,42 @@ class StepTimer {
 
         // Starts a step's phase clock; returns its start, for the step total.
         def startStep() -> u64 {
+                stepProbeCycles = 0;
+                markIndex = 0;
                 mark = Target.rdtsc();
                 return mark;
         }
 
         // PWSieve.onPhase: charge the time since the previous mark to {p}.
+        // With clock=probe, a probe pair then runs, and the mark moves past
+        // it, so the probes are charged to no phase.
         def onPhase(p: PWSievePhase) {
-                def now = Target.rdtsc();
-                if (recording) phaseCycles[p.tag] += now - mark;
+                var now = Target.rdtsc();
+                if (recording) {
+                        phaseCycles[p.tag] += now - mark;
+                        if (ClockProbe.enabled) {
+                                if (markIndex < MARK_PHASES.length && MARK_PHASES[markIndex] == p) {
+                                        clockPoints[markIndex].measure();
+                                } else {
+                                        marksChanged = true;
+                                }
+                                def done = Target.rdtsc();
+                                stepProbeCycles += done - now;
+                                now = done;
+                        }
+                        markIndex++;
+                }
                 mark = now;
         }
 
+        // {cycles} is the whole step; its probes are removed here.
         def noteStep(cycles: u64) {
                 if (!recording) return;
+                def c = cycles - stepProbeCycles;
+                probeCycles += stepProbeCycles;
                 steps++;
-                stepCycles += cycles;
-                if (stepSamples.length < MAX_SAMPLES) stepSamples.put(cycles);
+                stepCycles += c;
+                if (stepSamples.length < MAX_SAMPLES) stepSamples.put(c);
         }
 }
 
@@ -453,6 +604,7 @@ def runRound(round: int, timer: StepTimer) -> string {
         // Exactly the steps the descriptor table has left, so no measured call
         // is the one that finds the table full.
         def measured = capacity - sieve.numSegments();
+        def p0 = timer.probeCycles;
         def f0 = minorFaults();
         def t0 = BenchClock.nanos();
         timer.recording = true;
@@ -471,7 +623,7 @@ def runRound(round: int, timer: StepTimer) -> string {
         timer.recording = false;
         def t1 = BenchClock.nanos();
         def f1 = minorFaults();
-        timer.wallNs += t1 - t0;
+        timer.wallNs += (t1 - t0) - long.!(BenchClock.cyclesToNanos(timer.probeCycles - p0));
         if (f0 >= 0 && f1 >= 0) timer.faults += f1 - f0;
         else timer.faultsKnown = false;
 
@@ -523,15 +675,45 @@ def report(timer: StepTimer) {
                 BenchClock.cyclesToNanos(p.at(99)),
                 BenchClock.cyclesToNanos(p.at(100))).ln();
         // Means per step; the five sum to the step, less the call and return.
-        def names = ["compute", "alloc", "bitmap", "publish", "retire"];
         for (i < PHASES) {
                 def ns = if(steps > 0, BenchClock.cyclesToNanos(timer.phaseCycles[i]) / u64.!(steps), 0u64);
-                Trace.OUT.put2("phase %s ns per step %d", names[i], ns).ln();
+                Trace.OUT.put2("phase %s ns per step %d", PHASE_NAMES[i], ns).ln();
         }
         Trace.OUT.put1("boundaries per step x1000 %d", perStepX1000(timer.persistCalls, steps)).ln();
         Trace.OUT.put1("prepare calls per step x1000 %d", perStepX1000(timer.prepareCalls, steps)).ln();
         Trace.OUT.put1("clwb lines per step x1000 %d", perStepX1000(timer.clwbLines, steps)).ln();
         if (timer.faultsKnown) Trace.OUT.put1("minor faults per step x1000 %d", perStepX1000(timer.faults, steps)).ln();
+}
+
+// One line per probe point, named for the mark it follows (MARK_NAMES): after
+// sieve is the end of the step's main computation, before its first boundary;
+// after count follows the short count that comes after the bitmap boundary;
+// after retire is the step's last boundary, and so the start of the next
+// step's sieving. Returns the median, for the busy reference.
+def reportClockPoint(label: string, point: ClockPoint, busyTicks: u64) -> u64 {
+        def sorted = Arrays.sort(point.ticks.copy(), 0, point.ticks.length, u64.<=);
+        def p = Percentiles.new(sorted);
+        def median = p.at(50);
+        def excess = Arrays.sort(point.excess.copy(), 0, point.excess.length, long.<=);
+        def ex = if(excess.length > 0, excess[(excess.length - 1) / 2], 0L);
+        def mhz = if(median > 0, (u64.!(PROBE_OPS) * BenchClock.cyclesPerUs) / median, 0u64);
+        def ofBusy = if(median > 0 && busyTicks > 0, (1000u64 * busyTicks) / median, 1000u64);
+        Trace.OUT.puts("clock ").puts(label)
+                .put3(": ticks median %d p10 %d p90 %d", median, p.at(10), p.at(90))
+                .put3(", implied MHz %d, x1000 of busy %d, first-probe excess ticks %d", mhz, ofBusy, ex)
+                .put1(", samples %d", sorted.length).ln();
+        return median;
+}
+
+def reportClock(timer: StepTimer, busy: ClockPoint, slept: ClockPoint) {
+        def busyTicks = reportClockPoint("busy", busy, 0);
+        reportClockPoint("after sleep", slept, busyTicks);
+        for (i < MARK_NAMES.length) {
+                reportClockPoint(Strings.format1("after %s", MARK_NAMES[i]), timer.clockPoints[i], busyTicks);
+        }
+        def steps = timer.steps;
+        def ns = if(steps > 0, BenchClock.cyclesToNanos(timer.probeCycles) / u64.!(steps), 0u64);
+        Trace.OUT.put1("clock probe ns per step %d (removed from the figures above)", ns).ln();
 }
 
 def parseU64(s: string, dflt: u64) -> u64 {
@@ -565,11 +747,12 @@ def cpuidWriteback() -> string {
 }
 
 def usage() -> int {
-        System.puts("Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>]\n");
+        System.puts("Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [clock=probe]\n");
         return 2;
 }
 
 def main(args: Array<string>) -> int {
+        ClockProbe.install();   // first: Target.supportsClwb() below generates the stubs
         if (args.length < 2 || args[0] == null || args[0].length == 0) return usage();
         // Rejected rather than defaulted: a file run reported as a PMEM one
         // would invert the comparison this program exists to make.
@@ -584,10 +767,13 @@ def main(args: Array<string>) -> int {
         if (args.length > 4) SieveBenchConfig.blocks = parseU64(args[4], 256);
         if (args.length > 5) SieveBenchConfig.blockSize = parseU64(args[5], 4096);
         for (i = 6; i < args.length; i++) {
-                if (!parseWriteback(args[i])) {
-                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|none>\n");
-                        return 2;
+                if (parseWriteback(args[i])) continue;
+                if (Strings.equal(args[i], "clock=probe")) {
+                        ClockProbe.enabled = true;
+                        continue;
                 }
+                System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|none> or clock=probe\n");
+                return 2;
         }
         if (SieveBenchConfig.writeback != SieveBenchWriteback.AUTO && SieveBenchConfig.backend != SieveBenchBackend.PMEM) {
                 System.puts("writeback= applies only to the pmem backend\n");
@@ -612,6 +798,7 @@ def main(args: Array<string>) -> int {
         SieveBenchConfig.directory = args[0];
 
         BenchClock.calibrate();
+        if (!ClockProbe.generated()) return fail("the clock probe stub was not generated");
         Trace.OUT.put1("backend %s", SieveBenchConfig.backend.label).ln();
         Trace.OUT.put1("directory %s", SieveBenchConfig.directory).ln();
         if (SieveBenchConfig.backend == SieveBenchBackend.PMEM) {
@@ -621,12 +808,23 @@ def main(args: Array<string>) -> int {
         Trace.OUT.put3("region %d blocks of %d bytes, rounds %d",
                 SieveBenchConfig.blocks, SieveBenchConfig.blockSize, SieveBenchConfig.rounds).ln();
 
+        if (ClockProbe.enabled) {
+                Trace.OUT.put2("clock probe on: %d dependent single-cycle operations per probe; references busy and after a %d ns sleep",
+                        PROBE_OPS, PROBE_SLEEP_NS).ln();
+        }
+
+        def busy = ClockPoint.new();
+        def slept = ClockPoint.new();
+        if (ClockProbe.enabled) clockReferences(busy, slept);
         def timer = StepTimer.new();
         for (r < SieveBenchConfig.rounds) {
                 def err = runRound(r, timer);
                 if (err != null) return fail(err);
         }
+        // Probe points are named for PWSieve's marks; refuse to misname them.
+        if (timer.marksChanged) return fail("PWSieve.step()'s phase marks no longer match MARK_PHASES; update the clock probe points");
         report(timer);
+        if (ClockProbe.enabled) reportClock(timer, busy, slept);
         if (SieveBenchConfig.writeback == SieveBenchWriteback.NONE) {
                 System.puts("OK timing-only: writeback=none, the region was never durable\n");
         } else {

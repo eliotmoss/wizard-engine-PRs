@@ -22,10 +22,21 @@
 #   file-block       the file backend on block storage (PWSB_BLOCK_DIR)
 #   direct-block     the direct backend (pwrite + O_DIRECT + fdatasync) on the
 #                    same block storage (PWSB_BLOCK_DIR)
+#   <config>+clock   any of the above with pwsievebench's clock=probe: the core
+#                    clock where each of the step's marks falls, read without
+#                    root by timing a chain of dependent register operations;
+#                    the probes' time is removed from the step and phase figures
 #
 # The block configurations run only when PWSB_BLOCK_DIR is set, and never on a
 # network filesystem, whose fdatasync would measure the network. The default is
 # the four DAX configurations, plus the two block ones when PWSB_BLOCK_DIR is set.
+#
+# Clock campaign. PWSB_CLOCK=1 asks whether the slower computation on block
+# storage is the core clock: the default becomes pmem-auto and file-dax, plus
+# file-block and direct-block when PWSB_BLOCK_DIR is set, each once plain and
+# once +clock, interleaved, so the probe's own effect is visible in the same
+# sitting. The probe readings go to clock.csv, and the summary compares each
+# configuration's computation with its clock against the one that never blocks.
 #
 # Each run is one pwsievebench invocation: PWSB_ROUNDS rounds, each a freshly
 # formatted region, PWSB_WARMUP unmeasured steps, then every step the region's
@@ -43,8 +54,8 @@
 # PWSB_GEOMETRY (256x4096, <blocks>x<blockSize>: 1 MiB, which a DAX file maps
 # with 4 KiB entries -- at 2 MiB and above fdatasync on DAX writes back whole
 # 2 MiB entries, docs/persistent-backends.md), PWSB_CONFIGS, PWSB_CPUS,
-# PWSB_NUMA_NODE, PWSB_OUT (results/<stamp>-<host>-pwsieve-bench[-cpus<list>]),
-# PWSB_ALLOW_DIRTY (0).
+# PWSB_NUMA_NODE, PWSB_CLOCK (0), PWSB_OUT
+# (results/<stamp>-<host>-pwsieve-bench[-cpus<list>][-clock]), PWSB_ALLOW_DIRTY (0).
 
 set -euo pipefail
 
@@ -56,13 +67,21 @@ ROUNDS="${PWSB_ROUNDS:-20}"
 WARMUP="${PWSB_WARMUP:-8}"
 GEOMETRY="${PWSB_GEOMETRY:-256x4096}"
 BLOCK_DIR="${PWSB_BLOCK_DIR:-}"
-DEFAULT_CONFIGS="pmem-auto pmem-clflushopt pmem-none file-dax"
-[ -n "$BLOCK_DIR" ] && DEFAULT_CONFIGS="$DEFAULT_CONFIGS file-block direct-block"
+CLOCK="${PWSB_CLOCK:-0}"
+if [ "$CLOCK" = 1 ]; then
+    DEFAULT_CONFIGS="pmem-auto pmem-auto+clock file-dax file-dax+clock"
+    [ -n "$BLOCK_DIR" ] && DEFAULT_CONFIGS="$DEFAULT_CONFIGS file-block file-block+clock direct-block direct-block+clock"
+else
+    DEFAULT_CONFIGS="pmem-auto pmem-clflushopt pmem-none file-dax"
+    [ -n "$BLOCK_DIR" ] && DEFAULT_CONFIGS="$DEFAULT_CONFIGS file-block direct-block"
+fi
 CONFIGS="${PWSB_CONFIGS:-$DEFAULT_CONFIGS}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CPU_TAG=
 [ -n "${PWSB_CPUS:-}" ] && CPU_TAG="-cpus${PWSB_CPUS//,/_}"
-OUT="${PWSB_OUT:-$REPO/results/$STAMP-$(hostname -s)-pwsieve-bench$CPU_TAG}"
+CLOCK_TAG=
+[ "$CLOCK" = 1 ] && CLOCK_TAG=-clock
+OUT="${PWSB_OUT:-$REPO/results/$STAMP-$(hostname -s)-pwsieve-bench$CPU_TAG$CLOCK_TAG}"
 
 BENCH_BIN=bin/pwsievebench.x86-64-linux
 
@@ -118,6 +137,29 @@ core_types_of() {
     echo "${found:-not hybrid}"
 }
 
+# What decides the clock, as far as a user can read it: the frequency driver
+# (Magpie has none, so the platform sets it), turbo, and the idle states the
+# measured CPU may enter (C1E runs at the lowest frequency; C6 also empties
+# the core's private caches).
+power_facts() {
+    local cpu=${PWSB_CPUS:-0} d name
+    cpu=${cpu%%[,-]*}
+    printf 'cpu          %s (the first pinned CPU, or 0)\n' "$cpu"
+    printf 'intel_pstate %s\n' "$(cat /sys/devices/system/cpu/intel_pstate/status 2>/dev/null || echo absent)"
+    printf 'no_turbo     %s\n' "$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo unknown)"
+    printf 'governor     %s\n' "$(cat "/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor" 2>/dev/null || echo 'none (no cpufreq driver)')"
+    printf 'epp          %s\n' "$(cat "/sys/devices/system/cpu/cpu$cpu/cpufreq/energy_performance_preference" 2>/dev/null || echo unknown)"
+    printf 'cpuidle      %s\n' "$(cat /sys/devices/system/cpu/cpuidle/current_driver 2>/dev/null || echo unknown)"
+    printf 'idle states '
+    for d in /sys/devices/system/cpu/cpu"$cpu"/cpuidle/state*; do
+        [ -r "$d/name" ] || continue
+        name=$(cat "$d/name")
+        [ "$(cat "$d/disable" 2>/dev/null)" = 1 ] && name="$name(disabled)"
+        printf ' %s' "$name"
+    done
+    printf '\n'
+}
+
 PIN=()
 PIN_DESC=none
 resolve_pinning() {
@@ -150,9 +192,10 @@ is_network_fs() {
     return 1
 }
 
-# The configurations that need each directory.
-uses_dax()   { [[ " $CONFIGS " == *" pmem-"* || " $CONFIGS " == *" file-dax "* ]]; }
-uses_block() { [[ " $CONFIGS " == *" file-block "* || " $CONFIGS " == *" direct-block "* ]]; }
+# The configurations that need each directory, with or without +clock.
+config_bases() { local c; for c in $CONFIGS; do echo "${c%+clock}"; done; }
+uses_dax()   { config_bases | grep -qxE 'pmem-.*|file-dax'; }
+uses_block() { config_bases | grep -qxE 'file-block|direct-block'; }
 
 # Refused rather than warned about, as in clwb-eviction.sh: off a DAX mount
 # the pmem configurations fail, but file-dax would run on whatever filesystem
@@ -180,14 +223,16 @@ require_clean_tree() {
     die "working tree is dirty; commit first so the results name a revision, or set PWSB_ALLOW_DIRTY=1"
 }
 
-# config -> "<backend> <directory> [writeback=<w>]"
+# config -> "<backend> <directory> [writeback=<w>] [clock=probe]"
 config_args() {
-    case "$1" in
+    local base=${1%+clock} extra=
+    [ "$base" != "$1" ] && extra=" clock=probe"
+    case "$base" in
         pmem-auto|pmem-clwb|pmem-clflushopt|pmem-none)
-                      echo "pmem ${PWASM_PMEM_TEST_DIR:-.} writeback=${1#pmem-}" ;;
-        file-dax)     echo "file ${PWASM_PMEM_TEST_DIR:-.}" ;;
-        file-block)   echo "file ${BLOCK_DIR:-.}" ;;
-        direct-block) echo "direct ${BLOCK_DIR:-.}" ;;
+                      echo "pmem ${PWASM_PMEM_TEST_DIR:-.} writeback=${base#pmem-}$extra" ;;
+        file-dax)     echo "file ${PWASM_PMEM_TEST_DIR:-.}$extra" ;;
+        file-block)   echo "file ${BLOCK_DIR:-.}$extra" ;;
+        direct-block) echo "direct ${BLOCK_DIR:-.}$extra" ;;
         *) die "unknown configuration: $1" ;;
     esac
 }
@@ -215,17 +260,43 @@ write_provenance() {
                 "$(source_of "$BLOCK_DIR")" "$(fstype_of "$BLOCK_DIR")" "$(options_of "$BLOCK_DIR")"
         fi
         printf 'pinned   %s\n' "$PIN_DESC"
+        rule "power"
+        power_facts
         rule "parameters"
-        printf 'reps %s\nrounds %s\nwarmup %s\ngeometry %s\nconfigs %s\n' "$REPS" "$ROUNDS" "$WARMUP" "$GEOMETRY" "$CONFIGS"
+        printf 'reps %s\nrounds %s\nwarmup %s\ngeometry %s\nclock %s\nconfigs %s\n' "$REPS" "$ROUNDS" "$WARMUP" "$GEOMETRY" "$CLOCK" "$CONFIGS"
     } > "$OUT/provenance.txt"
 }
 
 # ------------------------------------------------------------ runs
 
 CSV=
+CLOCK_CSV=
+CLOCK_POINTS=8          # busy, sleep, and the six marks of a step
 csv_header() {
     CSV=$OUT/runs.csv
     echo "config,rep,tsc_per_us,steps,wall_ns_per_step,step_ns_mean,step_ns_median,step_ns_p90,compute_ns,alloc_ns,bitmap_ns,publish_ns,retire_ns,boundaries_x1000,prepare_x1000,clwb_lines_x1000,faults_x1000,load1" > "$CSV"
+    # Written only once a +clock run is recorded; re-derived from the logs
+    # on a rebuild, so no older directory gains one.
+    CLOCK_CSV=$OUT/clock.csv
+    rm -f "$CLOCK_CSV"
+}
+
+# One row per clock line: point, then the second probe's median, p10 and p90
+# ticks, implied MHz, x1000 of the busy reference, the first probe's median
+# excess ticks, and the sample count. point is busy, sleep, or the mark.
+parse_clock() {
+    awk '
+        /^clock (busy|after [a-z]+):/ {
+            if ($2 == "busy:") p = "busy"; else { p = $3; sub(/:$/, "", p) }
+            for (i = 1; i < NF; i++) { t = $(i + 1); sub(/,$/, "", t)
+                if ($i == "median") m = t
+                if ($i == "p10") lo = t
+                if ($i == "p90") hi = t
+                if ($i == "MHz") mhz = t
+                if ($i == "busy") ofb = t
+                if ($i == "ticks" && $(i - 1) == "excess") ex = t
+                if ($i == "samples") n = t }
+            print p "," m "," lo "," hi "," mhz "," ofb "," ex "," n }' "$1"
 }
 
 parse_bench() {
@@ -253,8 +324,13 @@ parse_bench() {
 record_run() {
     local config=$1 rep=$2 load=$3 log=$4 dir=${5:-}
     local args; read -r -a args <<< "$(config_args "$config")"
-    local backend=${args[0]} wb=
-    [ "${#args[@]}" -gt 2 ] && wb=${args[2]#writeback=}
+    local backend=${args[0]} wb= clock=0 a
+    for a in "${args[@]:2}"; do
+        case "$a" in
+            writeback=*) wb=${a#writeback=} ;;
+            clock=probe) clock=1 ;;
+        esac
+    done
     local want='^OK$'
     [ "$wb" = none ] && want='^OK timing-only: writeback=none'
     grep -qE "$want" "$log" || { warn "    no expected final line in $log"; return 1; }
@@ -269,10 +345,26 @@ record_run() {
     if [ -n "$dir" ]; then
         grep -qxF "directory $dir" "$log" || { warn "    $log does not name directory $dir"; return 1; }
     fi
+    # A plain run must not have probed, or the pair would compare nothing.
+    if [ "$clock" = 1 ]; then
+        grep -q '^clock probe on:' "$log" || { warn "    $log has no clock probe"; return 1; }
+    elif grep -q '^clock probe on:' "$log"; then
+        warn "    $log ran the clock probe, which $config does not name"; return 1
+    fi
     local row; row=$(parse_bench "$log")
     [[ "$row" != *,,* && "$row" != ,* && "$row" != *, ]] ||
         { warn "    could not parse $log -- pwsievebench's output format has moved: $row"; return 1; }
+    local clock_rows=
+    if [ "$clock" = 1 ]; then
+        clock_rows=$(parse_clock "$log")
+        [ "$(grep -c . <<< "$clock_rows")" -eq "$CLOCK_POINTS" ] && ! grep -qE ',,|,$' <<< "$clock_rows" ||
+            { warn "    could not parse the clock lines in $log -- the format has moved"; return 1; }
+    fi
     printf '%s,%s,%s,%s\n' "$config" "$rep" "$row" "$load" >> "$CSV"
+    if [ -n "$clock_rows" ]; then
+        [ -f "$CLOCK_CSV" ] || echo "config,rep,point,ticks_median,ticks_p10,ticks_p90,mhz,x1000_busy,excess_ticks,samples" > "$CLOCK_CSV"
+        while IFS= read -r a; do printf '%s,%s,%s\n' "$config" "$rep" "$a"; done <<< "$clock_rows" >> "$CLOCK_CSV"
+    fi
 }
 
 run_one() {
@@ -287,6 +379,7 @@ run_one() {
 }
 
 campaign() {
+    case "$CLOCK" in 0|1) ;; *) die "PWSB_CLOCK must be 0 or 1: $CLOCK" ;; esac
     local c; for c in $CONFIGS; do config_args "$c" >/dev/null; done
     require_dirs
     require_clean_tree
@@ -344,17 +437,17 @@ summary() {
         function hi(s,   a, m, i, r) { m = split(s, a, " "); r = a[1]; for (i = 2; i <= m; i++) if (a[i] + 0 > r + 0) r = a[i]; return r }
         END {
             print "---- per step, median over repetitions (ns unless noted; steps per run in the log)"
-            printf "%-16s %4s %9s %13s %9s %8s %8s %8s %8s %8s %8s %6s %7s %6s\n", "config", "reps", "wall", "wall range", "median", "compute", "alloc", "bitmap", "publish", "retire", "persist", "bound", "lines", "faults"
+            printf "%-20s %4s %9s %13s %9s %8s %8s %8s %8s %8s %8s %6s %7s %6s\n", "config", "reps", "wall", "wall range", "median", "compute", "alloc", "bitmap", "publish", "retire", "persist", "bound", "lines", "faults"
             for (i = 1; i <= n; i++) { c = order[i]
                 w = med(v[c, 5]); p = med(v[c, 10]) + med(v[c, 11]) + med(v[c, 12]) + med(v[c, 13])
                 persist[c] = p; wall[c] = w
-                printf "%-16s %4d %9.0f %6.0f-%-6.0f %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %6.2f %7.1f %6.2f\n", c, reps[c], w, lo(v[c, 5]), hi(v[c, 5]), med(v[c, 7]),
+                printf "%-20s %4d %9.0f %6.0f-%-6.0f %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %6.2f %7.1f %6.2f\n", c, reps[c], w, lo(v[c, 5]), hi(v[c, 5]), med(v[c, 7]),
                     med(v[c, 9]), med(v[c, 10]), med(v[c, 11]), med(v[c, 12]), med(v[c, 13]), p,
                     med(v[c, 14]) / 1000, med(v[c, 16]) / 1000, med(v[c, 17]) / 1000 }
             print ""
             print "---- shares"
             for (i = 1; i <= n; i++) { c = order[i]
-                if (wall[c] > 0) printf "%-16s persistence phases (alloc+bitmap+publish+retire) %5.1f %% of a step\n", c, 100 * persist[c] / wall[c] }
+                if (wall[c] > 0) printf "%-20s persistence phases (alloc+bitmap+publish+retire) %5.1f %% of a step\n", c, 100 * persist[c] / wall[c] }
             if (("pmem-auto" in wall) && ("pmem-none" in wall) && wall["pmem-auto"] > 0) {
                 d = wall["pmem-auto"] - wall["pmem-none"]
                 printf "writebacks by removal: pmem-auto - pmem-none = %.0f ns per step (%.1f %% of pmem-auto)\n", d, 100 * d / wall["pmem-auto"]
@@ -371,6 +464,64 @@ summary() {
             print "boundaries per step; lines = cache-line writebacks per step (pmem only); faults = minor faults"
             print "per step. A difference of a few percent is real only outside the wall range of both."
         }' "$csv"
+    clock_summary "$1"
+}
+
+# The clock at each point from the +clock runs, and whether it accounts for
+# the computation's slowdown against a configuration that never blocks.
+clock_summary() {
+    local dir=$1
+    [ -f "$dir/clock.csv" ] && [ "$(wc -l < "$dir/clock.csv")" -gt 1 ] || return 0
+    awk -F, '
+        function med(s,   a, m, i, j, t) { m = split(s, a, " ")
+            for (i = 1; i <= m; i++) for (j = i + 1; j <= m; j++) if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
+            if (m == 0) return ""; if (m % 2) return a[(m + 1) / 2]; return (a[m / 2] + a[m / 2 + 1]) / 2 }
+        function lo(s,   a, m, i, r) { m = split(s, a, " "); r = a[1]; for (i = 2; i <= m; i++) if (a[i] + 0 < r + 0) r = a[i]; return r }
+        function hi(s,   a, m, i, r) { m = split(s, a, " "); r = a[1]; for (i = 2; i <= m; i++) if (a[i] + 0 > r + 0) r = a[i]; return r }
+        # Rounded to a whole tick, without printing a negative zero.
+        function whole(v) { v = int(v + (v < 0 ? -0.5 : 0.5)); return v == 0 ? 0 : v }
+        FNR == 1 { next }
+        FILENAME == ARGV[1] { c = $1; p = $3
+            if (!(c in seen)) { seen[c] = 1; order[++n] = c }
+            mhz[c, p] = mhz[c, p] " " $7; ofb[c, p] = ofb[c, p] " " $8; ex[c, p] = ex[c, p] " " $9; next }
+        { compute[$1] = compute[$1] " " $9 }
+        END {
+            np = split("busy sleep sieve alloc bitmap count publish retire", pt, " ")
+            print ""
+            print "---- clock (+clock runs): implied MHz where each point falls, median over repetitions"
+            printf "%-20s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; print ""
+            for (i = 1; i <= n; i++) { c = order[i]; printf "%-20s", c
+                for (k = 1; k <= np; k++) printf " %7.0f", med(mhz[c, pt[k]]); print "" }
+            print ""
+            print "---- the same as x1000 of the busy reference, with the repetitions'"'"' range at the end of the sieve"
+            printf "%-20s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; printf " %11s\n", "sieve range"
+            for (i = 1; i <= n; i++) { c = order[i]; printf "%-20s", c
+                for (k = 1; k <= np; k++) printf " %7.0f", med(ofb[c, pt[k]])
+                printf " %5.0f-%-5.0f\n", lo(ofb[c, "sieve"]), hi(ofb[c, "sieve"]) }
+            print ""
+            print "---- first probe'"'"'s excess over the second, ticks (cold private caches or a clock still changing)"
+            printf "%-20s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; print ""
+            for (i = 1; i <= n; i++) { c = order[i]; printf "%-20s", c
+                for (k = 1; k <= np; k++) printf " %7d", whole(med(ex[c, pt[k]])); print "" }
+            ref = ""
+            if (("pmem-auto+clock", "sieve") in mhz) ref = "pmem-auto+clock"
+            else if (("file-dax+clock", "sieve") in mhz) ref = "file-dax+clock"
+            if (ref == "" || med(compute[ref]) + 0 <= 0) exit
+            rc = med(compute[ref]); rs = med(mhz[ref, "retire"]); re = med(mhz[ref, "sieve"])
+            print ""
+            print "---- does the clock account for the computation? against " ref
+            printf "%-20s %10s %8s %12s %12s\n", "config", "compute ns", "ratio", "clock ratio", "clock ratio"
+            printf "%-20s %10s %8s %12s %12s\n", "", "", "", "sieve start", "sieve end"
+            for (i = 1; i <= n; i++) { c = order[i]
+                cc = med(compute[c]); s = med(mhz[c, "retire"]); e = med(mhz[c, "sieve"])
+                if (cc == "" || s + 0 <= 0 || e + 0 <= 0) continue
+                printf "%-20s %10.0f %8.2f %12.2f %12.2f\n", c, cc, cc / rc, rs / s, re / e }
+            print ""
+            print "ratio = this configuration'"'"'s compute phase over the reference'"'"'s; clock ratio = the reference'"'"'s"
+            print "clock over this one'"'"'s where the sieve starts (after retire, the last boundary) and ends (after"
+            print "sieve). The computation is partly memory-bound, so a clock that accounts for its slowdown gives"
+            print "a ratio at or somewhat below the clock ratios; a ratio well above them points past the clock."
+        }' "$dir/clock.csv" "$dir/runs.csv"
 }
 
 doctor() {
@@ -385,6 +536,8 @@ doctor() {
         warn "hybrid CPU: set PWSB_CPUS to CPUs of one core type (cpu_core = performance, cpu_atom = efficiency)"
     fi
     say "governor $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort | uniq -c | tr -s ' ' | tr '\n' ';' || echo unknown)"
+    rule "power"
+    power_facts
     rule "dax directory (PWASM_PMEM_TEST_DIR)"
     if [ -z "${PWASM_PMEM_TEST_DIR:-}" ]; then
         warn "unset: the pmem-* and file-dax configurations cannot run"
