@@ -2097,23 +2097,40 @@ are documented in `docs/pmem-emulation.md`.
 
 ### Correctness argument by layers
 
-No single test backend or experiment proves end-to-end durability. The project
-uses a layered argument so that each class of evidence has a precise claim:
+No single test backend or experiment proves end-to-end durability. The argument
+is layered so that each class of evidence has a precise claim and a known blind
+spot. These are *evidence* layers. They are numbered independently of the four
+software layers this document is organised by (Layer 1 — Storage Abstraction to
+Layer 4 — Block Allocator). The numbering is the one the negative control and
+the test sources already use ("layer 1b", "layer 3").
 
-| Layer | Claim | Required evidence |
-|---|---|---|
-| 1a. Abstract WAL protocol | `DualTxnWal` and `RegionTransaction` preserve acknowledged updates and recover correctly at every abstract persistence boundary. | Deterministic shadow durable-memory tests that separate live and durable bytes, discard unpersisted bytes on crash, and inject success, failure, indeterminate and torn outcomes. |
-| 1b. PMEM event model | The protocol recovers for every explored ordering of dirty-line eviction, asynchronous `CLWB` completion, `SFENCE`, and crash within a declared bound and persistence-domain model. | A trace-driven state explorer that generates concrete durable images and feeds them into the production recovery implementation; see [PMEM Crash Model](pmem-crash-model.md). |
-| 2. Backend translation | A `BackendRegion` implementation maps the abstract operations to the intended mechanism and propagates its result: `fdatasync`/`msync` for files, cache-line write-back/fence for PMEM. | Backend unit/integration tests, syscall or instruction tracing where practical, bounds/error tests, and explicit failure injection. |
-| 3. Software crash consistency | The complete allocator and WAL recover after the running process or VM disappears without a clean close. | Child-process `_exit`/`SIGKILL` tests for the file backend; DAX integration plus guest reset/QEMU restart for emulated PMEM; structural allocator-invariant checks after reopen. |
-| 4. Physical durability | Acknowledged state survives loss of the host and volatile hardware caches on the target medium. | Implemented `CLWB`/`CLFLUSHOPT`/`CLFLUSH` + `SFENCE` path and controlled power-interruption tests on real PMEM. |
+| Evidence layer | Claim | Evidence | Blind spot |
+|---|---|---|---|
+| 0. Functional | Each component behaves correctly when nothing crashes: the cache's read and write-behind paths, allocation, splitting and coalescing, record validation, input rejection. | `region_transaction:`; `pwregion:`, including seeded 64-step mixed histories checked after every operation; the `dual_wal:` validation cases; `txn_backend:`; `pwsieve:`. | Anything about crashes. |
+| 1a. Abstract WAL protocol | `DualTxnWal`, `RegionTransaction` and `PWRegion` preserve acknowledged updates at every abstract persistence boundary, and a failed or indeterminate boundary latches recovery-required instead of claiming durability. | `ShadowDurableRegion` (see below): separate live and durable bytes, with fail-before-copy, copy-then-fail and partial-copy outcomes; the `dual_wal:` crash and fault matrix; injection in `region_transaction:` and `pwregion_recovery:`. | One outcome per persistence call: no eviction, no asynchronous `CLWB`, one partial outcome rather than every subset of lines. |
+| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistent_trace:`, `persistent_image:`, `persistent_explore:`), checked against the WAL contract (`persistent_recovery:`), the allocator invariants (`persistent_alloc:`) and the sieve's cross-object invariants (`persistent_sieve:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `persistent_control:` keeps it sensitive to flush placement. See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios, budgeted at mid-record cuts. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. |
+| 2. Backend translation | Each backend maps the abstract operations to the intended mechanism and propagates its result. | Instruction encodings and the native CPUID/writeback/fence smoke path (`persistent_ops:`); `fdatasync`/`msync` ordering and real `EBADF` injection at the file-sync seam (`pwregion_bd:`); marking, coalescing, drain, the `O_DIRECT` probe and device refusals (`direct_io:`); `MAP_SYNC` integration on Magpie's fsdax (`pmem_dax:`, opt-in). | Whether the protocol is correct; anything a crash loses. |
+| 3a. Process crash, nothing lost | The allocator, WAL and workload recover after the process dies without a clean close, both at named protocol boundaries and at arbitrary points over long histories. | Thirteen abrupt-termination tests at named boundaries (`pwregion_bd:`); the random-timer `pwsieve` kill loop on the file and PMEM backends, which requires every acknowledged step to survive. | Flush placement. Process death on an mmap backend loses nothing, because the page cache or the CPU cache keeps every store, so the surviving image is the model's eager one. The elided-writeback mutant passes here (measured 2026-09-18, again 2026-09-27). |
+| 3b. Real loss of unwritten data | On real hardware, under a crash that discards what was never written back, the production write-back placement is needed (the mutant loses acknowledged state) and suffices at the crash points reached (the ordinary build loses none). | Stage 2c warm reset over reserved DRAM (`pwreboot`: `SURVIVED` and `LOST`, 3 of 3 each); the `pwsieve` kill loop on the direct backend, at random crash points (see [Crash behaviour](#crash-behaviour-process-death-is-the-crash)). | Stage 2c has one crash point per run, and DRAM stands in for PMEM. The direct backend works in 4 KiB units with drain-all fences, and says nothing about `CLWB`/`SFENCE`. |
+| 4. Physical durability | Acknowledged state survives power loss on the target medium and persistence domain. | None; not attainable on Magpie. ADR is assumed, and the DIMM audit (dirty-shutdown count 0 on all twelve DIMMs) is the baseline a future run would be read against. | — |
 
-Evidence at an outer layer does not replace an inner layer. For example, a
-successful filesystem remount is not an exhaustive WAL fault model, while a
-shadow backend cannot establish that Linux or a storage device honoured a
-syscall. Together the layers support scoped conclusions: protocol correctness
-under the abstract boundary and bounded PMEM event model, correct backend
-translation, software crash consistency, and finally physical durability.
+The validation stages of [PMEM Emulation](pmem-emulation.md#validation-stages)
+map onto these layers: Stage 0a is layer 1a, 0b is 1b, Stage 1 is part of
+layer 2, Stage 2 is 3a, Stage 2c is 3b and Stage 3 is 4.
+
+Evidence at an outer layer does not replace an inner layer. A successful
+filesystem remount is not an exhaustive WAL fault model, and a shadow backend
+cannot establish that Linux or a storage device honoured a system call. The
+layers also do not merely coexist. Several tests exist to discharge the
+explorer's assumptions: the store audit shows that the trace is complete,
+`validate()` shows it is inside the model's domain, and the reduced search is
+checked against the full one. `direct_io:boundary_images_are_model_images`
+compares real bytes with the model. Each crash layer also samples a predictable
+part of the explorer's image set: layer 3a the eager end, the direct backend
+the lazy end rounded up to 4 KiB, Stage 2c one real image. That is why layer
+3a cannot discriminate flush placement and layer 3b can. The argument, and the
+exact statement of what is covered, is in
+[Honours Thesis](THESIS.md#how-the-evidence-fits-together).
 
 ### Resumable workload driver
 
@@ -2160,14 +2177,16 @@ range byte for byte. Publication and retirement are separate transactions, so th
 bound that holds at every instant is `live <= window + 1`; `open()` finishes an
 interrupted retirement so the surplus cannot accumulate.
 
-Three harnesses drive it, at three evidence layers:
+Its harnesses sit at four of the [evidence layers](#correctness-argument-by-layers):
 
-| Harness | Layer | What it shows |
+| Harness | Evidence layer | What it shows |
 |---|---|---|
-| `PWSieveTest.v3` | 3 | Graceful remounts preserve and resume the workload; retirement recycles blocks; a leak is reclaimed |
-| `test/pwsieve.main.v3` (`make pwsieve`) | 3 | Random-timer `SIGKILL` at arbitrary points, remount, invariants, monotone progress, final count against an independent sieve |
-| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3 | The same loop through `PmemMmapBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Passed on Magpie 2026-09-01 (13 kills, all `REPLAYED`, 376,256 primes matching an independent sieve). Needs `PWASM_PMEM_TEST_DIR`. Executes the production path on real media but does **not** discriminate flush placement — a killed process on a DAX mapping loses nothing still in cache; that sensitivity is layer 1b's |
-| `PersistentSieveTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants |
+| `PWSieveTest.v3` | 0 | Graceful remounts preserve and resume the workload; retirement recycles blocks; a leak is reclaimed |
+| `test/pwsieve.main.v3` (`make pwsieve`) | 3a | Random-timer `SIGKILL` at arbitrary points, remount, invariants, monotone progress, final count against an independent sieve |
+| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3a | The same loop through `PmemMmapBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Passed on Magpie 2026-09-01 (13 kills, all `REPLAYED`, 376,256 primes matching an independent sieve). Needs `PWASM_PMEM_TEST_DIR`. Executes the production path on real media but does **not** discriminate flush placement — a killed process on a DAX mapping loses nothing still in cache; that sensitivity is layers 1b and 3b's |
+| `test/pwsieve.main.v3` (`make pwsieve-direct`) | 3b | The same loop on the direct backend, where process death discards what was never written back: the elided-writeback mutant loses every acknowledged step (see [Crash behaviour](#crash-behaviour-process-death-is-the-crash)) |
+| `test/pwreboot.main.v3` (`scripts/stage2c.sh`) | 3b | Stage 2c: the sieve armed, then a warm reset that discards the CPU cache over reserved DRAM, verified after reboot |
+| `PersistentSieveTest.v3`, `PersistentControlTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants; the control changes only the provider and must catch the mutant |
 
 The crash loop forks a child that sieves while the parent sleeps a seeded
 pseudo-random 50 us - 20 ms interval and sends `SIGKILL`. Across five seeds at
@@ -2235,9 +2254,13 @@ That state now propagates through `RegionTransaction`/`PWRegion`. The remaining
 core integration work is a test-only `ShadowTxnBackend` factory that exposes
 the same live/durable pair to `PWRegion` so complete
 allocation split/exact-fit and free/coalescing transactions are checked after
-simulated crashes. The shadow model establishes Layer 1a; it complements the
-planned Layer-1b trace explorer rather than replacing the file/DAX and hardware
-work in Layers 2–4.
+simulated crashes. The shadow model establishes evidence layer 1a. It
+complements the layer-1b trace explorer rather than being replaced by it. The
+explorer enumerates which bytes survive a crash, and injects a failed boundary
+only into recovery and mount. The shadow covers a persistence call that fails or
+whose outcome is unknown at every boundary: fresh initialization, commit, apply,
+recovery, flush and close. Neither replaces the backend and hardware work in
+layers 2–4.
 
 Run with:
 
@@ -2255,4 +2278,3 @@ test/unit.sh
 | 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
-| 9 | `docs/pmem-crash-model.md` | Extend the completed persistent-operation seam and typed recorder with durable images plus a bounded explorer for background eviction, asynchronous `CLWB`, `SFENCE`, and crash schedules. |

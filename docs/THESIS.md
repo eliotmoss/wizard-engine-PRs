@@ -381,6 +381,211 @@ point, line by line, still rests on the explorer alone.
 
 ---
 
+## How the evidence fits together
+
+The thesis is framed around testing, so the testing needs one picture rather
+than fifteen test files and five harness binaries. The picture has two axes. One
+is the software stack under test: the sieve workload, `PWRegion`,
+`RegionTransaction`, `DualTxnWal`, the seam and the backends. The other is a
+ladder of *evidence layers*, and each layer produces the bytes that exist after
+a crash in a different way. The explorer is the hub. Every other layer feeds it,
+discharges one of its assumptions, or samples part of what it enumerates. The
+claims and evidence of each layer are defined in
+[Persistent Backends](persistent-backends.md#correctness-argument-by-layers);
+this section is the argument that connects them.
+
+Added 2026-09-30. It is analysis of results already in hand and adds no
+experiment. The one reading that is argued rather than tested is marked where
+it appears.
+
+### The ladder
+
+| Layer | Where the post-crash bytes come from | Blind spot |
+|---|---|---|
+| 0. Functional | No crash | Crashes |
+| 1a. Abstract protocol | A shadow durable array, with failed, indeterminate and torn persistence calls injected | One outcome per persistence call: no eviction, no asynchronous `CLWB` |
+| 1b. PMEM event model | Every image the model admits at a cut of a recorded production trace | Short scenarios; assumes the trace is complete and the hardware obeys the model |
+| 2. Backend translation | Real instructions and system calls, with errors injected at the seam | Whether the protocol is correct |
+| 3a. Process crash | Process death on an mmap backend, which loses nothing | Flush placement (measured: the mutant passes) |
+| 3b. Real loss of unwritten data | A warm reset that discards the CPU cache (Stage 2c), or process death that discards the direct backend's staging buffer | One cut per reset; 4 KiB units on the direct backend |
+| 4. Physical durability | Power loss on the target medium | Not attainable; a stated limitation |
+
+The PMEM campaign's stage names map onto the ladder: Stage 0a is layer 1a, 0b
+is 1b, Stage 1 is part of layer 2, Stage 2 is 3a, Stage 2c is 3b and Stage 3 is
+4. Stage 2b's boundary kills were done on the file backend, at layer 3a. Its
+QEMU guest reset was never run, and would add nothing layer 3a lacks, since
+QEMU models no cache. The thesis should use the layer numbers throughout and
+give the stage names once. The four *software* layers of Figure 1 are a
+different numbering, and the text should never call them layers 1–4.
+
+### One oracle, many image sources
+
+The properties form a ladder of their own, each strictly stronger than the one
+before: the WAL's acknowledgement contract, the allocator's structural
+invariants (`PersistentAllocatorInvariants.check()`), and the sieve's
+cross-object invariants (`PWSieve.checkInvariants()`). The strictness is shown,
+not assumed: `persistent_sieve:` corrupts two bytes of a durable bitmap, which
+the allocator walk accepts and the sieve property rejects.
+
+The layers share the code of their oracles, not only the properties.
+`checkInvariants()` runs in `PWSieveTest`, in `PersistentSieveProperty`, after
+every restart of the `pwsieve` kill loop, in `pwreboot`'s verify step, and after
+every `pwsievebench` round. The allocator walk runs in unit tests, in the
+explorer, and in the direct backend's `SIGKILL` cases. The layers therefore
+differ in which images they produce, never in what they check, and that is what
+makes the cells of figure 7 comparable.
+
+### Each crash layer samples the explorer's image set
+
+At any cut, the images the model admits are bracketed by two schedules. Under
+`lazyCrash()`, only what the fences required has reached the media. Under
+`eagerCrash()`, every dirty line is evicted after every event, so every store
+survives. Each crash layer lands somewhere predictable in that set:
+
+```
+lazy ─────────────── images the model admits at one cut ─────────────── eager
+  ▲                               ▲                                        ▲
+direct-backend kill loop        Stage 2c warm reset:                  kill loop on DAX or an
+(layer 3b; lazy, rounded up     whatever the real cache               mmap file (layer 3a):
+ to 4 KiB write units)          held (layer 3b, one cut)              every store survives
+  └── explorer (layer 1b): the lazy image at every cut, every image at the exhaustive cuts ──┘
+```
+
+This reading explains the negative control rather than only recording it:
+
+- **Layer 3a cannot see flush placement, by construction.** The eager image
+  depends only on the stores. The elided-writeback mutant changes only the
+  `CLWB`s, so its eager image is the ordinary build's at every cut, and a layer
+  that draws eager images can never separate the two builds. What the hardware
+  run adds reduces to one empirical fact: process death on an mmap backend
+  leaves the eager image. The bit-identical 376,256 primes confirm it.
+- **Layer 3b sees placement because it draws from the lazy end.** With no
+  `CLWB`, the mutant's lazy image after the armed steps is the state it started
+  from. Stage 2c found exactly that (the raw image byte-identical to setup's,
+  cursor 65,024), and so did the direct kill loop (8 of 8 and 19 of 19
+  acknowledged steps lost).
+- **The direct backend's place in the picture is tested, not argued.**
+  `direct_io:boundary_images_are_model_images` requires the real file after
+  every `fdatasync` to be an image the model admits. At 2 KiB blocks it also
+  requires the file to differ from the exact lazy image, so the rounding up to
+  4 KiB units is exercised rather than assumed.
+- **Stage 2c's ordinary image lies inside the set as well.** It is
+  byte-identical to a crash-free run, which is one of the images the model
+  admits at that cut.
+
+The first bullet, and the lazy-image half of the second, follow from the
+model's definitions together with the observed results. No test pins the
+corresponding fact about the explorer's own counterexample, namely that the
+mutant's failing image is not the eager one. Figure 4 should carry this
+picture: if the fan-out is annotated with where each layer lands, figure 7's
+pattern can be read off it.
+
+### What discharges the explorer's assumptions
+
+The explorer's verdict rests on several assumptions. Each is discharged by a
+test at another layer:
+
+| The explorer assumes | Discharged by |
+|---|---|
+| The trace contains every persistent store | The `persistent_ops:` store audit: complete byte coverage of `format()` with its padding holes asserted as holes, and allocator after-images strictly after the commit boundary. The Immix line marks are the one stated exception (Chapter 3) |
+| The trace is inside the model's domain | `validate()` on every explored trace; `persistent_trace:` pins the seven defects it rejects, each at the right event |
+| The provider's `clwb`/`sfence` are `CLWB`/`SFENCE` | `persistent_ops:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
+| The search finds every admitted image | The reduced search equals the full branching search at every cut of three traces; an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
+| Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, and Stage 2c's ordinary image. These are the only two places where real bytes are compared with the model |
+| One exploration covers more than one backend | Trace identity between the direct and PMEM backends at 2 KiB and 4 KiB blocks. The file backend has a stated model and no explorer |
+| "Recovery" means production recovery | Images are mounted through the production mount path (`runDualWal()`, `PersistentImageBackend`), never through a reimplementation |
+
+The bridge runs the other way too. The explorer's scenarios are one sieve step
+or at most three transactions. The kill loop runs long histories at arbitrary
+points until the descriptor table fills, and it is what found the two workload
+defects Chapter 6 reports: the alloc-then-publish leak and `live <= window + 1`.
+
+### Every oracle has been shown to fail
+
+A check that cannot fail is not evidence, so each one has a case in which it
+does. These are permanent tests:
+
+- the allocator walk reports a one-byte corruption of the durable block table;
+- the sieve property rejects the bitmap corruption that the walk misses;
+- the recovery property turns an unmet survival claim into a counterexample;
+- the trace validator rejects seven defects, each at the right event;
+- the model-conformance check rejects a flipped byte of the WAL header magic;
+  and
+- the explorer catches the elided-writeback mutant 710 events into 1,401.
+
+These were one-off mutation runs:
+
+- the batched apply's four mutants (an unprepared merged range, no commit drain,
+  no `persistAppliedData()` drain, and the facade skipping the prepare) each
+  failed at least one test;
+- a deliberately broken direct write-back was rejected at the fifth boundary;
+  and
+- the `MultiTxnWal` regression tests were verified to fail before their fixes.
+
+`persistent_control:` stays in the default suite for this reason. If the
+explorer ever stopped catching the mutant, every result that leans on it would
+be worth less, and the suite would say so.
+
+### What the evidence covers, stated exactly
+
+Chapter 6 should state coverage in these terms and no stronger:
+
+- **The lazy end, at every cut of the swept scenarios.** A budgeted sweep
+  starts from the fence-forced floor, which is the lazy image, and checks only
+  the next few images above it: 4 per cut for the sieve, 64 for the negative
+  control.
+- **Every image, at selected cuts.** "Exhaustive" is true at the
+  commit-boundary cuts, the final cut of a sieve step, the batched apply's cuts,
+  the canonical two-crash image and the cheap allocator cuts. Mid-record cuts
+  admit on the order of 10⁵ images and are budgeted.
+- **Long histories, at the two ends only.** The kill loops sample the eager
+  image (layer 3a) and the lazy image rounded up to 4 KiB (the direct backend)
+  at random cuts, and Stage 2c adds one real image per run. The interior of the
+  set is explored only for short scenarios. Seeded exploration of long histories
+  (crash-model milestone 8, cut) is exactly the missing cell, and future work
+  should name it in those words.
+- **Not explored by the model:** the explicit-flush and clean-close scrub paths
+  (covered at layers 1a and 3a only), the Immix line marks (outside the seam),
+  the file backend (model stated, not implemented) and the emitted instructions
+  (milestone 9, cut).
+- **Not attainable:** power loss on the target medium (layer 4).
+
+### Outline for Chapters 5 and 6
+
+Chapter 5, *Verifying through the seam*, is the method: layer 1b and what holds
+it up.
+
+1. The baseline crash model, and why it is PMEM-shaped
+   ([PMEM Crash Model](pmem-crash-model.md)).
+2. Recording through the seam: the provider, the store audit that makes the
+   trace complete, `validate()`, and the Immix exception.
+3. From a cut to its images: the crash machine, the lazy and eager brackets,
+   full search against the reduction, and the check that the two agree
+   (figures 4 and 5).
+4. Properties over production recovery: the WAL contract, the allocator
+   invariants and the sieve invariants, each with the self-check that shows it
+   can fail.
+5. Beyond one crash: multi-transaction histories and the overwrite guard, crash
+   during recovery, and failed recovery boundaries.
+6. The other media: the file backend's model as stated, and the direct
+   backend's as a checked restriction of the PMEM one.
+7. Sensitivity: the mutant caught, and why that licenses reading the hardware
+   layers' passes as their limitation rather than as evidence.
+
+Chapter 6, *Evaluation and evidence boundary*, has a correctness half, outlined
+here; the cost results of figures 6–6e sit beside it.
+
+1. The ladder, and which layer each experiment sits on.
+2. The negative control across its four columns, read through the sampling
+   picture (figure 7 against the annotated figure 4).
+3. What the unbounded layers found that the bounded one did not: the leak and
+   `live <= window + 1`.
+4. The coverage statement above, in substance unchanged.
+5. The hardware boundary: no power loss, ADR assumed against a clean DIMM
+   audit, and a write-through controller behind every block-storage figure.
+
+---
+
 ## Chapter structure
 
 | # | Chapter | Principal source material |
@@ -389,8 +594,8 @@ point, line by line, still rests on the explorer alone.
 | 2 | Background and related work | **new, and the only real gap** |
 | 3 | Design: the persistence seam | [persistent-backends.md](persistent-backends.md), [wal-comparison.md](wal-comparison.md) |
 | 4 | Where unification leaks | this document, plus the cost measurement |
-| 5 | Verifying through the seam | [pmem-crash-model.md](pmem-crash-model.md) |
-| 6 | Evaluation and evidence boundary | [ROADMAP.md](ROADMAP.md), [pmem-emulation.md](pmem-emulation.md) |
+| 5 | Verifying through the seam | [pmem-crash-model.md](pmem-crash-model.md); outline in [How the evidence fits together](#outline-for-chapters-5-and-6) |
+| 6 | Evaluation and evidence boundary | [ROADMAP.md](ROADMAP.md), [pmem-emulation.md](pmem-emulation.md); outline of its correctness half in [How the evidence fits together](#outline-for-chapters-5-and-6) |
 | 7 | Conclusion and future work | new |
 
 Chapters 3, 5 and 6 largely exist already as prose in `docs/`. They need
@@ -594,7 +799,12 @@ Seven, and they need real hours budgeted.
 2. On-region layout.
 3. Phase B commit timeline, showing the piggybacked boundary.
 4. **One trace cut fanning out into its permitted durable images.** The
-   signature figure of the thesis.
+   signature figure of the thesis. Mark the lazy and eager images at the two
+   ends and annotate where each crash layer lands (see
+   [How the evidence fits together](#each-crash-layer-samples-the-explorers-image-set)):
+   the direct kill loop at the lazy end, the mmap kill loops at the eager end,
+   Stage 2c between them, and the explorer over the whole set. Figure 7's
+   pattern can then be read off this one.
 5. The reduction — fence-forced floor plus per-line prefix product, against
    full branching search.
 6. Boundary cost — three configurations, separating the boundary primitive from
@@ -660,6 +870,8 @@ Seven, and they need real hours budgeted.
    the only hardware column with random crash points; say in the caption that it
    is 4 KiB-granular. `pwreboot` on the same backend reproduces the third
    column's cursor values (162,560 against 65,024) without a reboot.
+   Head each column with its evidence layer as well as its name: 3a, 1b, 3b and
+   3b. The cells then say which layers discriminate, and figure 4 says why.
 
 Figure 7 is the whole argument in one picture.
 
