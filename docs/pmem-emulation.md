@@ -597,8 +597,12 @@ copy-then-fail and partial-copy outcomes. The `DualTxnWal` commit and recovery
 paths now latch persistence failures, reject further same-instance work, and
 require a fresh instance to recover. Fresh initialization, after-image
 preparation, flush, close, transaction-facade, and allocator propagation are
-covered as well. The remaining Stage-0a work is a `ShadowTxnBackend` factory
-for complete allocator transactions.
+covered as well. A `ShadowTxnBackend` factory for complete allocator
+transactions was planned as the last Stage-0a item and was not built. The
+explorer, the allocator's commit-point injection and a real `EBADF` at the
+file-sync seam cover those transactions instead; exact-fit allocation is
+covered only by `SIGKILL` (see
+[Persistent Backends](persistent-backends.md#shadow-durable-memory-test-backend)).
 
 Stage 0a answers whether the WAL is correct under the abstract `BackendRegion`
 persistence contract. It is fast, deterministic and suitable for the default

@@ -2250,11 +2250,19 @@ copy-then-fail/clean-reopen outcomes.
 The direct `DualTxnWal` core crash/fault matrix and backend self-tests are in
 place. Fresh initialization, commit, apply, recovery, explicit flush,
 final-data close and slot scrub now latch and enforce recovery-required state.
-That state now propagates through `RegionTransaction`/`PWRegion`. The remaining
-core integration work is a test-only `ShadowTxnBackend` factory that exposes
-the same live/durable pair to `PWRegion` so complete
-allocation split/exact-fit and free/coalescing transactions are checked after
-simulated crashes. The shadow model establishes evidence layer 1a. It
+That state now propagates through `RegionTransaction`/`PWRegion`. A test-only
+`ShadowTxnBackend` factory, exposing the same live/durable pair to `PWRegion`,
+was planned so that complete allocator transactions would be checked after
+simulated crashes. It was not built, because other layers reached the same
+transactions under stronger fault models. `persistent_alloc:` mounts every image
+a split allocation and a coalescing free admit as a real `PWRegion` and walks
+it (layer 1b). `pwregion_recovery:` injects a failed commit point into an
+allocation and a free. The file-sync seam injects a real `EBADF` whose record
+may still be durable, which is the copy-then-fail case
+(`pwregion_bd:file_commit_fdatasync_failure_requires_reopen`). Exact-fit
+allocation is the one transaction shape left outside the explorer. It is covered
+by `SIGKILL` at its commit boundary and after its apply (layer 3a), which sees
+only the eager image. The shadow model establishes evidence layer 1a. It
 complements the layer-1b trace explorer rather than being replaced by it. The
 explorer enumerates which bytes survive a crash, and injects a failed boundary
 only into recovery and mount. The shadow covers a persistence call that fails or
@@ -2274,7 +2282,6 @@ test/unit.sh
 
 | # | Location | Description |
 |---|---|---|
-| 2 | `DualTxnWalTest.v3` | Extend the shadow live/durable model through a `ShadowTxnBackend` allocator integration factory. |
 | 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
 | 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
 | 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |

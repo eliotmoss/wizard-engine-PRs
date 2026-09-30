@@ -545,7 +545,9 @@ Chapter 6 should state coverage in these terms and no stronger:
   (crash-model milestone 8, cut) is exactly the missing cell, and future work
   should name it in those words.
 - **Not explored by the model:** the explicit-flush and clean-close scrub paths
-  (covered at layers 1a and 3a only), the Immix line marks (outside the seam),
+  (covered at layers 1a and 3a only), exact-fit allocation (layer 3a only; the
+  explorer records a split allocation and a coalescing free), the Immix line
+  marks (outside the seam),
   the file backend (model stated, not implemented) and the emitted instructions
   (milestone 9, cut).
 - **Not attainable:** power loss on the target medium (layer 4).
@@ -867,8 +869,10 @@ Seven, and they need real hours budgeted.
    **Since 2026-09-27 it is 2×4**: a fourth column, the kill loop on the
    direct backend, where the ordinary build loses 0 of 8 acknowledged steps on
    Magpie and 0 of 17 on the PC and the mutant loses 8 of 8 and 19 of 19. It is
-   the only hardware column with random crash points; say in the caption that it
-   is 4 KiB-granular. `pwreboot` on the same backend reproduces the third
+   the only hardware column that both discriminates and has random crash points
+   (the first column has random points but cannot discriminate, the third
+   discriminates at one point per run); say in the caption that it is
+   4 KiB-granular. `pwreboot` on the same backend reproduces the third
    column's cursor values (162,560 against 65,024) without a reboot.
    Head each column with its evidence layer as well as its name: 3a, 1b, 3b and
    3b. The cells then say which layers discriminate, and figure 4 says why.
