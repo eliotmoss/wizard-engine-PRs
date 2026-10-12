@@ -31,25 +31,45 @@ leaks. Second, "WAL testing" undersells what was actually built, which is a
 general method for crash-consistency checking of persistent data structures
 that happens to have been demonstrated on a WAL.
 
-The emphasis is therefore inverted relative to Eliot's original framing: the
-interface is the substrate, and the verification method is the sharper
-contribution. **This inversion needs Eliot's agreement before writing starts.**
+This document first inverted Eliot's emphasis, making the interface the
+substrate and the verification method the sharper contribution. **Eliot chose
+otherwise on 2026-10-12:** the interface is the main subject, and the
+crash-checking method gets its own chapter as evidence that the interface
+holds. Both sharpenings still apply within that framing.
 
 ---
 
 ## Thesis statement
 
-> A single persistence seam can serve both byte-addressable and block-backed
-> media for a region allocator and its write-ahead log. Because that seam
-> concentrates every store, flush and fence at one observable point, it also
-> makes exhaustive crash-consistency checking of the *unmodified production*
-> code possible. Where the seam cannot unify the media — persistence
-> granularity, failure atomicity, boundary cost, and what a crash can be
-> observed to lose — those differences are measurable, and they are the real
-> cost of the abstraction.
+> A single persistence interface can carry a region allocator and its
+> write-ahead log over byte-addressable and block-backed media, but it cannot
+> hide what differs beneath it: persistence granularity, failure atomicity,
+> boundary cost, and what a crash can be observed to lose. Because every store,
+> writeback and fence crosses that interface, it is also where crash
+> consistency can be checked: a trace recorded there needs no hypervisor,
+> emulator or compiler pass, serves every backend that emits it, and lets each
+> crash image be run through production recovery against a contract that knows
+> what was acknowledged.
 
-The non-obvious part is the middle sentence: portability and verifiability fall
-out of the same design decision. Everything else is evidence for it.
+**Revised 2026-10-13.** Eliot chose the interface as the main subject, with the
+crash-checking method in its own chapter as evidence that the interface holds,
+so the statement now leads with the interface. Reading Yat, Jaaru, Witcher and
+Vinter also removed two claims from the earlier wording. It said the seam
+"makes exhaustive crash-consistency checking of the *unmodified production*
+code possible". Yat and Vinter already check unmodified code and run its real
+recovery, with no seam; and the explorer is exhaustive only at selected cuts
+(see [What the evidence covers](#what-the-evidence-covers-stated-exactly)), so
+"exhaustive" belongs in Chapter 5 with its bounds, not in the statement.
+
+What survives is narrower: portability and verifiability come from the same
+design decision, because the interface built so that one allocator and one log
+run over four backends is also the place the trace is recorded. The interface
+does not make checking possible; it changes where the trace comes from, what
+it costs, and how many media one exploration covers. "Every backend that emits
+it" is the PMEM and direct backends, which emit identical traces; the file
+backend has a stated model and no explorer. See
+[Related work](#related-work) for each differentiator against its closest
+prior work.
 
 ---
 
@@ -68,17 +88,21 @@ added 2026-09-24) without conditionals in the layers above. The direct backend
 emits the PMEM backend's `STORE`/`CLWB`/`SFENCE` trace for the same history,
 which is the seam's claim made checkable.
 
-**2. A recorded-trace crash-image method that checks production recovery over
-every durable image a crash permits.**
+**2. A recorded-trace crash-image method that runs production recovery over
+the durable images a crash admits, exhaustively at selected cuts.**
 
 Instrument the real store/flush/fence order at the seam, freeze it as an
 immutable artifact, enumerate the durable images a crash cut admits under a
 stated hardware model, and run the production recovery path over each one as a
 checkable property.
 
-The two are bound together: contribution 1 is what makes contribution 2
-possible, and contribution 2 is the only thing that makes contribution 1
-believable.
+The two are bound together, though not as this paragraph first said.
+Contribution 1 does not make contribution 2 possible: Yat and Vinter record
+unmodified code and run its real recovery with no such interface (see
+[Differentiators](#differentiators)). It decides where the trace is recorded,
+and it lets one exploration cover the PMEM and direct backends. Contribution 2
+is evidence that the backends honour the interface, which is why it has its own
+chapter rather than leading the thesis.
 
 ---
 
@@ -601,8 +625,8 @@ here; the cost results of figures 6–6e sit beside it.
 | 7 | Conclusion and future work | new |
 
 Chapters 3, 5 and 6 largely exist already as prose in `docs/`. They need
-restructuring, figures and a consistent voice, not fresh research. Chapter 5 is
-the centrepiece and should be drafted first among them.
+restructuring, figures and a consistent voice, not fresh research. Since
+2026-10-12 Chapter 3 is the centrepiece, not Chapter 5 (see [Origin](#origin)).
 
 Chapter 6 must report what the method actually *found*, not only that it
 passed. The two defects the `SIGKILL` crash loop surfaced are the strongest
@@ -744,21 +768,70 @@ enumeration work:
   Recover from fsync Failures?" (ATC '20), against which `DualTxnWal`'s
   latch-and-reopen contract should be positioned.
 
-Claimed differentiators, to be stated only after the closest work is read
-properly rather than assumed:
+### Differentiators
 
-1. Traces are recorded from **production code** through a seam that exists for
-   portability reasons anyway, so there is no separately maintained model to
-   drift from the implementation.
-2. The property checked is **production recovery**, not a reimplementation of
-   it.
-3. Properties climb to **workload-level cross-object invariants**
-   (`PersistentSieveProperty`), not only internal structural ones.
+Revised 2026-10-13, after reading Yat (Lantz et al., ATC '14), Jaaru
+(Gorjiara et al., ASPLOS '21), Witcher (Fu et al., SOSP '21), Vinter
+(Kalbfleisch et al., ATC '22), Mumak (Gonçalves et al., EuroSys '23) and
+`pmreorder` (Scargall, *Programming Persistent Memory*, ch. 12, and its man
+page). The earlier list claimed production code, production recovery and
+workload-level invariants. None of the three separates the thesis from that
+work, so each claim below names the closest prior work and states its cost.
 
-Jaaru in particular performs constraint-based reduction, so the reduction
-result — fence-forced floor plus per-line prefix product, shown to agree with
-full branching search at every cut of three traces — must be positioned
-against it honestly rather than claimed as novel outright.
+**Shared, not claimed.** Recording the unmodified program and running its own
+recovery over each crash image. Yat, Jaaru, Witcher, Vinter, Mumak and
+`pmreorder` all do both. The thesis does too, and says so, "like Yat, Jaaru,
+Witcher, Vinter and Mumak", rather than presenting it as a contribution.
+
+1. **The trace is recorded at the persistence interface, not under the
+   program.** Prior tools record beneath it: a hypervisor (Yat), an LLVM pass
+   (Jaaru, Witcher), whole-system emulation on PANDA (Vinter), or dynamic
+   binary instrumentation (Mumak on Pin, `pmemcheck` on Valgrind, whose log
+   `pmreorder` replays). Here the seam exists for portability anyway, the
+   recording provider is one more implementation of it, and the direct and
+   PMEM backends emit the same trace, so one exploration covers both (see
+   [What discharges the explorer's assumptions](#what-discharges-the-explorers-assumptions)).
+   *Cost:* the kernel and the emitted instructions are invisible, and Vinter
+   sees both; the trace is complete only by the store audit, with the Immix
+   line marks excepted; and no loads are recorded. Read CrashMonkey before
+   claiming anything "across media", since it is the block-level counterpart.
+2. **The oracle knows what was acknowledged.** At each cut the recovered state
+   is checked against the acknowledgement contract, the allocator's structural
+   walk and, for the sieve, cross-object invariants
+   (`PersistentSieveProperty`). Jaaru and Mumak count only crashes and failed
+   assertions or a recovery that reports failure; Witcher compares outputs
+   with crash-free runs; Vinter compares recovered POSIX states for atomicity.
+   In Stage 2c the elided-writeback mutant lost every acknowledged step while
+   recovery "found nothing to replay"
+   ([PMEM Emulation](pmem-emulation.md#flush-placement-negative-control)) and
+   finished without error. *Inference:* an oracle that sees only crashes,
+   assertions and recovery errors would pass that run. *Cost:* every property
+   is written by hand for one structure, which Witcher rejects as costly and
+   "error-prone"; the answer is that each one has been shown to fail (see
+   [Every oracle has been shown to fail](#every-oracle-has-been-shown-to-fail)).
+   Workload-level checking on its own is not the differentiator, because
+   Witcher and Vinter check at the workload level automatically.
+3. **Yat's reduction, with an executable check.** The fence-forced floor plus
+   per-line prefix product is Yat's count of a segment's states (§4, p. 436),
+   which Jaaru calls "an eager model checking approach"; Vinter's crash images
+   have the same floor-plus-in-flight structure. What the thesis adds is that
+   the reduced search is checked equal to full branching search at every cut
+   of three traces, under a stated model: asynchronous, non-snapshot `CLWB`,
+   background eviction at every event, and the bounded two-crash profile.
+   Neither Yat, Jaaru, Witcher nor Vinter reports such a check. *Cost:* Jaaru
+   also prunes by what recovery reads, and the seam cannot, since it records no loads, so
+   mid-record cuts are budgeted rather than exhausted (see
+   [What the evidence covers](#what-the-evidence-covers-stated-exactly)).
+
+Two points support these without being differentiators:
+
+- The negative control is Chapter 6 evidence, not a contribution: the
+  elided-writeback mutant passes on Magpie and the explorer rejects it 710
+  events into 1,401.
+- *Inference, to check before Chapter 5 states it:* between fences the floor is
+  fixed and per-line prefixes only grow, so every image at a cut recurs at the
+  last cut before the next `SFENCE`. "The lazy end at every cut" is then one
+  distinct image per fence interval, and the coverage statement should say so.
 
 ### The Optane objection
 
@@ -883,9 +956,10 @@ Figure 7 is the whole argument in one picture.
 
 ## To raise with supervisors
 
-- Confirm the emphasis inversion: interface as substrate, verification method
-  as the sharper contribution. Eliot's original framing weighted them roughly
-  equally.
+- ~~Confirm the emphasis inversion~~ — settled 2026-10-12: Eliot chose the
+  interface as the main subject, with the crash-checking method in its own
+  chapter. Show Tony and Eliot the thesis statement and differentiators revised
+  on 2026-10-13 to follow that choice.
 - State plainly that the WASM angle is motivation only, with no guest
   integration, so it cannot carry a contribution chapter.
 - Agree the code freeze date, so that late suggestions arrive as future work
