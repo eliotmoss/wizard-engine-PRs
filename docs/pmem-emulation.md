@@ -619,24 +619,39 @@ model must also allow dirty cache lines to be written back without `CLWB`, a
 to survive before a fence, and an `SFENCE` to complete the earlier writebacks
 on which the protocol relies.
 
-The first code milestone now records the production `DualTxnWal` ordering of
-persistent `STORE`, `CLWB`, and `SFENCE` actions through a per-region operation
-provider. It covers record construction, after-image apply/replay, slot scrub,
-and PMEM range/fence translation on ordinary memory. The remaining work explores every distinct durable image
-for short bounded scenarios, and invokes the real WAL/allocator recovery code
-against each image. An ordinary file or byte array is sufficient because the
-simulator—not DAX or the host page cache—defines durability. Exhaustive short
-scenarios should be supplemented, not replaced, by seeded randomized schedules
-for longer allocator histories. See
+That model is now built. Every persistent store on the active path —
+`PWRegion.format()`, `DirectRegionWriter` and `DualTxnWal` — goes through a
+per-region `PersistentOperations` provider, so a recording provider captures
+the production order of `STORE`, `CLWB` and `SFENCE` (crash-model milestone 2
+and the store audit). A recording is frozen as a `PersistentTrace` with crash
+cuts (milestone 3). `PersistentCrashMachine` replays it with asynchronous,
+non-snapshot writeback, fence obligations and background eviction, and
+materializes durable images (milestone 4). `PersistentExplorer` enumerates the
+images a cut admits, by full branching search or by the fence-forced floor plus
+per-line prefix product, which are checked against each other at every cut of
+three traces. Each image goes to production `DualTxnWal` recovery or a
+production `PWRegion` mount, which must satisfy the acknowledgement contract and
+the allocator's structural invariants (milestones 5–6). Crash during recovery
+and failed recovery boundaries run under the bounded two-crash profile
+(milestone 7). An ordinary file or byte array is sufficient because the
+simulator—not DAX or the host page cache—defines durability.
+
+Milestones 5–7 are not complete: allocator transactions, the rest of the
+scenario matrix, and the explicit-flush and clean-close scrub scenarios remain
+(see `ROADMAP.md`). The explorer is exhaustive only at selected cuts; elsewhere
+it checks the fence-forced floor and a few images above it. Seeded exploration
+of longer histories (milestone 8) was cut from thesis scope, so long histories
+are covered only at the two ends, by the kill loops and Stage 2c (see
+[Thesis](THESIS.md#what-the-evidence-covers-stated-exactly)). See
 [PMEM Crash Model](pmem-crash-model.md) for the event semantics, explicit
 hardware assumptions, state-space reductions, recovery integration, and
 evidence limits.
 
-The current recorder does not model durable bytes, eviction, asynchronous
-writeback completion, crash cuts, or recovery schedules. Stage 0b also cannot
-prove that the compiler and native backend emit the intended instructions.
-Instruction tracing and DAX/hardware integration remain separate validation
-layers.
+Stage 0b cannot prove that the compiler and native backend emit the intended
+instructions. Emitted-instruction validation (milestone 9) was cut; encoding
+and smoke tests cover the native path instead (see
+[Thesis](THESIS.md#what-discharges-the-explorers-assumptions)). Instruction
+tracing and DAX/hardware integration remain separate validation layers.
 
 ### Stage 1 — DAX and recovery integration
 
