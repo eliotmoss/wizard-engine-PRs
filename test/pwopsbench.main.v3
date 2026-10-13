@@ -1,0 +1,760 @@
+// Basic-operation latencies through the production allocator and WAL, per
+// persistence backend, in the style of Corundum's Table 5 (Hoseinzadeh and
+// Swanson, ASPLOS '21), which reports per-operation latencies over 50K
+// operations.
+//
+// pwbench measures one commit shape the harness chooses, and pwsievebench a
+// program's whole step; neither gives one operation's cost, and nothing
+// measured a mount or a recovery. Each operation here is the call a program
+// makes, through PWRegion, RegionTransaction and DualTxnWal:
+//
+//   alloc-<n>     allocChunk(n), n = 1, 8 and 64 blocks: one committed transaction
+//   free-<n>      freeChunk() of that chunk: one committed transaction
+//   commit-empty  RegionTransaction.commit() with nothing buffered
+//   mount-1mib    PWRegion.new() over a cleanly closed 1 MiB region
+//   mount-64mib   the same at 64 MiB
+//   recover-<k>   PWRegion.new() over a 1 MiB region whose log holds one
+//                 committed, unapplied transaction of k u64 entries, k = 8, 24
+//   timer         two back-to-back rdtsc reads: the floor under every figure,
+//                 and the empty commit's comparison
+//
+// A commit of k entries is pwbench's measurement and is not repeated here.
+//
+// Allocations and frees alternate on a region whose free space is one extent:
+// every allocation splits it and every free coalesces it back, so each pair
+// leaves the allocator as it found it and every operation of a kind commits
+// the same transaction. Each boundary also carries the previous operation's
+// after-images, as in production (phase B).
+//
+// What each operation should do is checked on every operation, warm-up and
+// measured, and a mismatch fails the run: an allocation or free makes exactly
+// one boundary, the empty commit and a clean mount none, a recovery one. On
+// PMEM, and on the direct backend, whose provider receives the same writeback
+// requests, an allocation or free writes back exactly the lines its record
+// predicts (PWOpsRecord.commitLines()), and a recovery one line per replayed
+// entry. The record is read back only during warm-up: reading it after a
+// measured commit would pull into the cache lines that later commits store
+// into. On the file and direct backends the prepare calls must also be the
+// same for every operation of a kind.
+//
+// Mounts are far dearer on the direct backend, which reads the whole region, so
+// they have their own, smaller counts. Each recovery's starting state is made,
+// untimed, by PWOps.commitUnapplied() and the region's destroy() without
+// close(); every mount is followed, untimed, by a clean deallocate(). The
+// 1 MiB clean mount and the recoveries alternate sample by sample, so the
+// difference between them is the replay.
+//
+// Times are rdtsc cycles around the call, converted with a calibrated TSC
+// frequency. The counting backends are pwsievebench's, duplicated rather than
+// shared so that neither program's code layout moves with the other's: on
+// PMEM a provider counts each fence and writeback, and writeback=none issues
+// no writeback instruction but keeps the fence. That approximates the timing
+// of an eADR platform, where the caches are in the persistence domain; it is
+// not one, and the region is NOT durable.
+//
+// Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>]
+
+def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def MAX_SAMPLES = 200000;
+def RW = BackendProt.READ.mask | BackendProt.WRITE.mask;
+
+def BLOCK_SIZE = 4096u64;
+def SMALL_BLOCKS = 256u64;      // 1 MiB: alloc, free, the empty commit and recovery
+def LARGE_BLOCKS = 16384u64;    // 64 MiB
+def ALLOC_BLOCKS = [1u32, 8u32, 64u32];
+def RECOVERY_ENTRIES = [8, 24];
+
+enum OpsBenchBackend(arg: string, label: string) {
+        FILE("file", "file (mmap + msync/fdatasync)"),
+        PMEM("pmem", "pmem (MAP_SYNC + CLWB/SFENCE)"),
+        DIRECT("direct", "direct (pwrite + O_DIRECT + fdatasync) on a file")
+}
+
+enum OpsBenchWriteback(arg: string, label: string) {
+        AUTO("auto", "auto (production CPUID selection)"),
+        NONE("none", "none -- no writeback, fence kept, approximates eADR timing, the region is NOT durable")
+}
+
+component OpsBenchConfig {
+        def var directory: string;
+        def var path: string;
+        def var backend = OpsBenchBackend.FILE;
+        def var writeback = OpsBenchWriteback.AUTO;
+        def var ops = 50000;           // Corundum's count
+        def var warmup = 2000;
+        def var mounts = 200;
+        def var mountWarmup = 20;
+
+        // Reserve a private, uniquely named region file, exactly as pwbench
+        // and pwsievebench do: O_EXCL so an earlier run's artifact is never
+        // silently replaced, and removal only of the file this run created.
+        def reservePath(dir: string) -> bool {
+                directory = dir;
+                def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+                def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                for (attempt < 100) {
+                        path = StringBuilder.new()
+                                .puts(directory)
+                                .puts("/wizard-pwopsbench-u")
+                                .putd(uid)
+                                .puts("-p")
+                                .putd(pid)
+                                .puts("-")
+                                .putd(attempt)
+                                .puts(".region")
+                                .toString();
+                        def fd = RegionFileIO.createExclusive(path);
+                        if (fd >= 0) {
+                                RegionFileIO.close(fd);
+                                return true;
+                        }
+                        if (fd != -LinuxConst.EEXIST) {
+                                path = null;
+                                return false;
+                        }
+                }
+                path = null;
+                return false;
+        }
+
+        // The writeback requests a backend's provider sees: the PMEM provider
+        // and the direct backend's staging provider receive the same ones.
+        def countsLines() -> bool {
+                return backend != OpsBenchBackend.FILE;
+        }
+
+        // prepareChangedRange() calls, which only the file and direct regions
+        // report.
+        def countsPrepares() -> bool {
+                return backend != OpsBenchBackend.PMEM;
+        }
+}
+
+// ---------------------------------------------------------------- clock
+
+component BenchClock {
+        def var cyclesPerUs = 0u64;
+
+        def nanos() -> long {
+                def ts = Array<long>.new(2);
+                Linux.syscall(LinuxConst.SYS_clock_gettime,
+                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                return ts[0] * 1000000000L + ts[1];
+        }
+
+        def sleepNanos(ns: long) {
+                def ts = Array<long>.new(2);
+                ts[0] = ns / 1000000000L;
+                ts[1] = ns % 1000000000L;
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
+        }
+
+        // As pwbench: the tree has no invariant-TSC check, so the derived
+        // frequency is reported rather than assumed.
+        def calibrate() {
+                def c0 = Target.rdtsc();
+                def t0 = nanos();
+                sleepNanos(100000000L);         // 100 ms
+                def c1 = Target.rdtsc();
+                def t1 = nanos();
+                def elapsedNs = t1 - t0;
+                if (elapsedNs <= 0) return;
+                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesToNanos(cycles: u64) -> u64 {
+                if (cyclesPerUs == 0) return 0;
+                return (cycles * 1000u64) / cyclesPerUs;
+        }
+}
+
+// ------------------------------------------------------------ accumulator
+
+// Persistence work since the start of the run, as one operation's delta.
+type OpCounts(boundaries: int, prepares: int, lines: int) #unboxed {
+        def minus(that: OpCounts) -> OpCounts {
+                return OpCounts(boundaries - that.boundaries, prepares - that.prepares, lines - that.lines);
+        }
+        def equals(that: OpCounts) -> bool {
+                return boundaries == that.boundaries && prepares == that.prepares && lines == that.lines;
+        }
+}
+
+// Shared by the backends, the regions and the provider; counts every call,
+// whether or not it falls in an operation, so each operation is a difference.
+class OpCounter {
+        var boundaries = 0;     // SFENCE / fdatasync / msync / direct write-back
+        var prepares = 0;       // file and direct prepareChangedRange() calls
+        var lines = 0;          // writeback requests (pmem and direct)
+
+        def notePersist() {
+                boundaries++;
+        }
+
+        def notePrepare() {
+                prepares++;
+        }
+
+        def noteLine() {
+                lines++;
+        }
+
+        def snapshot() -> OpCounts {
+                return OpCounts(boundaries, prepares, lines);
+        }
+}
+
+// -------------------------------------------------- PMEM instrumentation
+
+// pwsievebench's CountingPersistentOperations, less CLWB and CLFLUSHOPT: the
+// production bodies, the writeback selectable, each fence and line counted.
+class CountingPersistentOperations extends X86_64PersistentOperations {
+        def counter: OpCounter;
+
+        new(range: Range<byte>, counter: OpCounter) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                match (OpsBenchConfig.writeback) {
+                        AUTO => MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+                        NONE => ;       // still counted, so lines per operation stays checkable
+                }
+                counter.noteLine();
+        }
+
+        def sfence() {
+                MmapRegionUtils.storeFence();
+                counter.notePersist();
+        }
+}
+
+// Installs the provider inside create(), as pwbench does: PWRegion and
+// DualTxnWal each resolve it once, so a later swap would miss.
+class CountingPmemBackend extends PmemMmapBackend {
+        def counter: OpCounter;
+
+        new(path: string, counter: OpCounter) super(path) { }
+
+        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+                if (newMapping == null) return null;
+                def region = PmemMmapRegion.new(newMapping, fd);
+                region.setPersistentOperations(CountingPersistentOperations.new(region.range, counter));
+                return region;
+        }
+}
+
+// -------------------------------------------------- file instrumentation
+
+class CountingFileRegion extends FileMmapRegion {
+        def counter: OpCounter;
+
+        new(mapping: Mapping, fd: int, counter: OpCounter) super(mapping, fd) { }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                counter.notePrepare();
+        }
+
+        def syncFileData() -> bool {
+                def success = RegionFileIO.fdatasync(fd);
+                counter.notePersist();
+                return success;
+        }
+
+        // persistRange() -- format, and the WAL's scrub on close -- syncs with
+        // msync(MS_SYNC) rather than fdatasync, so it is a boundary too.
+        def syncMappedRange(offset: u64, size: u64) -> bool {
+                def success = Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
+                counter.notePersist();
+                return success;
+        }
+}
+
+class CountingFileBackend extends FileMmapBackend {
+        def counter: OpCounter;
+
+        new(path: string, counter: OpCounter) super(path) { }
+
+        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+                if (newMapping == null) return null;
+                return CountingFileRegion.new(newMapping, fd, counter);
+        }
+}
+
+// ------------------------------------------------ direct instrumentation
+
+// The production staging provider with each writeback request counted. The
+// region's dirty-marking provider forwards every request to it, so the counts
+// are the PMEM backend's for the same operations.
+class CountingStagingOperations extends DirectIoStagingOperations {
+        def counter: OpCounter;
+
+        new(range: Range<byte>, counter: OpCounter) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                counter.noteLine();
+        }
+}
+
+class CountingDirectRegion extends DirectIoRegion {
+        def counter: OpCounter;
+
+        new(mapping: Mapping, fd: int, blockDevice: bool, counter) super(mapping, fd, blockDevice) {
+                wrapProvider(CountingStagingOperations.new(range, counter));
+        }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                counter.notePrepare();
+        }
+
+        def syncDevice() -> bool {
+                def success = performSync();
+                counter.notePersist();
+                return success;
+        }
+}
+
+class CountingDirectBackend extends DirectIoBackend {
+        def counter: OpCounter;
+
+        new(path: string, counter: OpCounter) super(path, DirectIoTarget.FILE) { }
+
+        def makeDirectRegion(mapping: Mapping, fd: int, blockDevice: bool) -> DirectIoRegion {
+                return CountingDirectRegion.new(mapping, fd, blockDevice, counter);
+        }
+}
+
+// ---------------------------------------------------------------- stats
+
+class Percentiles(sorted: Array<u64>) {
+        def at(p: int) -> u64 {
+                if (sorted.length == 0) return 0;
+                var i = (p * (sorted.length - 1)) / 100;
+                if (i < 0) i = 0;
+                if (i >= sorted.length) i = sorted.length - 1;
+                return sorted[i];
+        }
+}
+
+// One operation's samples, and the persistence work each one must do.
+class OpStats(name: string) {
+        def samples = Vector<u64>.new();        // rdtsc cycles, measured operations only
+        var entries = 0;                        // redo entries the operation commits or replays
+        var expected: OpCounts;
+        var known = false;                      // expected and entries are set
+
+        def expect(counts: OpCounts, entryCount: int) -> this {
+                expected = counts;
+                entries = entryCount;
+                known = true;
+        }
+
+        def put(cycles: u64) {
+                if (samples.length < MAX_SAMPLES) samples.put(cycles);
+        }
+
+        // Checks operation {index}'s counts. In warm-up {region} is non-null,
+        // and an allocation or free derives what it should have written back
+        // from the record it committed, which must agree with every earlier
+        // one. Returns null, or why the operation failed.
+        def check(index: int, got: OpCounts, region: PWRegion) -> string {
+                if (region != null) {
+                        def rec = PWOps.latestRecord(region);
+                        if (rec == null) return Strings.format2("%s %d: no valid record in the log after the commit", name, index);
+                        def lines = if(OpsBenchConfig.countsLines(), rec.commitLines(), 0);
+                        // Prepare calls are learned from the first operation.
+                        def prepares = if(known, expected.prepares, got.prepares);
+                        def want = OpCounts(1, prepares, lines);
+                        if (!known) {
+                                expect(want, int.!(rec.entryCount));
+                        } else if (!want.equals(expected) || int.!(rec.entryCount) != entries) {
+                                return StringBuilder.new()
+                                        .put3("%s %d: committed %d entries", name, index, rec.entryCount)
+                                        .put1(" on %d lines, where the first warm-up operation", lines)
+                                        .put2(" committed %d on %d: the allocator left its steady state", entries, expected.lines)
+                                        .toString();
+                        }
+                }
+                if (got.equals(expected)) return null;
+                return StringBuilder.new()
+                        .put2("%s %d: ", name, index)
+                        .put3("%d boundaries, %d prepares, %d lines", got.boundaries, got.prepares, got.lines)
+                        .put3("; expected %d, %d, %d", expected.boundaries, expected.prepares, expected.lines)
+                        .toString();
+        }
+
+        def report() {
+                def sorted = Arrays.sort(samples.copy(), 0, samples.length, u64.<=);
+                def p = Percentiles.new(sorted);
+                var total = 0u64;
+                for (s in sorted) total += s;
+                def mean = if(sorted.length > 0, total / u64.!(sorted.length), 0u64);
+                Trace.OUT.puts("op ").puts(name)
+                        .put2(" samples %d entries %d", sorted.length, entries)
+                        .put3(" min_ns %d median_ns %d p90_ns %d",
+                                BenchClock.cyclesToNanos(p.at(0)),
+                                BenchClock.cyclesToNanos(p.at(50)),
+                                BenchClock.cyclesToNanos(p.at(90)))
+                        .put3(" p99_ns %d max_ns %d mean_ns %d",
+                                BenchClock.cyclesToNanos(p.at(99)),
+                                BenchClock.cyclesToNanos(p.at(100)),
+                                BenchClock.cyclesToNanos(mean))
+                        .put3(" boundaries %d prepares %d lines %d",
+                                expected.boundaries, expected.prepares, expected.lines)
+                        .ln();
+        }
+}
+
+// ---------------------------------------------------------------- run
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        if (OpsBenchConfig.path != null) {
+                System.puts("retained region image: ");
+                System.puts(OpsBenchConfig.path);
+                System.ln();
+        }
+        return 1;
+}
+
+def makeBackend(counter: OpCounter) -> TxnRegionBackend {
+        def path = OpsBenchConfig.path;
+        var backend: TxnRegionBackend;
+        match (OpsBenchConfig.backend) {
+                PMEM => backend = CountingPmemBackend.new(path, counter);
+                FILE => backend = CountingFileBackend.new(path, counter);
+                DIRECT => backend = CountingDirectBackend.new(path, counter);
+        }
+        return backend;
+}
+
+def open(backend: TxnRegionBackend, blocks: u64, fresh: bool) -> PWRegion {
+        return PWRegion.new(backend, blocks, Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, fresh);
+}
+
+// Why {region}, just opened from {backend}, is not a mounted region of the
+// backend asked for that found {want} in its log; null if it is. The
+// anti-fallback check is pwbench's: a file mapping reported as a PMEM result
+// would invert the comparison, and so would the mutant provider.
+def openError(backend: TxnRegionBackend, region: PWRegion, want: DualWalRecovery) -> string {
+        if (region == null || region.backendRegion == null) {
+                if (OpsBenchConfig.backend == OpsBenchBackend.PMEM) {
+                        return "PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
+                }
+                if (CountingDirectBackend.?(backend) && CountingDirectBackend.!(backend).lastError != null) {
+                        return Strings.format1("DirectIoBackend.create failed: %s", CountingDirectBackend.!(backend).lastError);
+                }
+                return "could not create or open the region file";
+        }
+        def got = region.backendRegion;
+        match (OpsBenchConfig.backend) {
+                PMEM => if (!PmemMmapRegion.?(got)) return "pmem mode did not produce a PmemMmapRegion";
+                FILE => if (!FileMmapRegion.?(got)) return "file mode did not produce a FileMmapRegion";
+                DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) {
+                        return "direct mode did not produce a file-backed DirectIoRegion";
+                }
+        }
+        if (ElidedWritebackOperations.?(got.persistentOperations())) {
+                return "an elided-writeback provider is installed; this must be an ordinary build";
+        }
+        if (region.txn == null) return "the region did not format or mount (geometry or header mismatch)";
+        if (region.requiresRecovery()) return "the region requires recovery";
+        if (region.lastRecovery != want) {
+                return Strings.format2("the mount's recovery was %s, expected %s", region.lastRecovery.name, want.name);
+        }
+        return null;
+}
+
+// Formats a fresh region of {blocks}: the region, or why there is none.
+def format(counter: OpCounter, blocks: u64) -> (PWRegion, string) {
+        def backend = makeBackend(counter);
+        def region = open(backend, blocks, true);
+        def err = openError(backend, region, DualWalRecovery.CLEAN);
+        if (err == null) return (region, null);
+        if (region != null) region.deallocate();
+        return (null, err);
+}
+
+// The floor under every figure: an empty timing window, timed as the empty
+// commit is and straight after it, so the two compare under the same clock.
+def runTimer() {
+        def stats = OpStats.new("timer").expect(OpCounts(0, 0, 0), 0);
+        for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
+                def c0 = Target.rdtsc();
+                def c1 = Target.rdtsc();
+                if (i >= OpsBenchConfig.warmup) stats.put(c1 - c0);
+        }
+        stats.report();
+}
+
+def runAllocFree(counter: OpCounter, region: PWRegion, n: u32) -> string {
+        def alloc = OpStats.new(Strings.format1("alloc-%d", n));
+        def free = OpStats.new(Strings.format1("free-%d", n));
+        for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
+                def measured = i >= OpsBenchConfig.warmup;
+                var inspect: PWRegion;          // warm-up only: read the record back
+                if (!measured) inspect = region;
+                var before = counter.snapshot();
+                def c0 = Target.rdtsc();
+                def chunk = region.allocChunk(n);
+                def c1 = Target.rdtsc();
+                if (chunk.isNull()) return Strings.format2("%s %d returned no chunk", alloc.name, i);
+                var err = alloc.check(i, counter.snapshot().minus(before), inspect);
+                if (err != null) return err;
+                if (measured) alloc.put(c1 - c0);
+
+                before = counter.snapshot();
+                def c2 = Target.rdtsc();
+                def ok = region.freeChunk(chunk);
+                def c3 = Target.rdtsc();
+                if (!ok) return Strings.format2("%s %d failed", free.name, i);
+                err = free.check(i, counter.snapshot().minus(before), inspect);
+                if (err != null) return err;
+                if (measured) free.put(c3 - c2);
+        }
+        alloc.report();
+        free.report();
+        return null;
+}
+
+// RegionTransaction.commit() with nothing buffered returns before the WAL, so
+// it is expected to cost no boundary.
+def runEmptyCommit(counter: OpCounter, region: PWRegion) -> string {
+        def stats = OpStats.new("commit-empty").expect(OpCounts(0, 0, 0), 0);
+        if (region.txn.isDirty()) return "the transaction is not empty before the empty commits";
+        for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
+                def before = counter.snapshot();
+                def c0 = Target.rdtsc();
+                def ok = region.txn.commit();
+                def c1 = Target.rdtsc();
+                if (!ok) return Strings.format1("commit-empty %d failed", i);
+                def err = stats.check(i, counter.snapshot().minus(before), null);
+                if (err != null) return err;
+                if (i >= OpsBenchConfig.warmup) stats.put(c1 - c0);
+        }
+        stats.report();
+        return null;
+}
+
+// One timed mount of a cleanly closed region of {blocks}: its log is scrubbed,
+// so the mount replays and persists nothing. Returns null, or why it failed.
+def mountClean(counter: OpCounter, stats: OpStats, i: int, blocks: u64) -> string {
+        def backend = makeBackend(counter);
+        def before = counter.snapshot();
+        def c0 = Target.rdtsc();
+        def region = open(backend, blocks, false);
+        def c1 = Target.rdtsc();
+        def got = counter.snapshot().minus(before);
+        var err = openError(backend, region, DualWalRecovery.CLEAN);
+        if (err == null) err = stats.check(i, got, null);
+        if (region != null) region.deallocate();
+        if (err != null) return Strings.format3("%s %d: %s", stats.name, i, err);
+        if (i >= OpsBenchConfig.mountWarmup) stats.put(c1 - c0);
+        return null;
+}
+
+// One timed mount of the 1 MiB region after leaving, untimed, one committed
+// transaction of {k} u64 entries at {base} that was never applied
+// (PWOps.commitUnapplied). The replay goes through DualTxnWal.applyUpdate(),
+// which prepares each entry on its own, then one boundary persists them all.
+def mountRecovering(counter: OpCounter, stats: OpStats, i: int, k: int, base: u64) -> string {
+        // A value per sample, so the check below sees this sample's replay.
+        def value = 0x5A5A_0000_0000u64 + u64.!(i) * 0x1_0000u64 + u64.!(k) * 0x100u64;
+        def raw = makeBackend(counter).create(SMALL_BLOCKS * BLOCK_SIZE, RW, false);
+        if (raw == null) return Strings.format2("%s %d: could not reopen the region to leave a record in it", stats.name, i);
+        def seq = PWOps.commitUnapplied(raw, BLOCK_SIZE, base, k, value);
+        raw.destroy();          // without close(): the record stays, the data was never applied
+        if (seq == 0u64) return Strings.format2("%s %d: could not commit the unapplied record", stats.name, i);
+
+        def backend = makeBackend(counter);
+        def before = counter.snapshot();
+        def c0 = Target.rdtsc();
+        def region = open(backend, SMALL_BLOCKS, false);
+        def c1 = Target.rdtsc();
+        def got = counter.snapshot().minus(before);
+        var err = openError(backend, region, DualWalRecovery.REPLAYED);
+        if (err == null) err = stats.check(i, got, null);
+        if (err == null) {
+                for (j < k) {
+                        def at = Pointer.atElement(region.rng, int.!(base + u64.!(j) * 8u64)).load<u64>();
+                        if (at != value + u64.!(j)) {
+                                err = Strings.format1("entry %d was not replayed", j);
+                                break;
+                        }
+                }
+        }
+        if (err == null) err = PersistentAllocatorInvariants.check(region);
+        if (region != null) region.deallocate();
+        if (err != null) return Strings.format3("%s %d: %s", stats.name, i, err);
+        if (i >= OpsBenchConfig.mountWarmup) stats.put(c1 - c0);
+        return null;
+}
+
+// The 1 MiB region's clean mount and its recoveries, interleaved sample by
+// sample, so that replay-k = recover-k - mount-1mib is a paired difference
+// with both sides taken under the same conditions. Run as separate loops they
+// differed by the loops' order rather than by the replay: on sean-tan-PC under
+// powersave a clean direct mount took 0.79 ms in a loop before the 64 MiB
+// mounts, and a recovery 0.59 ms in one after them.
+def runSmallMounts(counter: OpCounter) -> string {
+        def clean = OpStats.new("mount-1mib").expect(OpCounts(0, 0, 0), 0);
+        def recovering = Array<OpStats>.new(RECOVERY_ENTRIES.length);
+        for (r < recovering.length) {
+                def k = RECOVERY_ENTRIES[r];
+                recovering[r] = OpStats.new(Strings.format1("recover-%d", k)).expect(OpCounts(1,
+                        if(OpsBenchConfig.countsPrepares(), k, 0),
+                        if(OpsBenchConfig.countsLines(), k, 0)), k);
+        }
+        def formatted = format(counter, SMALL_BLOCKS);
+        if (formatted.1 != null) return Strings.format1("mount-1mib: format: %s", formatted.1);
+        def region = formatted.0;
+        // The replayed after-images go to an allocated chunk, as pwbench's entries do.
+        def chunk = region.allocChunk(1u32);
+        if (chunk.isNull()) {
+                region.deallocate();
+                return "could not allocate the chunk the replayed entries write";
+        }
+        def base = region.offsetInRegion(chunk.addr) + u64.!(ChunkHeader.size);
+        region.deallocate();
+        for (i < OpsBenchConfig.mountWarmup + OpsBenchConfig.mounts) {
+                var err = mountClean(counter, clean, i, SMALL_BLOCKS);
+                for (r < recovering.length) {
+                        if (err == null) err = mountRecovering(counter, recovering[r], i, RECOVERY_ENTRIES[r], base);
+                }
+                if (err != null) return err;
+        }
+        clean.report();
+        for (stats in recovering) stats.report();
+        return null;
+}
+
+def runLargeMounts(counter: OpCounter) -> string {
+        def stats = OpStats.new("mount-64mib").expect(OpCounts(0, 0, 0), 0);
+        def formatted = format(counter, LARGE_BLOCKS);
+        if (formatted.1 != null) return Strings.format1("mount-64mib: format: %s", formatted.1);
+        formatted.0.deallocate();
+        for (i < OpsBenchConfig.mountWarmup + OpsBenchConfig.mounts) {
+                def err = mountClean(counter, stats, i, LARGE_BLOCKS);
+                if (err != null) return err;
+        }
+        stats.report();
+        return null;
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var v: u64 = 0;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                v = v * 10u64 + u64.!(c - '0');
+        }
+        return v;
+}
+
+// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+def cpuidWriteback() -> string {
+        if (Target.supportsClwb()) return "CLWB";
+        if (Target.supportsClflushOpt()) return "CLFLUSHOPT";
+        if (Target.supportsClflush()) return "CLFLUSH";
+        return "nothing";
+}
+
+def usage() -> int {
+        System.puts("Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>]\n");
+        return 2;
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 2 || args[0] == null || args[0].length == 0) return usage();
+        // Rejected rather than defaulted: a file run reported as a PMEM one
+        // would invert the comparison this program exists to make.
+        if (Strings.equal(args[1], "pmem")) OpsBenchConfig.backend = OpsBenchBackend.PMEM;
+        else if (Strings.equal(args[1], "direct")) OpsBenchConfig.backend = OpsBenchBackend.DIRECT;
+        else if (!Strings.equal(args[1], "file")) {
+                System.puts("backend must be \"file\", \"pmem\" or \"direct\"\n");
+                return 2;
+        }
+        if (args.length > 2) OpsBenchConfig.ops = int.!(parseU64(args[2], 50000));
+        if (args.length > 3) OpsBenchConfig.warmup = int.!(parseU64(args[3], 2000));
+        if (args.length > 4) OpsBenchConfig.mounts = int.!(parseU64(args[4], 200));
+        if (args.length > 5) OpsBenchConfig.mountWarmup = int.!(parseU64(args[5], 20));
+        for (i = 6; i < args.length; i++) {
+                if (Strings.equal(args[i], "writeback=auto")) OpsBenchConfig.writeback = OpsBenchWriteback.AUTO;
+                else if (Strings.equal(args[i], "writeback=none")) OpsBenchConfig.writeback = OpsBenchWriteback.NONE;
+                else {
+                        System.puts("after the positional arguments, expected writeback=<auto|none>\n");
+                        return 2;
+                }
+        }
+        // On the direct backend a writeback request only marks a unit, so there
+        // is no instruction to remove.
+        if (OpsBenchConfig.writeback != OpsBenchWriteback.AUTO && OpsBenchConfig.backend != OpsBenchBackend.PMEM) {
+                System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        if (OpsBenchConfig.ops < 1 || OpsBenchConfig.mounts < 1) {
+                System.puts("ops and mounts must be positive\n");
+                return 2;
+        }
+        // An allocation's expected counts are learned from its first warm-up record.
+        if (OpsBenchConfig.warmup < 1) {
+                System.puts("warmup must be at least 1\n");
+                return 2;
+        }
+        if (!OpsBenchConfig.reservePath(args[0])) {
+                System.puts("Could not reserve a unique region file in the supplied directory.\n");
+                return 2;
+        }
+
+        BenchClock.calibrate();
+        Trace.OUT.put1("backend %s", OpsBenchConfig.backend.label).ln();
+        Trace.OUT.put1("directory %s", OpsBenchConfig.directory).ln();
+        if (OpsBenchConfig.backend == OpsBenchBackend.PMEM) {
+                Trace.OUT.put2("writeback %s, CPUID selects %s",
+                        OpsBenchConfig.writeback.label, cpuidWriteback()).ln();
+        }
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        Trace.OUT.put2("operations %d after %d warm-up", OpsBenchConfig.ops, OpsBenchConfig.warmup)
+                .put2(", mounts %d after %d warm-up", OpsBenchConfig.mounts, OpsBenchConfig.mountWarmup).ln();
+        Trace.OUT.put3("blocks of %d bytes; regions of %d blocks, and %d for mount-64mib",
+                BLOCK_SIZE, SMALL_BLOCKS, LARGE_BLOCKS).ln();
+
+        def counter = OpCounter.new();
+        def formatted = format(counter, SMALL_BLOCKS);
+        if (formatted.1 != null) return fail(formatted.1);
+        def region = formatted.0;
+        for (n in ALLOC_BLOCKS) {
+                def err = runAllocFree(counter, region, n);
+                if (err != null) {
+                        region.deallocate();
+                        return fail(err);
+                }
+        }
+        var err = PersistentAllocatorInvariants.check(region);
+        if (err == null) err = runEmptyCommit(counter, region);
+        region.deallocate();
+        if (err != null) return fail(err);
+        runTimer();
+
+        err = runSmallMounts(counter);
+        if (err == null) err = runLargeMounts(counter);
+        if (err != null) return fail(err);
+
+        if (!RegionFileIO.unlink(OpsBenchConfig.path)) return fail("could not remove the region file");
+        OpsBenchConfig.path = null;
+        if (OpsBenchConfig.writeback == OpsBenchWriteback.NONE) {
+                System.puts("OK timing-only: writeback=none, the region was never durable\n");
+        } else {
+                System.puts("OK\n");
+        }
+        return 0;
+}

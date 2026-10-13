@@ -1,0 +1,83 @@
+// Helpers for the basic-operation benchmark (test/pwopsbench.main.v3), kept
+// here, as PWSieve.v3 is for pwsievebench, so the unit tests can check them
+// (PWOpsTest.v3).
+//
+// A per-operation benchmark has two things to get right that its own numbers
+// cannot confirm: what persistence work each operation should do, so that a
+// count which drifts fails the run instead of skewing it, and how to leave a
+// region whose log holds a committed transaction that was never applied, so
+// that a mount has something to replay.
+
+// The newest valid record in a region's log, read back after a commit: the
+// transaction that commit wrote.
+class PWOpsRecord(txnSeq: u64, entryCount: u32, recordLen: u32, distinctLines: int) {
+        // The cache lines one commit of this record writes back on PMEM. The
+        // record's own: its slot is 64-byte aligned and the WAL prepares
+        // recordLen bytes of it. Then, once applied, each line its after-images
+        // touch, once: DualTxnWal.prepareApplied() merges extents whose lines
+        // touch and prepares each merged range, which covers exactly the lines
+        // written.
+        def commitLines() -> int {
+                return int.!(recordLen / u32.!(MmapRegionUtils.CACHE_LINE_SIZE)) + distinctLines;
+        }
+}
+
+component PWOps {
+        // The region-relative offset of the log chunk, read from the header as
+        // PWRegion.mount() reads it (0 means the pre-field default, block 1).
+        def logChunkOffset(range: Range<byte>, blockSize: u64) -> u64 {
+                def hdr = Ref<PWRegionHeader>.of(range[0 ..+ PWRegionHeader.size]);
+                return if(hdr.logChunk == 0, blockSize, hdr.logChunk);
+        }
+
+        // The newest record that validates in either slot of {region}'s log, or
+        // null. Reads through a second DualTxnWal over the same log, which only
+        // loads: its constructor validates the header and scans the slots, and
+        // validateSlot() checks the checksum exactly as recovery would.
+        def latestRecord(region: PWRegion) -> PWOpsRecord {
+                def offset = logChunkOffset(region.rng, region.blockSize);
+                def wal = DualTxnWal.new(region.regionStart, region.regionStart + offset,
+                        region.blockSize, region.backendRegion, false);
+                if (!wal.openOk) return null;
+                def seq0 = wal.validateSlot(0), seq1 = wal.validateSlot(1);
+                def seq = if(seq0 > seq1, seq0, seq1);
+                if (seq == 0u64) return null;
+                def addr = wal.slotAddr(wal.slotIndexOf(seq));
+                def header = wal.recordHeaderAt(addr);
+                def count = header.entryCount;
+                def lines = Vector<u64>.new();
+                var entryAddr = addr + u64.!(TxnRecordHeader.size);
+                for (i < count) {
+                        def line = wal.logEntryAt(entryAddr).offset >> 6;
+                        var seen = false;
+                        for (j < lines.length) if (lines[j] == line) seen = true;
+                        if (!seen) lines.put(line);
+                        entryAddr += u64.!(LogEntry.size);
+                }
+                return PWOpsRecord.new(seq, count, header.recordLen, lines.length);
+        }
+
+        // Leave {raw}, a formatted and cleanly closed region, with one committed
+        // transaction in its log whose after-images were never applied: {count}
+        // u64 entries at {offset}, {offset} + 8, ..., of {value}, {value} + 1,
+        // .... Returns the record's txnSeq, or 0 if it could not be committed.
+        //
+        // This is PmemDaxIntegrationTest's recipe, and DualTxnWalTest's
+        // writeTxn(): the production DualTxnWal appends and commits, so the
+        // record and its commit-point boundary are exactly what a
+        // RegionTransaction commit writes. Nothing is applied, and the caller
+        // destroys {raw} without close(), which would persist the data and
+        // scrub the record. The durable result is the state a crash leaves
+        // right after a commit point: the record valid, its after-images
+        // absent, so the next mount must replay them.
+        def commitUnapplied(raw: BackendRegion, blockSize: u64, offset: u64, count: int, value: u64) -> u64 {
+                def regionStart = u64.view(Pointer.atElement(raw.range, 0));
+                def wal = DualTxnWal.new(regionStart, regionStart + logChunkOffset(raw.range, blockSize),
+                        blockSize, raw, false);
+                if (!wal.openOk) return 0u64;
+                for (i < count) {
+                        if (!wal.append(offset + u64.!(i) * 8u64, value + u64.!(i), 8u8)) return 0u64;
+                }
+                return wal.commit();
+        }
+}
