@@ -92,7 +92,9 @@ class DirectIoDirtyUnits(unitBytes: u64, unitCount: u64) {
 // the staging buffer. A writeback request only validates its line: the buffer
 // is ordinary DRAM, so a CLWB would buy nothing. A fence does nothing either;
 // the region performs the write-back itself, so that an I/O failure reaches
-// the WAL as a failed boundary.
+// the WAL as a failed boundary. FileMmapRegion installs it too, beneath the same
+// marking provider: there the kernel's sync writes each marked page back (on
+// DAX, line by line), so a CLWB would only do part of that work early.
 class DirectIoStagingOperations extends X86_64PersistentOperations {
         new(range: Range<byte>) super(range) { }
 

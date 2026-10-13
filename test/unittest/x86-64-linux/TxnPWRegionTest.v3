@@ -1199,8 +1199,16 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 	var mappedSyncSizes = Vector<u64>.new();
 	var failNextDataSync = false;
 	var failNextMappedSync = false;
+	// Fail the data sync whose attempt number (counted since clearTrace())
+	// equals this, when nonzero.
+	var failDataSyncAt = 0;
 	var dataSyncAttempts = 0;
 	var mappedSyncAttempts = 0;
+	// The marked pages each data sync was asked to make durable: the first
+	// marked page, one past the last, and how many.
+	var syncMarkLo = Vector<u64>.new();
+	var syncMarkHi = Vector<u64>.new();
+	var syncMarkCount = Vector<u64>.new();
 
 	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
@@ -1212,8 +1220,11 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 
 	def syncFileData() -> bool {
 		dataSyncAttempts++;
+		syncMarkLo.put(dirty.lo);
+		syncMarkHi.put(dirty.hi);
+		syncMarkCount.put(dirty.markedCount());
 		var success = false;
-		if (failNextDataSync) {
+		if (failNextDataSync || dataSyncAttempts == failDataSyncAt) {
 			failNextDataSync = false;
 			// Exercise the real syscall error path without invalidating the
 			// mapping's owned descriptor, which is still needed for clean teardown.
@@ -1254,6 +1265,9 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 		preparedSizes.clear();
 		mappedSyncOffsets.clear();
 		mappedSyncSizes.clear();
+		syncMarkLo.clear();
+		syncMarkHi.clear();
+		syncMarkCount.clear();
 		dataSyncAttempts = 0;
 		mappedSyncAttempts = 0;
 	}
@@ -1311,36 +1325,41 @@ class CommitBoundaryStopFileMmapBackend extends FileMmapBackend {
 	}
 }
 
-// Stop after a real page-aligned msync completes while close() is reclaiming
-// WAL slots. Killing the child at that point exercises a durable prefix of the
-// ordered slot scrubs without allowing unmap, fd close, or later scrubs.
+// Stop after a real fdatasync completes while close() is reclaiming WAL slots.
+// close() first syncs the deferred data, then each slot scrub's persistRange()
+// is a fence of its own, so the first scrub is close()'s second sync. Killing
+// the child at that point exercises a durable prefix of the ordered slot scrubs
+// without allowing unmap, fd close, or later scrubs. Only syncs after the child
+// sets {closing} are counted.
 class SlotScrubBoundaryStopFileMmapRegion extends FileMmapRegion {
-	def stopAtMappedSync: int;
-	var mappedSyncCount = 0;
+	def stopAtCloseSync: int;
+	var closing = false;
+	var closeSyncCount = 0;
 
-	new(mapping: Mapping, fd: int, stopAtMappedSync: int) super(mapping, fd) { }
+	new(mapping: Mapping, fd: int, stopAtCloseSync: int) super(mapping, fd) { }
 
-	def syncMappedRange(offset: u64, size: u64) -> bool {
-		if (mapping == null) return false;
-		if (!Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC)) return false;
-		mappedSyncCount++;
+	def syncFileData() -> bool {
+		if (fd < 0) return false;
+		if (!RegionFileIO.fdatasync(fd)) return false;
+		if (!closing) return true;
+		closeSyncCount++;
 
-		if (mappedSyncCount == stopAtMappedSync) {
+		if (closeSyncCount == stopAtCloseSync) {
 			def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
 			Linux.syscall(LinuxConst.SYS_kill, (pid, BD_SIGSTOP));
 		}
-		return mappedSyncCount != stopAtMappedSync;
+		return closeSyncCount != stopAtCloseSync;
 	}
 }
 
 class SlotScrubBoundaryStopFileMmapBackend extends FileMmapBackend {
-	def stopAtMappedSync: int;
+	def stopAtCloseSync: int;
 
-	new(path: string, stopAtMappedSync: int) super(path) { }
+	new(path: string, stopAtCloseSync: int) super(path) { }
 
 	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
 		if (newMapping == null) return null;
-		return SlotScrubBoundaryStopFileMmapRegion.new(newMapping, fd, stopAtMappedSync);
+		return SlotScrubBoundaryStopFileMmapRegion.new(newMapping, fd, stopAtCloseSync);
 	}
 }
 
@@ -1357,13 +1376,13 @@ def BX = [
 	BT("coalesce",              test_bd_coalesce),
 	BT("persist_and_remount",   test_bd_persist_and_remount),
 	BT("remount_alloc_state",   test_bd_remount_alloc_state),
-	BT("file_format_orders_page_aligned_msync", test_bd_file_format_orders_page_aligned_msync),
+	BT("file_format_syncs_marked_pages", test_bd_file_format_syncs_marked_pages),
 	BT("file_commit_orders_fdatasync_before_after_images", test_bd_file_commit_orders_fdatasync_before_after_images),
 	BT("file_commit_fdatasync_failure_requires_reopen", test_bd_file_commit_fdatasync_failure_requires_reopen),
 	BT("file_recovery_fdatasync_failure_requires_reopen", test_bd_file_recovery_fdatasync_failure_requires_reopen),
 	BT("file_flush_fdatasync_failure_requires_reopen", test_bd_file_flush_fdatasync_failure_requires_reopen),
 	BT("file_close_fdatasync_failure_requires_reopen", test_bd_file_close_fdatasync_failure_requires_reopen),
-	BT("file_close_msync_failure_requires_reopen", test_bd_file_close_msync_failure_requires_reopen),
+	BT("file_close_scrub_sync_failure_requires_reopen", test_bd_file_close_scrub_sync_failure_requires_reopen),
 	BT("mixed_sequence_preserves_invariants", test_bd_mixed_sequence_preserves_invariants),
 	BT("seeded_mixed_histories_preserve_invariants", test_bd_seeded_mixed_histories_preserve_invariants),
 	BT("recover_committed_wal", test_bd_recover_committed_wal),
@@ -1778,12 +1797,12 @@ class BlockDevicePWRegionTester(t: Tester) {
 	}
 
 	// Apply two overlapping allocator transactions, enter clean close, and stop
-	// after its first real slot-scrub msync. The final fdatasync has already made
-	// both transactions' data durable; recovery must retain the newer record if
-	// the parent kills the child before the second scrub.
+	// after its first real slot-scrub sync. close()'s first fdatasync has already
+	// made both transactions' data durable; recovery must retain the newer record
+	// if the parent kills the child before the second scrub.
 	def allocateTwoAndCloseAtFirstSlotScrub() -> int {
 		region = PWRegion.new(
-			SlotScrubBoundaryStopFileMmapBackend.new(BD_PATH, 1),
+			SlotScrubBoundaryStopFileMmapBackend.new(BD_PATH, 2),
 			8u64,
 			Array<Ref<MetaDataDesc>>.new(0),
 			4096u64,
@@ -1799,6 +1818,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (!region.blockTableHandle[2u64].getUsed()) return 6;
 		if (!region.blockTableHandle[3u64].getUsed()) return 7;
 
+		SlotScrubBoundaryStopFileMmapRegion.!(region.backendRegion).closing = true;
 		region.deallocate();
 		region = null;
 		// Reaching this return means the expected first-scrub SIGSTOP did not
@@ -2140,7 +2160,13 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 // Fresh format issues two ordered WAL-header/slot scrubs before publishing the
 // complete region image. The file backend must translate each requested range
 // into the exact page-aligned msync span while preserving that protocol order.
-def test_bd_file_format_orders_page_aligned_msync(tc: BlockDevicePWRegionTester) {
+// Format issues three persistRange() fences, each a fence of its own: the two
+// ordered WAL initialization ranges, both in block 1's single page, and the
+// final publication of the complete eight-block mapping. Each must reach the
+// file as one fdatasync, asked to make exactly the pages its writebacks marked
+// durable -- the restriction of the PMEM model, not the page-aligned msync of
+// the range alone that the file backend issued until 2026-10-13.
+def test_bd_file_format_syncs_marked_pages(tc: BlockDevicePWRegionTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
 	tc.region = PWRegion.new(
@@ -2153,30 +2179,33 @@ def test_bd_file_format_orders_page_aligned_msync(tc: BlockDevicePWRegionTester)
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
-		tc.t.fail("msync-traced file backend format failed");
+		tc.t.fail("traced file backend format failed");
 		tc.cleanup();
 		return;
 	}
 
 	tc.t.assert_eq(3, traced.operations.length);
-	tc.t.assert_eq(3, traced.mappedSyncAttempts);
-	tc.t.assert_eq(0, traced.dataSyncAttempts);
-	if (traced.operations.length != 3 || traced.mappedSyncOffsets.length != 3) {
+	tc.t.assert_eq(3, traced.dataSyncAttempts);
+	tc.t.assert_eq(0, traced.mappedSyncAttempts);
+	if (traced.operations.length != 3 || traced.syncMarkLo.length != 3) {
 		tc.cleanup();
 		return;
 	}
 
 	for (i < 3) {
-		tc.t.assert_eq(FilePersistenceTraceOp.MSYNC_COMPLETE, traced.operations[i]);
+		tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_COMPLETE, traced.operations[i]);
 	}
 	// Both ordered WAL initialization ranges occupy block 1's single page.
-	tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[0]);
-	tc.t.assert_eq(4096u64, traced.mappedSyncSizes[0]);
-	tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[1]);
-	tc.t.assert_eq(4096u64, traced.mappedSyncSizes[1]);
+	for (i < 2) {
+		tc.t.assert_eq(1u64, traced.syncMarkLo[i]);
+		tc.t.assert_eq(2u64, traced.syncMarkHi[i]);
+		tc.t.assert_eq(1u64, traced.syncMarkCount[i]);
+	}
 	// The final format publication covers the complete eight-block mapping.
-	tc.t.assert_eq(0u64, traced.mappedSyncOffsets[2]);
-	tc.t.assert_eq(8u64 * 4096u64, traced.mappedSyncSizes[2]);
+	tc.t.assert_eq(0u64, traced.syncMarkLo[2]);
+	tc.t.assert_eq(8u64, traced.syncMarkHi[2]);
+	tc.t.assert_eq(8u64, traced.syncMarkCount[2]);
+	tc.t.assertz(true, traced.dirty.isEmpty());
 	tc.t.assertz(false, tc.region.requiresRecovery());
 	tc.assertAllocatorInvariants(tc.region);
 
@@ -2491,11 +2520,12 @@ def test_bd_file_close_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegion
 }
 
 // Clean close first makes the deferred allocator after-images durable with
-// fdatasync, then scrubs its reclaimable WAL slot with page-aligned msync. Fail
-// that actual msync call on an unmapped page: the old WAL instance must latch,
-// while remount remains structurally correct whether the idempotent record is
-// still visible or its live scrub is observed through the shared page cache.
-def test_bd_file_close_msync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+// fdatasync, then scrubs its reclaimable WAL slot, whose persistRange() is a
+// fence of its own: a second fdatasync, asked for the log page alone. Fail that
+// actual call: the old WAL instance must latch, while remount remains
+// structurally correct whether the idempotent record is still visible or its
+// live scrub is observed through the shared page cache.
+def test_bd_file_close_scrub_sync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
 	tc.region = PWRegion.new(
@@ -2508,7 +2538,7 @@ def test_bd_file_close_msync_failure_requires_reopen(tc: BlockDevicePWRegionTest
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
-		tc.t.fail("msync-failure file backend mount failed");
+		tc.t.fail("scrub-failure file backend mount failed");
 		tc.cleanup();
 		return;
 	}
@@ -2521,25 +2551,26 @@ def test_bd_file_close_msync_failure_requires_reopen(tc: BlockDevicePWRegionTest
 	}
 
 	traced.clearTrace();
-	traced.failNextMappedSync = true;
+	traced.failDataSyncAt = 2;
 	def closingTxn = tc.region.txn;
 	tc.region.deallocate();
 	tc.region = null;
 
 	tc.t.assertz(true, closingTxn.requiresRecovery());
-	tc.t.assert_eq(1, traced.dataSyncAttempts);
-	tc.t.assert_eq(1, traced.mappedSyncAttempts);
+	tc.t.assert_eq(2, traced.dataSyncAttempts);
+	tc.t.assert_eq(0, traced.mappedSyncAttempts);
 	tc.t.assert_eq(2, traced.operations.length);
-	if (traced.operations.length != 2 || traced.mappedSyncOffsets.length != 1) {
+	if (traced.operations.length != 2 || traced.syncMarkLo.length != 2) {
 		tc.cleanup();
 		return;
 	}
 
 	// close() must complete final-data fdatasync before attempting the slot scrub.
 	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_COMPLETE, traced.operations[0]);
-	tc.t.assert_eq(FilePersistenceTraceOp.MSYNC_FAILED, traced.operations[1]);
-	tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[0]);
-	tc.t.assert_eq(4096u64, traced.mappedSyncSizes[0]);
+	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_FAILED, traced.operations[1]);
+	tc.t.assert_eq(1u64, traced.syncMarkLo[1]);
+	tc.t.assert_eq(2u64, traced.syncMarkHi[1]);
+	tc.t.assert_eq(1u64, traced.syncMarkCount[1]);
 
 	def recovered = tc.remount();
 	tc.assertRecoveredSplitAllocation(recovered);
@@ -3059,7 +3090,7 @@ def test_bd_sigkill_explicit_flush_boundary_recovers(tc: BlockDevicePWRegionTest
 }
 
 // Clean close must reclaim two valid slots oldest-first. Stop after the first
-// real msync and kill the child: remount should see the newer surviving record,
+// scrub's real fdatasync and kill the child: remount should see the newer surviving record,
 // never replay transaction 1 over transaction 2's already-durable allocator
 // state. This is process-crash consistency evidence under the same kernel.
 def test_bd_sigkill_close_first_slot_scrub_preserves_latest_state(tc: BlockDevicePWRegionTester) {
