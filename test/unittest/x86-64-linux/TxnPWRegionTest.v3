@@ -2157,9 +2157,6 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 	tc.cleanup();
 }
 
-// Fresh format issues two ordered WAL-header/slot scrubs before publishing the
-// complete region image. The file backend must translate each requested range
-// into the exact page-aligned msync span while preserving that protocol order.
 // Format issues three persistRange() fences, each a fence of its own: the two
 // ordered WAL initialization ranges, both in block 1's single page, and the
 // final publication of the complete eight-block mapping. Each must reach the
