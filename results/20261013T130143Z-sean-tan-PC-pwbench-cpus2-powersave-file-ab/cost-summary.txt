@@ -1,0 +1,13 @@
+---- median boundary ns, median over 5 repetitions
+config             geometry  entries    boundary_ns
+file-block         512x4096        1         241346
+file-block         512x4096        8         255316
+file-block         512x4096       24         241580
+file-block-legacy  512x4096        1         241893
+file-block-legacy  512x4096        8         236981
+file-block-legacy  512x4096       24         245030
+file-block-msync   512x4096        1         241077
+file-block-msync   512x4096        8         236935
+file-block-msync   512x4096       24         241578
+---- boundaries per commit x1000 by configuration (must be 1000, except on file-*-msync, where it counts syncs; a higher value elsewhere means the overwrite guard fired)
+file-block=1000 file-block-legacy=1000 file-block-msync=1000 

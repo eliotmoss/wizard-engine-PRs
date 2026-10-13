@@ -1,0 +1,42 @@
+# 64 MiB mount transient, follow-up runs (2026-10-13, after the campaign; commit e3c04344, powersave, CPU 2)
+# bin/pwopsbench.x86-64-linux $PWD/bin/ab-mount file 2000 200 200 20 boundary=<b>, in the order shown; median ns:
+== legacy
+mount-1mib median_ns 15928
+recover-8 median_ns 269525
+recover-24 median_ns 269644
+mount-64mib median_ns 16740
+== fdatasync
+mount-1mib median_ns 16432
+recover-8 median_ns 272114
+recover-24 median_ns 272059
+mount-64mib median_ns 4587
+== fdatasync
+mount-1mib median_ns 15220
+recover-8 median_ns 273279
+recover-24 median_ns 273286
+mount-64mib median_ns 4720
+== legacy
+mount-1mib median_ns 16416
+recover-8 median_ns 271959
+recover-24 median_ns 272006
+mount-64mib median_ns 16781
+== legacy
+mount-1mib median_ns 15769
+recover-8 median_ns 269827
+recover-24 median_ns 269956
+mount-64mib median_ns 16608
+== fdatasync
+mount-1mib median_ns 16610
+recover-8 median_ns 271272
+recover-24 median_ns 271293
+mount-64mib median_ns 4604
+
+# the same with 5,000 mounts: bin/pwopsbench.x86-64-linux $PWD/bin/ab-mount file 50 10 5000 20 boundary=<b>
+legacy    mount-1mib median_ns 15845  mount-64mib median_ns 3895
+fdatasync mount-1mib median_ns 16431  mount-64mib median_ns 3802
+
+# minor faults over whole runs (/usr/bin/time %R), 50 ops, 20 or 420 mounts:
+legacy    20: 2497  420: 9403  -> 17.3 per mount iteration
+fdatasync 20: 2464  420: 9405  -> 17.4 per mount iteration
+
+# strace of the 64 MiB loop: mmap, munmap, close only, for both boundaries; no sync.

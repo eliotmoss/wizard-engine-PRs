@@ -1,0 +1,19 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwfile-restriction/bin/ab-block
+tsc cycles per microsecond 3417
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 223576 median_ns 283198 p90_ns 306472 p99_ns 311412 max_ns 6972185 mean_ns 288696 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 224164 median_ns 275451 p90_ns 299388 p99_ns 303614 max_ns 6977362 mean_ns 282123 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 223360 median_ns 284366 p90_ns 308911 p99_ns 314353 max_ns 6972037 mean_ns 291563 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 221050 median_ns 277652 p90_ns 301015 p99_ns 305529 max_ns 6963826 mean_ns 285909 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 224613 median_ns 306667 p90_ns 310761 p99_ns 317295 max_ns 6973173 mean_ns 301219 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 224560 median_ns 299228 p90_ns 302710 p99_ns 308945 max_ns 6966743 mean_ns 296670 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 4 median_ns 6 p90_ns 7 p99_ns 8 max_ns 1195 mean_ns 6 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 4 median_ns 5 p90_ns 6 p99_ns 6 max_ns 4432 mean_ns 5 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 3275 median_ns 14306 p90_ns 17975 p99_ns 23079 max_ns 24223 mean_ns 14573 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 227053 median_ns 274047 p90_ns 275263 p99_ns 298424 max_ns 1568856 mean_ns 277966 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 228266 median_ns 274131 p90_ns 276071 p99_ns 300011 max_ns 300529 mean_ns 273951 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 2624 median_ns 3445 p90_ns 4164 p99_ns 6474 max_ns 8521 mean_ns 3583 boundaries 0 prepares 0 lines 0
+OK

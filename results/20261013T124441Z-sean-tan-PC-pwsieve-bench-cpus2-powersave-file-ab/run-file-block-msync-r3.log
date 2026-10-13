@@ -1,0 +1,23 @@
+backend file (mmap + msync/fdatasync)
+boundary msync
+directory /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwfile-restriction/bin/ab-block
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 2738662
+step ns: mean 2738966
+step ns: min 1724856 median 2666799 p90 3191566
+step ns: p99 3272070 max 9945845
+phase compute ns per step 714321
+phase alloc ns per step 617030
+phase bitmap ns per step 862516
+phase publish ns per step 268401
+phase retire ns per step 276650
+boundaries per step x1000 7666
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12806
+OK
