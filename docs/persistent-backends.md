@@ -332,8 +332,10 @@ every operation.
   `mount-transient.txt` in the results). With 5,000 samples
   instead of 200 the two agree, 3.8 and 3.9 µs: the difference is a transient
   at the start of the 200-sample loop, which follows the 64 MiB format's sync.
-  Legacy's figure equals the 1 MiB mount's, which alternates with recoveries
-  that block, so the clock is a plausible cause; untested. The same transient
+  The clock ramping up after that sync is a plausible cause, untested; Magpie's
+  1 MiB mount is dearer than its 64 MiB one even on PMEM, where nothing blocks
+  ([below](#basic-operations-what-an-allocation-a-free-a-mount-and-a-recovery-cost-2026-10-13)),
+  so the clock is not the only influence on these mounts. The same transient
   is probably in the 14.2 µs reported for this mount below.
 - The file backend's work column now has lines: the same as the direct
   backend's for every operation.
@@ -1478,9 +1480,11 @@ PMEM path itself.
   writes. That is the 25 µs by which `alloc-64` and `free-64` undercut the
   other sizes (281 and 278 µs against 302–306 µs), about one O_DIRECT write on
   this drive (~23 µs, [above](#cost-the-same-seam-call-a-different-persistence-point));
-  pwbench's commit, which makes one write, is 267 µs. On the file backend, whose boundary is one `fdatasync` and no `msync`, n = 64
-  goes the other way: `free-64` is 293–300 µs against 275–278 µs in every
-  repetition, and `alloc-64` 284–306 µs against 283–284 µs. Not explained.
+  pwbench's commit, which makes one write, is 267 µs. On the file backend,
+  whose boundary is one `fdatasync` and no `msync`, n = 64 goes the other way:
+  `free-64` is 293–300 µs against 275–278 µs in every repetition, and
+  `alloc-64` 284–306 µs against 283–284 µs. Not explained by this host alone;
+  Magpie suggests a reason (below).
 - **The 7–8 % spreads are two modes.** A run's median lands near one of two
   levels about 20 µs apart: the direct `free-1` median is 301–303 µs in four
   repetitions and 282 µs in the fifth, `free-8` 278 µs in one of five, the file
@@ -1504,9 +1508,10 @@ PMEM path itself.
   at 397 µs. That the file backend's 1 MiB mount is slower than its 64 MiB one
   is plausibly the clock (last point): the 1 MiB samples alternate with
   recoveries that block in `fdatasync`, while the 64 MiB mounts run back to
-  back and never block. Untested. The 64 MiB figure is itself mostly a
-  transient at the start of its 200-sample loop: over 5,000 samples it is
-  3.8–3.9 µs ([measured 2026-10-13](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
+  back and never block. Untested, and Magpie shows the same on PMEM, where
+  nothing blocks, so the clock is at most part of it (below). The 64 MiB
+  figure is itself mostly a transient at the start of its 200-sample loop:
+  over 5,000 samples it is 3.8–3.9 µs ([measured 2026-10-13](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
 - **A recovery is a mount plus one boundary.** The replay costs 256 µs on the
   file backend at both sizes, one `fdatasync` (pwbench's file boundary on this
   drive is 237 µs). On the direct backend 251 and 290 µs; the 39 µs between 8
@@ -1517,25 +1522,123 @@ PMEM path itself.
   move little; the file mounts, and whatever each operation spends outside its
   boundary, are inflated. A rerun under `performance` separates the two.
 
-**Magpie: not yet run.** The default campaign there is `pmem-auto`,
-`pmem-none` and `file-dax` on `/mnt/pmem0.0/sean`, and `file-block` and
-`direct-block` on `/home/users/u7599095`, pinned to node 0, which owns the
-namespace. What to look for:
+**Magpie, PMEM and `/home`, node 0**
+(`results/20261013T114908Z-magpie-pwops-bench`). Xeon Gold 6252N pinned to
+node 0, which owns the namespace; `pmem-auto`, `pmem-none` and `file-dax` on
+`/mnt/pmem0.0/sean`, `file-block` and `direct-block` on `/home/users/u7599095`
+(ext4 on LVM on the rotational `sda` behind the write-through controller,
+[above](#cost-the-same-seam-call-a-different-persistence-point)); five
+repetitions, 41 minutes, start load 0.01. All 25 runs ended `OK` (`pmem-none`'s
+`OK timing-only`), so every operation did exactly the work expected of it. ns
+per operation, the median over repetitions of each run's median, with the
+spread of the medians; the p90s are in `summary.txt`. The work per operation is
+the sean-tan-PC table's on every configuration, with 0 lines on `file-dax` and
+`file-block`. The run is at commit `8b364dc2` (its `provenance.txt`), before
+the file backend's boundary changed on 2026-10-13, so the `file-dax` and
+`file-block` rows are the legacy boundary, hence the 0 lines; the change's
+effect on Magpie is not yet measured ([old against new](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)):
 
-- On PMEM, allocations and frees with one `SFENCE` and 15–17 and 11–13 lines,
-  costing about what pwbench's commits of comparable size do (below).
-- **Recovery should show the per-entry writeback.** Replay prepares each entry
-  on its own, so on Cascade Lake, where `CLWB` evicts, each replayed entry
-  after the first in a line stores into a line just written back: the cost the
-  batched apply removed from commits
+| Operation | `pmem-auto` | `pmem-none` | `file-dax` | `file-block` | `direct-block` |
+|---|---|---|---|---|---|
+| `alloc-1` | 15,788 (0.1 %) | 14,412 (0.1 %) | 33,146 (2.7 %) | 512,489 (8.6 %) | 517,780 (6.3 %) |
+| `alloc-8` | 16,301 (0.3 %) | 14,492 (0.1 %) | 33,526 (2.1 %) | 512,953 (9.5 %) | 517,658 (6.9 %) |
+| `alloc-64` | 16,117 (0.1 %) | 14,491 (0.2 %) | 37,136 (2.1 %) | 414,476 (8.3 %) | 393,630 (11.8 %) |
+| `free-1` | 10,993 (0.3 %) | 9,957 (0.1 %) | 29,342 (2.8 %) | 496,754 (7.9 %) | 496,832 (6.6 %) |
+| `free-8` | 11,416 (0.4 %) | 10,042 (0.3 %) | 29,851 (2.0 %) | 496,835 (8.7 %) | 496,380 (7.2 %) |
+| `free-64` | 11,420 (0.4 %) | 10,041 (0.4 %) | 33,539 (2.2 %) | 402,862 (8.4 %) | 376,666 (12.0 %) |
+| `commit-empty` | 14 | 13 | 14 | 13 | 14 |
+| `timer` | 11 | 13 | 11 | 12 | 12 |
+| `mount-1mib` | 9,367 (15.0 %) | 9,240 (1.5 %) | 9,970 (13.1 %) | 34,632 (14.3 %) | 24,368,514 (0.1 %) |
+| `mount-64mib` | 5,763 (0.4 %) | 5,790 (0.6 %) | 5,768 (1.0 %) | 23,751 (2.2 %) | 503,308,559 (3.8 %) |
+| `recover-8` | 20,864 (7.6 %) | 14,850 (1.0 %) | 19,373 (8.1 %) | 190,176 (11.8 %) | 21,778,030 (0.1 %) |
+| `recover-24` | 36,911 (5.2 %) | 20,515 (0.6 %) | 25,678 (5.9 %) | 209,829 (10.2 %) | 24,815,807 (0.0 %) |
+| `replay-8` (derived) | 11,497 | 5,610 | 9,403 | 155,544 | −2,590,484 |
+| `replay-24` (derived) | 27,544 | 11,275 | 15,708 | 175,197 | 447,293 |
+
+- **On PMEM an allocation costs what a commit of as many entries does.** An
+  allocation commits 16 entries and a free 10. pwbench's commits on this host
+  (below; means, 1 MiB, stride 8) interpolate to 15.5 µs at 16 entries and
+  10.9 µs at 10; `alloc-n` takes 15.8–16.3 µs and `free-n` 11.0–11.4 µs.
+  Without writeback, 14.4–14.5 µs against 14.7 µs and 10.0 µs against 10.05 µs.
+  The allocator's search and bookkeeping add nothing visible, to within 5 %,
+  beyond the entries they commit. Spreads are 0.1–0.4 %.
+- **The writebacks cost about 0.1 µs a line.** `pmem-auto − pmem-none`, paired
+  within each repetition: 1.38 µs for `alloc-1`'s 15 lines, 1.62–1.81 µs for
+  the other sizes' 17, 1.04 µs for `free-1`'s 11 and 1.38 µs for 13. That is
+  92–106 ns a line, 9–12 % of the operation.
+- **The recovery prediction held.** It was: replay prepares each entry on its
+  own, so on Cascade Lake, where `CLWB` evicts, each replayed entry after the
+  first in its line stores into a line just written back, the cost the batched
+  apply removed from commits
   ([above](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows)).
-  The entries start 32 bytes into a line, after the chunk header, so 24 of them
-  span four lines and make 20 such stores; at the ~775 ns each measured there,
-  `replay-24` on `pmem-auto` should exceed `pmem-none`'s by roughly 15 µs. A
-  prediction, to be checked.
-- `/home` is behind the write-through RAID controller, and Magpie's clock
-  drops after every block-storage boundary with no governor to change, so the
-  block figures include that penalty, as the sieve's do.
+  The entries start 32 bytes into a line, after the chunk header, so 24 span
+  four lines and make 20 such stores, and at ~775 ns each `replay-24` on
+  `pmem-auto` should exceed `pmem-none`'s by roughly 15 µs. Per repetition it
+  exceeds it by 15.9–16.8 µs, about 0.8 µs a store; for 8 entries (two lines,
+  six such stores) by 5.6–5.9 µs. The writebacks are 51 % (8 entries) and 59 %
+  (24) of the replay, and the PMEM backend replays slower than the file backend
+  on DAX: 27.5 µs against 15.7 µs at 24 entries, the inversion the batched apply
+  removed from commits. It is paid once per recovery, not per commit. Replaying
+  through `storeUpdate()` and `prepareApplied()` would remove it; not done.
+- **Interleaving the mounts paid off.** On `pmem-auto`, `mount-1mib` and both
+  recoveries sit about 1.2 µs lower in repetitions 2 and 3 than in the others,
+  all three together, hence their 5–15 % spreads; `file-dax`'s repetition 5 does
+  the same. The paired differences cancel it: `pmem-auto`'s `replay-8` is
+  11.2–11.6 µs in every repetition. Which level a run takes is not explained.
+- **At n = 64 a boundary writes one page more, in one write fewer, and each
+  medium charges for a different half.** On sean-tan-PC `strace` showed that at
+  n = 64 the operation also touches unit 254, so units 253–255 go out together.
+  Per repetition, n = 64 minus n = 8:
+  - `file-dax`: +3.5 to +3.9 µs, allocations and frees alike. At this region
+    size the kernel's `fdatasync` writes back each dirty 4 KiB page whole
+    ([above](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)), so
+    one more page is 64 more lines, ~57 ns each.
+  - `file-block` −80 to −102 µs, `direct-block` −119 to −136 µs: on this
+    volume a separate write costs of the order of the 144–178 µs `pwrite`
+    measured [above](#cost-the-same-seam-call-a-different-persistence-point).
+  - PMEM: 17 lines at either size. `pmem-none` shows no difference;
+    `pmem-auto`'s allocations are 0.17–0.20 µs cheaper (different lines, not
+    pursued).
+
+  The same split would explain sean-tan-PC's results: the direct backend saves
+  a `pwrite` (25 µs); the file backend's writes leave together from one
+  `fdatasync` to an NVMe that serves them in parallel, so the extra page is what
+  remains to pay (7–22 µs). That is a candidate, not tested.
+- **On `/home` an allocation is three writes.** `alloc-1` costs 512–518 µs
+  against pwbench's 213–214 µs for a commit that makes one write (below), and
+  `alloc-64`, two writes, 394–414 µs. On sean-tan-PC, where an O_DIRECT write
+  is ~23 µs, the same three writes cost an allocation 9–19 % more than
+  pwbench's one-entry commit.
+- **A direct mount on `/home` is a read off the disk, and replay cannot be had
+  by subtraction there.** 1 MiB takes 24.4 ms and 64 MiB 503 ms (about
+  133 MB/s; 64 times the data takes 20.7 times as long). The three interleaved
+  kinds each take a reproducible time, spreads 0.0–0.1 %, but not the same one:
+  `recover-8` 21.8 ms, `mount-1mib` 24.4 ms, `recover-24` 24.8 ms. Their timed
+  windows differ only by the replay and by what ran just before the read (a
+  recovery's setup reads the region, writes the log and calls `fdatasync`; the
+  clean mount follows the previous recovery's `close()`), and a replay cannot
+  be negative, so the gap belongs to the storage. `replay-8` comes out at
+  −2.6 ms in every repetition and `replay-24` at +0.45 ms; neither measures a
+  replay. Timing the read apart from the rest of the mount would; pwopsbench
+  does not.
+- **On DAX too the 1 MiB mount is the dearer one, which the clock cannot
+  explain.** `mount-1mib` is 9.2–10.0 µs against `mount-64mib`'s 5.8 µs on all
+  three DAX configurations (34.6 µs against 23.8 µs on `/home`). On sean-tan-PC
+  this section put the file backend's version down to the clock, since the
+  1 MiB mounts follow recoveries that block; on PMEM nothing blocks, so that
+  does not explain it here. A candidate is the mapping: a 1 MiB DAX file is
+  mapped with 4 KiB entries and a 64 MiB one with 2 MiB entries
+  ([above](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)), so the
+  pages a mount touches cost a fault each at 1 MiB and share one per 2 MiB at
+  64 MiB. Untested: pwopsbench counts no faults, and it would not cover `/home`'s
+  page-cache file.
+- **The first repetition on block storage was faster.** On both block
+  configurations repetition 1 ran 6–12 % faster than the others on allocations
+  and frees (and on `file-block`'s recoveries); repetitions 2–5 agree to within
+  0.1–1.9 %, so the 6–12 % spreads of the block allocations and frees are that
+  one run. Not explained; the n = 64 differences above are well outside it.
+- **An empty commit is no boundary here either:** 13–14 ns against the empty
+  window's 11–13 ns.
 
 #### Commits of k entries: pwbench's figures
 

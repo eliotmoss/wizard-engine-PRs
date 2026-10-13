@@ -1,0 +1,19 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+directory /mnt/pmem0.0/sean
+writeback auto (production CPUID selection), CPUID selects CLWB
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 15251 median_ns 15795 p90_ns 17418 p99_ns 18685 max_ns 110824 mean_ns 16112 boundaries 1 prepares 0 lines 15
+op free-1 samples 50000 entries 10 min_ns 10718 median_ns 10993 p90_ns 12539 p99_ns 13560 max_ns 91399 mean_ns 11210 boundaries 1 prepares 0 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 15848 median_ns 16314 p90_ns 17932 p99_ns 19183 max_ns 652076 mean_ns 16642 boundaries 1 prepares 0 lines 17
+op free-8 samples 50000 entries 10 min_ns 11143 median_ns 11429 p90_ns 12966 p99_ns 13956 max_ns 956857 mean_ns 11660 boundaries 1 prepares 0 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 15650 median_ns 16117 p90_ns 17730 p99_ns 18974 max_ns 89949 mean_ns 16448 boundaries 1 prepares 0 lines 17
+op free-64 samples 50000 entries 10 min_ns 11113 median_ns 11420 p90_ns 12961 p99_ns 14027 max_ns 81104 mean_ns 11639 boundaries 1 prepares 0 lines 13
+op commit-empty samples 50000 entries 0 min_ns 6 median_ns 14 p90_ns 16 p99_ns 17 max_ns 31 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 6 median_ns 11 p90_ns 13 p99_ns 13 max_ns 23 mean_ns 11 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 7812 median_ns 8156 p90_ns 9958 p99_ns 11136 max_ns 13412 mean_ns 8815 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 16945 median_ns 19360 p90_ns 21233 p99_ns 22775 max_ns 23371 mean_ns 19303 boundaries 1 prepares 0 lines 8
+op recover-24 samples 200 entries 24 min_ns 32769 median_ns 35375 p90_ns 37590 p99_ns 40176 max_ns 97413 mean_ns 36027 boundaries 1 prepares 0 lines 24
+op mount-64mib samples 200 entries 0 min_ns 5454 median_ns 5771 p90_ns 7482 p99_ns 8733 max_ns 11127 mean_ns 6262 boundaries 0 prepares 0 lines 0
+OK
