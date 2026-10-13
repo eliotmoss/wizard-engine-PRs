@@ -375,7 +375,7 @@ configurations and pins to the DAX namespace's node.
 # failing), then the file backend's restriction checks on their own, then the
 # opt-in PMEM DAX integration tests
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
-bin/unittest.x86-64-linux file_mmap:
+bin/unittest.x86-64-linux 'file_mmap:*'
 PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
 
 # B2 without root: stable pages requested, and whether any layer is dm-crypt
