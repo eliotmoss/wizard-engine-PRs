@@ -5,7 +5,7 @@
 # docs/pmem-emulation.md for the flush-placement negative control.
 #
 #   scripts/pmem-experiments.sh doctor    report what this host can run, and why
-#   scripts/pmem-experiments.sh cost      boundary-cost campaign, four configs
+#   scripts/pmem-experiments.sh cost      boundary-cost campaign, four configs by default
 #   scripts/pmem-experiments.sh control   flush-placement negative control
 #   scripts/pmem-experiments.sh direct-control
 #                                         the same control on the direct backend
@@ -25,14 +25,27 @@
 #   file-block    fdatasync boundary on block storage      (PWEXP_BLOCK_DIR)
 #   direct-block  pwrite + O_DIRECT + fdatasync, no page cache, on the same
 #                 block storage                            (PWEXP_BLOCK_DIR)
+#   file-dax-legacy, file-block-legacy
+#                 file-dax and file-block with the file backend's boundary before
+#                 2026-10-13 (a flag and fdatasync, persistRange an msync of its
+#                 own pages), for the old-against-new comparison only
+#   file-dax-msync, file-block-msync
+#                 the same with one msync(MS_SYNC) per run of marked pages instead
+#                 of one fdatasync, for the choice of fence; each msync is a
+#                 boundary sample, so boundaries per commit counts syncs
+#
+# The default is the first four; PWEXP_CONFIGS names the configurations to run,
+# interleaved in the order given, e.g. "file-block file-block-legacy
+# file-block-msync".
 #
 # pmem-dax versus file-dax isolates the primitive with the media held constant;
 # file-dax versus file-block isolates the media with the primitive held
 # constant; file-block versus direct-block isolates the page cache with the
-# media and the fdatasync held constant. file-block and direct-block are
-# skipped, loudly, when their directory is on a network filesystem: an
-# fdatasync dominated by a round trip measures the network. direct-block is
-# also skipped when the directory does not honour O_DIRECT (tmpfs, for one).
+# media and the fdatasync held constant. file-block (and its -legacy and
+# -msync variants) and direct-block are skipped, loudly, when their directory
+# is on a network filesystem: an fdatasync dominated by a round trip measures
+# the network. direct-block is also skipped when the directory does not honour
+# O_DIRECT (tmpfs, for one).
 #
 # direct-control needs no DAX at all: on the direct backend process death is
 # the crash, so pwreboot (crash straight after the last acknowledgement) and
@@ -69,7 +82,8 @@
 # error.
 #
 # Overrides: PWASM_PMEM_TEST_DIR (required for the DAX configs and the control),
-# PWEXP_BLOCK_DIR (default $HOME), PWEXP_REPS (3), PWEXP_SIZES ("1 8 32 56"),
+# PWEXP_BLOCK_DIR (default $HOME), PWEXP_CONFIGS ("pmem-dax file-dax file-block
+# direct-block"), PWEXP_REPS (3), PWEXP_SIZES ("1 8 32 56"),
 # PWEXP_REGION_BLOCKSIZES ("4096"), PWEXP_REGION_GEOMETRIES (unset),
 # PWEXP_COMMITS (20000), PWEXP_WARMUP (2000),
 # PWEXP_OUT (results/<stamp>), PWEXP_SIEVE_ARGS ("20 1 512 4096"),
@@ -81,6 +95,7 @@ REPO="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 BLOCK_DIR="${PWEXP_BLOCK_DIR:-$HOME}"
+COST_CONFIGS="${PWEXP_CONFIGS:-pmem-dax file-dax file-block direct-block}"
 REPS="${PWEXP_REPS:-3}"
 SIZES="${PWEXP_SIZES:-1 8 32 56}"
 REGION_BLOCKSIZES="${PWEXP_REGION_BLOCKSIZES:-4096}"
@@ -290,14 +305,26 @@ run_cost_one() {
     [ "$blocks" = 512 ] || geo="b$blocks-bs$bs"
     local log="$OUT/cost-$config-$geo-e$entries-r$rep.log"
     local load; load=$(loadavg | cut -d' ' -f1)
+    # A file configuration's boundary is its suffix, or fdatasync, pwbench's
+    # default, which is not passed, so the default invocations are unchanged.
+    local boundary= kw=
+    case "$config" in
+        file-*-legacy|file-*-msync) boundary=${config##*-} kw="boundary=${config##*-}" ;;
+        file-*) boundary=fdatasync ;;
+    esac
 
     say "  $config geometry=${blocks}x$bs entries=$entries rep=$rep"
-    if ! "${PIN_CMD[@]}" "$BENCH_BIN" "$dir" "$backend" "$COMMITS" "$entries" "$WARMUP" "$bs" "$blocks" > "$log" 2>&1; then
+    if ! "${PIN_CMD[@]}" "$BENCH_BIN" "$dir" "$backend" "$COMMITS" "$entries" "$WARMUP" "$bs" "$blocks" ${kw:+"$kw"} > "$log" 2>&1; then
         warn "    FAILED -- see $log"
         tail -3 "$log" >&2
         return 1
     fi
     grep -q '^OK$' "$log" || { warn "    no OK in $log"; return 1; }
+    # Every file run names the boundary it ran. There is no rebuild here, so
+    # no log checked predates the line.
+    if [ -n "$boundary" ]; then
+        grep -qxF "boundary $boundary" "$log" || { warn "    $log does not name boundary $boundary"; return 1; }
+    fi
 
     local parsed; parsed=$(parse_run "$log")
     local count; count=$(awk -F, '{ print NF }' <<< "$parsed")
@@ -341,6 +368,13 @@ check_geometry() {
 }
 
 cost() {
+    local c
+    for c in $COST_CONFIGS; do
+        case "$c" in
+            pmem-dax|file-dax|file-dax-legacy|file-dax-msync|file-block|file-block-legacy|file-block-msync|direct-block) ;;
+            *) die "unknown configuration in PWEXP_CONFIGS: $c" ;;
+        esac
+    done
     require_clean_tree
     [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"
     [ -d "$PWASM_PMEM_TEST_DIR" ] || die "PWASM_PMEM_TEST_DIR is not a directory: $PWASM_PMEM_TEST_DIR"
@@ -356,9 +390,9 @@ cost() {
     local block_fs; block_fs=$(fstype_of "$BLOCK_DIR")
     local do_block=1
     if [ ! -d "$BLOCK_DIR" ]; then
-        warn "skipping file-block: $BLOCK_DIR is not a directory"; do_block=0
+        warn "skipping file-block*: $BLOCK_DIR is not a directory"; do_block=0
     elif is_network_fs "$block_fs"; then
-        warn "skipping file-block: $BLOCK_DIR is $block_fs, and an fdatasync over a network filesystem measures the network"
+        warn "skipping file-block*: $BLOCK_DIR is $block_fs, and an fdatasync over a network filesystem measures the network"
         do_block=0
     fi
     printf 'file-block: %s (%s)\n' \
@@ -378,12 +412,16 @@ cost() {
         for g in $GEOMETRIES; do
             local blocks=${g%%x*} bs=${g#*x}
             for entries in $SIZES; do
-                run_cost_one pmem-dax   pmem "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1))
-                run_cost_one file-dax   file "$PWASM_PMEM_TEST_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1))
-                [ $do_block = 1 ] &&
-                    { run_cost_one file-block file "$BLOCK_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1)); }
-                [ $do_direct = 1 ] &&
-                    { run_cost_one direct-block direct "$BLOCK_DIR" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1)); }
+                for c in $COST_CONFIGS; do
+                    local backend dir
+                    case "$c" in
+                        pmem-dax)     backend=pmem dir=$PWASM_PMEM_TEST_DIR ;;
+                        file-dax*)    backend=file dir=$PWASM_PMEM_TEST_DIR ;;
+                        file-block*)  [ $do_block = 1 ] || continue; backend=file dir=$BLOCK_DIR ;;
+                        direct-block) [ $do_direct = 1 ] || continue; backend=direct dir=$BLOCK_DIR ;;
+                    esac
+                    run_cost_one "$c" "$backend" "$dir" "$entries" "$rep" "$blocks" "$bs" || failures=$((failures + 1))
+                done
             done
         done
     done
@@ -401,16 +439,18 @@ cost_summary() {
     rule "median boundary ns, median over $REPS repetitions"
     awk -F, 'NR > 1 { key = $1 "\t" $NF "x" $(NF - 1) "\t" $5; vals[key] = vals[key] " " $18 }
         END {
-            printf "%-12s %9s %8s %14s\n", "config", "geometry", "entries", "boundary_ns"
+            printf "%-17s %9s %8s %14s\n", "config", "geometry", "entries", "boundary_ns"
             for (k in vals) {
                 n = split(vals[k], a, " "); m = 0
                 for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
                 m = (n % 2) ? a[(n + 1) / 2] : int((a[n / 2] + a[n / 2 + 1]) / 2)
-                split(k, p, "\t"); printf "%-12s %9s %8s %14s\n", p[1], p[2], p[3], m
+                split(k, p, "\t"); printf "%-17s %9s %8s %14s\n", p[1], p[2], p[3], m
             }
         }' "$CSV" | { read -r h; printf '%s\n' "$h"; sort -k1,1 -k2,2 -k3,3n; }
-    rule "boundaries per commit (must be 1000; a higher value means the overwrite guard fired)"
-    awk -F, 'NR > 1 { print $9 }' "$CSV" | sort -u | tr '\n' ' '; echo
+    # Per configuration: on file-*-msync a sample is one msync, and a fence of
+    # several runs of marked pages is several.
+    rule "boundaries per commit x1000 by configuration (must be 1000, except on file-*-msync, where it counts syncs; a higher value elsewhere means the overwrite guard fired)"
+    awk -F, 'NR > 1 { print $1 "=" $9 }' "$CSV" | sort -u | tr '\n' ' '; echo
 }
 
 # -------------------------------------------------------- negative control
@@ -548,7 +588,7 @@ doctor() {
     printf 'clwb in /proc/cpuinfo   %s\n' "$(grep -qw clwb /proc/cpuinfo 2>/dev/null && echo yes || echo no)"
     rule "dax directory (PWASM_PMEM_TEST_DIR)"
     if [ -z "${PWASM_PMEM_TEST_DIR:-}" ]; then
-        warn "unset -- pmem-dax, file-dax and the whole control campaign are unavailable"
+        warn "unset -- pmem-dax, file-dax, file-dax-legacy, file-dax-msync and the whole control campaign are unavailable"
     else
         printf '%s\n  fstype   %s\n  source   %s\n  writable %s\n' \
             "$PWASM_PMEM_TEST_DIR" "$(fstype_of "$PWASM_PMEM_TEST_DIR")" \
@@ -564,7 +604,7 @@ doctor() {
     local fs; fs=$(fstype_of "$BLOCK_DIR")
     printf '%s\n  fstype   %s\n  source   %s\n' "$BLOCK_DIR" "$fs" "$(source_of "$BLOCK_DIR")"
     if is_network_fs "$fs"; then
-        warn "  network filesystem -- file-block will be skipped, since fdatasync would measure the network"
+        warn "  network filesystem -- file-block, file-block-legacy and file-block-msync will be skipped, since fdatasync would measure the network"
     else
         say "  usable as the block-media configuration"
         if odirect_ok "$BLOCK_DIR"; then

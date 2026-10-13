@@ -22,18 +22,25 @@
 #   pmem-none        the same with no writeback instruction and the fence kept:
 #                    an approximation of an eADR platform's timing, never durable,
 #                    and not an eADR measurement (an ADR host stays ADR)
-#   file-dax         the file backend (msync/fdatasync) on the same DAX mount
+#   file-dax         the file backend (mmap + fdatasync) on the same DAX mount
 #   file-block       the file backend on block storage (PWOB_BLOCK_DIR)
 #   direct-block     the direct backend (pwrite + O_DIRECT + fdatasync) on the
 #                    same block storage (PWOB_BLOCK_DIR)
+#   file-dax-legacy, file-block-legacy
+#                    file-dax and file-block with the file backend's boundary
+#                    before 2026-10-13 (a flag and fdatasync, persistRange an msync
+#                    of its own pages), for the old-against-new comparison only
 #
 # There is no direct configuration without writeback: on the direct backend a
-# writeback request only marks a unit for the boundary to write.
+# writeback request only marks a unit for the boundary to write. There is no
+# file configuration with pwopsbench's boundary=msync, which it refuses.
 #
 # The block configurations run only when PWOB_BLOCK_DIR is set, and never on a
 # network filesystem, whose fdatasync would measure the network. The default is
 # the three DAX configurations, plus the two block ones when PWOB_BLOCK_DIR is
-# set; PWOB_CONFIGS="file-block direct-block" runs block storage alone.
+# set; PWOB_CONFIGS="file-block direct-block" runs block storage alone. The
+# legacy configurations run only when named, e.g.
+# PWOB_CONFIGS="file-block file-block-legacy".
 #
 # Each run is one pwopsbench invocation: PWOB_WARMUP unmeasured and PWOB_OPS
 # measured operations of each allocation, free and empty commit, and
@@ -198,8 +205,8 @@ is_network_fs() {
     return 1
 }
 
-uses_dax()   { tr ' ' '\n' <<< "$CONFIGS" | grep -qxE 'pmem-.*|file-dax'; }
-uses_block() { tr ' ' '\n' <<< "$CONFIGS" | grep -qxE 'file-block|direct-block'; }
+uses_dax()   { tr ' ' '\n' <<< "$CONFIGS" | grep -qxE 'pmem-.*|file-dax(-legacy)?'; }
+uses_block() { tr ' ' '\n' <<< "$CONFIGS" | grep -qxE 'file-block(-legacy)?|direct-block'; }
 
 # Refused rather than warned about, as in pwsieve-bench.sh: off a DAX mount the
 # pmem configurations fail, but file-dax would run on whatever filesystem this
@@ -213,7 +220,7 @@ require_dirs() {
             die "PWASM_PMEM_TEST_DIR ($PWASM_PMEM_TEST_DIR) is on $(source_of "$PWASM_PMEM_TEST_DIR"), options '$(options_of "$PWASM_PMEM_TEST_DIR")': not a dax or dax=always mount"
     fi
     if uses_block; then
-        [ -n "$BLOCK_DIR" ] || die "file-block and direct-block need PWOB_BLOCK_DIR, a writable directory on block storage"
+        [ -n "$BLOCK_DIR" ] || die "file-block, file-block-legacy and direct-block need PWOB_BLOCK_DIR, a writable directory on block storage"
         [ -d "$BLOCK_DIR" ] && [ -w "$BLOCK_DIR" ] || die "PWOB_BLOCK_DIR is not a writable directory: $BLOCK_DIR"
         is_dax_dir "$BLOCK_DIR" && die "PWOB_BLOCK_DIR ($BLOCK_DIR) is on a DAX mount; the block configurations need block storage"
         is_network_fs "$BLOCK_DIR" && die "PWOB_BLOCK_DIR ($BLOCK_DIR) is on $(fstype_of "$BLOCK_DIR"), a network filesystem: fdatasync would measure the network"
@@ -227,12 +234,14 @@ require_clean_tree() {
     die "working tree is dirty; commit first so the results name a revision, or set PWOB_ALLOW_DIRTY=1"
 }
 
-# config -> "<backend> <directory> [writeback=<w>]"
+# config -> "<backend> <directory> [writeback=<w>] [boundary=<b>]"
 config_args() {
     case "$1" in
         pmem-auto|pmem-none) echo "pmem ${PWASM_PMEM_TEST_DIR:-.} writeback=${1#pmem-}" ;;
         file-dax)            echo "file ${PWASM_PMEM_TEST_DIR:-.}" ;;
+        file-dax-legacy)     echo "file ${PWASM_PMEM_TEST_DIR:-.} boundary=legacy" ;;
         file-block)          echo "file ${BLOCK_DIR:-.}" ;;
+        file-block-legacy)   echo "file ${BLOCK_DIR:-.} boundary=legacy" ;;
         direct-block)        echo "direct ${BLOCK_DIR:-.}" ;;
         *) die "unknown configuration: $1" ;;
     esac
@@ -293,14 +302,31 @@ parse_ops() {
 record_run() {
     local config=$1 rep=$2 load=$3 log=$4 dir=${5:-}
     local args; read -r -a args <<< "$(config_args "$config")"
-    local backend=${args[0]} wb=
-    [ "${#args[@]}" -gt 2 ] && wb=${args[2]#writeback=}
+    local backend=${args[0]} wb= boundary= a
+    for a in "${args[@]:2}"; do
+        case "$a" in
+            writeback=*) wb=${a#writeback=} ;;
+            boundary=*) boundary=${a#boundary=} ;;
+        esac
+    done
     local want='^OK$'
     [ "$wb" = none ] && want='^OK timing-only: writeback=none'
     grep -qE "$want" "$log" || { warn "    no expected final line in $log"; return 1; }
     grep -q "^backend $backend " "$log" || { warn "    $log does not name backend $backend"; return 1; }
     if [ -n "$wb" ]; then
         grep -qE "^writeback $wb " "$log" || { warn "    $log does not name writeback $wb"; return 1; }
+    fi
+    # Every file run names its boundary, fdatasync unless the configuration
+    # names another. Logs from before boundary= existed (2026-10-13) name
+    # none: those runs had the boundary now called legacy, under an
+    # unsuffixed name, so a rebuild accepts an unsuffixed file configuration's
+    # log without the line. A fresh run, a suffixed configuration and a log
+    # that names a boundary are always checked.
+    if [ "$backend" = file ]; then
+        if [ -n "$dir" ] || [ -n "$boundary" ] || grep -q '^boundary ' "$log"; then
+            grep -qxF "boundary ${boundary:-fdatasync}" "$log" ||
+                { warn "    $log does not name boundary ${boundary:-fdatasync}"; return 1; }
+        fi
     fi
     # Only a fresh run knows its directory; a rebuild elsewhere cannot.
     if [ -n "$dir" ]; then
@@ -404,10 +430,10 @@ summary() {
         function hi(s,   a, m, i, r) { m = split(s, a, " "); r = a[1]; for (i = 2; i <= m; i++) if (a[i] + 0 > r + 0) r = a[i]; return r }
         function reps(s,   a) { return split(s, a, " ") }
         function header(title,   i) { print ""; print title
-            printf "%-14s", "operation"; for (i = 1; i <= nc; i++) printf " %14s", cfg[i]; print "" }
+            printf "%-14s", "operation"; for (i = 1; i <= nc; i++) printf " %17s", cfg[i]; print "" }
         function table(title, v,   k, i, s) { header(title)
             for (k = 1; k <= nops; k++) { printf "%-14s", ops[k]
-                for (i = 1; i <= nc; i++) { s = v[cfg[i], ops[k]]; if (s == "") printf " %14s", "-"; else printf " %14.0f", median(s) }
+                for (i = 1; i <= nc; i++) { s = v[cfg[i], ops[k]]; if (s == "") printf " %17s", "-"; else printf " %17.0f", median(s) }
                 print "" } }
         END {
             nops = split(order, ops, " ")
@@ -418,26 +444,26 @@ summary() {
             header("---- spread of the per-run medians, (max - min) / median, %")
             for (k = 1; k <= nops; k++) { printf "%-14s", ops[k]
                 for (i = 1; i <= nc; i++) { s = med[cfg[i], ops[k]]
-                    if (s == "" || median(s) + 0 <= 0) printf " %14s", "-"
-                    else printf " %13.1f%%", 100 * (hi(s) - lo(s)) / median(s) }
+                    if (s == "" || median(s) + 0 <= 0) printf " %17s", "-"
+                    else printf " %16.1f%%", 100 * (hi(s) - lo(s)) / median(s) }
                 print "" }
             header("---- work per operation, checked on every operation: entries / boundaries / lines written back")
             for (k = 1; k <= nops; k++) { printf "%-14s", ops[k]
                 for (i = 1; i <= nc; i++) { s = counts[cfg[i], ops[k]]
                     if (s == "") s = "-"; else if (s != "VARIES") { split(s, w, " "); s = w[1] " / " w[2] " / " w[3] }
-                    printf " %14s", s }
+                    printf " %17s", s }
                 print "" }
             header("---- derived, from the medians")
             split("recover-8 recover-24", rk, " ")
             for (r = 1; r <= 2; r++) { printf "%-14s", "replay-" substr(rk[r], 9)
                 for (i = 1; i <= nc; i++) { c = cfg[i]
-                    if (med[c, rk[r]] == "" || med[c, "mount-1mib"] == "") printf " %14s", "-"
-                    else printf " %14.0f", median(med[c, rk[r]]) - median(med[c, "mount-1mib"]) }
+                    if (med[c, rk[r]] == "" || med[c, "mount-1mib"] == "") printf " %17s", "-"
+                    else printf " %17.0f", median(med[c, rk[r]]) - median(med[c, "mount-1mib"]) }
                 print "" }
             printf "%-14s", "64mib/1mib"
             for (i = 1; i <= nc; i++) { c = cfg[i]
-                if (med[c, "mount-64mib"] == "" || median(med[c, "mount-1mib"]) + 0 <= 0) printf " %14s", "-"
-                else printf " %13.1fx", median(med[c, "mount-64mib"]) / median(med[c, "mount-1mib"]) }
+                if (med[c, "mount-64mib"] == "" || median(med[c, "mount-1mib"]) + 0 <= 0) printf " %17s", "-"
+                else printf " %16.1fx", median(med[c, "mount-64mib"]) / median(med[c, "mount-1mib"]) }
             print ""
             if (("pmem-auto", "alloc-1") in med && ("pmem-none", "alloc-1") in med) {
                 print ""
@@ -452,8 +478,9 @@ summary() {
             print "it: no boundary) and timer (an empty rdtsc window, the floor under every figure). mount-* opens a"
             print "cleanly closed region; recover-k opens a 1 MiB region whose log holds one committed, unapplied"
             print "transaction of k entries, so replay-k = recover-k - mount-1mib. lines counts writeback requests"
-            print "(pmem and direct; 0 where the backend has none). pmem-none drops CLWB and keeps SFENCE: an"
-            print "approximation of eADR timing, never durable. A difference is real only outside both spreads."
+            print "(pmem, direct and file; 0 on file-*-legacy, the file boundary before 2026-10-13, which makes none)."
+            print "pmem-none drops CLWB and keeps SFENCE: an approximation of eADR timing, never durable. A difference"
+            print "is real only outside both spreads."
         }' "$csv"
 }
 
@@ -473,7 +500,7 @@ doctor() {
     power_facts
     rule "dax directory (PWASM_PMEM_TEST_DIR)"
     if [ -z "${PWASM_PMEM_TEST_DIR:-}" ]; then
-        warn "unset: the pmem-* and file-dax configurations cannot run"
+        warn "unset: the pmem-*, file-dax and file-dax-legacy configurations cannot run"
     else
         say "$PWASM_PMEM_TEST_DIR"
         say "  source  $(source_of "$PWASM_PMEM_TEST_DIR")"
@@ -484,7 +511,7 @@ doctor() {
     fi
     rule "block directory (PWOB_BLOCK_DIR)"
     if [ -z "$BLOCK_DIR" ]; then
-        say "unset: file-block and direct-block are skipped"
+        say "unset: file-block, file-block-legacy and direct-block are skipped"
     else
         say "$BLOCK_DIR"
         say "  source  $(source_of "$BLOCK_DIR")"

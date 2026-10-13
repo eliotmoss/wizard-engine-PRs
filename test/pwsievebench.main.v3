@@ -30,6 +30,12 @@
 // removes the bitmap's writebacks as well as the log's. On the file and direct
 // backends the boundary is timed in the region.
 //
+// boundary= (file only) chooses the file backend's fence (FileBoundary):
+// fdatasync (the default, and the production path), msync (one msync(MS_SYNC)
+// per run of marked pages), or legacy (the boundary before 2026-10-13: a flag
+// and fdatasync, persistRange an msync of its own pages). Every sync counts as
+// a boundary, so under msync a fence of several runs counts as several.
+//
 // Times are rdtsc cycles converted with a calibrated TSC frequency, reported
 // with the frequency. rdtsc is not ordered with CLWB, but every step ends in a
 // commit's fence and lasts microseconds, so the step and phase figures are
@@ -41,7 +47,7 @@
 // probes' own time is removed from every step, phase and wall figure. See the
 // clock probe section below.
 //
-// Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [clock=probe]
+// Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [boundary=<fdatasync|msync|legacy>] [clock=probe]
 
 def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
 def RUSAGE_SELF = 0;
@@ -84,6 +90,7 @@ component SieveBenchConfig {
         def var blocks = 256u64;
         def var blockSize = 4096u64;
         def var writeback = SieveBenchWriteback.AUTO;
+        def var boundary = FileBoundary.FDATASYNC;      // file backend only
 
         // Reserve a private, uniquely named region file, exactly as pwbench
         // and pwsieve do: O_EXCL so an earlier run's artifact is never
@@ -407,8 +414,10 @@ class CountingFileRegion extends FileMmapRegion {
                 return success;
         }
 
-        // persistRange() -- the sieve's bitmap -- syncs with msync(MS_SYNC)
-        // here rather than fdatasync, so it is a boundary too.
+        // With boundary=legacy, persistRange() -- the sieve's bitmap -- syncs
+        // its own pages with msync(MS_SYNC) rather than fdatasync, so it is a
+        // boundary too. With boundary=msync every fence is one msync per run of
+        // marked pages, so a fence of several runs counts as several boundaries.
         def syncMappedRange(offset: u64, size: u64) -> bool {
                 def success = Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
                 timer.notePersist();
@@ -419,7 +428,9 @@ class CountingFileRegion extends FileMmapRegion {
 class CountingFileBackend extends FileMmapBackend {
         def timer: StepTimer;
 
-        new(path: string, timer: StepTimer) super(path) { }
+        new(path: string, timer: StepTimer) super(path) {
+                boundary = SieveBenchConfig.boundary;
+        }
 
         def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
                 if (newMapping == null) return null;
@@ -738,6 +749,16 @@ def parseWriteback(arg: string) -> bool {
         return true;
 }
 
+def parseBoundary(arg: string) -> bool {
+        if (arg == null || !Strings.startsWith(arg, "boundary=")) return false;
+        def name = Arrays.range(arg, 9, arg.length);
+        if (Strings.equal(name, FileBoundary.FDATASYNC.arg)) SieveBenchConfig.boundary = FileBoundary.FDATASYNC;
+        else if (Strings.equal(name, FileBoundary.MSYNC.arg)) SieveBenchConfig.boundary = FileBoundary.MSYNC;
+        else if (Strings.equal(name, FileBoundary.LEGACY.arg)) SieveBenchConfig.boundary = FileBoundary.LEGACY;
+        else return false;
+        return true;
+}
+
 // What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
 def cpuidWriteback() -> string {
         if (Target.supportsClwb()) return "CLWB";
@@ -747,7 +768,7 @@ def cpuidWriteback() -> string {
 }
 
 def usage() -> int {
-        System.puts("Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [clock=probe]\n");
+        System.puts("Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [boundary=<fdatasync|msync|legacy>] [clock=probe]\n");
         return 2;
 }
 
@@ -768,15 +789,20 @@ def main(args: Array<string>) -> int {
         if (args.length > 5) SieveBenchConfig.blockSize = parseU64(args[5], 4096);
         for (i = 6; i < args.length; i++) {
                 if (parseWriteback(args[i])) continue;
+                if (parseBoundary(args[i])) continue;
                 if (Strings.equal(args[i], "clock=probe")) {
                         ClockProbe.enabled = true;
                         continue;
                 }
-                System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|none> or clock=probe\n");
+                System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|none>, boundary=<fdatasync|msync|legacy> or clock=probe\n");
                 return 2;
         }
         if (SieveBenchConfig.writeback != SieveBenchWriteback.AUTO && SieveBenchConfig.backend != SieveBenchBackend.PMEM) {
                 System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        if (SieveBenchConfig.boundary != FileBoundary.FDATASYNC && SieveBenchConfig.backend != SieveBenchBackend.FILE) {
+                System.puts("boundary= applies only to the file backend\n");
                 return 2;
         }
         if ((SieveBenchConfig.writeback == SieveBenchWriteback.CLWB && !Target.supportsClwb()) ||
@@ -800,6 +826,9 @@ def main(args: Array<string>) -> int {
         BenchClock.calibrate();
         if (!ClockProbe.generated()) return fail("the clock probe stub was not generated");
         Trace.OUT.put1("backend %s", SieveBenchConfig.backend.label).ln();
+        if (SieveBenchConfig.backend == SieveBenchBackend.FILE) {
+                Trace.OUT.put1("boundary %s", SieveBenchConfig.boundary.arg).ln();
+        }
         Trace.OUT.put1("directory %s", SieveBenchConfig.directory).ln();
         if (SieveBenchConfig.backend == SieveBenchBackend.PMEM) {
                 Trace.OUT.put2("writeback %s, CPUID selects %s",

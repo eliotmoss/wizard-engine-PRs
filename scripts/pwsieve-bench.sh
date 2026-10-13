@@ -18,10 +18,18 @@
 #   pmem-clwb        the same with CLWB named explicitly (not in the default)
 #   pmem-none        no writeback at all -- timing only, never durable -- so
 #                    pmem-auto minus pmem-none is what the writebacks cost a step
-#   file-dax         the file backend (msync/fdatasync) on the same DAX mount
+#   file-dax         the file backend (mmap + fdatasync) on the same DAX mount
 #   file-block       the file backend on block storage (PWSB_BLOCK_DIR)
 #   direct-block     the direct backend (pwrite + O_DIRECT + fdatasync) on the
 #                    same block storage (PWSB_BLOCK_DIR)
+#   file-dax-legacy, file-block-legacy
+#                    file-dax and file-block with the file backend's boundary
+#                    before 2026-10-13 (a flag and fdatasync, persistRange an msync
+#                    of its own pages), for the old-against-new comparison only
+#   file-dax-msync, file-block-msync
+#                    the same with one msync(MS_SYNC) per run of marked pages
+#                    instead of one fdatasync, for the choice of fence; each
+#                    msync counts as a boundary
 #   <config>+clock   any of the above with pwsievebench's clock=probe: the core
 #                    clock where each of the step's marks falls, read without
 #                    root by timing a chain of dependent register operations;
@@ -30,6 +38,7 @@
 # The block configurations run only when PWSB_BLOCK_DIR is set, and never on a
 # network filesystem, whose fdatasync would measure the network. The default is
 # the four DAX configurations, plus the two block ones when PWSB_BLOCK_DIR is set.
+# The legacy and msync configurations run only when named in PWSB_CONFIGS.
 #
 # Clock campaign. PWSB_CLOCK=1 asks whether the slower computation on block
 # storage is the core clock: the default becomes pmem-auto and file-dax, plus
@@ -194,8 +203,8 @@ is_network_fs() {
 
 # The configurations that need each directory, with or without +clock.
 config_bases() { local c; for c in $CONFIGS; do echo "${c%+clock}"; done; }
-uses_dax()   { config_bases | grep -qxE 'pmem-.*|file-dax'; }
-uses_block() { config_bases | grep -qxE 'file-block|direct-block'; }
+uses_dax()   { config_bases | grep -qxE 'pmem-.*|file-dax(-legacy|-msync)?'; }
+uses_block() { config_bases | grep -qxE 'file-block(-legacy|-msync)?|direct-block'; }
 
 # Refused rather than warned about, as in clwb-eviction.sh: off a DAX mount
 # the pmem configurations fail, but file-dax would run on whatever filesystem
@@ -209,7 +218,7 @@ require_dirs() {
             die "PWASM_PMEM_TEST_DIR ($PWASM_PMEM_TEST_DIR) is on $(source_of "$PWASM_PMEM_TEST_DIR"), options '$(options_of "$PWASM_PMEM_TEST_DIR")': not a dax or dax=always mount"
     fi
     if uses_block; then
-        [ -n "$BLOCK_DIR" ] || die "file-block and direct-block need PWSB_BLOCK_DIR, a writable directory on block storage"
+        [ -n "$BLOCK_DIR" ] || die "file-block, file-block-legacy, file-block-msync and direct-block need PWSB_BLOCK_DIR, a writable directory on block storage"
         [ -d "$BLOCK_DIR" ] && [ -w "$BLOCK_DIR" ] || die "PWSB_BLOCK_DIR is not a writable directory: $BLOCK_DIR"
         is_dax_dir "$BLOCK_DIR" && die "PWSB_BLOCK_DIR ($BLOCK_DIR) is on a DAX mount; the block configurations need block storage"
         is_network_fs "$BLOCK_DIR" && die "PWSB_BLOCK_DIR ($BLOCK_DIR) is on $(fstype_of "$BLOCK_DIR"), a network filesystem: fdatasync would measure the network"
@@ -223,7 +232,7 @@ require_clean_tree() {
     die "working tree is dirty; commit first so the results name a revision, or set PWSB_ALLOW_DIRTY=1"
 }
 
-# config -> "<backend> <directory> [writeback=<w>] [clock=probe]"
+# config -> "<backend> <directory> [writeback=<w>] [boundary=<b>] [clock=probe]"
 config_args() {
     local base=${1%+clock} extra=
     [ "$base" != "$1" ] && extra=" clock=probe"
@@ -231,7 +240,11 @@ config_args() {
         pmem-auto|pmem-clwb|pmem-clflushopt|pmem-none)
                       echo "pmem ${PWASM_PMEM_TEST_DIR:-.} writeback=${base#pmem-}$extra" ;;
         file-dax)     echo "file ${PWASM_PMEM_TEST_DIR:-.}$extra" ;;
+        file-dax-legacy|file-dax-msync)
+                      echo "file ${PWASM_PMEM_TEST_DIR:-.} boundary=${base#file-dax-}$extra" ;;
         file-block)   echo "file ${BLOCK_DIR:-.}$extra" ;;
+        file-block-legacy|file-block-msync)
+                      echo "file ${BLOCK_DIR:-.} boundary=${base#file-block-}$extra" ;;
         direct-block) echo "direct ${BLOCK_DIR:-.}$extra" ;;
         *) die "unknown configuration: $1" ;;
     esac
@@ -324,10 +337,11 @@ parse_bench() {
 record_run() {
     local config=$1 rep=$2 load=$3 log=$4 dir=${5:-}
     local args; read -r -a args <<< "$(config_args "$config")"
-    local backend=${args[0]} wb= clock=0 a
+    local backend=${args[0]} wb= boundary= clock=0 a
     for a in "${args[@]:2}"; do
         case "$a" in
             writeback=*) wb=${a#writeback=} ;;
+            boundary=*) boundary=${a#boundary=} ;;
             clock=probe) clock=1 ;;
         esac
     done
@@ -339,6 +353,18 @@ record_run() {
     # case-insensitively up to the label's end.
     if [ -n "$wb" ]; then
         grep -qiE "^writeback $wb([ ,]|$)" "$log" || { warn "    $log does not name writeback $wb"; return 1; }
+    fi
+    # Every file run names its boundary, fdatasync unless the configuration
+    # names another. Logs from before boundary= existed (2026-10-13) name
+    # none: those runs had the boundary now called legacy, under an
+    # unsuffixed name, so a rebuild accepts an unsuffixed file configuration's
+    # log without the line. A fresh run, a suffixed configuration and a log
+    # that names a boundary are always checked.
+    if [ "$backend" = file ]; then
+        if [ -n "$dir" ] || [ -n "$boundary" ] || grep -q '^boundary ' "$log"; then
+            grep -qxF "boundary ${boundary:-fdatasync}" "$log" ||
+                { warn "    $log does not name boundary ${boundary:-fdatasync}"; return 1; }
+        fi
     fi
     grep -q 'reference sieve agrees' "$log" || { warn "    $log has no reference check"; return 1; }
     # Only a fresh run knows its directory; a rebuild elsewhere cannot.
@@ -437,17 +463,17 @@ summary() {
         function hi(s,   a, m, i, r) { m = split(s, a, " "); r = a[1]; for (i = 2; i <= m; i++) if (a[i] + 0 > r + 0) r = a[i]; return r }
         END {
             print "---- per step, median over repetitions (ns unless noted; steps per run in the log)"
-            printf "%-20s %4s %9s %13s %9s %8s %8s %8s %8s %8s %8s %6s %7s %6s\n", "config", "reps", "wall", "wall range", "median", "compute", "alloc", "bitmap", "publish", "retire", "persist", "bound", "lines", "faults"
+            printf "%-23s %4s %9s %13s %9s %8s %8s %8s %8s %8s %8s %6s %7s %6s\n", "config", "reps", "wall", "wall range", "median", "compute", "alloc", "bitmap", "publish", "retire", "persist", "bound", "lines", "faults"
             for (i = 1; i <= n; i++) { c = order[i]
                 w = med(v[c, 5]); p = med(v[c, 10]) + med(v[c, 11]) + med(v[c, 12]) + med(v[c, 13])
                 persist[c] = p; wall[c] = w
-                printf "%-20s %4d %9.0f %6.0f-%-6.0f %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %6.2f %7.1f %6.2f\n", c, reps[c], w, lo(v[c, 5]), hi(v[c, 5]), med(v[c, 7]),
+                printf "%-23s %4d %9.0f %6.0f-%-6.0f %9.0f %8.0f %8.0f %8.0f %8.0f %8.0f %8.0f %6.2f %7.1f %6.2f\n", c, reps[c], w, lo(v[c, 5]), hi(v[c, 5]), med(v[c, 7]),
                     med(v[c, 9]), med(v[c, 10]), med(v[c, 11]), med(v[c, 12]), med(v[c, 13]), p,
                     med(v[c, 14]) / 1000, med(v[c, 16]) / 1000, med(v[c, 17]) / 1000 }
             print ""
             print "---- shares"
             for (i = 1; i <= n; i++) { c = order[i]
-                if (wall[c] > 0) printf "%-20s persistence phases (alloc+bitmap+publish+retire) %5.1f %% of a step\n", c, 100 * persist[c] / wall[c] }
+                if (wall[c] > 0) printf "%-23s persistence phases (alloc+bitmap+publish+retire) %5.1f %% of a step\n", c, 100 * persist[c] / wall[c] }
             if (("pmem-auto" in wall) && ("pmem-none" in wall) && wall["pmem-auto"] > 0) {
                 d = wall["pmem-auto"] - wall["pmem-none"]
                 printf "writebacks by removal: pmem-auto - pmem-none = %.0f ns per step (%.1f %% of pmem-auto)\n", d, 100 * d / wall["pmem-auto"]
@@ -461,8 +487,9 @@ summary() {
             print ""
             print "Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median"
             print "step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence"
-            print "boundaries per step; lines = cache-line writebacks per step (pmem only); faults = minor faults"
-            print "per step. A difference of a few percent is real only outside the wall range of both."
+            print "boundaries per step (syncs per step on file-*-msync, one per run of marked pages); lines ="
+            print "cache-line writebacks per step (pmem only); faults = minor faults per step. A difference of a"
+            print "few percent is real only outside the wall range of both."
         }' "$csv"
     clock_summary "$1"
 }
@@ -489,19 +516,19 @@ clock_summary() {
             np = split("busy sleep sieve alloc bitmap count publish retire", pt, " ")
             print ""
             print "---- clock (+clock runs): implied MHz where each point falls, median over repetitions"
-            printf "%-20s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; print ""
-            for (i = 1; i <= n; i++) { c = order[i]; printf "%-20s", c
+            printf "%-23s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; print ""
+            for (i = 1; i <= n; i++) { c = order[i]; printf "%-23s", c
                 for (k = 1; k <= np; k++) printf " %7.0f", med(mhz[c, pt[k]]); print "" }
             print ""
             print "---- the same as x1000 of the busy reference, with the repetitions'"'"' range at the end of the sieve"
-            printf "%-20s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; printf " %11s\n", "sieve range"
-            for (i = 1; i <= n; i++) { c = order[i]; printf "%-20s", c
+            printf "%-23s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; printf " %11s\n", "sieve range"
+            for (i = 1; i <= n; i++) { c = order[i]; printf "%-23s", c
                 for (k = 1; k <= np; k++) printf " %7.0f", med(ofb[c, pt[k]])
                 printf " %5.0f-%-5.0f\n", lo(ofb[c, "sieve"]), hi(ofb[c, "sieve"]) }
             print ""
             print "---- first probe'"'"'s excess over the second, ticks (cold private caches or a clock still changing)"
-            printf "%-20s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; print ""
-            for (i = 1; i <= n; i++) { c = order[i]; printf "%-20s", c
+            printf "%-23s", "config"; for (k = 1; k <= np; k++) printf " %7s", pt[k]; print ""
+            for (i = 1; i <= n; i++) { c = order[i]; printf "%-23s", c
                 for (k = 1; k <= np; k++) printf " %7d", whole(med(ex[c, pt[k]])); print "" }
             ref = ""
             if (("pmem-auto+clock", "sieve") in mhz) ref = "pmem-auto+clock"
@@ -510,12 +537,12 @@ clock_summary() {
             rc = med(compute[ref]); rs = med(mhz[ref, "retire"]); re = med(mhz[ref, "sieve"])
             print ""
             print "---- does the clock account for the computation? against " ref
-            printf "%-20s %10s %8s %12s %12s\n", "config", "compute ns", "ratio", "clock ratio", "clock ratio"
-            printf "%-20s %10s %8s %12s %12s\n", "", "", "", "sieve start", "sieve end"
+            printf "%-23s %10s %8s %12s %12s\n", "config", "compute ns", "ratio", "clock ratio", "clock ratio"
+            printf "%-23s %10s %8s %12s %12s\n", "", "", "", "sieve start", "sieve end"
             for (i = 1; i <= n; i++) { c = order[i]
                 cc = med(compute[c]); s = med(mhz[c, "retire"]); e = med(mhz[c, "sieve"])
                 if (cc == "" || s + 0 <= 0 || e + 0 <= 0) continue
-                printf "%-20s %10.0f %8.2f %12.2f %12.2f\n", c, cc, cc / rc, rs / s, re / e }
+                printf "%-23s %10.0f %8.2f %12.2f %12.2f\n", c, cc, cc / rc, rs / s, re / e }
             print ""
             print "ratio = this configuration'"'"'s compute phase over the reference'"'"'s; clock ratio = the reference'"'"'s"
             print "clock over this one'"'"'s where the sieve starts (after retire, the last boundary) and ends (after"
@@ -540,7 +567,7 @@ doctor() {
     power_facts
     rule "dax directory (PWASM_PMEM_TEST_DIR)"
     if [ -z "${PWASM_PMEM_TEST_DIR:-}" ]; then
-        warn "unset: the pmem-* and file-dax configurations cannot run"
+        warn "unset: the pmem-*, file-dax, file-dax-legacy and file-dax-msync configurations cannot run"
     else
         say "$PWASM_PMEM_TEST_DIR"
         say "  source  $(source_of "$PWASM_PMEM_TEST_DIR")"
@@ -551,7 +578,7 @@ doctor() {
     fi
     rule "block directory (PWSB_BLOCK_DIR)"
     if [ -z "$BLOCK_DIR" ]; then
-        say "unset: file-block and direct-block are skipped"
+        say "unset: file-block, file-block-legacy, file-block-msync and direct-block are skipped"
     else
         say "$BLOCK_DIR"
         say "  source  $(source_of "$BLOCK_DIR")"

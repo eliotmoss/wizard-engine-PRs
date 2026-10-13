@@ -24,8 +24,9 @@
 // Instrumentation is asymmetric because the primitives are. On PMEM the
 // boundary is a CLWB loop plus one SFENCE, both issued through the
 // PersistentOperations provider, so a timing provider measures it. On a file
-// the boundary is one fdatasync behind FileMmapRegion.syncFileData(), so a
-// timing region measures that. Both report the same semantic unit -- the
+// the boundary is one fdatasync behind FileMmapRegion.syncFileData() (or, with
+// boundary=msync, an msync per run of marked pages behind syncMappedRange()),
+// so a timing region measures that. Both report the same semantic unit -- the
 // prepare side and the persist side of one boundary -- and the difference in
 // mechanism is itself the granularity difference under study. Neither path
 // reimplements a persistence state machine: each overrides only the narrow
@@ -34,10 +35,10 @@
 // then one fdatasync -- behind DirectIoRegion.writeUnits()/syncDevice(), and
 // both are timed together as one boundary sample.
 //
-// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>] [stride=<bytes>]
+// Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<w>] [stride=<bytes>] [boundary=<b>]
 //        pwbench.x86-64-linux <device> direct-device=<device> [commits] ...
 //
-// Two keyword arguments, in any order after the positional ones, exist for
+// Keyword arguments go in any order after the positional ones. Two exist for
 // the CLWB-eviction experiment (scripts/clwb-eviction.sh):
 //
 // writeback= (pmem only) changes how the timing provider writes lines back:
@@ -55,6 +56,17 @@
 // stride= (default 8) spaces the transaction's u64 entries that many bytes
 // apart. 64 puts each entry on its own cache line, which keeps the number of
 // writebacks per commit while removing every same-line store after one.
+//
+// boundary= (file only) chooses the file backend's fence (FileBoundary), for
+// the old-against-new comparison and the choice of fence (the cost campaign of
+// scripts/pmem-experiments.sh): fdatasync (the default, and the production
+// path -- one fdatasync whenever a page is marked), msync (one msync(MS_SYNC)
+// per run of marked pages), or legacy (the boundary before 2026-10-13: a flag
+// and fdatasync, persistRange an msync of its own pages). Every fdatasync and
+// every msync is a persist sample, so under msync a fence of several runs is
+// several samples, and "boundaries per commit" counts syncs per commit. clwb
+// lines counts the writeback requests the file region's provider receives,
+// the PMEM backend's for the same commits; legacy issues none.
 //
 // A raw device is overwritten from offset 0 for the region's length. Its path
 // has to be given twice, as the first argument and inside the mode word, so a
@@ -106,6 +118,7 @@ component BenchConfig {
         def var blockSize = 4096u64;
         def var writeback = BenchWriteback.AUTO;
         def var stride = 8u64;          // bytes between consecutive entries
+        def var boundary = FileBoundary.FDATASYNC;      // file backend only
 
         def backendName() -> string {
                 return backend.label;
@@ -334,13 +347,36 @@ class TimingPmemBackend extends PmemMmapBackend {
 
 // -------------------------------------------------- file instrumentation
 
-// The file boundary is one fdatasync behind syncFileData(). onRangePrepared is
-// the paired seam on the prepare side; it does no syscall, so it is counted
-// rather than timed.
+// The file region's staging provider with each writeback request counted, as
+// pwopsbench's: the region's page-marking provider forwards every request to
+// it, so clwb lines are the PMEM backend's for the same commits.
+class CountingStagingOperations extends DirectIoStagingOperations {
+        def timer: BoundaryTimer;
+
+        new(range: Range<byte>, timer: BoundaryTimer) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                if (timer.recording) timer.clwbLines++;
+        }
+}
+
+// The file boundary is one fdatasync behind syncFileData(), or with
+// boundary=msync one msync per run of marked pages behind syncMappedRange()
+// (with boundary=legacy, a persistRange()'s msync of its own pages); each sync
+// is one persist sample. onRangePrepared is the paired seam on the prepare
+// side; it does no syscall, so it is counted rather than timed.
 class TimingFileRegion extends FileMmapRegion {
         def timer: BoundaryTimer;
 
-        new(mapping: Mapping, fd: int, timer: BoundaryTimer) super(mapping, fd) { }
+        // boundary=legacy replaces this provider (selectBoundary()), so it
+        // counts no lines.
+        new(mapping: Mapping, fd: int, timer: BoundaryTimer) super(mapping, fd) {
+                wrapProvider(CountingStagingOperations.new(range, timer));
+        }
 
         def onRangePrepared(offset: u64, size: u64) {
                 timer.notePrepare(0);
@@ -352,12 +388,21 @@ class TimingFileRegion extends FileMmapRegion {
                 timer.notePersist(Target.rdtsc() - c0);
                 return success;
         }
+
+        def syncMappedRange(offset: u64, size: u64) -> bool {
+                def c0 = Target.rdtsc();
+                def success = Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
+                timer.notePersist(Target.rdtsc() - c0);
+                return success;
+        }
 }
 
 class TimingFileBackend extends FileMmapBackend {
         def timer: BoundaryTimer;
 
-        new(path: string, timer: BoundaryTimer) super(path) { }
+        new(path: string, timer: BoundaryTimer) super(path) {
+                boundary = BenchConfig.boundary;
+        }
 
         def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
                 if (newMapping == null) return null;
@@ -496,7 +541,8 @@ def report(timer: BoundaryTimer, measured: int, wallNs: long, faults: long) {
         // Phase B claims one boundary per commit in steady state. The overwrite
         // guard can fire a second, so this is measured rather than assumed; a
         // ratio above 1 means the per-boundary figures below are being divided
-        // by the wrong denominator.
+        // by the wrong denominator. Under boundary=msync it counts syncs, one
+        // per run of marked pages.
         if (measured > 0) {
                 Trace.OUT.put2("boundaries per commit x1000 %d, clwb lines %d",
                         (1000 * timer.persistCalls) / measured, timer.clwbLines).ln();
@@ -563,7 +609,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
 
 def main(args: Array<string>) -> int {
         if (args.length < 2 || args[0] == null || args[0].length == 0) {
-                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|deferred|none>] [stride=<bytes>]\n");
+                System.puts("Usage: pwbench.x86-64-linux <writable-directory> <file|pmem|direct> [commits] [entries] [warmup] [blockSize] [blocks] [writeback=<auto|clwb|clflushopt|clflush|deferred|none>] [stride=<bytes>] [boundary=<fdatasync|msync|legacy>]\n");
                 System.puts("       pwbench.x86-64-linux <device> direct-device=<device> [commits] [entries] [warmup] [blockSize] [blocks]\n");
                 return 2;
         }
@@ -589,7 +635,7 @@ def main(args: Array<string>) -> int {
         if (args.length > 6) BenchConfig.blocks = parseU64(args[6], 512);
         for (i = 7; i < args.length; i++) {
                 if (!parseKeyword(args[i])) {
-                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|clflush|deferred|none> or stride=<bytes>\n");
+                        System.puts("after the positional arguments, expected writeback=<auto|clwb|clflushopt|clflush|deferred|none>, stride=<bytes> or boundary=<fdatasync|msync|legacy>\n");
                         return 2;
                 }
         }
@@ -601,6 +647,11 @@ def main(args: Array<string>) -> int {
         // provider, so a selector there would be recorded and have no effect.
         if (BenchConfig.writeback != BenchWriteback.AUTO && BenchConfig.backend != BenchBackend.PMEM) {
                 System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        // The fence is FileMmapRegion's; no other backend has the choice.
+        if (BenchConfig.boundary != FileBoundary.FDATASYNC && BenchConfig.backend != BenchBackend.FILE) {
+                System.puts("boundary= applies only to the file backend\n");
                 return 2;
         }
         def missing = unsupportedWriteback();
@@ -630,6 +681,9 @@ def main(args: Array<string>) -> int {
         }
         BenchClock.calibrate();
         Trace.OUT.put1("backend %s", BenchConfig.backendName()).ln();
+        if (BenchConfig.backend == BenchBackend.FILE) {
+                Trace.OUT.put1("boundary %s", BenchConfig.boundary.arg).ln();
+        }
         Trace.OUT.put1("region file %s", BenchConfig.path).ln();
         if (BenchConfig.backend == BenchBackend.PMEM) {
                 Trace.OUT.put2("writeback %s, CPUID selects %s",
@@ -745,6 +799,14 @@ def parseKeyword(arg: string) -> bool {
                 def text = Arrays.range(arg, 7, arg.length);
                 BenchConfig.stride = parseU64(text, 0);
                 return text.length > 0;
+        }
+        if (Strings.startsWith(arg, "boundary=")) {
+                def name = Arrays.range(arg, 9, arg.length);
+                if (Strings.equal(name, FileBoundary.FDATASYNC.arg)) BenchConfig.boundary = FileBoundary.FDATASYNC;
+                else if (Strings.equal(name, FileBoundary.MSYNC.arg)) BenchConfig.boundary = FileBoundary.MSYNC;
+                else if (Strings.equal(name, FileBoundary.LEGACY.arg)) BenchConfig.boundary = FileBoundary.LEGACY;
+                else return false;
+                return true;
         }
         if (!Strings.startsWith(arg, "writeback=")) return false;
         def name = Arrays.range(arg, 10, arg.length);

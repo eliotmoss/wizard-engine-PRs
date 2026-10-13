@@ -29,10 +29,12 @@
 // What each operation should do is checked on every operation, warm-up and
 // measured, and a mismatch fails the run: an allocation or free makes exactly
 // one boundary, the empty commit and a clean mount none, a recovery one. On
-// PMEM, and on the direct backend, whose provider receives the same writeback
-// requests, an allocation or free writes back exactly the lines its record
-// predicts (PWOpsRecord.commitLines()), and a recovery one line per replayed
-// entry. The record is read back only during warm-up: reading it after a
+// PMEM, and on the direct and file backends, whose providers receive the same
+// writeback requests, an allocation or free writes back exactly the lines its
+// record predicts (PWOpsRecord.commitLines()), and a recovery one line per
+// replayed entry; the file backend's boundary before 2026-10-13
+// (boundary=legacy) makes no writeback request, so it is expected to write
+// back none. The record is read back only during warm-up: reading it after a
 // measured commit would pull into the cache lines that later commits store
 // into. On the file and direct backends the prepare calls must also be the
 // same for every operation of a kind.
@@ -52,7 +54,14 @@
 // of an eADR platform, where the caches are in the persistence domain; it is
 // not one, and the region is NOT durable.
 //
-// Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>]
+// boundary= (file only) chooses the file backend's fence (FileBoundary), for
+// the old-against-new comparison: fdatasync (the default, and the production
+// path) or legacy (the boundary before 2026-10-13: a flag and fdatasync,
+// persistRange an msync of its own pages). msync is refused: the work check
+// expects one boundary per fence, and msync issues one sync per run of marked
+// pages.
+//
+// Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>] [boundary=<fdatasync|legacy>]
 
 def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
 def MAX_SAMPLES = 200000;
@@ -80,6 +89,7 @@ component OpsBenchConfig {
         def var path: string;
         def var backend = OpsBenchBackend.FILE;
         def var writeback = OpsBenchWriteback.AUTO;
+        def var boundary = FileBoundary.FDATASYNC;      // file backend only
         def var ops = 50000;           // Corundum's count
         def var warmup = 2000;
         def var mounts = 200;
@@ -118,9 +128,10 @@ component OpsBenchConfig {
         }
 
         // The writeback requests a backend's provider sees: the PMEM provider
-        // and the direct backend's staging provider receive the same ones.
+        // and the direct and file backends' staging providers receive the same
+        // ones. The file backend's legacy boundary makes none.
         def countsLines() -> bool {
-                return backend != OpsBenchBackend.FILE;
+                return backend != OpsBenchBackend.FILE || boundary != FileBoundary.LEGACY;
         }
 
         // prepareChangedRange() calls, which only the file and direct regions
@@ -185,7 +196,7 @@ type OpCounts(boundaries: int, prepares: int, lines: int) #unboxed {
 class OpCounter {
         var boundaries = 0;     // SFENCE / fdatasync / msync / direct write-back
         var prepares = 0;       // file and direct prepareChangedRange() calls
-        var lines = 0;          // writeback requests (pmem and direct)
+        var lines = 0;          // writeback requests (pmem, direct, and file unless legacy)
 
         def notePersist() {
                 boundaries++;
@@ -248,10 +259,14 @@ class CountingPmemBackend extends PmemMmapBackend {
 
 // -------------------------------------------------- file instrumentation
 
+// The staging provider is wrapped as on the direct backend; boundary=legacy
+// replaces it (selectBoundary()), so it counts no lines.
 class CountingFileRegion extends FileMmapRegion {
         def counter: OpCounter;
 
-        new(mapping: Mapping, fd: int, counter: OpCounter) super(mapping, fd) { }
+        new(mapping: Mapping, fd: int, counter: OpCounter) super(mapping, fd) {
+                wrapProvider(CountingStagingOperations.new(range, counter));
+        }
 
         def onRangePrepared(offset: u64, size: u64) {
                 counter.notePrepare();
@@ -263,8 +278,9 @@ class CountingFileRegion extends FileMmapRegion {
                 return success;
         }
 
-        // persistRange() -- format, and the WAL's scrub on close -- syncs with
-        // msync(MS_SYNC) rather than fdatasync, so it is a boundary too.
+        // With boundary=legacy, persistRange() -- format, and the WAL's scrub
+        // on close -- syncs its own pages with msync(MS_SYNC) rather than
+        // fdatasync, so it is a boundary too.
         def syncMappedRange(offset: u64, size: u64) -> bool {
                 def success = Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
                 counter.notePersist();
@@ -275,7 +291,9 @@ class CountingFileRegion extends FileMmapRegion {
 class CountingFileBackend extends FileMmapBackend {
         def counter: OpCounter;
 
-        new(path: string, counter: OpCounter) super(path) { }
+        new(path: string, counter: OpCounter) super(path) {
+                boundary = OpsBenchConfig.boundary;
+        }
 
         def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
                 if (newMapping == null) return null;
@@ -285,9 +303,10 @@ class CountingFileBackend extends FileMmapBackend {
 
 // ------------------------------------------------ direct instrumentation
 
-// The production staging provider with each writeback request counted. The
-// region's dirty-marking provider forwards every request to it, so the counts
-// are the PMEM backend's for the same operations.
+// The production staging provider with each writeback request counted, for
+// the direct and file regions. The region's dirty-marking provider forwards
+// every request to it, so the counts are the PMEM backend's for the same
+// operations.
 class CountingStagingOperations extends DirectIoStagingOperations {
         def counter: OpCounter;
 
@@ -669,7 +688,7 @@ def cpuidWriteback() -> string {
 }
 
 def usage() -> int {
-        System.puts("Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>]\n");
+        System.puts("Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>] [boundary=<fdatasync|legacy>]\n");
         return 2;
 }
 
@@ -690,8 +709,13 @@ def main(args: Array<string>) -> int {
         for (i = 6; i < args.length; i++) {
                 if (Strings.equal(args[i], "writeback=auto")) OpsBenchConfig.writeback = OpsBenchWriteback.AUTO;
                 else if (Strings.equal(args[i], "writeback=none")) OpsBenchConfig.writeback = OpsBenchWriteback.NONE;
-                else {
-                        System.puts("after the positional arguments, expected writeback=<auto|none>\n");
+                else if (Strings.equal(args[i], "boundary=fdatasync")) OpsBenchConfig.boundary = FileBoundary.FDATASYNC;
+                else if (Strings.equal(args[i], "boundary=legacy")) OpsBenchConfig.boundary = FileBoundary.LEGACY;
+                else if (Strings.equal(args[i], "boundary=msync")) {
+                        System.puts("boundary=msync is not supported: the work check counts one boundary per fence, and msync issues one sync per run of marked pages\n");
+                        return 2;
+                } else {
+                        System.puts("after the positional arguments, expected writeback=<auto|none> or boundary=<fdatasync|legacy>\n");
                         return 2;
                 }
         }
@@ -699,6 +723,10 @@ def main(args: Array<string>) -> int {
         // is no instruction to remove.
         if (OpsBenchConfig.writeback != OpsBenchWriteback.AUTO && OpsBenchConfig.backend != OpsBenchBackend.PMEM) {
                 System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        if (OpsBenchConfig.boundary != FileBoundary.FDATASYNC && OpsBenchConfig.backend != OpsBenchBackend.FILE) {
+                System.puts("boundary= applies only to the file backend\n");
                 return 2;
         }
         if (OpsBenchConfig.ops < 1 || OpsBenchConfig.mounts < 1) {
@@ -717,6 +745,9 @@ def main(args: Array<string>) -> int {
 
         BenchClock.calibrate();
         Trace.OUT.put1("backend %s", OpsBenchConfig.backend.label).ln();
+        if (OpsBenchConfig.backend == OpsBenchBackend.FILE) {
+                Trace.OUT.put1("boundary %s", OpsBenchConfig.boundary.arg).ln();
+        }
         Trace.OUT.put1("directory %s", OpsBenchConfig.directory).ln();
         if (OpsBenchConfig.backend == OpsBenchBackend.PMEM) {
                 Trace.OUT.put2("writeback %s, CPUID selects %s",
