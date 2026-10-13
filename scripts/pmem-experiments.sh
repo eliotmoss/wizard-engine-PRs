@@ -369,15 +369,19 @@ check_geometry() {
 
 cost() {
     local c
+    local need_dax=0
     for c in $COST_CONFIGS; do
         case "$c" in
-            pmem-dax|file-dax|file-dax-legacy|file-dax-msync|file-block|file-block-legacy|file-block-msync|direct-block) ;;
+            pmem-dax|file-dax|file-dax-legacy|file-dax-msync) need_dax=1 ;;
+            file-block|file-block-legacy|file-block-msync|direct-block) ;;
             *) die "unknown configuration in PWEXP_CONFIGS: $c" ;;
         esac
     done
     require_clean_tree
-    [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"
-    [ -d "$PWASM_PMEM_TEST_DIR" ] || die "PWASM_PMEM_TEST_DIR is not a directory: $PWASM_PMEM_TEST_DIR"
+    if [ $need_dax = 1 ]; then
+        [ -n "${PWASM_PMEM_TEST_DIR:-}" ] || die "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"
+        [ -d "$PWASM_PMEM_TEST_DIR" ] || die "PWASM_PMEM_TEST_DIR is not a directory: $PWASM_PMEM_TEST_DIR"
+    fi
     check_geometry
     ensure_bin "$BENCH_BIN"
     resolve_pinning
