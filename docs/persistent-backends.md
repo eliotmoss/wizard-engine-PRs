@@ -1051,6 +1051,230 @@ slow boundaries are the ones that start at the higher clock, after the sieve
 (1.8 GHz) and after the count (1.5 GHz), while the fast two start at 1.0 GHz:
 the opposite of what a clock cause would predict.
 
+### Basic operations: what an allocation, a free, a mount and a recovery cost (2026-10-13)
+
+pwbench times a commit whose shape the harness chooses, and the sieve times a
+program. `test/pwopsbench.main.v3` times the operations the interface offers,
+one at a time, in the form of Corundum's Table 5 (Hoseinzadeh and Swanson,
+ASPLOS '21), which gives basic-operation latencies over 50,000 operations.
+Every operation goes through the production `PWRegion`, `RegionTransaction` and
+`DualTxnWal` on each backend. Corundum's BST, KVStore and B+Tree workloads are
+out of scope; the sieve above is this project's workload.
+
+| Operation | What is timed | Persistence work |
+|---|---|---|
+| `alloc-1`, `alloc-8`, `alloc-64` | `PWRegion.allocChunk(n)` of n 4 KiB blocks, its own committed transaction | one boundary |
+| `free-1`, `free-8`, `free-64` | `freeChunk()` of that chunk, its own transaction | one boundary |
+| `commit-empty` | `RegionTransaction.commit()` with nothing buffered | none: it returns before the WAL (`X86_64TxnPWRegion.v3:444`) |
+| `timer` | an empty `rdtsc` window | the floor under every figure |
+| `mount-1mib`, `mount-64mib` | opening a cleanly closed region of 256 or 16,384 blocks | none: `close()` scrubbed the log, recovery reports `CLEAN` |
+| `recover-8`, `recover-24` | opening a 1 MiB region whose log holds one committed, unapplied transaction of 8 or 24 `u64` entries | one boundary, the replay; recovery reports `REPLAYED` |
+| commit of 1, 8, 24 entries | not measured here: pwbench's, [below](#commits-of-k-entries-pwbenchs-figures) | one boundary |
+
+**Method.**
+
+- **One extent, alternating.** Allocations and frees run on a freshly
+  formatted 1 MiB region (256 × 4 KiB) whose user blocks are one free extent.
+  `alloc-n` splits it and `free-n` coalesces it back, so each operation leaves
+  the allocator as it found it, and every operation of a kind does the same
+  work: an allocation commits 16 entries and a free 10, whatever n. For each n
+  in turn, 2,000 unmeasured then 50,000 measured allocation–free pairs, each
+  operation timed on its own. Then 2,000 and 50,000 empty commits, and the
+  same of the empty timer window.
+- **The work is checked on every operation, not sampled.** Counting backends
+  (duplicated from pwsievebench, not shared) count boundaries, prepare calls
+  and writeback requests (lines). An allocation or free must make exactly one
+  boundary and write back the record's lines plus each distinct line its
+  after-images touch; that expectation is derived from the record the commit
+  wrote (`PWOps.latestRecord()`, read through a second `DualTxnWal` over the
+  same log) during warm-up, and every measured operation must match it. An
+  empty commit and a clean mount must do nothing; a recovery of k entries one
+  boundary and k lines, because `redoSlot()` replays through `applyUpdate()`,
+  which prepares each entry on its own (`X86_64DualTxnWal.v3:426`), while
+  commits use the batched apply. Any mismatch fails the run with exit 1 and
+  keeps the region image (tested by mutating an expectation). The suite hosts
+  have no DAX mount, so `PWOpsTest.v3`'s six tests check the same expectations
+  on the production `PmemMmapRegion` boundary over anonymous memory, recording
+  every `CLWB` and `SFENCE`.
+- **How the recovery state is produced.** `PWOps.commitUnapplied()`, which is
+  `PmemDaxIntegrationTest`'s recipe: open the cleanly closed region's backend
+  directly, without a `PWRegion`, build the production `DualTxnWal` over it,
+  append k `u64` after-images to a chunk allocated for them, and `commit()`,
+  which writes the record and its commit-point boundary exactly as a
+  `RegionTransaction` commit does. Nothing is applied, and the backend region
+  is destroyed without `close()`, which would persist the data and scrub the
+  record. The durable state is a crash straight after a commit point: the
+  record valid, its after-images absent. That setup is untimed. The timed
+  mount must report `REPLAYED` with the expected counts, and afterwards every
+  replayed value (distinct per sample, so a replay that did nothing is caught)
+  and the allocator's invariants are checked.
+- **Mounts are interleaved.** 20 unmeasured and 200 measured samples of each
+  kind (a direct mount reads the whole region). `mount-1mib`, `recover-8` and
+  `recover-24` alternate within each sample, so `replay-k = recover-k −
+  mount-1mib` compares like with like. In a first version each kind had its own
+  loop, the recoveries running after the 64 MiB mounts, and on the direct
+  backend `recover-8` measured 591 µs against `mount-1mib`'s 785 µs: a negative
+  replay. What the order changed was not isolated.
+- **`pmem-none` is not eADR.** `writeback=none` drops `CLWB` and keeps
+  `SFENCE`, which approximates the timing of an eADR platform, where the
+  caches are inside the persistence domain. Magpie is ADR (`memory_controller`
+  persistence domain, `docs/pmem-emulation.md`), so there it is a timing
+  configuration that is never durable, and its runs end `OK timing-only`. The
+  direct backend has no such configuration: its writeback request only marks a
+  unit for the boundary to write.
+- **Reported:** per run, the minimum, median, p90, p99, maximum and mean in ns
+  (TSC calibrated per run); over five repetitions, interleaved with the
+  configuration innermost, the median of each statistic and the spread of the
+  per-run medians, `(max − min) / median`. A difference is real only outside
+  both spreads. `scripts/pwops-bench.sh` refuses a dirty tree and records the
+  commit, host, CPU, governor, idle states, mount options, the block device's
+  write cache and the load.
+
+**sean-tan-PC, NVMe, P-core, `powersave`**
+(`results/20261013T084519Z-sean-tan-PC-pwops-bench-cpus2-powersave`). i7-14700KF
+pinned to CPU 2 (a performance core), block storage the Solidigm NVMe root
+(ext4, write cache `write back`), five repetitions, 15.5 minutes, start load
+0.36. The emulated PMEM was not mounted that day, so the DAX configurations
+wait for Magpie, and the governor could not be changed without root (see the
+last point below). ns per operation, the median over repetitions of each run's
+median and p90, with the spread of the medians; the work column is the direct
+backend's, and the file backend's is the same with 0 lines, since its
+preparation makes no writeback request:
+
+| Operation | `file` median | `file` p90 | `direct` median | `direct` p90 | entries / boundaries / lines |
+|---|---|---|---|---|---|
+| `alloc-1` | 283,242 (0.2 %) | 300,624 | 305,654 (0.1 %) | 306,872 | 16 / 1 / 15 |
+| `alloc-8` | 283,665 (0.4 %) | 307,326 | 305,787 (0.3 %) | 307,069 | 16 / 1 / 17 |
+| `alloc-64` | 290,233 (7.4 %) | 310,017 | 280,677 (0.2 %) | 304,846 | 16 / 1 / 17 |
+| `free-1` | 275,217 (0.3 %) | 298,415 | 301,849 (6.9 %) | 303,719 | 10 / 1 / 11 |
+| `free-8` | 275,748 (1.0 %) | 300,496 | 302,485 (8.1 %) | 303,926 | 10 / 1 / 13 |
+| `free-64` | 299,285 (2.4 %) | 303,094 | 277,561 (0.1 %) | 279,053 | 10 / 1 / 13 |
+| `commit-empty` | 6 | 7 | 6 | 7 | 0 / 0 / 0 |
+| `timer` | 4 | 5 | 4 | 6 | 0 / 0 / 0 |
+| `mount-1mib` | 16,161 (4.1 %) | 18,976 | 652,609 (9.2 %) | 700,938 | 0 / 0 / 0 |
+| `mount-64mib` | 14,213 (2.0 %) | 17,185 | 9,644,380 (1.1 %) | 9,758,914 | 0 / 0 / 0 |
+| `recover-8` | 271,888 (0.8 %) | 273,051 | 903,255 (10.3 %) | 954,945 | 8 / 1 / 8 |
+| `recover-24` | 272,031 (0.7 %) | 276,408 | 942,416 (6.2 %) | 992,542 | 24 / 1 / 24 |
+| `replay-8` (derived) | 255,727 | | 250,646 | | |
+| `replay-24` (derived) | 255,870 | | 289,807 | | |
+
+The lines are what the PMEM backend issues for the same operation: the direct
+backend's requests come from the same provider calls, which is the trace
+identity `DirectIoRegionTest` pins, and `PWOpsTest` checks the counts on the
+PMEM path itself.
+
+- **An allocation or a free is one boundary, and on this drive it costs what a
+  boundary costs.** 275–299 µs on the file backend and 278–306 µs on the direct
+  one, against pwbench's whole 8-entry commit of 265 µs (file) and 267 µs
+  (direct) on the same drive (2 MiB region, `20260927T083305Z`, governor not
+  recorded). The allocator's own work does not show at this scale: 64 blocks
+  cost what one does, because a split commits the same 16 fields whatever its
+  size, and a coalescing free 10.
+- **What does vary on the direct backend is the number of writes.** `strace`
+  of a short run: an allocation's boundary writes units 0–2 (header, log, first
+  user block) as one `pwrite` and block-table units 253 and 255 as two more,
+  then `fdatasync`; a free writes units 0–1 and the same two. At n = 64 the
+  split also touches unit 254, so 253–255 coalesce and the boundary makes two
+  writes. That is the 25 µs by which `alloc-64` and `free-64` undercut the
+  other sizes (281 and 278 µs against 302–306 µs), about one O_DIRECT write on
+  this drive (~23 µs, [above](#cost-the-same-seam-call-a-different-persistence-point));
+  pwbench's commit, which makes one write, is 267 µs. On the file backend, whose boundary is one `fdatasync` and no `msync`, n = 64
+  goes the other way: `free-64` is 293–300 µs against 275–278 µs in every
+  repetition, and `alloc-64` 284–306 µs against 283–284 µs. Not explained.
+- **The 7–8 % spreads are two modes.** A run's median lands near one of two
+  levels about 20 µs apart: the direct `free-1` median is 301–303 µs in four
+  repetitions and 282 µs in the fifth, `free-8` 278 µs in one of five, the file
+  `alloc-64` 305–306 µs in two. Each run is internally tight; which level a run
+  takes is not explained.
+- **An empty commit is no boundary.** `RegionTransaction.commit()` returns
+  `true` before the WAL when nothing is buffered: no record, store, writeback
+  or fence, checked on all 52,000 calls and by `pwops:empty_commit_issues_nothing`.
+  It costs 5–6 ns against the empty window's 4–5 ns, 1–2 ns over the floor.
+  Their spreads (17 % and 25 %) are integer nanoseconds.
+- **A clean mount is flat in region size on the file backend, and a read of
+  the whole region on the direct one.** File: 16.2 µs at 1 MiB, 14.2 µs at
+  64 MiB, opening and mapping the file and checking the header and log, with
+  pages faulted in only when touched. Direct: `DirectIoRegion.create()` reads
+  the region into its staging buffer (`X86_64DirectIoBackend.v3:397`), and
+  `strace -T` shows that one `pread` is the mount's time. 64 MiB in 9.64 ms is
+  about 7 GB/s; at that rate 1 MiB would take 0.15 ms, so most of the 1 MiB
+  mount's 0.65 ms is not transfer, and 64 times the region costs 14.8 times as
+  long. The direct
+  1 MiB mount is also unsteady, run medians 640–701 µs with one run's minimum
+  at 397 µs. That the file backend's 1 MiB mount is slower than its 64 MiB one
+  is plausibly the clock (last point): the 1 MiB samples alternate with
+  recoveries that block in `fdatasync`, while the 64 MiB mounts run back to
+  back and never block. Untested.
+- **A recovery is a mount plus one boundary.** The replay costs 256 µs on the
+  file backend at both sizes, one `fdatasync` (pwbench's file boundary on this
+  drive is 237 µs). On the direct backend 251 and 290 µs; the 39 µs between 8
+  and 24 entries is inside `recover-8`'s 10 % spread.
+- **All of it is under `powersave`.** On this host a thread that blocks comes
+  back at about a third of its busy clock ([the sieve above](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence)),
+  so the work around each boundary runs slow. Figures dominated by a boundary
+  move little; the file mounts, and whatever each operation spends outside its
+  boundary, are inflated. A rerun under `performance` separates the two.
+
+**Magpie: not yet run.** The default campaign there is `pmem-auto`,
+`pmem-none` and `file-dax` on `/mnt/pmem0.0/sean`, and `file-block` and
+`direct-block` on `/home/users/u7599095`, pinned to node 0, which owns the
+namespace. What to look for:
+
+- On PMEM, allocations and frees with one `SFENCE` and 15–17 and 11–13 lines,
+  costing about what pwbench's commits of comparable size do (below).
+- **Recovery should show the per-entry writeback.** Replay prepares each entry
+  on its own, so on Cascade Lake, where `CLWB` evicts, each replayed entry
+  after the first in a line stores into a line just written back: the cost the
+  batched apply removed from commits
+  ([above](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows)).
+  The entries start 32 bytes into a line, after the chunk header, so 24 of them
+  span four lines and make 20 such stores; at the ~775 ns each measured there,
+  `replay-24` on `pmem-auto` should exceed `pmem-none`'s by roughly 15 µs. A
+  prediction, to be checked.
+- `/home` is behind the write-through RAID controller, and Magpie's clock
+  drops after every block-storage boundary with no governor to change, so the
+  block figures include that penalty, as the sieve's do.
+
+#### Commits of k entries: pwbench's figures
+
+Not re-measured; wall time per commit, the median over repetitions of each
+run's mean:
+
+| Host and configuration | 1 entry | 8 entries | 24 entries | Source |
+|---|---|---|---|---|
+| Magpie, `pmem`, production (batched apply) | 4.5 µs | 9.4 µs | 21.6 µs | `20260928T051804Z`, 1 MiB, stride 8, node 0 |
+| Magpie, `pmem`, no writeback | 3.8 µs | 8.5 µs | 20.9 µs | same |
+| Magpie, `file` on DAX | 12.7 µs | 17.3 µs | 29.3 µs | same |
+| Magpie, `file` on `/home` | 213 µs | 220 µs | 255 µs | `20260927T080050Z`, 1 MiB |
+| Magpie, `direct` on `/home` | 214 µs | 215 µs | 245 µs | same |
+| Raptor Lake P-core, `pmem` (DRAM-emulated), production | 0.95 µs | 2.12 µs | 5.25 µs | [table above](#on-raptor-lake-clwb-does-not-evict-and-the-same-line-store-is-still-the-cost), `performance` |
+| same, no writeback | 0.91 µs | 2.08 µs | 5.21 µs | same |
+| same, `file` on DAX | 3.47 µs | 4.63 µs | 7.67 µs | same |
+| Raptor Lake, `file` on NVMe | 260 µs | 265 µs | — | `20260927T083305Z`, 2 MiB, governor not recorded |
+| Raptor Lake, `direct` on NVMe | 257 µs | 267 µs | — | same |
+
+#### Reproducing
+
+```
+make bin/pwopsbench.x86-64-linux     # the campaign also builds it
+scripts/pwops-bench.sh doctor        # what this host can run, and why not
+
+# sean-tan-PC, block storage only, on a performance core:
+PWOB_BLOCK_DIR=$PWD/bin/pwops-bench-block PWOB_CONFIGS="file-block direct-block" \
+    PWOB_CPUS=2 scripts/pwops-bench.sh campaign
+
+# Magpie, every configuration, pinned to the namespace's node:
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean PWOB_BLOCK_DIR=/home/users/u7599095 \
+    PWOB_NUMA_NODE=0 scripts/pwops-bench.sh campaign
+```
+
+Each campaign writes `results/<stamp>-<host>-pwops-bench[-cpus<list>]/` with
+every run's log, `runs.csv`, `summary.txt` and `provenance.txt`;
+`scripts/pwops-bench.sh summary <dir>` recomputes the summary, and `rebuild
+<dir>` re-derives `runs.csv` from the logs first. `PWOB_REPS`, `PWOB_OPS`,
+`PWOB_WARMUP`, `PWOB_MOUNTS` and `PWOB_MOUNT_WARMUP` default to 5, 50,000,
+2,000, 200 and 20.
+
 ### Region size at fixed block size, and the NUMA penalty at 1 MiB
 
 Measured 2026-09-23 on Magpie, two campaigns back to back, 1, 8 and 24 entries,
@@ -2022,6 +2246,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
+| `PWOpsTest.v3` | 6 | the basic-operation benchmark's expectations on the production PMEM boundary path: exact `CLWB`/`SFENCE` counts per allocation and free against the record, the steady state alternating them returns to, no event for an empty commit, no boundary for a clean mount, and one line per replayed entry under one fence for a recovery |
 | `PersistentSieveTest.v3` | 6 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check |
 
 The trace recorder deliberately has no durable image, background eviction,
