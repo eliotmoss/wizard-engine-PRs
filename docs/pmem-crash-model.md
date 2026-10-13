@@ -873,8 +873,9 @@ before that fence's `SFENCE`, which is recorded before the sync is issued. On
 fsdax the assumptions are the baseline profile's own plus the kernel's `fsync`
 contract. On block storage they include one, B2, that no specification
 guarantees, and that holds by construction only when the filesystem has stable
-writes, which sean-tan-PC's NVMe does not request (Magpie's devices were not
-checked).
+writes, which sean-tan-PC's NVMe does not request. Magpie's devices are not
+yet checked; `scripts/magpie-root-checks.sh` collects their `stable_writes`
+with the device-mapper table below.
 
 **On fsdax.** There is no page cache. The mapping is the media, stores reach it
 through the CPU cache, and dirty lines are evicted when the CPU chooses: the
@@ -953,8 +954,12 @@ writes the page cannot change while it is written, and B2 holds by
 construction. sean-tan-PC's storage path (ext4 on an NVMe partition) copies no
 pages, so there B2 is the platform's DMA read granularity. Magpie's (ext4 on an
 LVM volume on the RAID controller) should not either, if the volume is linear
-and unencrypted, as its name suggests; its device-mapper table was not checked
-(`sudo dmsetup table`).
+and unencrypted, as its name suggests; that is not yet checked.
+`scripts/magpie-root-checks.sh` now records `dmsetup table` and `dmsetup info -c`
+(the volume's targets: `linear`, not `crypt` or `raid`) and every block
+device's `queue/stable_writes`; without root, `lsblk -o NAME,TYPE` (a `crypt`
+type) and `/sys/block/dm-*/dm/uuid` (a `CRYPT-` prefix) already rule out
+encryption, and `stable_writes` is world-readable.
 
 *Sector atomicity, flushes, filesystems.* A 512-byte sector holds eight whole
 lines, so under B3 every line is old or new. The model admits either, line by

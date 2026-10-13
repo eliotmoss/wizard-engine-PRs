@@ -6,6 +6,10 @@
 #
 #   sudo scripts/magpie-root-checks.sh
 #
+# or, when the sudoer is not the checkout's owner:
+#
+#   sudo env PWROOT_USER=<owner> <checkout>/scripts/magpie-root-checks.sh
+#
 # 1. RAID controller. /home is LVM on sda behind a MegaRAID SAS3508 that
 #    reports write-through, so fdatasync sends no flush and every file-block
 #    and direct-block figure is the controller's acknowledgement. Whether that
@@ -18,9 +22,15 @@
 # 3. DAX writeback granularity. fs_dax:dax_writeback_one during short pwbench
 #    runs on the DAX mount at 2 MiB and 1 MiB regions: the region-size
 #    mechanism predicts pglen 0x200 (a whole 2 MiB entry) and 0x1.
+# 4. Block stack, for B2 of the file backend's restriction argument
+#    (docs/pmem-crash-model.md): is /home's LVM volume linear and unencrypted,
+#    so that no layer copies pages with the CPU, and does any block device
+#    request stable writes? dmsetup table and dmsetup info -c (crypt keys are
+#    not shown without --showkeys, which is not used), lsblk, and every block
+#    device's queue/stable_writes.
 #
 # Nothing here changes the host: the controller and drive queries are "show"
-# and "get" operations; tracing is switched on only around each run and the
+# and "get" operations, the device-mapper queries only read tables; tracing is switched on only around each run and the
 # previous state and buffer size are restored; the benchmarks run as the
 # checkout's owner in that owner's own directories. Results go to
 # results/<stamp>-<host>-root-checks/, owned by that account.
@@ -95,6 +105,29 @@ STORCLI=$(command -v storcli64 || command -v storcli || command -v perccli64 || 
 chown "$U" "$OUT/controller.txt"
 say "1. controller queries -> controller.txt (storcli: ${STORCLI:-not found})"
 
+# ------------------------------------------------------------ 4. block stack (B2)
+
+{
+    rule "findmnt -T $BLOCK_DIR"
+    findmnt -T "$BLOCK_DIR" 2>&1
+    rule "lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT"
+    lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT 2>&1
+    rule "dmsetup table (target per segment: linear, striped, crypt, raid, ...)"
+    if command -v dmsetup >/dev/null; then dmsetup table 2>&1; else say "dmsetup not installed"; fi
+    rule "dmsetup info -c"
+    if command -v dmsetup >/dev/null; then dmsetup info -c 2>&1; fi
+    rule "dm uuids (CRYPT- for dm-crypt, LVM- for LVM)"
+    for d in /sys/block/dm-*; do
+        [ -e "$d/dm/uuid" ] && say "$(basename "$d") $(cat "$d/dm/name" 2>/dev/null) $(cat "$d/dm/uuid")"
+    done
+    rule "queue/stable_writes per block device (1 = the device requests stable pages)"
+    for d in /sys/block/*; do
+        [ -e "$d/queue/stable_writes" ] && say "$(basename "$d") $(cat "$d/queue/stable_writes")"
+    done
+} > "$OUT/block-stack.txt" 2>&1
+chown "$U" "$OUT/block-stack.txt"
+say "4. block stack -> block-stack.txt"
+
 # ------------------------------------------------------------ 2 and 3. traces
 
 T=/sys/kernel/tracing
@@ -163,6 +196,9 @@ fi
         say "$name:"
         grep -o 'pglen 0x[0-9a-f]*' "$OUT/$name.trace" | sort | uniq -c | sed 's/^/  /'
     done
+    rule "block stack (B2): device-mapper targets, and devices requesting stable writes"
+    say "targets: $(dmsetup table 2>/dev/null | awk '{ print $4 }' | sort | uniq -c | tr -s ' \n' ' ')"
+    say "stable_writes=1: $(for d in /sys/block/*; do [ "$(cat "$d/queue/stable_writes" 2>/dev/null)" = 1 ] && printf '%s ' "$(basename "$d")"; done)"
 } | tee "$OUT/summary.txt"
 chown -R "$U" "$OUT"
 say "done; commit $OUT as $U"

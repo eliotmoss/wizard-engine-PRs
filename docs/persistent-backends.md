@@ -200,7 +200,8 @@ In short: on fsdax the restriction needs the baseline profile and the kernel's
 `fsync` contract; on block storage it also needs every 64-byte line to reach
 the device as it stood at one instant (B2), which no specification promises and
 which holds by construction only under stable writes, which sean-tan-PC's NVMe
-does not request (Magpie's devices were not checked).
+does not request (Magpie's devices are not yet checked; see the last
+follow-up below).
 
 Before the change the backend set a flag in `prepareChangedRange`, called
 `fdatasync` in `persistChanges`, and synced a `persistRange` with an `msync` of
@@ -371,9 +372,16 @@ configurations and pins to the DAX namespace's node.
 
 ```
 # Unit tests: the full binary (2,009 of 2,016 should pass, the 7 known failures
-# failing), then the file backend's restriction checks on their own
+# failing), then the file backend's restriction checks on their own, then the
+# opt-in PMEM DAX integration tests
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
 bin/unittest.x86-64-linux file_mmap:
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
+
+# B2 without root: stable pages requested, and whether any layer is dm-crypt
+cat /sys/block/*/queue/stable_writes
+lsblk -o NAME,TYPE,FSTYPE,MOUNTPOINT
+cat /sys/block/dm-*/dm/uuid
 
 # The file backend's kill loop on /home, ordinary and mutant (cannot discriminate)
 mkdir -p $HOME/pwsieve-file
@@ -482,6 +490,12 @@ the kill loop's result on a second host.
 4. **The A/B under `performance`**, to compare with the 86 % directly:
    `echo performance | sudo tee /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor`,
    then the campaigns above, then set it back to `powersave`.
+5. **Magpie's block stack, for B2.** `scripts/magpie-root-checks.sh` now also
+   records, read-only, `dmsetup table` and `dmsetup info -c` (is `/home`'s LVM
+   volume `linear` and unencrypted, so that no layer copies pages with the
+   CPU?), `lsblk`, the dm uuids and every block device's `queue/stable_writes`,
+   in `block-stack.txt` and a line of `summary.txt`:
+   `sudo env PWROOT_USER=u7599095 <checkout>/scripts/magpie-root-checks.sh`.
 
 ---
 
