@@ -1,0 +1,75 @@
+---- ns per operation; each cell the median over repetitions of a run's statistic
+repetitions: file-block 5 direct-block 5
+
+---- median
+operation          file-block   direct-block
+alloc-1                283242         305654
+alloc-8                283665         305787
+alloc-64               290233         280677
+free-1                 275217         301849
+free-8                 275748         302485
+free-64                299285         277561
+commit-empty                6              6
+timer                       4              4
+mount-1mib              16161         652609
+mount-64mib             14213        9644380
+recover-8              271888         903255
+recover-24             272031         942416
+
+---- p90
+operation          file-block   direct-block
+alloc-1                300624         306872
+alloc-8                307326         307069
+alloc-64               310017         304846
+free-1                 298415         303719
+free-8                 300496         303926
+free-64                303094         279053
+commit-empty                7              7
+timer                       5              6
+mount-1mib              18976         700938
+mount-64mib             17185        9758914
+recover-8              273051         954945
+recover-24             276408         992542
+
+---- spread of the per-run medians, (max - min) / median, %
+operation          file-block   direct-block
+alloc-1                  0.2%           0.1%
+alloc-8                  0.4%           0.3%
+alloc-64                 7.4%           0.2%
+free-1                   0.3%           6.9%
+free-8                   1.0%           8.1%
+free-64                  2.4%           0.1%
+commit-empty            16.7%           0.0%
+timer                    0.0%          25.0%
+mount-1mib               4.1%           9.2%
+mount-64mib              2.0%           1.1%
+recover-8                0.8%          10.3%
+recover-24               0.7%           6.2%
+
+---- work per operation, checked on every operation: entries / boundaries / lines written back
+operation          file-block   direct-block
+alloc-1            16 / 1 / 0    16 / 1 / 15
+alloc-8            16 / 1 / 0    16 / 1 / 17
+alloc-64           16 / 1 / 0    16 / 1 / 17
+free-1             10 / 1 / 0    10 / 1 / 11
+free-8             10 / 1 / 0    10 / 1 / 13
+free-64            10 / 1 / 0    10 / 1 / 13
+commit-empty        0 / 0 / 0      0 / 0 / 0
+timer               0 / 0 / 0      0 / 0 / 0
+mount-1mib          0 / 0 / 0      0 / 0 / 0
+mount-64mib         0 / 0 / 0      0 / 0 / 0
+recover-8           8 / 1 / 0      8 / 1 / 8
+recover-24         24 / 1 / 0    24 / 1 / 24
+
+---- derived, from the medians
+operation          file-block   direct-block
+replay-8               255727         250646
+replay-24              255870         289807
+64mib/1mib               0.9x          14.8x
+
+Each operation is its own committed transaction except commit-empty (production commits nothing for
+it: no boundary) and timer (an empty rdtsc window, the floor under every figure). mount-* opens a
+cleanly closed region; recover-k opens a 1 MiB region whose log holds one committed, unapplied
+transaction of k entries, so replay-k = recover-k - mount-1mib. lines counts writeback requests
+(pmem and direct; 0 where the backend has none). pmem-none drops CLWB and keeps SFENCE: an
+approximation of eADR timing, never durable. A difference is real only outside both spreads.

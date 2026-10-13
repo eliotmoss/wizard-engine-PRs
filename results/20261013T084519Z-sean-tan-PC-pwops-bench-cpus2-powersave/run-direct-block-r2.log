@@ -1,0 +1,18 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwops-bench/bin/pwops-bench-block
+tsc cycles per microsecond 3417
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 249726 median_ns 305877 p90_ns 307182 p99_ns 331844 max_ns 6961476 mean_ns 308130 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 232263 median_ns 302956 p90_ns 304265 p99_ns 327630 max_ns 7152419 mean_ns 305471 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 241354 median_ns 305864 p90_ns 307215 p99_ns 331644 max_ns 7155646 mean_ns 307983 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 239267 median_ns 302826 p90_ns 304121 p99_ns 326926 max_ns 6970258 mean_ns 305017 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 227300 median_ns 280592 p90_ns 294380 p99_ns 307508 max_ns 6962641 mean_ns 284345 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 226852 median_ns 277372 p90_ns 278755 p99_ns 303904 max_ns 6971384 mean_ns 280277 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 4 median_ns 6 p90_ns 7 p99_ns 9 max_ns 21 mean_ns 6 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 4 median_ns 4 p90_ns 5 p99_ns 7 max_ns 1209 mean_ns 4 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 583983 median_ns 640493 p90_ns 700938 p99_ns 747411 max_ns 762295 mean_ns 647612 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 832659 median_ns 894971 p90_ns 954945 p99_ns 979491 max_ns 980825 mean_ns 902190 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 829036 median_ns 903092 p90_ns 953385 p99_ns 1010775 max_ns 1053854 mean_ns 909675 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 9613903 median_ns 9704584 p90_ns 9818909 p99_ns 10496441 max_ns 10786759 mean_ns 9735339 boundaries 0 prepares 0 lines 0
+OK
