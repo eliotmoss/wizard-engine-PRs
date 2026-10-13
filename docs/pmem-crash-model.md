@@ -723,9 +723,9 @@ survived.
 ### The file-backed model is simpler, but not trivial
 
 This document models PMEM. The same seam also carries `FileMmapRegion`, whose
-`prepareChangedRange` / `persistChanges` become `msync` on a page-aligned range
-or `fdatasync` on the whole file, so the question of what a crash can leave
-behind has a second answer that the thesis has to state.
+boundaries reach the file as `fdatasync` (until 2026-10-13 also as `msync` of a
+`persistRange`'s own pages), so the question of what a crash can leave behind
+has a second answer that the thesis has to state.
 
 It is tempting to claim the file backend admits only two images at any cut —
 the state before the boundary and the state after it. **That is wrong.** The
@@ -759,8 +759,12 @@ and on the flush-placement negative control. That is a property of where those
 two backends keep dirty data, not of block storage: the direct backend below
 keeps it in the process, and its crash loop does discriminate.
 
-Implementing a file-backed explorer is not currently planned. Stating the model
-is what the thesis requires; see [Honours Thesis](THESIS.md).
+A file-backed explorer is not needed. Since 2026-10-13 the file backend emits
+the PMEM backend's trace, and under stated assumptions every image it can
+leave is one this model admits for that trace, so the explorer's results carry
+over to it: see [the file backend is a restriction of the PMEM model](#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)
+below. What this section says about the file backend's *own* image set stays
+true; the restriction shows that set is inside the model's.
 
 ### The direct backend is a restriction of the PMEM model
 
@@ -832,6 +836,213 @@ sector *unreadable* rather than old-or-new could take out the slot holding the
 only durable copy of acknowledged data. The same holds for the mmap file
 backend, whose writeback is page-granular. The layout, not the interface, has to
 know the device's write unit to rule it out.
+
+### The file backend is a restriction of the PMEM model, on block storage only conditionally
+
+Since 2026-10-13 the mapped-file backend (`FileMmapRegion`, see
+[Persistent Backends](persistent-backends.md#implementations)) sits on the seam
+as the direct backend does. `prepareChangedRange` issues one `clwb()` per
+64-byte line through the region's provider, which is the direct backend's
+`DirectIoOperations` and marks the line's 4 KiB page instead of executing
+`CLWB`; `persistChanges` and `persistRange` issue one `sfence()` and then sync
+every marked page, with one `fdatasync` of the file when any page is marked and
+nothing otherwise. `persistRange` syncs every marked page, not only its own,
+because the `SFENCE` that ends a PMEM `persistRange` completes every
+outstanding `CLWB`. Its trace is the PMEM backend's for the same history
+(`file_mmap:trace_matches_pmem_region`), so, as for the direct backend, the
+question is only which durable images each admits. Before the change the file
+backend issued no writeback request at all, so its trace said nothing was ever
+made durable and the model could not speak for it.
+
+**Which fence.** One `fdatasync`, chosen against two alternatives. An
+`msync(MS_SYNC)` per run of marked pages syncs exactly what was asked, but on
+ext4 each call is an `fsync` of its range with its own journal commit or device
+flush (`ext4_sync_file()`), so a fence over several runs pays several flushes:
+in the sieve, 7.67 syncs a step instead of 4.00 and a step 78 % slower on
+sean-tan-PC's NVMe ([measured](persistent-backends.md#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
+`sync_file_range()` writes no metadata and sends the device no flush, so it
+covers neither a page's first allocation nor the device's cache, and cannot be
+a fence at all. `fdatasync` makes durable every page of the file dirty when it
+is called, marked or not, with one flush; an unmarked dirty page holds each of
+its lines' full prefix, the model's eviction, so the superset is admitted.
+
+**Claim.** Every durable image the file backend can leave is an image this
+model admits for the same trace, provided the assumptions below hold for its
+medium. A crash anywhere inside a fence's sync is admitted at the cut just
+before that fence's `SFENCE`, which is recorded before the sync is issued. On
+fsdax the assumptions are the baseline profile's own plus the kernel's `fsync`
+contract. On block storage they include one, B2, that no specification
+guarantees, and that holds by construction only when the filesystem has stable
+writes, which sean-tan-PC's NVMe does not request (Magpie's devices were not
+checked).
+
+**On fsdax.** There is no page cache. The mapping is the media, stores reach it
+through the CPU cache, and dirty lines are evicted when the CPU chooses: the
+model's background eviction, under the baseline profile unchanged. The kernel
+adds no writeback of its own between fences: `dax_writeback_mapping_range()`
+returns at once unless the writeback is `WB_SYNC_ALL` (`fs/dax.c`, Linux v7.0),
+so the background flusher writes nothing. At a fence, `fdatasync` writes back
+every line of every entry dirtied since its last writeback (`dax_writeback_one()`
+issues `CLWB` over the whole 4 KiB or 2 MiB entry and write-protects it), and
+the filesystem's cache flush reaches the pmem driver, whose `nvdimm_flush()`
+ends in `wmb()`, an `SFENCE`. The next store to a cleaned entry faults and
+re-dirties it. A fence therefore writes back a superset of the lines requested
+before it, and the extra lines are eviction, which the model admits. Beyond the
+baseline profile this needs:
+
+- **X1.** `fdatasync` on a DAX file returns only once every line of every entry
+  dirtied since that entry's last writeback is in the persistence domain,
+  together with the block allocations needed to read it back. The region is
+  mapped without `MAP_SYNC`, so the first store to a hole allocates a block,
+  and that mapping is metadata. *Argued from the kernel source above; not
+  checked.*
+- **X2.** Until that allocation is durable, the page reads as zeros, the file's
+  initial content, which the model admits for every line no fence has covered
+  yet; the fence that covers a line commits its page's allocation. *Argued from
+  the ext4 and XFS allocation paths (B5 below); not checked.*
+
+**On block storage, through the page cache.** The kernel writes any dirty page
+back at any time with its current contents. For that to be the model's
+eviction of every dirty line in the page, and a fence's `fdatasync` the
+model's fence, the backend needs:
+
+| | Assumption | Status |
+|---|---|---|
+| B1 | One writer, and every persistent store through the provider | Checked: the store audit (milestone 2), and the file after every sync is the trace's full image (`file_mmap:boundary_images_are_model_images`) |
+| B2 | Each 64-byte line the device receives holds the line as it stood at one instant | **Argued only; not guaranteed.** Below |
+| B3 | Each naturally aligned 512-byte sector holds, after a crash, the data of one write issued to it or its earlier content: never a mixture, never unreadable | A device property, reported and not checked: sean-tan-PC's NVMe gives `atomic_write_unit_max_bytes` 512 |
+| B4 | A completed flush, or FUA write, makes durable what a read would then return, and the filesystem issues one in every `fdatasync` | Not checked. ext4 issues one per call (`ext4_sync_file()` → `blkdev_issue_flush()`); a write-through device, such as Magpie's controller, is sent none, and its acknowledgement is the boundary |
+| B5 | Data is overwritten in place, and a block not yet durably part of the file reads as zeros | Argued for ext4 `data=ordered` and `data=writeback` with delayed allocation, and XFS without reflinked extents; exclusions below |
+
+Two kernel facts complete it, both confirmed in the Linux v7.0 source and the
+second also checked: a page is never written twice at once (background
+writeback skips a page under writeback, and `fdatasync` waits for it, so a
+background write already in flight also completes before `fdatasync`
+returns); and `fdatasync` writes back every page of the file that is dirty
+when it is called (`file_mmap:synced_pages_reach_the_device`).
+
+*Can a page be written back while the program is still storing to it?* Yes,
+unless the filesystem requires stable writes. Writeback write-protects the page
+(`folio_clear_dirty_for_io()` → `folio_mkclean()`), and the next store faults
+into `ext4_page_mkwrite()` (XFS: `iomap_page_mkwrite()`), whose
+`folio_wait_stable()` waits for the writeback only when the mapping has stable
+writes. Otherwise the store proceeds while the device may still be reading the
+page. Stable writes are taken from the block device at mount
+(`setup_bdev_super()`), and only integrity checksums, `md` RAID5 with
+`skip_copy` and a few network block devices request them; sean-tan-PC's NVMe
+reports `stable_writes` 0. btrfs waits whatever the device says.
+
+*Does each 64-byte line then still hold a prefix of its stores?* Only if B2
+holds. With one writer, x86's store order makes a line's contents at any
+instant a prefix of the stores to it, so a device that reads each line at one
+instant receives a prefix. x86 servers service a device read with one coherent
+request per 64-byte line (Intel's DDIO documentation: "Even if the I/O agent
+requests a partial cache-line read, a full cache-line is read from coherent
+memory"), which suggests B2 holds in practice for DMA straight from the page
+cache. No document promises it. The PCI Express Base Specification puts it
+outside its scope (§2.4.2, "Update Ordering and Granularity Observed by a Read
+Transaction"): under concurrent CPU updates "the Requester may observe an
+updated value in location B and an old value in location A, regardless of the
+placement of locations A and B within the data block", even a QWORD may be seen
+half-updated, and only DWORD granularity is recommended. B2 is *false* wherever
+the CPU copies the page piecewise while the program stores to it: `swiotlb`
+bounce buffering, `dm-crypt`, `md` RAID5 without `skip_copy`. A copy that reads
+a line's first half, then its second, can catch a later store to the second
+half and miss an earlier store to the first, which is no prefix. With stable
+writes the page cannot change while it is written, and B2 holds by
+construction. sean-tan-PC's storage path (ext4 on an NVMe partition) copies no
+pages, so there B2 is the platform's DMA read granularity. Magpie's (ext4 on an
+LVM volume on the RAID controller) should not either, if the volume is linear
+and unencrypted, as its name suggests; its device-mapper table was not checked
+(`sudo dmsetup table`).
+
+*Sector atomicity, flushes, filesystems.* A 512-byte sector holds eight whole
+lines, so under B3 every line is old or new. The model admits either, line by
+line, when both are prefixes at or above the line's floor. The old content is a
+prefix because writes of one page never overlap. The floor rises only at a
+fence, and the fence's flush (B4) leaves each sector at least as new as its
+last write before the flush. B5 excludes three configurations:
+
+- ext4 `data=journal`, where data goes through the journal and jbd2 copies
+  pages modified during a commit;
+- copy-on-write placement (btrfs's default, XFS reflinked extents, ZFS,
+  bcachefs), whose per-page versions this argument does not cover;
+- ext4 `data=writeback` without delayed allocation or without `dioread_nolock`,
+  which can expose stale data in a block allocated before its data is written.
+
+The region file is created sparse (`O_TRUNC`, then `ftruncate`), so the first
+write-back of each page allocates. With ext4's defaults (delayed allocation,
+`dioread_nolock`) and on XFS the new block is an unwritten extent until the
+write completes and its conversion commits, and until then the page reads as
+zeros: the initial content, which the model admits until a fence covers the
+page. `fdatasync` commits the conversion, because it is metadata needed to read
+the data (ext4 advances `i_datasync_tid` for it). `fallocate`'s unwritten
+extents behave the same way.
+
+**Checked, not only argued.** `FileMmapRegionTest.v3` records a format, an
+allocation, user data made durable with `persistRange` while that allocation's
+after-images still wait (the sieve's step, and the one place a fence must
+drain more than its own range), a second allocation, a free and a clean close,
+over a real file, with both fences, at 2 KiB and 4 KiB blocks:
+
+- `file_mmap:fences_sync_every_requested_page` replays the trace alone, not the
+  region's marks: every page holding a line written back before a fence must be
+  covered by the syncs that fence issues, and every sync must follow an
+  `SFENCE`.
+- `file_mmap:boundary_images_are_model_images` checks, after each fence, two
+  images with the direct backend's exact check (`dioAdmittedAt()`): the file as
+  the page cache holds it, which is every page written back (the eager
+  extreme), and the *marked-only* image, the initial file overwritten at each
+  sync by the pages that were marked, which is the least those syncs guarantee
+  (the lazy extreme). Any page the kernel writes beyond that holds each line's
+  full prefix, admitted line by line. Every image during a fence is checked at
+  the cut just before its `SFENCE`.
+- `file_mmap:synced_pages_reach_the_device` re-reads each synced range with
+  `O_DIRECT` right after the sync and requires the page cache's bytes. The
+  range is clean, so the read writes nothing back first. This checks, on the
+  test host's filesystem and device, that a fence's sync wrote what it was
+  asked for; it runs where the direct backend's tests run (`bin/` on
+  sean-tan-PC, since `/tmp` is tmpfs).
+
+The checks can fail. A deliberately broken `msync` fence that syncs only its
+first run of pages fails both the coverage and the image check. As mutations
+of production code, run once and reverted: a `persistRange` that syncs only its
+own pages fails both, and a `persistRange` without its writeback requests fails
+the trace check.
+
+**What remains argued.** The device's image *between* fences. Reading the file
+through the page cache shows memory, not the device, and an `O_DIRECT` read of
+a range holding dirty pages makes the kernel write them back first, which
+perturbs the state under test. So B2–B5, X1 and X2 are argued, and B2 is the
+weak one. Three follow-ups would check more; all need root:
+
+1. **A kernel crash on block storage.** `pwreboot` already runs the file
+   backend (`setup`/`arm`/`verify` with `file`), and `arm` with an inherited
+   `/proc/sysrq-trigger` descriptor resets the machine straight after the
+   last acknowledgement. A warm reset loses the page cache but not, on most
+   machines, the device's cache, so the ordinary build must give `SURVIVED`
+   and the elided-writeback mutant, whose fences now sync nothing, `LOST`:
+   the discrimination the kill loop cannot make (commands in
+   [Persistent Backends](persistent-backends.md#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
+2. **Block-level images.** dm-log-writes logs every write and flush beneath
+   the filesystem; `replay-log` (xfstests) rebuilds the device at every entry,
+   and each image, once its filesystem is mounted on a copy, can be compared
+   with the trace by the same check. The log copies each write's data with the
+   CPU when the write is submitted, so it checks B3–B5 over the writes the
+   kernel issued, not B2. Commands in the same section.
+3. **Stable writes.** `echo 1 > /sys/block/<dev>/queue/stable_writes` before
+   mounting makes B2 hold by construction; the setting is read only at mount.
+
+**What changes against the PMEM model.** Process death loses nothing: the page
+cache is the kernel's. A `SIGKILL` therefore samples the eager image, and the
+crash loop cannot discriminate flush placement on this backend, before or after
+the change. On 2026-10-13, after it, on sean-tan-PC's NVMe: `pwsieve` with the
+ordinary provider `OK` over 20 kills (20 acknowledged-step checks, 0 lost); with
+the elided-writeback mutant, whose fences sync nothing, also `OK`. The mutant
+never waits for the device, so at the default delay it fills the sieve's table
+after 4 kills (4 checks, 0 lost); with the kill delay capped at 2,000 µs it
+takes all 20 (6 checks, 0 lost). As on DAX, the evidence for the file backend is the model plus
+the checks above.
 
 ### Scale
 

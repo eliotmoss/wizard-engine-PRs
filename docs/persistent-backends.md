@@ -183,6 +183,304 @@ about the device under power loss: a killed process never takes the device's
 cache with it. The relation of this backend's crash images to the PMEM model is
 stated in [PMEM Crash Model](pmem-crash-model.md#the-direct-backend-is-a-restriction-of-the-pmem-model).
 
+## The file backend, a restriction of the PMEM model (2026-10-13)
+
+`FileMmapRegion` now sits on the persistent-operations seam as the direct
+backend does, so the PMEM crash model, and with it every explorer result, speaks
+for it. `prepareChangedRange` issues one `clwb()` per 64-byte line through the
+region's provider, which is the direct backend's `DirectIoOperations` and marks
+the line's 4 KiB page; `persistChanges` and `persistRange` issue one `sfence()`
+and then one `fdatasync` if any page is marked, and nothing otherwise. The
+recorded trace is the PMEM backend's for the same history
+(`file_mmap:trace_matches_pmem_region`). The argument that every image the
+backend can leave is one the model admits for that trace, its assumptions, and
+which of them are checked, are in
+[PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally).
+In short: on fsdax the restriction needs the baseline profile and the kernel's
+`fsync` contract; on block storage it also needs every 64-byte line to reach
+the device as it stood at one instant (B2), which no specification promises and
+which holds by construction only under stable writes, which sean-tan-PC's NVMe
+does not request (Magpie's devices were not checked).
+
+Before the change the backend set a flag in `prepareChangedRange`, called
+`fdatasync` in `persistChanges`, and synced a `persistRange` with an `msync` of
+the range's own pages. Two things differ. The trace holds the `CLWB`s; before,
+it said nothing was ever written back, so the model could not speak for the
+backend. And a `persistRange` syncs every marked page, not only its own, because
+the `SFENCE` that ends a PMEM `persistRange` completes every outstanding `CLWB`.
+In the sieve that `persistRange` is the bitmap's, which now also makes the
+allocation's after-images durable, one boundary earlier than before.
+
+### The fence: one `fdatasync`
+
+- **`msync(MS_SYNC)` per run of marked pages** syncs exactly what was asked, but
+  on ext4 each call is an `fsync` of its range with its own journal commit or
+  device flush, so a fence over several runs pays several flushes. Measured
+  below as `file-block-msync`: 7.67 syncs a sieve step instead of 4.00, and the
+  step 78 % slower.
+- **`sync_file_range()`** writes no metadata and sends the device no flush, so it
+  covers neither a page's first allocation nor the device's cache. Its manual
+  page: unless the writes only overwrite already-allocated blocks "there are no
+  guarantees that the data will be available after a crash", and it "does not
+  flush disk write caches". It cannot be a fence, so it was not measured.
+- **`fdatasync`** makes durable every page of the file dirty when it is called,
+  marked or not, with one flush. An unmarked dirty page holds each of its lines'
+  full prefix, which is the model's eviction, so the superset is admitted.
+
+`FileBoundary.MSYNC` and `FileBoundary.LEGACY`, the boundary before the change,
+stay selectable through `FileMmapBackend.boundary` and the benchmarks'
+`boundary=` keyword, for comparison only.
+
+### Cost, old against new (sean-tan-PC, 2026-10-13)
+
+Each campaign ran every configuration from one binary (the sieve and pwops at
+`c1dfd14f`, pwbench at `e3c04344`, whose engine and benchmark code are the
+same), interleaved within each repetition, five repetitions, pinned to CPU 2 (a performance core), on the NVMe
+root (ext4 on `/dev/nvme1n1p3`, `bin/ab-block`). The governor was `powersave`
+(EPP `balance_performance`); it cannot be changed without root. These figures
+compare with each other and with the 2026-09-28 `powersave` runs, not with the
+`performance` figures elsewhere in this document.
+
+**Sieve step** (`results/20261013T124441Z-sean-tan-PC-pwsieve-bench-cpus2-powersave-file-ab`,
+256 × 4 KiB, 20 rounds of 159 steps). Wall time per step, the median over
+repetitions with their range; the median step (`rdtsc`) likewise; phases are
+means:
+
+| Boundary | Wall per step (range) | Median step (range) | compute | alloc | bitmap | publish | retire | persistence (share) | syncs per step |
+|---|---|---|---|---|---|---|---|---|---|
+| new | 1,540 µs (1,521–1,545) | 1,593 µs (1,582–1,595) | 497 µs | 267 µs | 265 µs | 252 µs | 259 µs | 1,042 µs (67.7 %) | 4.00 |
+| legacy | 1,528 µs (1,510–1,535) | 1,572 µs (1,570–1,575) | 490 µs | 269 µs | 255 µs | 255 µs | 259 µs | 1,038 µs (67.9 %) | 4.00 |
+| `msync` per run | 2,734 µs (2,704–2,769) | 2,667 µs (2,661–2,670) | 708 µs | 619 µs | 863 µs | 266 µs | 277 µs | 2,025 µs (74.1 %) | 7.67 |
+
+- **New against legacy: a small cost, consistent in the median and not
+  resolvable in the mean.** Wall time per step is 0.8 % longer, inside both
+  ranges. The median step is 1.3 % longer, and that is in every repetition:
+  the ranges do not meet. The persistence phases are 4 µs (0.4 %) longer, and
+  the share is the same (67.7 against 67.9 %). The phases show where the work
+  moved: the bitmap's boundary is 10 µs longer and the publish commit 4 µs
+  shorter, in every repetition, as expected now that the bitmap's fence also
+  writes the allocation's after-image pages, which the publish commit used to.
+- **`msync` per run costs 78 % a step**, 80 % of it in the two phases whose
+  fences span several runs: the allocation (619 against 267 µs) and the bitmap
+  (863 against 265 µs). The computation is also 42 % longer, plausibly the
+  clock penalty of blocking more often under `powersave` (see the sieve
+  section).
+- 2026-09-28's `powersave` run with the legacy boundary
+  (`results/20260928T105045Z-sean-tan-PC-pwsieve-bench-cpus2-powersave`) gave
+  1,558 µs, 1,042 µs of persistence and 66.9 %: the same machine state.
+
+**Commit boundary** (pwbench, `results/20261013T130143Z-sean-tan-PC-pwbench-cpus2-powersave-file-ab`,
+512 × 4 KiB, 20,000 commits after 2,000 warm-up; commit `e3c04344`, whose
+engine and benchmark code are `c1dfd14f`'s). The boundary's median, then the
+wall time per commit, each the median over repetitions with their range:
+
+| Entries | new boundary | legacy boundary | `msync` boundary | new per commit | legacy per commit | lines per commit (new) |
+|---|---|---|---|---|---|---|
+| 1 | 241.3 µs (241.2–241.8) | 241.9 µs (241.7–242.4) | 241.1 µs (240.8–241.5) | 255.5 µs (254.6–258.5) | 255.9 µs (255.0–257.0) | 4 |
+| 8 | 255.3 µs (235.8–258.3) | 237.0 µs (236.6–237.4) | 236.9 µs (235.4–242.0) | 267.6 µs (265.6–278.0) | 263.5 µs (262.9–265.8) | 8 |
+| 24 | 241.6 µs (241.3–242.3) | 245.0 µs (245.0–245.5) | 241.6 µs (241.1–241.7) | 280.9 µs (278.6–281.7) | 278.9 µs (276.5–283.3) | 18 |
+
+- **The same boundary within this drive's two modes.** At 1 entry the three
+  are equal. At 24 the new boundary is 3.4 µs (1.4 %) *shorter* than legacy's
+  in every repetition, unexplained and small. At 8 entries three of the five
+  new runs sit in the upper of the two levels about 20 µs apart that this drive
+  shows (see [basic operations](#basic-operations-what-an-allocation-a-free-a-mount-and-a-recovery-cost-2026-10-13),
+  "two modes"), and no legacy run does; the other two new runs are at
+  legacy's level. Per commit, new is 0.2 % faster at 1 entry and 1.6 % and
+  0.7 % slower at 8 and 24, inside or at the edge of the ranges.
+- **The `msync` fence is the same as `fdatasync` here**, one sync a commit:
+  pwbench's record page and the previous commit's after-image page are
+  adjacent, so a fence marks one run. The sieve's fences span several runs,
+  which is what makes it 78 % slower there.
+- The file backend now reports the lines its commits write back, as the PMEM
+  and direct backends do: 4, 8 and 18 a commit. Legacy reports none.
+
+**Basic operations** (pwopsbench, `results/20261013T124629Z-sean-tan-PC-pwops-bench-cpus2-powersave-file-ab`,
+50,000 operations after 2,000 warm-up, 200 mounts after 20). The median over
+repetitions of each run's median, the spread of those medians, and the p90:
+
+| Operation | new median (spread) | legacy median (spread) | new p90 | legacy p90 | work, new (legacy) |
+|---|---|---|---|---|---|
+| `alloc-1` | 283,225 (0.3 %) | 283,095 (0.2 %) | 306,997 | 306,406 | 16 / 1 / 15 (0) |
+| `alloc-8` | 284,299 (11.4 %) | 283,123 (0.2 %) | 308,911 | 306,519 | 16 / 1 / 17 (0) |
+| `alloc-64` | 307,167 (0.4 %) | 287,293 (7.8 %) | 310,858 | 309,591 | 16 / 1 / 17 (0) |
+| `free-1` | 275,308 (0.3 %) | 275,533 (0.5 %) | 299,388 | 300,191 | 10 / 1 / 11 (0) |
+| `free-8` | 277,452 (16.4 %) | 275,294 (1.2 %) | 300,860 | 299,911 | 10 / 1 / 13 (0) |
+| `free-64` | 299,359 (0.1 %) | 298,570 (6.6 %) | 302,710 | 302,419 | 10 / 1 / 13 (0) |
+| `mount-1mib` | 14,676 (52.5 %) | 16,265 (4.8 %) | 18,793 | 19,057 | 0 / 0 / 0 |
+| `mount-64mib` | 4,474 (29.2 %) | 16,624 (1.6 %) | 4,974 | 17,671 | 0 / 0 / 0 |
+| `recover-8` | 271,424 (8.7 %) | 271,767 (0.7 %) | 272,940 | 272,719 | 8 / 1 / 8 (0) |
+| `recover-24` | 271,658 (8.5 %) | 271,734 (0.8 %) | 279,565 | 279,607 | 24 / 1 / 24 (0) |
+| `replay-8` (derived) | 256,748 | 255,502 | | | |
+| `replay-24` (derived) | 256,982 | 255,469 | | | |
+
+ns per operation; work is entries / boundaries / lines written back, checked on
+every operation.
+
+- **Allocations, frees and recoveries are unchanged** outside the two modes:
+  every p90 is within 0.8 %, and where both spreads are under 1 % (`alloc-1`,
+  `free-1`) the medians are within 0.1 %. The large spreads are runs in the
+  other mode, in both configurations. `alloc-64` is 306–308 µs in all five new
+  runs, and 284–287 µs in three legacy runs and 305–306 µs in the other two.
+  The new run of repetition 4 is 20–30 µs below the others in `alloc-8`,
+  `free-8` and both recoveries (and its 1 MiB mount 8.9 against 14–17 µs), and
+  new `free-8` has one run 20 µs above. The replay is one `fdatasync` either
+  way, 255.5–257.0 µs.
+- **The 64 MiB mount is not faster.** Its 4.5 against 16.6 µs reproduced in
+  every repetition and in either order, with the same system calls and the
+  same minor faults (17.3 and 17.4 per iteration of the mount loops;
+  `mount-transient.txt` in the results). With 5,000 samples
+  instead of 200 the two agree, 3.8 and 3.9 µs: the difference is a transient
+  at the start of the 200-sample loop, which follows the 64 MiB format's sync.
+  Legacy's figure equals the 1 MiB mount's, which alternates with recoveries
+  that block, so the clock is a plausible cause; untested. The same transient
+  is probably in the 14.2 µs reported for this mount below.
+- The file backend's work column now has lines: the same as the direct
+  backend's for every operation.
+
+### Do the quoted sieve figures change?
+
+The sieve section's 86 % (sean-tan-PC's NVMe, 85.6 %, `performance`) and 55 %
+(Magpie's `/home`, 54.6 %) were measured with the legacy boundary. On
+sean-tan-PC under `powersave` the share is 67.7 % against 67.9 %, unchanged
+within its spread, while the median step is 1.3 % longer. Nothing here suggests
+the 86 % would move by more than a point under `performance`, but that is
+inferred: the rerun needs root to set the governor. Magpie's `/home` is a
+different storage path (LVM on a write-through RAID controller, where the
+boundary is the controller's acknowledgement, not a flush) and was not
+re-measured; until it is, the 55 % stands for the legacy boundary only.
+
+### Crash behaviour
+
+Unchanged by the restriction: process death loses nothing on this backend,
+because the page cache is the kernel's, so a `SIGKILL` samples the model's
+eager image and the kill loop cannot discriminate flush placement. On
+sean-tan-PC's NVMe after the change, `pwsieve` with the ordinary provider gave
+`OK` over 20 kills (20 acknowledged-step checks, 0 lost), and so did the
+elided-writeback mutant, whose fences now sync nothing: 4 kills at the default
+delay before the table filled (4 checks, 0 lost), and 20 with the kill delay
+capped at 2,000 µs (6 checks, 0 lost). The evidence for this backend is the
+model and the checks in `FileMmapRegionTest.v3`.
+
+### On Magpie
+
+Run from a clean tree at the commit under test; each campaign interleaves its
+configurations and pins to the DAX namespace's node.
+
+```
+# Unit tests: the full binary (2,009 of 2,016 should pass, the 7 known failures
+# failing), then the file backend's restriction checks on their own
+make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
+bin/unittest.x86-64-linux file_mmap:
+
+# The file backend's kill loop on /home, ordinary and mutant (cannot discriminate)
+mkdir -p $HOME/pwsieve-file
+make bin/pwsieve.x86-64-linux
+for p in ordinary elide-clwb; do
+    bin/pwsieve.x86-64-linux $HOME/pwsieve-file 20 1 512 4096 file $p
+done
+
+# Sieve step, file on DAX and on /home, old against new
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean PWSB_BLOCK_DIR=/home/users/u7599095 \
+    PWSB_CONFIGS="file-dax file-dax-legacy file-dax-msync file-block file-block-legacy file-block-msync" \
+    PWSB_NUMA_NODE=0 scripts/pwsieve-bench.sh campaign
+
+# Commit boundary (pwbench), the same configurations
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean PWEXP_BLOCK_DIR=/home/users/u7599095 \
+    PWEXP_CONFIGS="file-dax file-dax-legacy file-dax-msync file-block file-block-legacy file-block-msync" \
+    PWEXP_NUMA_NODE=0 PWEXP_REPS=5 PWEXP_SIZES="1 8 24" scripts/pmem-experiments.sh cost
+
+# Basic operations (pwopsbench has no msync boundary)
+PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean PWOB_BLOCK_DIR=/home/users/u7599095 \
+    PWOB_CONFIGS="file-dax file-dax-legacy file-block file-block-legacy" \
+    PWOB_NUMA_NODE=0 scripts/pwops-bench.sh campaign
+```
+
+The unit tests never touch DAX: `file_mmap:` writes its region in `/tmp`, and
+the `O_DIRECT` re-read in whichever of `/tmp` and `bin/` honours `O_DIRECT`, so
+on Magpie it checks that path's filesystem and device. Nothing in the
+restriction's checks needs Magpie; the runs above price it there and confirm
+the kill loop's result on a second host.
+
+### Follow-ups that need root
+
+1. **A kernel crash on block storage, with discrimination.** `pwreboot` already
+   runs the file backend, and `arm` with an inherited `/proc/sysrq-trigger`
+   descriptor resets the machine straight after the `fsync` of its last
+   acknowledgement. A warm reset discards the page cache, so the ordinary build
+   should give `SURVIVED` and the mutant `LOST`. On sean-tan-PC (this resets
+   the machine; keep the region's directory off any filesystem the reset could
+   damage, and if possible the state files on a different filesystem from the
+   region, so that their `fsync` cannot write the region back):
+
+   ```
+   make bin/pwreboot.x86-64-linux
+   D=$HOME/pwfile-reboot && mkdir -p "$D"
+   bin/pwreboot.x86-64-linux setup "$D" "$D/setup.state" file 512 4096 2
+   sync -f "$D"
+   R=$(awk '$1 == "region" { print $2 }' "$D/setup.state")
+   sudo sh -c "exec 3>/proc/sysrq-trigger && exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- $PWD/bin/pwreboot.x86-64-linux arm $R $D/arm.state file elide-clwb 512 4096 3 3"
+   # after the machine is back:
+   bin/pwreboot.x86-64-linux verify "$R" file 512 4096 \
+       "$(awk '$1 == "setup_cursor" { print $2 }' "$D/setup.state")" \
+       "$(awk '$1 == "acked_cursor" { print $2 }' "$D/arm.state")" \
+       "$(awk '$1 == "acked_count" { print $2 }' "$D/arm.state")"
+   ```
+
+   Then the same with `ordinary` in place of `elide-clwb`, and a fresh `D`.
+   `scripts/stage2c.sh` treats the file backend as a dry run without a reboot,
+   so it cannot be used as it stands.
+
+2. **Block-level images (dm-log-writes).** The `log-writes` device-mapper target
+   logs every write and flush beneath the filesystem, and xfstests'
+   `replay-log` rebuilds the device entry by entry. Each image, mounted on a
+   copy, could be checked against the trace. It checks B3–B5 over the writes the
+   kernel actually issued, not B2: the target copies each write's data when it
+   is submitted, not when the device reads it. Each prefix of the log is one
+   crash state; losing an arbitrary subset of the writes completed since the
+   last flush is not enumerated. What is missing is the checker: a dump of the
+   scenario's trace and an offline `dioAdmittedAt()` over a region file. An
+   image between fences k and k + 1 must be admitted at the cut just before
+   `SFENCE` k + 1, and must meet fence k's floor. The setup, on loop devices:
+
+   ```
+   # replay-log: two C files from xfstests, system headers only
+   git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /tmp/xfstests
+   gcc -O2 -o $HOME/bin/replay-log /tmp/xfstests/src/log-writes/replay-log.c /tmp/xfstests/src/log-writes/log-writes.c
+
+   truncate -s 1G /var/tmp/lw-data.img /var/tmp/lw-log.img /var/tmp/lw-replay.img
+   DATA=$(sudo losetup -f --show /var/tmp/lw-data.img)
+   LOG=$(sudo losetup -f --show /var/tmp/lw-log.img)
+   REPLAY=$(sudo losetup -f --show /var/tmp/lw-replay.img)
+   sudo dmsetup create lw --table "0 $(sudo blockdev --getsz $DATA) log-writes $DATA $LOG"
+   sudo mkfs.ext4 -q /dev/mapper/lw
+   sudo dmsetup message lw 0 mark mkfs
+   sudo mkdir -p /mnt/lw && sudo mount /dev/mapper/lw /mnt/lw && sudo chown $USER /mnt/lw
+   bin/pwsieve.x86-64-linux /mnt/lw 5 1 512 4096 file    # or the trace scenario, once it can dump its trace
+   sudo dmsetup message lw 0 mark done
+   sudo umount /mnt/lw && sudo dmsetup remove lw
+
+   # Rebuild the filesystem, then replay to each flush and run the check there.
+   sudo $HOME/bin/replay-log --log $LOG --replay $REPLAY --end-mark mkfs
+   sudo $HOME/bin/replay-log --log $LOG --replay $REPLAY --start-mark mkfs --end-mark done \
+       --check flush --fsck /var/tmp/lw-check.sh
+   ```
+
+   `replay-log` stops at the first check that exits non-zero. `lw-check.sh`
+   must not change the replay device, so it copies it first:
+   `cp --sparse=always /var/tmp/lw-replay.img /var/tmp/lw-copy.img`, then
+   `mount -o loop` the copy (the journal is recovered on the copy), runs the
+   checker on the region file, and unmounts. `--check 1` checks after every
+   entry instead of every flush.
+
+3. **Stable writes.** `echo 1 | sudo tee /sys/block/nvme1n1/queue/stable_writes`
+   before the filesystem is mounted makes B2 hold by construction; the setting
+   is read only at mount, so for the root filesystem it needs a reboot path that
+   sets it first (a udev rule). Then rerun the A/B above to price it.
+4. **The A/B under `performance`**, to compare with the 86 % directly:
+   `echo performance | sudo tee /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor`,
+   then the campaigns above, then set it back to `powersave`.
+
 ---
 
 ## Persistence-boundary cost (measured 2026-09-18, Magpie)
@@ -890,7 +1188,8 @@ type lives in computation, not in the persistence path.
   after each `fdatasync` described above. On the NVMe, persistence is 79–86 % of
   a step.
 - **Four boundaries per step on every backend**, as designed: three commits and
-  the bitmap's `persistRange()`, which on the file backend is an `msync`. On the
+  the bitmap's `persistRange()`, which on the file backend was then an `msync`
+  (since 2026-10-13 an `fdatasync`; [old against new](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)). On the
   NVMe each costs about 235 µs (P-core), close to the 237 µs pwbench records for
   this machine's file-backend boundary. The direct backend is 2.6 % slower than the file backend
   there, the direction pwbench shows on this machine (241 against 237 µs per
@@ -1138,8 +1437,9 @@ pinned to CPU 2 (a performance core), block storage the Solidigm NVMe root
 wait for Magpie, and the governor could not be changed without root (see the
 last point below). ns per operation, the median over repetitions of each run's
 median and p90, with the spread of the medians; the work column is the direct
-backend's, and the file backend's is the same with 0 lines, since its
-preparation makes no writeback request:
+backend's, and the file backend's was the same with 0 lines, since its
+preparation then made no writeback request (since 2026-10-13 it is the same
+with the lines; [old against new](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)):
 
 | Operation | `file` median | `file` p90 | `direct` median | `direct` p90 | entries / boundaries / lines |
 |---|---|---|---|---|---|
@@ -1204,7 +1504,9 @@ PMEM path itself.
   at 397 µs. That the file backend's 1 MiB mount is slower than its 64 MiB one
   is plausibly the clock (last point): the 1 MiB samples alternate with
   recoveries that block in `fdatasync`, while the 64 MiB mounts run back to
-  back and never block. Untested.
+  back and never block. Untested. The 64 MiB figure is itself mostly a
+  transient at the start of its 200-sample loop: over 5,000 samples it is
+  3.8–3.9 µs ([measured 2026-10-13](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
 - **A recovery is a mount plus one boundary.** The replay costs 256 µs on the
   file backend at both sizes, one `fdatasync` (pwbench's file boundary on this
   drive is 237 µs). On the direct backend 251 and 290 µs; the 39 µs between 8
@@ -1796,15 +2098,17 @@ retains typed `STORE`/`CLWB`/`SFENCE` events for deterministic tests.
 | Class | Storage | `prepareChangedRange` | `persistChanges` | `persistRange` |
 |---|---|---|---|---|
 | `VolatileRegion` | `Array<byte>` (GC'd) | no-op | no-op | no-op |
-| `FileMmapRegion` | file + `mmap(MAP_SHARED)` | sets `hasDirtyChanges` | `fdatasync()` if dirty | page-aligned `msync()` |
+| `FileMmapRegion` | file + `mmap(MAP_SHARED)` | provider `clwb()` per line marks its 4 KiB page (the direct backend's `DirectIoOperations`); sets `hasDirtyChanges` | fence, then one `fdatasync()` if any page is marked | as `persistChanges`, after marking the range: syncs every marked page |
 | `PmemMmapRegion` | file + `mmap(MAP_SHARED_VALIDATE\|MAP_SYNC)` | cache-line flush; sets `hasPendingWriteback` | store fence | flush range + store fence |
 | `DirectIoRegion` | anonymous staging buffer + `O_DIRECT` file or block device | provider `clwb()` per line marks its 4 KiB unit; sets `hasPendingWriteback` | fence, `pwrite` marked units, `fdatasync` | as `persistChanges`, after marking the range: drains every marked unit |
 
 `FileMmapRegion`, `PmemMmapRegion` and `DirectIoRegion` all extend `FdMmapRegion`, which holds the `Mapping` and `fd` and handles `destroy()`. For `DirectIoRegion` the `Mapping` is the anonymous staging buffer, not a mapping of the `fd`.
 
+Until 2026-10-13 `FileMmapRegion` set a flag in `prepareChangedRange`, called `fdatasync` in `persistChanges` if it was set, and synced a `persistRange` with `msync(MS_SYNC)` of the range's own pages; it made no provider call, so its trace held no `CLWB` and the PMEM model said nothing about it. That boundary is still selectable, for the old-against-new comparison only, as `FileBoundary.LEGACY` (`FileMmapBackend.boundary`, the benchmarks' `boundary=legacy`), and so is `FileBoundary.MSYNC`, one `msync` per run of marked pages in place of the `fdatasync`; see [the file backend, a restriction of the PMEM model](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13).
+
 ```
 FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
-  ├── FileMmapRegion   (disk durability via msync/fdatasync)
+  ├── FileMmapRegion   (marks pages through the provider; fdatasync at each fence)
   ├── PmemMmapRegion   (PMEM durability via clflush + sfence)
   └── DirectIoRegion   (explicit pwrite + O_DIRECT from a private staging buffer, then fdatasync)
 ```
@@ -2243,11 +2547,12 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `DualTxnWalTest.v3` | 40 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `PersistentOperationsTest.v3` | 5 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, page-aligned `msync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
 | `PWOpsTest.v3` | 6 | the basic-operation benchmark's expectations on the production PMEM boundary path: exact `CLWB`/`SFENCE` counts per allocation and free against the record, the steady state alternating them returns to, no event for an empty commit, no boundary for a clean mount, and one line per replayed entry under one fence for a recovery |
 | `PersistentSieveTest.v3` | 6 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check |
+| `FileMmapRegionTest.v3` | 6 | the file backend as a restriction of the PMEM model (2026-10-13): trace identity with the PMEM backend, every page written back before a fence covered by that fence's syncs, the file after every sync admitted by the model exactly (eager and marked-only images), an `O_DIRECT` re-read of every synced range, no sync under the elided-writeback mutant, and the legacy boundary unchanged; at 2 KiB and 4 KiB blocks, with the `fdatasync` and `msync` fences |
 
 The trace recorder deliberately has no durable image, background eviction,
 asynchronous writeback completion, crash cuts, or schedule exploration yet.
@@ -2270,8 +2575,9 @@ fail-before-copy and copy-then-fail during fresh-header initialization.
 Normative copy-then-fail tests confirm that a complete record may replay and a
 complete header may reopen even though the original persistence call failed.
 
-The file-backed tests exercise the actual `fdatasync` and page-aligned
-`msync(MS_SYNC)` code paths, including basic failure propagation, committed-WAL
+The file-backed tests exercise the actual `fdatasync` code path (and, until
+2026-10-13, the page-aligned `msync(MS_SYNC)` that synced a `persistRange`),
+including basic failure propagation, committed-WAL
 recovery, graceful close/remount, forked writers that call `exit_group`, and a
 writer deterministically stopped at either a split, exact-fit, or coalescing-
 free transaction's commit-before-apply boundary or after allocator after-image
@@ -2289,11 +2595,12 @@ WAL-record preparation before that boundary and allocator after-image
 preparation after it. The same seam injects one real `EBADF` result through
 `fdatasync(-1)`: the allocator propagates failure, latches recovery-required,
 blocks same-mount retry/flush, and replays the complete page-cache record after
-remount. The mapped-range seam additionally records the exact page-aligned
-`msync` spans: fresh format orders two WAL initialization syncs before the
-whole-region publication, while clean close completes final-data `fdatasync`
-before an injected failing slot-scrub `msync`. The latter latches its old WAL
-instance and remount preserves the allocated structure. These tests do not yet
+remount. The same seam records which pages each `fdatasync` was asked to make
+durable: fresh format issues two WAL initialization fences, each marking the
+log's one page, before the whole-region publication, while clean close
+completes the final-data `fdatasync` before an injected failing slot-scrub
+`fdatasync` marking the log page alone. The latter latches its old WAL instance
+and remount preserves the allocated structure. These tests do not yet
 clear the kernel page cache, reset a VM, interrupt power, or trace at the kernel
 syscall layer beyond the explicit test seams. A same-kernel remount can observe
 cached data that has not been shown to survive a system crash. Full gaps and
@@ -2333,9 +2640,9 @@ the test sources already use ("layer 1b", "layer 3").
 |---|---|---|---|
 | 0. Functional | Each component behaves correctly when nothing crashes: the cache's read and write-behind paths, allocation, splitting and coalescing, record validation, input rejection. | `region_transaction:`; `pwregion:`, including seeded 64-step mixed histories checked after every operation; the `dual_wal:` validation cases; `txn_backend:`; `pwsieve:`. | Anything about crashes. |
 | 1a. Abstract WAL protocol | `DualTxnWal`, `RegionTransaction` and `PWRegion` preserve acknowledged updates at every abstract persistence boundary, and a failed or indeterminate boundary latches recovery-required instead of claiming durability. | `ShadowDurableRegion` (see below): separate live and durable bytes, with fail-before-copy, copy-then-fail and partial-copy outcomes; the `dual_wal:` crash and fault matrix; injection in `region_transaction:` and `pwregion_recovery:`. | One outcome per persistence call: no eviction, no asynchronous `CLWB`, one partial outcome rather than every subset of lines. |
-| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistent_trace:`, `persistent_image:`, `persistent_explore:`), checked against the WAL contract (`persistent_recovery:`), the allocator invariants (`persistent_alloc:`) and the sieve's cross-object invariants (`persistent_sieve:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `persistent_control:` keeps it sensitive to flush placement. See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios, budgeted at mid-record cuts. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. |
-| 2. Backend translation | Each backend maps the abstract operations to the intended mechanism and propagates its result. | Instruction encodings and the native CPUID/writeback/fence smoke path (`persistent_ops:`); `fdatasync`/`msync` ordering and real `EBADF` injection at the file-sync seam (`pwregion_bd:`); marking, coalescing, drain, the `O_DIRECT` probe and device refusals (`direct_io:`); `MAP_SYNC` integration on Magpie's fsdax (`pmem_dax:`, opt-in). | Whether the protocol is correct; anything a crash loses. |
-| 3a. Process crash, nothing lost | The allocator, WAL and workload recover after the process dies without a clean close, both at named protocol boundaries and at arbitrary points over long histories. | Thirteen abrupt-termination tests at named boundaries (`pwregion_bd:`); the random-timer `pwsieve` kill loop on the file and PMEM backends, which requires every acknowledged step to survive. | Flush placement. Process death on an mmap backend loses nothing, because the page cache or the CPU cache keeps every store, so the surviving image is the model's eager one. The elided-writeback mutant passes here (measured 2026-09-18, again 2026-09-27). |
+| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistent_trace:`, `persistent_image:`, `persistent_explore:`), checked against the WAL contract (`persistent_recovery:`), the allocator invariants (`persistent_alloc:`) and the sieve's cross-object invariants (`persistent_sieve:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `persistent_control:` keeps it sensitive to flush placement. See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios, budgeted at mid-record cuts. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. Speaks for the direct and file backends through their restriction arguments; for the file backend on block storage only under assumptions B2–B5, of which nothing guarantees B2. |
+| 2. Backend translation | Each backend maps the abstract operations to the intended mechanism and propagates its result. | Instruction encodings and the native CPUID/writeback/fence smoke path (`persistent_ops:`); `fdatasync` ordering and real `EBADF` injection at the file-sync seam (`pwregion_bd:`); marking, coalescing, drain, the `O_DIRECT` probe and device refusals (`direct_io:`); fence coverage of every requested page and an `O_DIRECT` re-read of every synced range (`file_mmap:`); `MAP_SYNC` integration on Magpie's fsdax (`pmem_dax:`, opt-in). | Whether the protocol is correct; anything a crash loses. |
+| 3a. Process crash, nothing lost | The allocator, WAL and workload recover after the process dies without a clean close, both at named protocol boundaries and at arbitrary points over long histories. | Thirteen abrupt-termination tests at named boundaries (`pwregion_bd:`); the random-timer `pwsieve` kill loop on the file and PMEM backends, which requires every acknowledged step to survive. | Flush placement. Process death on an mmap backend loses nothing, because the page cache or the CPU cache keeps every store, so the surviving image is the model's eager one. The elided-writeback mutant passes here (measured 2026-09-18, again 2026-09-27, and on the file backend after its 2026-10-13 change). |
 | 3b. Real loss of unwritten data | On real hardware, under a crash that discards what was never written back, the production write-back placement is needed (the mutant loses acknowledged state) and suffices at the crash points reached (the ordinary build loses none). | Stage 2c warm reset over reserved DRAM (`pwreboot`: `SURVIVED` and `LOST`, 3 of 3 each); the `pwsieve` kill loop on the direct backend, at random crash points (see [Crash behaviour](#crash-behaviour-process-death-is-the-crash)). | Stage 2c has one crash point per run, and DRAM stands in for PMEM. The direct backend works in 4 KiB units with drain-all fences, and says nothing about `CLWB`/`SFENCE`. |
 | 4. Physical durability | Acknowledged state survives power loss on the target medium and persistence domain. | None; not attainable on Magpie. ADR is assumed, and the DIMM audit (dirty-shutdown count 0 on all twelve DIMMs) is the baseline a future run would be read against. | — |
 
@@ -2350,7 +2657,8 @@ layers also do not merely coexist. Several tests exist to discharge the
 explorer's assumptions: the store audit shows that the trace is complete,
 `validate()` shows it is inside the model's domain, and the reduced search is
 checked against the full one. `direct_io:boundary_images_are_model_images`
-compares real bytes with the model. Each crash layer also samples a predictable
+and `file_mmap:boundary_images_are_model_images` compare real file bytes with
+the model. Each crash layer also samples a predictable
 part of the explorer's image set: layer 3a the eager end, the direct backend
 the lazy end rounded up to 4 KiB, Stage 2c one real image. That is why layer
 3a cannot discriminate flush placement and layer 3b can. The argument, and the
