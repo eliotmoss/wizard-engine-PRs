@@ -1,0 +1,481 @@
+// Tests for the claim that the mapped-file backend (FileMmapRegion,
+// X86_64TxnBackend.v3) is a restriction of the PMEM crash model, as
+// DirectIoRegionTest.v3 tests it for the direct backend.
+//
+// What can be checked here, without root, and what cannot. The trace is the
+// PMEM backend's. Every fence asks the kernel to sync at least every page whose
+// lines the trace wrote back since the previous fence -- derived from the trace
+// alone, not from the region's own marks. The file after every real sync is a
+// model image for the trace at that cut, and so is the smallest image those
+// syncs alone can leave, the marked pages and nothing else: any page the kernel
+// writes beyond that holds each of its lines' full prefix, which the model's
+// background eviction admits line by line. And, on a filesystem that honours
+// O_DIRECT, what the device returns for every synced page right after the sync
+// is what the page cache holds. What cannot be checked here is the device's
+// image between syncs: the page cache shows memory, and an O_DIRECT read of a
+// range holding dirty pages makes the kernel write them back first. That part
+// of the claim -- the kernel writes a page back with each line as it stood at
+// one instant, sectors do not tear, flushes are honoured -- is argued in
+// docs/pmem-crash-model.md, not checked.
+
+def FM_RW = BackendProt.READ.mask | BackendProt.WRITE.mask;
+def FM_PAGE = 4096u64;
+def FM_BLOCKS = 8u64;
+def FM_PATH = "/tmp/wiz_test_file_restriction";
+
+def FMT = UnitTests.registerT("file_mmap:", _, FileMmapTester.new, _);
+def FMX = [
+        FMT("trace_matches_pmem_region", test_fm_trace_matches_pmem_region),
+        FMT("fences_sync_every_requested_page", test_fm_fences_sync_every_requested_page),
+        FMT("boundary_images_are_model_images", test_fm_boundary_images_are_model_images),
+        FMT("synced_pages_reach_the_device", test_fm_synced_pages_reach_the_device),
+        FMT("elided_provider_syncs_nothing", test_fm_elided_provider_syncs_nothing),
+        FMT("legacy_boundary_is_the_old_one", test_fm_legacy_boundary_is_the_old_one),
+        ()
+];
+
+// A file region whose two sync seams are observable. With a recording provider
+// installed beneath the marking one, every sync call is kept with its cut (the
+// number of trace events so far), the range it asked for (the whole file for
+// fdatasync), the pages marked when it was asked, and the file's bytes read
+// through the page cache afterwards; optionally also the synced range re-read
+// with O_DIRECT. {dropLaterRuns} breaks the msync fence on purpose: every run
+// after a fence's first is reported synced and is not.
+class ProbeFileRegion extends FileMmapRegion {
+        def path: string;
+        var recorder: RecordingPersistentOperations;
+        var rereadDirect = false;
+        var dropLaterRuns = false;
+        var syncCalls = 0;
+        def syncCuts = Vector<int>.new();
+        def syncOffsets = Vector<u64>.new();
+        def syncSizes = Vector<u64>.new();
+        def syncMarks = Vector<Array<bool>>.new();
+        def syncFiles = Vector<Array<byte>>.new();
+        def syncDevice = Vector<Array<byte>>.new();
+        var rereadError: string;
+
+        new(mapping: Mapping, fd: int, path) super(mapping, fd) { }
+
+        def syncFileData() -> bool {
+                if (!RegionFileIO.fdatasync(fd)) return false;
+                syncCalls++;
+                noteSync(0u64, u64.!(range.length));
+                return true;
+        }
+
+        def syncMappedRange(offset: u64, size: u64) -> bool {
+                if (dropLaterRuns && recorder != null && syncCuts.length > 0 &&
+                        syncCuts[syncCuts.length - 1] == recorder.events.length) {
+                        return true;
+                }
+                if (!Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC)) return false;
+                syncCalls++;
+                noteSync(offset, size);
+                return true;
+        }
+
+        private def noteSync(offset: u64, size: u64) {
+                if (recorder == null) return;
+                syncCuts.put(recorder.events.length);
+                syncOffsets.put(offset);
+                syncSizes.put(size);
+                def marks = Array<bool>.new(int.!(dirty.unitCount));
+                for (u = dirty.lo; u < dirty.hi; u++) marks[int.!(u)] = dirty.isMarked(u);
+                syncMarks.put(marks);
+                syncFiles.put(System.fileLoad(path));
+                syncDevice.put(if(rereadDirect, readDirect(offset, size), null));
+        }
+
+        // The synced range as the device returns it. Right after the sync every
+        // page in it is clean, so the O_DIRECT read makes the kernel write
+        // nothing back first.
+        private def readDirect(offset: u64, size: u64) -> Array<byte> {
+                def fd2 = RegionFileIO.open(path);
+                if (fd2 < 0 || !DirectIoFileIO.setODirect(fd2)) {
+                        if (fd2 >= 0) RegionFileIO.close(fd2);
+                        rereadError = "could not open the region file with O_DIRECT";
+                        return null;
+                }
+                def buf = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+                var out: Array<byte>;
+                if (buf == null) {
+                        rereadError = "could not reserve the read buffer";
+                } else if (!DirectIoFileIO.preadFully(fd2, buf.range.start, size, offset)) {
+                        rereadError = "the O_DIRECT read failed";
+                } else {
+                        out = Array<byte>.new(int.!(size));
+                        for (i < out.length) out[i] = (buf.range.start + i).load<byte>();
+                }
+                if (buf != null) buf.range.unmap();
+                RegionFileIO.close(fd2);
+                return out;
+        }
+}
+
+class ProbeFileBackend extends FileMmapBackend {
+        var record = false;
+        var dropLaterRuns = false;
+        var rereadDirect = false;
+        var last: ProbeFileRegion;
+
+        new(path: string) super(path) { }
+
+        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+                if (newMapping == null) return null;
+                def region = ProbeFileRegion.new(newMapping, fd, path);
+                region.dropLaterRuns = dropLaterRuns;
+                region.rereadDirect = rereadDirect;
+                if (record) {
+                        region.recorder = RecordingPersistentOperations.new(region.range);
+                        region.wrapProvider(region.recorder);
+                }
+                last = region;
+                return region;
+        }
+}
+
+class FileMmapTester(t: Tester) {
+        var raw: BackendRegion;
+        var pw: PWRegion;
+        var path = FM_PATH;
+
+        new() {
+                RegionFileIO.unlink(FM_PATH);
+        }
+
+        def cleanup() {
+                if (raw != null) {
+                        raw.destroy();
+                        raw = null;
+                }
+                if (pw != null) {
+                        pw.deallocate();
+                        pw = null;
+                }
+                RegionFileIO.unlink(path);
+        }
+
+        // Record fmScenario() over a fresh file region with the given fence;
+        // the region is returned deallocated, its records intact.
+        def record(boundary: FileBoundary, blockSize: u64, dropLaterRuns: bool, rereadDirect: bool) -> ProbeFileRegion {
+                RegionFileIO.unlink(path);
+                def probe = ProbeFileBackend.new(path);
+                probe.record = true;
+                probe.boundary = boundary;
+                probe.dropLaterRuns = dropLaterRuns;
+                probe.rereadDirect = rereadDirect;
+                def region = PWRegion.new(probe, FM_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
+                if (!fmScenario(region)) {
+                        t.fail2("the %s scenario failed at block size %d", boundary.arg, blockSize);
+                        return null;
+                }
+                if (probe.last.rereadError != null) t.fail1("re-reading the device: %s", probe.last.rereadError);
+                return probe.last;
+        }
+}
+
+def FM_FENCES = [FileBoundary.FDATASYNC, FileBoundary.MSYNC];
+
+// The direct tests' scenario -- format, two allocations, a free and a clean
+// close -- with one step the sieve takes: after the first allocation, user data
+// written straight into the chunk and made durable with persistRange() while
+// the allocation's after-images still wait for the next boundary. That fence
+// must make them durable too, which no other step of the scenario exercises.
+def fmScenario(region: PWRegion) -> bool {
+        if (region.backendRegion == null || region.txn == null) return false;
+        def a = region.allocChunk(1u32);
+        if (a.isNull()) return false;
+        def data = region.offsetInRegion(a.addr) + u64.!(ChunkHeader.size);
+        def ops = region.backendRegion.persistentOperations();
+        for (i < 16) ops.storeU64(data + u64.!(8 * i), 0xF11E0000u64 + u64.!(i));
+        if (!region.backendRegion.persistRange(data, 128u64)) return false;
+        if (region.allocChunk(2u32).isNull()) return false;
+        if (!region.freeChunk(a)) return false;
+        region.deallocate();
+        return true;
+}
+
+// =============================================================================
+// Agreement with the PMEM backend and its crash model
+// =============================================================================
+
+// The seam is the only difference between the backends: the same allocator
+// history emits the same STORE/CLWB/SFENCE stream over a mapped file, with
+// either fence, as over a PMEM region.
+def test_fm_trace_matches_pmem_region(tc: FileMmapTester) {
+        for (blockSize in [2048u64, 4096u64]) {
+                def pmem = PWRegion.new(RecordingPmemBackend.new(), FM_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
+                if (pmem.backendRegion == null) {
+                        tc.t.fail("could not create the recording PMEM region");
+                        return tc.cleanup();
+                }
+                def pmemRecorder = RecordingPersistentOperations.!(pmem.backendRegion.persistentOperations());
+                if (!fmScenario(pmem)) {
+                        tc.t.fail("the PMEM scenario failed");
+                        return tc.cleanup();
+                }
+                def expected = pmemRecorder.snapshot("pmem");
+                for (boundary in FM_FENCES) {
+                        def file = tc.record(boundary, blockSize, false, false);
+                        if (file == null) return tc.cleanup();
+                        def got = file.recorder.snapshot("file");
+                        tc.t.assert_eq(expected.length(), got.length());
+                        if (expected.digest() != got.digest()) {
+                                tc.t.fail2("the file trace (%s) differs from the PMEM trace at block size %d", boundary.arg, blockSize);
+                        }
+                }
+        }
+        tc.cleanup();
+}
+
+// Why {region}'s sync calls fail to cover the trace's writeback requests, or
+// null. The pending set is replayed from the trace alone: a CLWB adds its
+// line's page, and the syncs recorded at a cut remove what they cover. Every
+// sync must sit just after an SFENCE, and after a fence's syncs nothing may be
+// pending -- the model's fence completes every earlier CLWB.
+def fmCoverageError(trace: PersistentTrace, region: ProbeFileRegion) -> string {
+        def pages = int.!((trace.regionBytes + FM_PAGE - 1u64) / FM_PAGE);
+        def pending = Array<bool>.new(pages);
+        var k = 0;
+        for (i < trace.events.length) {
+                def e = trace.events[i];
+                match (e.kind) {
+                        CLWB => pending[int.!(e.offset / FM_PAGE)] = true;
+                        SFENCE => ;
+                        STORE => ;
+                }
+                def cut = i + 1;
+                while (k < region.syncCuts.length && region.syncCuts[k] == cut) {
+                        if (e.kind != PersistentEventKind.SFENCE) {
+                                return Strings.format1("a sync at cut %d does not follow an SFENCE", cut);
+                        }
+                        def lo = region.syncOffsets[k] / FM_PAGE;
+                        def hi = (region.syncOffsets[k] + region.syncSizes[k] + FM_PAGE - 1u64) / FM_PAGE;
+                        for (p = lo; p < hi && p < u64.!(pages); p++) pending[int.!(p)] = false;
+                        k++;
+                }
+                if (e.kind == PersistentEventKind.SFENCE) {
+                        for (p < pages) {
+                                if (pending[p]) return Strings.format2("the fence at cut %d left page %d unsynced", cut, p);
+                        }
+                }
+        }
+        if (k != region.syncCuts.length) return "a sync was recorded at a cut beyond the trace";
+        return null;
+}
+
+// Every fence asks the kernel to sync at least every page whose lines were
+// written back before it, whichever fence implementation; and the check can
+// fail: an msync fence that syncs only its first run of pages is rejected.
+def test_fm_fences_sync_every_requested_page(tc: FileMmapTester) {
+        for (blockSize in [2048u64, 4096u64]) {
+                for (boundary in FM_FENCES) {
+                        def region = tc.record(boundary, blockSize, false, false);
+                        if (region == null) return tc.cleanup();
+                        def trace = region.recorder.snapshot("file");
+                        if (trace.count(PersistentEventKind.CLWB) == 0) tc.t.fail("the trace has no writeback request");
+                        def err = fmCoverageError(trace, region);
+                        if (err != null) tc.t.fail3("%s at block size %d: %s", boundary.arg, blockSize, err);
+                        if (region.syncCuts.length < 4) tc.t.fail1("only %d syncs were observed", region.syncCuts.length);
+                }
+                def broken = tc.record(FileBoundary.MSYNC, blockSize, true, false);
+                if (broken == null) return tc.cleanup();
+                if (fmCoverageError(broken.recorder.snapshot("broken"), broken) == null) {
+                        tc.t.fail1("an msync fence that syncs only its first run was accepted at block size %d", blockSize);
+                }
+        }
+        tc.cleanup();
+}
+
+// The smallest image the syncs up to sync {upTo} can have left on the device:
+// the initial (zero) file, overwritten at each sync by the pages that were
+// both marked and in the synced range, as the page cache held them after that
+// sync. The kernel may also have written any other page, at any time; each such
+// page holds every line's full prefix at the moment it was written, which the
+// model's background eviction admits line by line.
+def fmMarkedOnlyImage(region: ProbeFileRegion, upTo: int, regionBytes: int) -> Array<byte> {
+        def image = Array<byte>.new(regionBytes);
+        for (k = 0; k <= upTo; k++) {
+                def marks = region.syncMarks[k];
+                def file = region.syncFiles[k];
+                def lo = region.syncOffsets[k] / FM_PAGE;
+                def hi = (region.syncOffsets[k] + region.syncSizes[k] + FM_PAGE - 1u64) / FM_PAGE;
+                for (p = lo; p < hi && p < u64.!(marks.length); p++) {
+                        if (!marks[int.!(p)]) continue;
+                        def start = int.!(p * FM_PAGE);
+                        for (i = start; i < start + int.!(FM_PAGE) && i < regionBytes; i++) image[i] = file[i];
+                }
+        }
+        return image;
+}
+
+// Whether sync {k} is its fence's last: an msync fence makes one call per run
+// of marked pages, all at the fence's cut, and the fence has not returned
+// until the last.
+def fmEndsFence(region: ProbeFileRegion, k: int) -> bool {
+        return k + 1 >= region.syncCuts.length || region.syncCuts[k + 1] != region.syncCuts[k];
+}
+
+// The refinement claim, executed as far as it can be without root. After a
+// fence's last sync, the file as the page cache holds it -- every page written,
+// the eager extreme -- and the marked-only image -- the lazy extreme of what the
+// syncs guarantee -- must both be model images at that cut; and since a crash
+// inside the fence leaves each page old or new, the previous marked-only image
+// and both new ones, after every sync of the fence, must be admitted at the cut
+// just before its SFENCE. A flipped header byte must be rejected, and the
+// broken msync fence must fail.
+def test_fm_boundary_images_are_model_images(tc: FileMmapTester) {
+        for (blockSize in [2048u64, 4096u64]) {
+                for (boundary in FM_FENCES) {
+                        def region = tc.record(boundary, blockSize, false, false);
+                        if (region == null) return tc.cleanup();
+                        def trace = region.recorder.snapshot("file");
+                        def check = trace.validate();
+                        if (!check.ok()) tc.t.fail1("the recorded trace fails the baseline: %s", check.render(StringBuilder.new()).toString());
+                        def bytes = int.!(trace.regionBytes);
+                        def n = region.syncCuts.length;
+                        if (n < 4) tc.t.fail1("only %d syncs were observed", n);
+                        var previous = Array<byte>.new(bytes);
+                        var differsFromEager = false;
+                        for (k < n) {
+                                def cut = region.syncCuts[k];
+                                def file = region.syncFiles[k];
+                                def lazy = fmMarkedOnlyImage(region, k, bytes);
+                                var err: string;
+                                if (fmEndsFence(region, k)) {
+                                        err = DioRefinement.admittedAt(trace, cut, file);
+                                        if (err == null) err = DioRefinement.admittedAt(trace, cut, lazy);
+                                }
+                                if (err == null) err = DioRefinement.admittedAt(trace, cut - 1, previous);
+                                if (err == null) err = DioRefinement.admittedAt(trace, cut - 1, lazy);
+                                if (err == null) err = DioRefinement.admittedAt(trace, cut - 1, file);
+                                if (err != null) {
+                                        tc.t.fail(StringBuilder.new()
+                                                .put3("%s, block size %d, sync %d: an image is not admitted: ", boundary.arg, blockSize, k)
+                                                .puts(err).toString());
+                                        break;
+                                }
+                                if (!DioRefinement.sameBytes(lazy, file)) differsFromEager = true;
+                                previous = lazy;
+                        }
+                        // The marked-only image must sometimes lag the page
+                        // cache, or the lazy side of the check went untested.
+                        if (!differsFromEager) tc.t.fail1("%s: no sync left a page unwritten", boundary.arg);
+                        if (n > 0) {
+                                def flipped = Arrays.dup(region.syncFiles[n - 1]);
+                                flipped[int.!(blockSize)] ^= 0xFF;
+                                if (DioRefinement.admittedAt(trace, region.syncCuts[n - 1], flipped) == null) {
+                                        tc.t.fail("a corrupted image was admitted");
+                                }
+                        }
+                }
+                // Syncing only a fence's first run leaves later runs' requested
+                // lines below the fence's floor in the marked-only image.
+                def broken = tc.record(FileBoundary.MSYNC, blockSize, true, false);
+                if (broken == null) return tc.cleanup();
+                def trace = broken.recorder.snapshot("broken");
+                var rejected = false;
+                for (k < broken.syncCuts.length) {
+                        if (!fmEndsFence(broken, k)) continue;
+                        def lazy = fmMarkedOnlyImage(broken, k, int.!(trace.regionBytes));
+                        if (DioRefinement.admittedAt(trace, broken.syncCuts[k], lazy) != null) {
+                                rejected = true;
+                                break;
+                        }
+                }
+                if (!rejected) tc.t.fail1("the broken msync fence's images were all admitted at block size %d", blockSize);
+        }
+        tc.cleanup();
+}
+
+// What the device returns for each synced range right after the sync is what
+// the page cache holds, read without perturbing anything: the range is clean.
+// This checks, on this host's filesystem and device, that a fence's sync wrote
+// every page it was asked for; with fdatasync, that is the whole file. It needs
+// a filesystem that honours O_DIRECT, so it runs where the direct backend's
+// tests run.
+def test_fm_synced_pages_reach_the_device(tc: FileMmapTester) {
+        def p = DirectIoTestPaths.path("wiz_test_file_restriction");
+        if (p == null) {
+                tc.t.fail("no candidate directory supports O_DIRECT (tried /tmp and bin)");
+                return;
+        }
+        tc.path = p;
+        for (blockSize in [2048u64, 4096u64]) {
+                for (boundary in FM_FENCES) {
+                        def region = tc.record(boundary, blockSize, false, true);
+                        if (region == null) return tc.cleanup();
+                        for (k < region.syncCuts.length) {
+                                def device = region.syncDevice[k];
+                                if (device == null) {
+                                        tc.t.fail1("sync %d was not re-read", k);
+                                        break;
+                                }
+                                def file = region.syncFiles[k];
+                                def offset = int.!(region.syncOffsets[k]);
+                                var same = true;
+                                for (i < device.length) if (device[i] != file[offset + i]) same = false;
+                                if (!same) {
+                                        tc.t.fail3("%s, block size %d: the device differs from the page cache after sync %d", boundary.arg, blockSize, k);
+                                        break;
+                                }
+                        }
+                }
+        }
+        tc.cleanup();
+}
+
+// The mutant: a provider whose clwb() does nothing marks nothing, so every
+// boundary reports success and syncs nothing.
+def test_fm_elided_provider_syncs_nothing(tc: FileMmapTester) {
+        RegionFileIO.unlink(tc.path);
+        def probe = ProbeFileBackend.new(tc.path);
+        tc.raw = ElidedWritebackBackend.new(probe).create(FM_BLOCKS * FM_PAGE, FM_RW, true);
+        if (tc.raw == null) {
+                tc.t.fail("could not create the elided region");
+                return tc.cleanup();
+        }
+        def region = probe.last;
+        tc.t.assert(ElidedWritebackOperations.?(region.persistentOperations()), "mutant provider not installed");
+        region.persistentOperations().storeU64(8192u64, 0xBADu64);
+        tc.t.assert(region.prepareChangedRange(8192u64, 8u64), "the mutant's prepare failed");
+        tc.t.assert(region.dirty.isEmpty(), "the mutant marked a page");
+        tc.t.assert(region.persistChanges(), "the mutant's boundary failed");
+        tc.t.assert(region.persistRange(8192u64, 8u64), "the mutant's persistRange failed");
+        tc.t.assert_eq(0, region.syncCalls);
+        tc.cleanup();
+}
+
+// The old-against-new comparison is only fair if LEGACY really is the boundary
+// the file backend had until 2026-10-13: no writeback request reaches the
+// provider, format's persistRange() calls are msyncs of their own pages (two of
+// block 1's page, then the whole mapping), and a commit is one fdatasync.
+def test_fm_legacy_boundary_is_the_old_one(tc: FileMmapTester) {
+        RegionFileIO.unlink(tc.path);
+        def backend = FilePersistenceTraceBackend.new(tc.path);
+        backend.boundary = FileBoundary.LEGACY;
+        tc.pw = PWRegion.new(backend, FM_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), 4096u64, true);
+        def traced = backend.tracedRegion;
+        if (tc.pw.backendRegion == null || tc.pw.txn == null || traced == null) {
+                tc.t.fail("could not format a legacy file region");
+                return tc.cleanup();
+        }
+        tc.t.assert(!DirectIoOperations.?(traced.persistentOperations()), "the legacy region kept the marking provider");
+        tc.t.assert_eq(3, traced.mappedSyncAttempts);
+        tc.t.assert_eq(0, traced.dataSyncAttempts);
+        if (traced.mappedSyncOffsets.length == 3) {
+                tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[0]);
+                tc.t.assert_eq(4096u64, traced.mappedSyncSizes[0]);
+                tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[1]);
+                tc.t.assert_eq(4096u64, traced.mappedSyncSizes[1]);
+                tc.t.assert_eq(0u64, traced.mappedSyncOffsets[2]);
+                tc.t.assert_eq(FM_BLOCKS * 4096u64, traced.mappedSyncSizes[2]);
+        }
+        traced.clearTrace();
+        tc.t.assert(!tc.pw.allocChunk(1u32).isNull(), "allocation failed");
+        tc.t.assert_eq(1, traced.dataSyncAttempts);
+        tc.t.assert_eq(0, traced.mappedSyncAttempts);
+        tc.t.assert(traced.dirty.isEmpty(), "the legacy region marked a page");
+        tc.cleanup();
+}

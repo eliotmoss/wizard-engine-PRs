@@ -382,7 +382,7 @@ class FileMmapBackend extends TxnRegionBackend {
 	def path: string;
 	// Benchmark-only: the fence every region this backend creates uses (see
 	// FileBoundary).
-	def var boundary = FileBoundary.FDATASYNC;
+	var boundary = FileBoundary.FDATASYNC;
 
 	new(path) { }
 

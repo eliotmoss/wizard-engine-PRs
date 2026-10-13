@@ -735,6 +735,13 @@ def dioSameBytes(a: Array<byte>, b: Array<byte>) -> bool {
         return true;
 }
 
+// The image check, for FileMmapRegionTest.v3, whose backend makes the same
+// claim; top-level functions are private to their file.
+component DioRefinement {
+        def admittedAt = dioAdmittedAt;
+        def sameBytes = dioSameBytes;
+}
+
 // The refinement claim, executed. After every real fdatasync the file must be
 // an image the PMEM model admits at that cut; and since a crash inside the
 // write-back leaves each unit old or new, both the previous and the new file
