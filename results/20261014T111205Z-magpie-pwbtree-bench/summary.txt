@@ -1,0 +1,68 @@
+---- per operation, ns; each figure the median over repetitions of a run's statistic
+kind     config         reps     median        p90       mean  spread   compute     alloc     write   publish      free   persist    share
+insert   pmem-auto         5      58691      64121      59435    0.2%      5612     24303      7778     13666      7968     53715    90.4%
+insert   pmem-none         5      50590      55266      51374    0.3%      3440     21930      6224     12631      7030     47815    93.1%
+insert   file-dax          5     127225     134504     126981    0.6%      5521     53203     20508     24423     23257    121391    95.6%
+insert   file-block        5    2141156    2678517    2164923    1.6%     13303    904454    614368    242292    386900   2148014    99.2%
+insert   direct-block      5    2194789    2892808    2662705    3.6%     13298   1077589    749235    225920    597474   2650218    99.5%
+update   pmem-auto         5      58057      60674      58455    0.3%      5194     23578      7647     13709      8164     53098    90.8%
+update   pmem-none         5      50143      52117      50325    0.2%      3404     21071      6066     12521      7166     46824    93.0%
+update   file-dax          5     126287     131028     126988    1.3%      5104     53566     19685     24359     24246    121856    96.0%
+update   file-block        5    2219857    2584323    2215120    0.8%     13270    920113    638767    244814    398431   2202125    99.4%
+update   direct-block      5    2534253   23224224    6724839   10.3%     13506   2879085    867055    403836   2560746   6710722    99.8%
+lookup   pmem-auto         5       1333       2212       1343    1.1%      1337         0         0         0         0         0     0.0%
+lookup   pmem-none         5        277        312        278    0.4%       274         0         0         0         0         0     0.0%
+lookup   file-dax          5       1331       2175       1330    1.8%      1322         0         0         0         0         0     0.0%
+lookup   file-block        5       1216       1462       1248    0.7%      1220         0         0         0         0         0     0.0%
+lookup   direct-block      5       1257       1684       1321    2.3%      1268         0         0         0         0         0     0.0%
+
+---- work per operation, checked on every operation of every round: boundaries (min-max) / lines written back / prepare calls, per op; splits
+insert   pmem-auto        4.905 (3-6) /   94.876 /    0.000; 93 splits over 15000 ops
+insert   pmem-none        4.905 (3-6) /   94.876 /    0.000; 93 splits over 15000 ops
+insert   file-dax         4.905 (3-6) /   94.876 /   16.430; 93 splits over 15000 ops
+insert   file-block       4.905 (3-6) /   94.876 /   16.430; 93 splits over 15000 ops
+insert   direct-block     4.905 (3-6) /   94.876 /   16.430; 93 splits over 15000 ops
+update   pmem-auto        5.000 (5-5) /   94.660 /    0.000; 0 splits over 7539 ops
+update   pmem-none        5.000 (5-5) /   94.660 /    0.000; 0 splits over 7539 ops
+update   file-dax         5.000 (5-5) /   94.660 /   16.945; 0 splits over 7539 ops
+update   file-block       5.000 (5-5) /   94.660 /   16.945; 0 splits over 7539 ops
+update   direct-block     5.000 (5-5) /   94.660 /   16.945; 0 splits over 7539 ops
+lookup   pmem-auto        0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+lookup   pmem-none        0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+lookup   file-dax         0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+lookup   file-block       0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+lookup   direct-block     0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+
+---- per boundary: the persistence phases over the boundaries they make, ns
+insert   pmem-auto          10951
+insert   pmem-none           9748
+insert   file-dax           24748
+insert   file-block        437923
+insert   direct-block      540309
+update   pmem-auto          10620
+update   pmem-none           9365
+update   file-dax           24371
+update   file-block        440425
+update   direct-block     1342144
+
+---- run facts, median over repetitions
+pmem-auto      height after the load 2; wall ns per insert 59981, per mixed operation 30428
+pmem-none      height after the load 2; wall ns per insert 51722, per mixed operation 25711
+file-dax       height after the load 2; wall ns per insert 127575, per mixed operation 64909
+file-block     height after the load 2; wall ns per insert 2166539, per mixed operation 1115193
+direct-block   height after the load 2; wall ns per insert 2664203, per mixed operation 3381366
+
+---- pmem-auto - pmem-none: what the writeback instructions cost an operation, ns (an eADR approximation)
+insert         8101  ( 13.8 % of pmem-auto)
+update         7914  ( 13.6 % of pmem-auto)
+lookup         1056  ( 79.2 % of pmem-auto)
+
+Columns: median, p90 and mean of each run's per-operation rdtsc times; spread = (max - min) / median
+of the per-run medians; the phases are PWBTree's onPhase marks, means per operation; persist =
+alloc + write + publish + free; share = persist / mean, the persistence phases over the whole
+operation's mean time (rdtsc around each put or get), as pwsieve-bench.sh's share is over a
+whole step's wall time; what the marks leave out counts against it. A mutation at height h
+with k new nodes makes k + h + 1 boundaries: k allocations, one fence over the new nodes, the
+publish (root swap and first free) and h - 1 further frees. Inserts include the load's first
+inserts, made while the root is still a leaf. pmem-none drops CLWB and keeps SFENCE: an
+approximation of eADR timing, never durable. A difference is real only outside both spreads.
