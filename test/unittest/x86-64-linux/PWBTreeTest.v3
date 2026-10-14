@@ -36,6 +36,7 @@ def BTX = [
         BTT("each_put_makes_k_plus_h_plus_1_boundaries", test_btree_each_put_makes_k_plus_h_plus_1_boundaries),
         BTT("unaligned_block_size_writes_back_whole_lines", test_btree_unaligned_block_size_writes_back_whole_lines),
         BTT("survives_a_garbage_collection",         test_btree_survives_a_garbage_collection),
+        BTT("corrupted_image_fails_cleanly",         test_btree_corrupted_image_fails_cleanly),
         ()
 ];
 
@@ -390,6 +391,82 @@ def test_btree_survives_a_garbage_collection(tc: PWBTreeTester) {
         tc.t.assert_eq(0, again.leaksReclaimed());
         tc.sameAs(again, ref);
 }
+
+// A corrupted or cyclic image, which a region whose memory moved under it
+// also looks like, must be refused by open() and by forEach(), not walked
+// until the stack runs out: a root node that is its own child, a node at the
+// wrong level, a height beyond MAX_HEIGHT, one more than the tree's, and zero.
+// A child shared with its sibling is refused by open(); forEach() walks it
+// twice, boundedly, and compare() then sees too many keys. Each is planted,
+// checked and undone, and the tree then opens again.
+def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(37);
+        while (tree.height() < 3u64) tc.put(tree, ref, rng.below(100000), rng.next());
+        def root = tree.rootNode();
+        def height = tree.height();
+        // Child j of an internal node is word 2 + 2j of its payload.
+        def child0 = btreeChildAddr(tc, root, 0);
+        def child1 = btreeChildAddr(tc, root, 1);
+        def heightField = tc.region.regionStart + tree.rootChunk() + u64.!(ChunkHeader.size) + 32u64;
+
+        // The root node as its own child: a cycle.
+        var saved = btreeSwap(child0, root);
+        btreeRefused(tc, tree, ref, true, "a root node that is its own child");
+        btreeSwap(child0, saved);
+        // A grandchild where a child belongs: a node at the wrong level.
+        def grandchild = btreeLoad(btreeChildAddr(tc, btreeLoad(child0), 0));
+        saved = btreeSwap(child1, grandchild);
+        btreeRefused(tc, tree, ref, true, "a node at the wrong level");
+        btreeSwap(child1, saved);
+        // A child shared with its sibling: reached twice.
+        saved = btreeSwap(child1, btreeLoad(child0));
+        btreeRefused(tc, tree, ref, false, "a node reached twice");
+        btreeSwap(child1, saved);
+        // Heights the tree does not have.
+        def heights = [u64.!(PWBTreeConst.MAX_HEIGHT) + 1u64, height + 1u64, 0u64];
+        for (h in heights) {
+                tc.region.txn.writeU64(heightField, h);
+                tc.region.txn.commit();
+                btreeRefused(tc, tree, ref, true, "a height the tree does not have");
+        }
+        tc.region.txn.writeU64(heightField, height);
+        tc.region.txn.commit();
+
+        // Undone, the tree is whole again.
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.checkOk(again);
+        tc.sameAs(again, ref);
+}
+
+// The address of child {j}'s offset in the internal node at {node}.
+def btreeChildAddr(tc: PWBTreeTester, node: u64, j: int) -> u64 {
+        return tc.region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(2 + 2 * j);
+}
+
+def btreeLoad(addr: u64) -> u64 {
+        return (Pointer.NULL + i64.view(addr)).load<u64>();
+}
+
+// Stores {v} at {addr} directly, as a stray write would; returns what was there.
+def btreeSwap(addr: u64, v: u64) -> u64 {
+        def old = btreeLoad(addr);
+        (Pointer.NULL + i64.view(addr)).store<u64>(v);
+        return old;
+}
+
+// open() must refuse the image; forEach() must refuse it too when {walkFails}
+// (it checks every node it reaches, but not reachability); compare() must not
+// match it either way.
+def btreeRefused(tc: PWBTreeTester, tree: PWBTree, ref: PWBTreeReference, walkFails: bool, what: string) {
+        if (PWBTree.new(tc.region, 4).open()) tc.t.fail1("open() accepted %s", what);
+        if (walkFails && tree.forEach(ignoreKeyValue) == null) tc.t.fail1("forEach() walked %s", what);
+        if (ref.compare(tree) == null) tc.t.fail1("compare() matched %s", what);
+}
+
+def ignoreKeyValue(k: u64, v: u64) { }
 
 // =============================================================================
 // Persistence work per operation, on the production PMEM boundary path

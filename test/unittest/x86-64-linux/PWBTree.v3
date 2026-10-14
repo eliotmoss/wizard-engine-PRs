@@ -540,19 +540,52 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 return result;
         }
 
-        // Every key and value in key order.
-        def forEach(f: (u64, u64) -> void) {
-                if (rootOffset == 0) return;
-                visit(rootGet(TreeRoot.rootNode.offset), int.!(rootGet(TreeRoot.height.offset)) - 1, f);
+        // Every key and value in key order. Returns null, or why the image
+        // cannot be walked: forEach() trusts nothing it reads, so a corrupted or
+        // cyclic image ends the walk with a reason rather than recursing without
+        // bound. The height must be in [1, MAX_HEIGHT] and every node must carry
+        // the level its depth implies; levels strictly decrease on the way down,
+        // so the recursion is at most MAX_HEIGHT deep and a child pointer back to
+        // an ancestor, or to the node itself, is refused. (open() and the leak
+        // sweep walk with walkNode(), which also refuses a node reached twice.)
+        def forEach(f: (u64, u64) -> void) -> string {
+                if (rootOffset == 0) return "tree root not opened";
+                def h = rootGet(TreeRoot.height.offset);
+                if (h < 1 || h > u64.!(PWBTreeConst.MAX_HEIGHT)) return "height out of range";
+                return visit(rootGet(TreeRoot.rootNode.offset), int.!(h) - 1, f);
         }
 
-        private def visit(node: u64, level: int, f: (u64, u64) -> void) {
+        private def visit(node: u64, level: int, f: (u64, u64) -> void) -> string {
+                def err = nodeError(node, level);
+                if (err != null) return err;
                 def c = int.!(nodeKeys(node));
                 if (level == 0) {
                         for (i < c) f(leafKey(node, i), leafValue(node, i));
-                        return;
+                        return null;
                 }
-                for (j = 0; j <= c; j++) visit(innerChild(node, j), level - 1, f);
+                for (j = 0; j <= c; j++) {
+                        def e = visit(innerChild(node, j), level - 1, f);
+                        if (e != null) return e;
+                }
+                return null;
+        }
+
+        // Why {node} cannot be read as a node at {level}, or null: an offset in
+        // the region and block aligned, a node's tag carrying that level, and no
+        // more keys than the capacity. Checked before anything else is read
+        // from it, by both walks.
+        private def nodeError(node: u64, level: int) -> string {
+                def regionBytes = region.numBlocks * region.blockSize;
+                if (node == 0 || node >= regionBytes || node % region.blockSize != 0) {
+                        return "a node offset is outside the region or not block aligned";
+                }
+                def tag = nodeTag(node);
+                if ((tag & PWBTreeConst.MAGIC_MASK) != PWBTreeConst.NODE_MAGIC) return "node magic wrong";
+                if ((tag & PWBTreeConst.LEVEL_MASK) != u64.!(level)) {
+                        return "a node's level does not match its depth: the leaves are not all at the tree's height";
+                }
+                if (nodeKeys(node) > u64.!(cap)) return "a node holds more keys than the capacity";
+                return null;
         }
 
         // The number of separators at or below {key}: the child that holds it.
@@ -647,10 +680,8 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
 
         private def walkNode(node: u64, level: int, isRoot: bool, lo: u64, hasLo: bool, hi: u64, hasHi: bool,
                         marked: Array<bool>, totals: Array<u64>) -> string {
-                def regionBytes = region.numBlocks * region.blockSize;
-                if (node == 0 || node >= regionBytes || node % region.blockSize != 0) {
-                        return "a node offset is outside the region or not block aligned";
-                }
+                def err = nodeError(node, level);
+                if (err != null) return err;
                 def block = int.!(node / region.blockSize);
                 if (marked[block]) return "a node is reachable twice, or is the root chunk";
                 marked[block] = true;
@@ -658,13 +689,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (entry.isNull() || !entry.getUsed() || entry.getListNum() != ListKind.NONE.code) {
                         return "a reachable node is not an allocated chunk";
                 }
-                def tag = nodeTag(node);
-                if ((tag & PWBTreeConst.MAGIC_MASK) != PWBTreeConst.NODE_MAGIC) return "node magic wrong";
-                if ((tag & PWBTreeConst.LEVEL_MASK) != u64.!(level)) {
-                        return "a node's level does not match its depth: the leaves are not all at the tree's height";
-                }
                 def count = nodeKeys(node);
-                if (count > u64.!(cap)) return "a node holds more keys than the capacity";
                 def c = int.!(count);
                 if (!isRoot && c < cap / 2) return "a node below the root is less than half full";
                 totals[1] = totals[1] + 1u64;
@@ -774,7 +799,8 @@ class PWBTreeReference {
         // keys are distinct (checkInvariants(): strictly increasing).
         def compare(tree: PWBTree) -> string {
                 def c = PWBTreeComparison.new(this);
-                tree.forEach(c.visit);
+                def walked = tree.forEach(c.visit);
+                if (walked != null) return walked;
                 if (c.err != null) return c.err;
                 if (c.count != keys.length) return "the tree holds a different number of keys from the reference";
                 if (tree.keyCount() != u64.!(keys.length)) return "the tree's key count differs from the reference";
