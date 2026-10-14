@@ -177,11 +177,24 @@ def wiringError(region: BackendRegion, expectElided: bool) -> string {
         return null;
 }
 
-def sleepNanos(ns: long) {
+// A struct timespec for nanosleep, built before the fork.
+def timespec(ns: long) -> Array<long> {
         def ts = Array<long>.new(2);
         ts[0] = ns / 1000000000L;
         ts[1] = ns % 1000000000L;
-        Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
+        return ts;
+}
+
+// Waits for {pid}, already sent SIGKILL; a wait interrupted by a signal is
+// retried, so a false return is a real wait4 failure.
+def reap(pid: long, status: Array<int>) -> bool {
+        while (true) {
+                def r = Linux.syscall(LinuxConst.SYS_wait4,
+                        (pid, Pointer.atElement(status, 0), 0, Pointer.NULL)).0;
+                if (r == pid) return true;
+                if (r != -LinuxConst.EINTR) return false;
+        }
+        return false;
 }
 
 def fail(msg: string) -> int {
@@ -266,8 +279,11 @@ def main(args: Array<string>) -> int {
         }
         if (args.length > 7) {
                 def us = parseU64(args[7], 0);
-                if (us == 0) {
-                        System.puts("max-delay-us must be a positive number of microseconds\n");
+                // The delay is drawn from [MIN_DELAY_NS, maxDelayNs), which a
+                // bound at or below the minimum leaves empty.
+                if (us == 0 || long.!(us) * 1000L <= TreeLoopConfig.MIN_DELAY_NS) {
+                        System.puts(Strings.format1("max-delay-us must exceed the minimum delay, %d us\n",
+                                TreeLoopConfig.MIN_DELAY_NS / 1000L));
                         return 2;
                 }
                 TreeLoopConfig.maxDelayNs = long.!(us) * 1000L;
@@ -332,19 +348,21 @@ def main(args: Array<string>) -> int {
                 TreeAck.set(TreeAck.WIRING, 0);
                 TreeAck.set(TreeAck.STATE, 0);
                 TreeAck.set(TreeAck.PUTS, 0);
+                // Everything that can fail or allocate happens before the fork:
+                // from it until the child is killed the parent makes system
+                // calls only, so no error path can leave a child running.
+                def delay = timespec(TreeLoopConfig.MIN_DELAY_NS +
+                        long.!(rng.below(u64.!(TreeLoopConfig.maxDelayNs - TreeLoopConfig.MIN_DELAY_NS))));
+                def waitStatus = Array<int>.new(1);
                 def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
                 if (pid < 0) return fail("fork failed");
                 if (pid == 0) {
                         Linux.syscall(LinuxConst.SYS_exit_group, runChild());
                         return 0;
                 }
-                sleepNanos(long.!(TreeLoopConfig.MIN_DELAY_NS) +
-                        long.!(rng.below(u64.!(TreeLoopConfig.maxDelayNs - TreeLoopConfig.MIN_DELAY_NS))));
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(delay, 0), Pointer.NULL));
                 Linux.syscall(LinuxConst.SYS_kill, (pid, SIGKILL));
-                def waitStatus = Array<int>.new(1);
-                def waited = Linux.syscall(LinuxConst.SYS_wait4,
-                        (pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL)).0;
-                if (waited != pid) return fail("wait4 did not reap the child");
+                if (!reap(pid, waitStatus)) return fail("wait4 did not reap the child (it has been sent SIGKILL)");
                 if (waitStatus[0] != SIGKILL) {
                         def code = waitStatus[0] >> 8;
                         Trace.OUT.put2("iteration %d: child exited %d", iteration, code).ln();
