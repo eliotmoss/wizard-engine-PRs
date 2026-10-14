@@ -1,0 +1,20 @@
+bin/pwbtree.x86-64-linux "/home/users/u7599095" 50 1 256 4096 direct ordinary
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+region file /home/users/u7599095/wizard-pwbtree-u7599095-p204812-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iterations 50 of 50 requested, seed 1
+replayed a record 22, child finished early 0, children confirmed wiring 23
+puts acknowledged by children 54; durable mutations 61
+acknowledged-mutation checks 19, lost 0; the put in flight durable 7, not durable 15
+killed between puts: 28
+killed in a put, before its first mark: 0
+killed after COMPUTE: 11
+killed after ALLOC: 4
+killed after WRITE: 3
+killed after PUBLISH: 4
+killed after FREE: 0
+leaked chunks reclaimed at mount: 36, on 19 mounts
+final tree: 59 keys, height 3 (at most 3 over the run), 14 nodes; matches the reference
+OK

@@ -1,0 +1,21 @@
+./build.sh pwbtree x86-64-linux
+bin/pwbtree.x86-64-linux "/mnt/pmem0.0/sean" 50 1 256 4096 pmem ordinary
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+region file /mnt/pmem0.0/sean/wizard-pwbtree-u7599095-p204702-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iterations 50 of 50 requested, seed 1
+replayed a record 50, child finished early 0, children confirmed wiring 50
+puts acknowledged by children 2956; durable mutations 2970
+acknowledged-mutation checks 49, lost 0; the put in flight durable 14, not durable 35
+killed between puts: 1
+killed in a put, before its first mark: 1
+killed after COMPUTE: 5
+killed after ALLOC: 24
+killed after WRITE: 7
+killed after PUBLISH: 5
+killed after FREE: 7
+leaked chunks reclaimed at mount: 121, on 47 mounts
+final tree: 597 keys, height 4 (at most 4 over the run), 124 nodes; matches the reference
+OK
