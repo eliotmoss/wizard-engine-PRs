@@ -163,8 +163,11 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 def existing = region.getUserRoot();
                 if (existing != 0) {
                         // Validate before trusting: the region cannot know what
-                        // published its root.
-                        if (existing % region.blockSize != 0 || existing + region.blockSize > regionBytes) return false;
+                        // published its root. No sum: existing + blockSize can
+                        // wrap past zero and pass. Block aligned and below
+                        // regionBytes, a whole number of blocks, the whole
+                        // block is in the region.
+                        if (existing % region.blockSize != 0 || existing >= regionBytes) return false;
                         rootOffset = existing;
                         if (rootGet(TreeRoot.magic.offset) != PWBTreeConst.MAGIC ||
                                 rootGet(TreeRoot.blockSize.offset) != region.blockSize ||
@@ -546,8 +549,10 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         // bound. The height must be in [1, MAX_HEIGHT] and every node must carry
         // the level its depth implies; levels strictly decrease on the way down,
         // so the recursion is at most MAX_HEIGHT deep and a child pointer back to
-        // an ancestor, or to the node itself, is refused. (open() and the leak
-        // sweep walk with walkNode(), which also refuses a node reached twice.)
+        // an ancestor, or to the node itself, is refused. It does not track
+        // reachability: a subtree reached twice is walked twice, boundedly.
+        // open() and the leak sweep walk with walkNode(), which refuses a node
+        // reached twice; PWBTreeReference.compare() refuses the repeated keys.
         def forEach(f: (u64, u64) -> void) -> string {
                 if (rootOffset == 0) return "tree root not opened";
                 def h = rootGet(TreeRoot.height.offset);
@@ -573,7 +578,10 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         // Why {node} cannot be read as a node at {level}, or null: an offset in
         // the region and block aligned, a node's tag carrying that level, and no
         // more keys than the capacity. Checked before anything else is read
-        // from it, by both walks.
+        // from it, by both walks. The range check adds nothing to {node}, so a
+        // planted offset near 2^64 cannot wrap into range; aligned and below
+        // regionBytes, the whole block is in the region, and the capacity
+        // bound keeps every word read within it.
         private def nodeError(node: u64, level: int) -> string {
                 def regionBytes = region.numBlocks * region.blockSize;
                 if (node == 0 || node >= regionBytes || node % region.blockSize != 0) {
@@ -794,9 +802,13 @@ class PWBTreeReference {
         def get(key: u64) -> u64 { return map[key]; }
         def size() -> int { return keys.length; }
 
-        // Null when {tree} holds exactly this map's keys and values: every
-        // pair it holds is in the map, it holds as many as the map, and its
-        // keys are distinct (checkInvariants(): strictly increasing).
+        // Null when {tree} holds exactly this map's keys and values: the keys
+        // forEach() yields strictly increase, so none is held twice; every
+        // pair it holds is in the map; and it holds as many as the map.
+        // forEach() checks each node but not reachability, so a subtree
+        // reached twice is walked twice; it repeats its keys and fails the
+        // order here, even when it is the same size as the subtree it
+        // replaced and the count still matches.
         def compare(tree: PWBTree) -> string {
                 def c = PWBTreeComparison.new(this);
                 def walked = tree.forEach(c.visit);
@@ -810,13 +822,17 @@ class PWBTreeReference {
 
 class PWBTreeComparison(ref: PWBTreeReference) {
         var count = 0;
+        var last: u64;
         var err: string;
 
         def visit(k: u64, v: u64) {
+                if (err == null) {
+                        if (count > 0 && k <= last) err = "the tree's keys do not strictly increase in key order: a key repeats or is out of place";
+                        else if (!ref.map.has(k)) err = "the tree holds a key the reference does not";
+                        else if (ref.map[k] != v) err = "the tree's value for a key differs from the reference";
+                }
+                last = k;
                 count++;
-                if (err != null) return;
-                if (!ref.map.has(k)) err = "the tree holds a key the reference does not";
-                else if (ref.map[k] != v) err = "the tree's value for a key differs from the reference";
         }
 }
 

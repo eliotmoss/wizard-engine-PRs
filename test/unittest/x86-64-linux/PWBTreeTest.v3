@@ -1,7 +1,7 @@
 // PWBTree tests
 //
 // Drives the persistent B+Tree over a PWRegion. Most tests use a 1 MiB region
-// (256 x 4096, the benchmark's) over the volatile backend and a capacity of 4
+// (256 x 4096, the benchmark's) in an anonymous mapping and a capacity of 4
 // or 5 keys per node, so a few dozen keys reach a height of 3 or more; one
 // checks the default capacity, 252 at 4 KiB blocks. Contents are compared with
 // an independent DRAM map (PWBTreeReference) and checkInvariants() runs after
@@ -397,8 +397,11 @@ def test_btree_survives_a_garbage_collection(tc: PWBTreeTester) {
 // until the stack runs out: a root node that is its own child, a node at the
 // wrong level, a height beyond MAX_HEIGHT, one more than the tree's, and zero.
 // A child shared with its sibling is refused by open(); forEach() walks it
-// twice, boundedly, and compare() then sees too many keys. Each is planted,
-// checked and undone, and the tree then opens again.
+// twice, boundedly, and compare() refuses the repeated keys, even when the
+// shared leaf is the same size as the one it displaced, so the count matches.
+// A root offset whose sum with the block size wraps past zero is refused by
+// open() rather than read. Each is planted, checked and undone, and the tree
+// then opens again.
 def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
         def tree = tc.open(4);
         def ref = PWBTreeReference.new();
@@ -407,8 +410,8 @@ def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
         def root = tree.rootNode();
         def height = tree.height();
         // Child j of an internal node is word 2 + 2j of its payload.
-        def child0 = btreeChildAddr(tc, root, 0);
-        def child1 = btreeChildAddr(tc, root, 1);
+        def child0 = btreeChildAddr(tc.region, root, 0);
+        def child1 = btreeChildAddr(tc.region, root, 1);
         def heightField = tc.region.regionStart + tree.rootChunk() + u64.!(ChunkHeader.size) + 32u64;
 
         // The root node as its own child: a cycle.
@@ -416,7 +419,7 @@ def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
         btreeRefused(tc, tree, ref, true, "a root node that is its own child");
         btreeSwap(child0, saved);
         // A grandchild where a child belongs: a node at the wrong level.
-        def grandchild = btreeLoad(btreeChildAddr(tc, btreeLoad(child0), 0));
+        def grandchild = btreeLoad(btreeChildAddr(tc.region, btreeLoad(child0), 0));
         saved = btreeSwap(child1, grandchild);
         btreeRefused(tc, tree, ref, true, "a node at the wrong level");
         btreeSwap(child1, saved);
@@ -433,17 +436,67 @@ def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
         }
         tc.region.txn.writeU64(heightField, height);
         tc.region.txn.commit();
+        // A root offset, block aligned, whose sum with the block size wraps
+        // to zero; setUserRoot() would refuse it, so it is planted as a stray
+        // write would leave it.
+        def userRootField = tc.region.regionStart + u64.view(PWRegionHeader.userRoot.offset);
+        def wrapping = 0u64 - BT_BLOCK_SIZE;
+        tc.t.assert_eq(0xFFFF_FFFF_FFFF_F000u64, wrapping);
+        tc.region.txn.writeU64(userRootField, wrapping);
+        tc.region.txn.commit();
+        if (PWBTree.new(tc.region, 4).open()) tc.t.fail("open() accepted a root offset that wraps past zero");
+        tc.region.txn.writeU64(userRootField, tree.rootChunk());
+        tc.region.txn.commit();
 
         // Undone, the tree is whole again.
         def again = PWBTree.new(tc.region, 4);
         tc.t.assertz(true, again.open());
         tc.checkOk(again);
         tc.sameAs(again, ref);
+
+        // A leaf in place of its sibling of the same size, in a tree of its
+        // own: capacity 3 and keys 0 to 3 make a root over two leaves of two
+        // keys each. forEach() walks the shared leaf twice and yields as many
+        // keys as the tree holds, each in the reference with its value; only
+        // the order shows the repeat.
+        def small = tc.anonRegion(BT_BLOCKS);
+        def pair = PWBTree.new(small, 3);
+        tc.t.assertz(true, pair.open());
+        def pairRef = PWBTreeReference.new();
+        for (k < 4) tc.put(pair, pairRef, u64.!(k), 1000u64 + u64.!(k));
+        tc.t.assert_eq(2u64, pair.height());
+        def pairRoot = pair.rootNode();
+        tc.t.assert_eq(1u64, btreeNodeKeys(small, pairRoot));
+        def leaf0 = btreeChildAddr(small, pairRoot, 0);
+        def leaf1 = btreeChildAddr(small, pairRoot, 1);
+        tc.t.assert_eq(2u64, btreeNodeKeys(small, btreeLoad(leaf0)));
+        tc.t.assert_eq(2u64, btreeNodeKeys(small, btreeLoad(leaf1)));
+        saved = btreeSwap(leaf1, btreeLoad(leaf0));
+        if (PWBTree.new(small, 3).open()) tc.t.fail("open() accepted a leaf reached twice");
+        def counter = PWBTreeKeyCounter.new();
+        tc.t.assertz(true, pair.forEach(counter.visit) == null);
+        tc.t.assert_eq(pairRef.size(), counter.count);
+        if (pairRef.compare(pair) == null) tc.t.fail("compare() matched a leaf in place of its sibling of the same size");
+        btreeSwap(leaf1, saved);
+        tc.sameAs(pair, pairRef);
+        def pairAgain = PWBTree.new(small, 3);
+        tc.t.assertz(true, pairAgain.open());
+        tc.sameAs(pairAgain, pairRef);
 }
 
 // The address of child {j}'s offset in the internal node at {node}.
-def btreeChildAddr(tc: PWBTreeTester, node: u64, j: int) -> u64 {
-        return tc.region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(2 + 2 * j);
+def btreeChildAddr(region: PWRegion, node: u64, j: int) -> u64 {
+        return region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(2 + 2 * j);
+}
+
+// The key count of the node at {node}: word 1 of its payload.
+def btreeNodeKeys(region: PWRegion, node: u64) -> u64 {
+        return btreeLoad(region.regionStart + node + u64.!(ChunkHeader.size) + 8u64);
+}
+
+class PWBTreeKeyCounter {
+        var count = 0;
+        def visit(k: u64, v: u64) { count++; }
 }
 
 def btreeLoad(addr: u64) -> u64 {
