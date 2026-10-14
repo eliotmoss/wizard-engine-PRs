@@ -1,0 +1,20 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+region file /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwbtree/bin/pwbtree-bench-block/wizard-pwbtree-u1000-p539595-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iterations 50 of 50 requested, seed 1
+replayed a record 49, child finished early 0, children confirmed wiring 49
+puts acknowledged by children 174; durable mutations 193
+acknowledged-mutation checks 44, lost 0; the put in flight durable 19, not durable 30
+killed between puts: 1
+killed in a put, before its first mark: 0
+killed after COMPUTE: 17
+killed after ALLOC: 13
+killed after WRITE: 6
+killed after PUBLISH: 7
+killed after FREE: 6
+leaked chunks reclaimed at mount: 90, on 42 mounts
+final tree: 160 keys, height 3 (at most 3 over the run), 34 nodes; matches the reference
+OK
+exit=0
