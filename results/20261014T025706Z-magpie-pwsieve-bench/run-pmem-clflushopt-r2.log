@@ -1,0 +1,23 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+directory /mnt/pmem0.0/sean
+writeback CLFLUSHOPT, CPUID selects CLWB
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+wall ns per step 477577
+step ns: mean 477673
+step ns: min 438172 median 478289 p90 492380
+step ns: p99 515594 max 1195357
+phase compute ns per step 425377
+phase alloc ns per step 12548
+phase bitmap ns per step 18938
+phase publish ns per step 9084
+phase retire ns per step 11706
+boundaries per step x1000 4000
+prepare calls per step x1000 0
+clwb lines per step x1000 94584
+minor faults per step x1000 2142
+OK
