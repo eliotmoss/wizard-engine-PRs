@@ -419,7 +419,12 @@ summary() {
                     med = m(c, k, "median_ns")
                     spread = (med > 0 ? 100 * (hi(v[c, k, "median_ns"]) - lo(v[c, k, "median_ns"])) / med : 0)
                     comp = m(c, k, "compute_ns"); per = m(c, k, "alloc_ns") + m(c, k, "write_ns") + m(c, k, "publish_ns") + m(c, k, "free_ns")
-                    tot = comp + per
+                    # The share is of the whole operation, as the sieve'"'"'s is of the
+                    # whole step: the persistence phases over the mean rdtsc time of
+                    # an operation of this kind, which includes what falls outside
+                    # the marks (pwsieve-bench.sh divides by its wall time per step,
+                    # clock_gettime over a loop of nothing but steps).
+                    tot = m(c, k, "mean_ns")
                     printf "%-8s %-14s %4d %10.0f %10.0f %10.0f %6.1f%% %9.0f %9.0f %9.0f %9.0f %9.0f %9.0f %7.1f%%\n", k, c, reps(v[c, k, "median_ns"]),
                         med, m(c, k, "p90_ns"), m(c, k, "mean_ns"), spread, comp, m(c, k, "alloc_ns"), m(c, k, "write_ns"),
                         m(c, k, "publish_ns"), m(c, k, "free_ns"), per, (tot > 0 ? 100 * per / tot : 0) }
@@ -456,7 +461,9 @@ summary() {
             print ""
             print "Columns: median, p90 and mean of each run'"'"'s per-operation rdtsc times; spread = (max - min) / median"
             print "of the per-run medians; the phases are PWBTree'"'"'s onPhase marks, means per operation; persist ="
-            print "alloc + write + publish + free; share = persist / (compute + persist). A mutation at height h"
+            print "alloc + write + publish + free; share = persist / mean, the persistence phases over the whole"
+            print "operation'"'"'s mean time (rdtsc around each put or get), as pwsieve-bench.sh'"'"'s share is over a"
+            print "whole step'"'"'s wall time; what the marks leave out counts against it. A mutation at height h"
             print "with k new nodes makes k + h + 1 boundaries: k allocations, one fence over the new nodes, the"
             print "publish (root swap and first free) and h - 1 further frees. Inserts include the load'"'"'s first"
             print "inserts, made while the root is still a leaf. pmem-none drops CLWB and keeps SFENCE: an"
