@@ -20,7 +20,8 @@
 // the parent, the mutation count it has acknowledged and the last phase mark of
 // the put in flight; a store to shared memory outlives the SIGKILL. A durable m
 // below the acknowledged count is a LOST restart: the loop counts it and the run
-// ends LOST rather than OK. m may exceed it by one, the put in flight having
+// ends LOST rather than OK. A run in which no kill came after an acknowledgement
+// has checked nothing and ends UNCHECKED (exit 3), never OK. m may exceed it by one, the put in flight having
 // published before the kill, and never by more. The mark also says which m the
 // kill allows: before the WRITE mark the publish cannot have started, so m is
 // the acknowledged count; from the PUBLISH mark on it has committed, so m is one
@@ -457,7 +458,15 @@ def main(args: Array<string>) -> int {
                 retained();
                 return 1;
         }
-        if (applied == 0) return fail("no mutation survived any iteration; the kill delays are too short to test anything");
+        // OK claims that acknowledged mutations survived, so it needs at least
+        // one kill that came after an acknowledgement. Without one the run has
+        // shown nothing either way (a single short iteration, say, killed after
+        // the first publish but before the child stored its acknowledgement).
+        if (ackChecks == 0) {
+                System.puts("UNCHECKED: no kill came after an acknowledged mutation, so no acknowledgement was checked; raise the iterations or max-delay-us\n");
+                retained();
+                return 3;
+        }
         if (!RegionFileIO.unlink(TreeLoopConfig.path)) {
                 System.puts("Could not remove the region file printed above.\n");
                 return 2;
