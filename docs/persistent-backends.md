@@ -371,7 +371,7 @@ Run from a clean tree at the commit under test; each campaign interleaves its
 configurations and pins to the DAX namespace's node.
 
 ```
-# Unit tests: the full binary (2,029 of 2,036 should pass since the B+Tree's 20
+# Unit tests: the full binary (2,031 of 2,038 should pass since the B+Tree's 22
 # were added, the 7 known failures failing), then the file backend's restriction
 # checks on their own, then the
 # opt-in PMEM DAX integration tests
@@ -1453,6 +1453,11 @@ list, tagged with the magic and the level its depth implies; at most capacity
 keys, and at least capacity / 2 in every node but the root (only splits happen,
 and a split leaves both halves that full); keys strictly increasing and within
 the separators above; the totals equal to the root's key and node counts.
+`forEach()`, which the reference comparisons use, checks each node it reaches
+the same way (in the region, a node's tag at the level its depth implies,
+within the capacity) and returns a reason instead of walking on, so neither
+walk recurses deeper than the height, at most 32, on a corrupted or cyclic
+image.
 
 **Method.** pwbtreebench runs rounds, each on a freshly formatted region: a
 load of N random distinct keys, each insert timed, then N operations, half
@@ -1667,8 +1672,8 @@ done; done
 ```
 
 ```
-# Magpie. Unit tests: the full binary (2,029 of 2,036 should pass, the 7 known
-# failures failing), then the B+Tree's 20
+# Magpie. Unit tests: the full binary (2,031 of 2,038 should pass, the 7 known
+# failures failing), then the B+Tree's 22
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
 bin/unittest.x86-64-linux 'pwbtree*'
 
@@ -2988,7 +2993,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
-| `PWBTreeTest.v3` | 20 | the persistent B+Tree workload (2026-10-14): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, and a full region failing cleanly; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
+| `PWBTreeTest.v3` | 22 | the persistent B+Tree workload (2026-10-14), over regions in anonymous mappings rather than the volatile backend, whose heap array Virgil's copying collector moves under PWRegion's raw addresses (a collection during a test aborted the full binary on 2026-10-14; `pwsieve:` and the `pwregion:` groups still use that backend): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, a full region failing cleanly, three forced collections between mutations, and a corrupted or cyclic image (a node that is its own child, one at the wrong level, one reached twice, impossible heights) refused by `open()` and `forEach()` rather than walked; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
 | `PWOpsTest.v3` | 6 | the basic-operation benchmark's expectations on the production PMEM boundary path: exact `CLWB`/`SFENCE` counts per allocation and free against the record, the steady state alternating them returns to, no event for an empty commit, no boundary for a clean mount, and one line per replayed entry under one fence for a recovery |
 | `PersistentSieveTest.v3` | 6 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check |
 | `FileMmapRegionTest.v3` | 6 | the file backend as a restriction of the PMEM model (2026-10-13): trace identity with the PMEM backend, every page written back before a fence covered by that fence's syncs, the file after every sync admitted by the model exactly (eager and marked-only images), an `O_DIRECT` re-read of every synced range, no sync under the elided-writeback mutant, and the legacy boundary unchanged; at 2 KiB and 4 KiB blocks, with the `fdatasync` and `msync` fences |
@@ -3179,7 +3184,7 @@ replaced nodes after it. Its harnesses:
 
 | Harness | Evidence layer | What it shows |
 |---|---|---|
-| `PWBTreeTest.v3` (`pwbtree:`, `pwbtree_bd:`) | 0 | Format, reattach and refusal; splits to height 3 and beyond; seeded histories against a DRAM map with the invariants after every mutation; leaks reclaimed; a full region fails cleanly; graceful remounts preserve and resume the tree |
+| `PWBTreeTest.v3` (`pwbtree:`, `pwbtree_bd:`) | 0 | Format, reattach and refusal; splits to height 3 and beyond; seeded histories against a DRAM map with the invariants after every mutation; leaks reclaimed; a full region fails cleanly; the tree unchanged across forced collections; a corrupted or cyclic image refused; graceful remounts preserve and resume the tree |
 | `PWBTreeTest.v3` (`pwbtree:each_put_makes_k_plus_h_plus_1_boundaries`, `pwbtree:unaligned_block_size_writes_back_whole_lines`) | 0 | On the production PMEM boundary path over anonymous memory, counted: every put makes k + h + 1 fences, each commit the lines its record predicts, WRITE exactly the lines of its new nodes, and a lookup nothing; at 4 KiB and at 4,104-byte blocks |
 | `PWBTreeTest.v3` (`pwbtree_dio:`) | 3b | A child on the direct backend stopped at every phase mark of a root split (height 3 to 4) and of an update, then killed: the tree before the mutation up to the PUBLISH mark and after it from there on, and exactly the expected chunks reclaimed |
 | `test/pwbtree.main.v3` (`make pwbtree`, `make pwbtree-pmem`) | 3a | Random-timer `SIGKILL`, remount, invariants, the whole tree against a DRAM map; every acknowledged mutation survives, and the one in flight lands on the side its last phase mark allows; `OK` needs at least one acknowledgement checked, else `UNCHECKED`. File: `OK` on sean-tan-PC, 2026-10-14. PMEM: not yet run |
