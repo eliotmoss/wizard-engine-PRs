@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsievebench-pmem pwopsbench-pmem pwsieve-direct pwsieve-direct-mutant pwsieve-device
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsievebench-pmem pwopsbench-pmem pwbtreebench pwbtreebench-pmem pwbtreebench-direct pwsieve-direct pwsieve-direct-mutant pwsieve-device
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -35,6 +35,7 @@ PWREBOOT_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64
 PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbench.main.v3
 PWSIEVEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsievebench.main.v3
 PWOPSBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwopsbench.main.v3
+PWBTREEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtreebench.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -232,6 +233,38 @@ pwopsbench-pmem: bin/pwopsbench.x86-64-linux
 
 bin/pwopsbench.x86-64-linux: $(ENGINE) $(PWOPSBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwopsbench x86-64-linux
+
+# B+Tree operation cost through the production allocator and WAL
+# (scripts/pwbtree-bench.sh runs the campaign): rounds of a freshly formatted
+# region, a load of random keys, then half lookups and half updates, each
+# operation's persistence work checked. One run per backend; PWBTREEBENCH_ARGS
+# overrides rounds, keys, operations and geometry. The file run needs block
+# storage (PWBTREEBENCH_DIR), the direct run storage that honours O_DIRECT
+# (PWDIRECT_DIR), the PMEM run the DAX mount.
+PWBTREEBENCH_ARGS ?= 3 5000 5000 256 4096
+pwbtreebench: bin/pwbtreebench.x86-64-linux
+	@if [ -z "$(PWBTREEBENCH_DIR)" ]; then \
+		echo "PWBTREEBENCH_DIR must name a writable directory on block storage"; \
+		exit 2; \
+	fi
+	bin/pwbtreebench.x86-64-linux "$(PWBTREEBENCH_DIR)" file $(PWBTREEBENCH_ARGS)
+
+pwbtreebench-direct: bin/pwbtreebench.x86-64-linux
+	@if [ -z "$(PWDIRECT_DIR)" ]; then \
+		echo "PWDIRECT_DIR must name a writable directory on block storage that honours O_DIRECT"; \
+		exit 2; \
+	fi
+	bin/pwbtreebench.x86-64-linux "$(PWDIRECT_DIR)" direct $(PWBTREEBENCH_ARGS)
+
+pwbtreebench-pmem: bin/pwbtreebench.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name your writable directory on the fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pwbtreebench.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" pmem $(PWBTREEBENCH_ARGS)
+
+bin/pwbtreebench.x86-64-linux: $(ENGINE) $(PWBTREEBENCH_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pwbtreebench x86-64-linux
 
 # Stage 2c warm-reboot harness; driven by scripts/stage2c.sh, see
 # docs/stage2c-handoff.md.
