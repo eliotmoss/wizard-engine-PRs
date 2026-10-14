@@ -15,6 +15,9 @@
 
 def BT_BLOCKS = 256u64;
 def BT_BLOCK_SIZE = 4096u64;
+// A multiple of 8, as PWRegion requires, and not of a cache line: chunks, and
+// so node payloads, start at every 8-byte offset within a line.
+def BT_UNALIGNED_BLOCK_SIZE = 4104u64;
 
 def BTT = UnitTests.registerT("pwbtree:", _, PWBTreeTester.new, _);
 def BTX = [
@@ -31,6 +34,7 @@ def BTX = [
         BTT("open_without_root_reclaims_orphans",    test_btree_open_without_root_reclaims_orphans),
         BTT("full_region_fails_cleanly",             test_btree_full_region_fails_cleanly),
         BTT("each_put_makes_k_plus_h_plus_1_boundaries", test_btree_each_put_makes_k_plus_h_plus_1_boundaries),
+        BTT("unaligned_block_size_writes_back_whole_lines", test_btree_unaligned_block_size_writes_back_whole_lines),
         ()
 ];
 
@@ -371,8 +375,10 @@ class PWBTreeAnonPmemRegion extends PmemMmapRegion {
 
 // Checks every mark of a put() as it happens: COMPUTE does no persistence work;
 // ALLOC, PUBLISH and FREE are one commit each, so one fence and the lines its
-// record predicts (PWOps.latestRecord().commitLines()); WRITE one fence.
-class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
+// record predicts (PWOps.latestRecord().commitLines()); WRITE one fence. The
+// prediction counts a record as recordLen / 64 lines, which holds only where the
+// log chunk starts on a line, so {recordLines} is false at other block sizes.
+class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps, recordLines: bool) {
         var lastLines = 0;
         var lastFences = 0;
         def marks = Array<int>.new(5);
@@ -399,6 +405,10 @@ class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
                         }
                         ALLOC, PUBLISH, FREE => {
                                 if (fences != 1) t.fail2("%s made %d fences, expected 1", p.name, fences);
+                                if (!recordLines) {
+                                        finish();
+                                        return;
+                                }
                                 def rec = PWOps.latestRecord(region);
                                 if (rec == null) t.fail1("%s: no valid record in the log", p.name);
                                 else if (lines != rec.commitLines()) {
@@ -406,6 +416,10 @@ class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
                                 }
                         }
                 }
+                finish();
+        }
+
+        private def finish() {
                 lastLines = ops.lines;
                 lastFences = ops.fences;
         }
@@ -416,15 +430,35 @@ class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
 // frees. Its node writebacks are exactly the lines its new nodes occupy, read
 // back from the nodes; a lookup does nothing.
 def test_btree_each_put_makes_k_plus_h_plus_1_boundaries(tc: PWBTreeTester) {
-        def mapping = Mmap.reserve(BT_BLOCKS * BT_BLOCK_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE);
-        if (mapping == null) return tc.t.fail("could not reserve the test region");
+        btreeBoundaryHistory(tc, BT_BLOCK_SIZE);
+}
+
+// A block size that is not a multiple of a line: node payloads start mid-line,
+// and the writebacks must start on the line that holds the first word, as
+// persistRange()'s do. The production provider (and this counting one) raises
+// PersistentOperationError on a writeback that does not start on a line.
+def test_btree_unaligned_block_size_writes_back_whole_lines(tc: PWBTreeTester) {
+        def unaligned = btreeBoundaryHistory(tc, BT_UNALIGNED_BLOCK_SIZE);
+        tc.t.assertz(true, unaligned > 0);
+}
+
+// The history behind both: inserts, updates and lookups on the counted PMEM
+// boundary path at {blockSize}. Returns how many new nodes did not start on a
+// line, so a caller can check its geometry was exercised.
+def btreeBoundaryHistory(tc: PWBTreeTester, blockSize: u64) -> int {
+        def mapping = Mmap.reserve(BT_BLOCKS * blockSize, Mmap.PROT_READ | Mmap.PROT_WRITE);
+        if (mapping == null) {
+                tc.t.fail("could not reserve the test region");
+                return 0;
+        }
         def container = PWBTreeAnonPmemRegion.new(mapping);
         def ops = PWBTreeCountingOps.new(container.range);
         container.setPersistentOperations(ops);
         tc.region = PWRegion.new(PreparedRegionBackend.new(container), BT_BLOCKS,
-                Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
+                Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
         def tree = tc.open(4);
-        def audit = PWBTreeMarkAudit.new(tc.t, tc.region, ops);
+        def audit = PWBTreeMarkAudit.new(tc.t, tc.region, ops, blockSize % PWBTreeConst.LINE == 0);
+        var unaligned = 0;
         tree.onPhase = audit.mark;
         def ref = PWBTreeReference.new();
         def rng = PWBTreeRandom.new(99);
@@ -458,8 +492,9 @@ def test_btree_each_put_makes_k_plus_h_plus_1_boundaries(tc: PWBTreeTester) {
                 tc.t.assert_eq(h - 1, audit.marks[PWBTreePhase.FREE.tag]);
                 var nodeLines = 0;
                 for (j < k) {
-                        def words = tree.nodeWords(tree.lastNewNode(j));
-                        nodeLines += (int.!(ChunkHeader.size) + 8 * words + 63) / 64;
+                        def node = tree.lastNewNode(j);
+                        nodeLines += PWBTreeConst.nodeLines(node, tree.nodeWords(node));
+                        if ((node + u64.!(ChunkHeader.size)) % PWBTreeConst.LINE != 0) unaligned++;
                 }
                 tc.t.assert_eq(nodeLines, audit.writeLines);
                 tc.t.assert_eq(nodeLines, tree.lastNodeLines());
@@ -476,6 +511,7 @@ def test_btree_each_put_makes_k_plus_h_plus_1_boundaries(tc: PWBTreeTester) {
         tc.t.assertz(true, tree.height() >= 3u64);
         tc.region.deallocate();
         container.release();
+        return unaligned;
 }
 
 
@@ -490,12 +526,14 @@ def BTBDX = [
         BTBD("resumes_after_remount",           test_btree_bd_resumes_after_remount),
         BTBD("resume_is_idempotent",            test_btree_bd_resume_is_idempotent),
         BTBD("invariants_hold_across_remounts", test_btree_bd_invariants_hold_across_remounts),
+        BTBD("unaligned_block_size_splits_and_resumes", test_btree_bd_unaligned_block_size_splits_and_resumes),
         ()
 ];
 
 class PWBTreeFileTester(t: Tester) {
         var region: PWRegion;
         var tree: PWBTree;
+        var blockSize = BT_BLOCK_SIZE;
 
         new() {
                 RegionFileIO.unlink(BTREE_BD_PATH);
@@ -505,7 +543,15 @@ class PWBTreeFileTester(t: Tester) {
 
         private def openRegion(forceFormat: bool) -> PWRegion {
                 return PWRegion.new(X86_64Backends.getFileMapped(BTREE_BD_PATH), BT_BLOCKS,
-                        Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, forceFormat);
+                        Array<Ref<MetaDataDesc>>.new(0), blockSize, forceFormat);
+        }
+
+        // Start again on a fresh file at {size}.
+        def reformat(size: u64) {
+                cleanup();
+                blockSize = size;
+                region = openRegion(true);
+                tree = PWBTree.new(region, 4);
         }
 
         // Close cleanly and mount the same file again, as a restart would.
@@ -597,6 +643,26 @@ def test_btree_bd_invariants_hold_across_remounts(tc: PWBTreeFileTester) {
                 tc.sameAs(ref);
         }
         tc.t.assert_eq(120u64, tc.tree.mutations());
+        tc.cleanup();
+}
+
+// The production file provider at a block size that is not a multiple of a
+// line: splits write nodes whose payloads start mid-line, and their writebacks
+// must start on a line or the provider raises PersistentOperationError.
+def test_btree_bd_unaligned_block_size_splits_and_resumes(tc: PWBTreeFileTester) {
+        tc.reformat(BT_UNALIGNED_BLOCK_SIZE);
+        tc.open();
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(17);
+        for (i < 80) {
+                tc.put(ref, rng.below(10000), u64.!(i));
+                tc.checkOk();
+        }
+        tc.t.assertz(true, tc.tree.height() >= 3u64);
+        tc.remount();
+        tc.checkOk();
+        tc.sameAs(ref);
+        tc.t.assert_eq(80u64, tc.tree.mutations());
         tc.cleanup();
 }
 

@@ -59,6 +59,23 @@ component PWBTreeConst {
         def MIN_CAPACITY = 3;   // a split must leave both halves a key
         def MAX_HEIGHT = 32;
         def LINE = 64u64;
+
+        // The first cache line a node's stores touch: its payload starts after
+        // the chunk header, and a chunk is block aligned, but PWRegion only
+        // requires a block size to be a multiple of 8, so the payload need not
+        // start on a line. Aligned down, as persistRange() aligns its range
+        // (MmapRegionUtils.flushRange).
+        def nodeLineStart(offset: u64) -> u64 {
+                def start = offset + u64.!(ChunkHeader.size);
+                return start - start % LINE;
+        }
+
+        // The cache lines a node of {words} words in the chunk at {offset}
+        // touches, from nodeLineStart() to the line holding its last word.
+        def nodeLines(offset: u64, words: int) -> int {
+                def end = offset + u64.!(ChunkHeader.size) + u64.!(words) * 8u64;
+                return int.!((end - nodeLineStart(offset) + LINE - 1u64) / LINE);
+        }
 }
 
 // The phases of one put(), for a timing harness (test/pwbtreebench.main.v3). A
@@ -490,16 +507,15 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 for (i < img.used) writer.writeU64(base + u64.!(i) * 8u64, w[i]);
         }
 
-        // The cache lines the node's stores touch. The chunk is block aligned
-        // and the payload starts in its first line, after the chunk header.
+        // The cache lines the node's stores touch, counted as they are
+        // written back: the same lines persistRange() covers for the last node.
         private def imageLines(img: PWBTreeImage) -> int {
-                def end = u64.!(ChunkHeader.size) + u64.!(img.used) * 8u64;
-                return int.!((end + PWBTreeConst.LINE - 1u64) / PWBTreeConst.LINE);
+                return PWBTreeConst.nodeLines(img.offset, img.used);
         }
 
         private def writeBackImage(img: PWBTreeImage) {
                 def end = img.offset + u64.!(ChunkHeader.size) + u64.!(img.used) * 8u64;
-                var line = img.offset;
+                var line = PWBTreeConst.nodeLineStart(img.offset);
                 while (line < end) {
                         ops.clwb(line);
                         line += PWBTreeConst.LINE;

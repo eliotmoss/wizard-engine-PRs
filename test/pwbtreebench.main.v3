@@ -515,8 +515,8 @@ def runOp(index: int, timer: TreeTimer, tree: PWBTree, kind: KindStats, key: u64
                 if (timer.auditing) {
                         var lines = 0;
                         for (i < k) {
-                                def words = tree.nodeWords(tree.lastNewNode(i));
-                                lines += (int.!(ChunkHeader.size) + 8 * words + 63) / 64;
+                                def node = tree.lastNewNode(i);
+                                lines += PWBTreeConst.nodeLines(node, tree.nodeWords(node));
                         }
                         if (timer.writeLines != lines) {
                                 return StringBuilder.new()
