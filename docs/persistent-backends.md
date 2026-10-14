@@ -1489,7 +1489,7 @@ records the commit, host, CPU, governor, load, mount options and device chain.
 **Measured on sean-tan-PC's NVMe only, 2026-10-14.** The `pmem-auto`,
 `pmem-none` and `file-dax` configurations need a DAX mount; the memmap
 `/dev/pmem0` has no filesystem mounted now and mounting one was out of scope, so
-they wait for Magpie (below). `file` and `direct` ran on `/dev/nvme1n1p3`
+they ran on Magpie (below). `file` and `direct` ran on `/dev/nvme1n1p3`
 (ext4, `rw,relatime`; the Solidigm SSD, write cache write back), pinned to
 CPU 2, a P-core, under `powersave` (EPP `balance_performance`): five
 repetitions of three measured rounds after the audited one, 5,000 keys and then
@@ -1559,11 +1559,92 @@ operation of every round:
 - **Lines are not the cost on this storage.** A mutation writes back about 95
   lines in about 16–17 prepare calls, but the file backend syncs whole pages and
   the direct backend writes whole 4 KiB units, so the line count is not what a
-  mutation pays here. On PMEM each line is a `CLWB`; whether they matter there
-  is Magpie's question.
+  mutation pays here. On PMEM each line is a `CLWB`; Magpie measured what they
+  cost there (below).
 - Wall time per insert during the load is 1,384 µs (`file`) and 1,400 µs
   (`direct`); per operation of the mix, 705 and 731 µs, about half an update,
   since half the mix is lookups.
+
+**Measured on Magpie, every configuration, 2026-10-14.** The Xeon Gold 6252N
+was pinned to node 0, which owns the namespace. `pmem-auto`, `pmem-none` and
+`file-dax` ran on `/mnt/pmem0.0/sean` (`dax=always`), and `file-block` and
+`direct-block` on `/home/users/u7599095`: ext4 on LVM on the rotational `sda`
+behind the write-through controller
+([above](#cost-the-same-seam-call-a-different-persistence-point)). The host has
+no cpufreq driver, so there is no governor. The parameters are the PC run's:
+five repetitions of three measured rounds after the audited one, 5,000 keys and
+then 5,000 operations, a 1 MiB region and seed 1. The campaign took 17 minutes
+from a start load of 0.08, at `1d7c3276`
+(`results/20261014T111205Z-magpie-pwbtree-bench`). All 25 runs ended `OK`
+(`pmem-none`'s `OK timing-only`), every round 0 audit passed, and `summary`
+recomputes the committed summary from `runs.csv`. The tree and the work per
+operation are the PC's: height 2 and 33 nodes after the load, and the same
+boundaries, lines and splits. PMEM makes no prepare calls. Figures are in µs,
+lookups in ns; the phases are means.
+
+| Operation, configuration | Median | p90 | Mean | compute | alloc | write | publish | free | persistence share |
+|---|---|---|---|---|---|---|---|---|---|
+| insert, `pmem-auto` | 58.7 | 64.1 | 59.4 | 5.6 | 24.3 | 7.8 | 13.7 | 8.0 | 90.4 % |
+| insert, `pmem-none` | 50.6 | 55.3 | 51.4 | 3.4 | 21.9 | 6.2 | 12.6 | 7.0 | 93.1 % |
+| insert, `file-dax` | 127.2 | 134.5 | 127.0 | 5.5 | 53.2 | 20.5 | 24.4 | 23.3 | 95.6 % |
+| insert, `file-block` | 2,141 | 2,679 | 2,165 | 13.3 | 904 | 614 | 242 | 387 | 99.2 % |
+| insert, `direct-block` | 2,195 | 2,893 | 2,663 | 13.3 | 1,078 | 749 | 226 | 597 | 99.5 % |
+| update, `pmem-auto` | 58.1 | 60.7 | 58.5 | 5.2 | 23.6 | 7.6 | 13.7 | 8.2 | 90.8 % |
+| update, `pmem-none` | 50.1 | 52.1 | 50.3 | 3.4 | 21.1 | 6.1 | 12.5 | 7.2 | 93.0 % |
+| update, `file-dax` | 126.3 | 131.0 | 127.0 | 5.1 | 53.6 | 19.7 | 24.4 | 24.2 | 96.0 % |
+| update, `file-block` | 2,220 | 2,584 | 2,215 | 13.3 | 920 | 639 | 245 | 398 | 99.4 % |
+| update, `direct-block` | 2,534 | 23,224 | 6,725 | 13.5 | 2,879 | 867 | 404 | 2,561 | 99.8 % |
+| lookup, `pmem-auto` | 1,333 ns | 2,212 ns | 1,343 ns | 1,337 ns | – | – | – | – | 0 |
+| lookup, `pmem-none` | 277 ns | 312 ns | 278 ns | 274 ns | – | – | – | – | 0 |
+| lookup, `file-dax` | 1,331 ns | 2,175 ns | 1,330 ns | 1,322 ns | – | – | – | – | 0 |
+| lookup, `file-block` | 1,216 ns | 1,462 ns | 1,248 ns | 1,220 ns | – | – | – | – | 0 |
+| lookup, `direct-block` | 1,257 ns | 1,684 ns | 1,321 ns | 1,268 ns | – | – | – | – | 0 |
+
+- **On PMEM a mutation is still nine-tenths persistence.** The persistence
+  phases are 90.4 % of an insert's mean time and 90.8 % of an update's on
+  `pmem-auto`. With the file backend they are 95.6–96.0 % on DAX, 99.2–99.4 % on
+  `/home`, and through the direct backend 99.5–99.8 %. A boundary costs
+  10.6–11.0 µs on PMEM, 24.4–24.7 µs with the file backend on DAX and 438–440 µs
+  with it on `/home`: the persistence phases over the boundaries they make. The
+  sieve on the same host spends 11.2 % of a step on persistence on PMEM, 18.9 %
+  with the file backend on DAX, and 57.9–58.3 % on `/home`
+  ([above](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence),
+  `results/20261014T025706Z-magpie-pwsieve-bench`). On one host, then, the two
+  workloads bracket the share: 11–90 % on PMEM and 58–99 % on the disk.
+- **The writebacks cost a PMEM mutation 14 %, and not only inside its
+  boundaries.** `pmem-auto − pmem-none` is 8.1 µs per insert (13.8 %) and 7.9 µs
+  per update (13.6 %). For the sieve the same difference is 1.0 % of a step. An
+  insert computes for 5.6 µs with the writebacks and 3.4 µs without them; for an
+  update it is 5.2 against 3.4 µs. A lookup makes no boundary, yet it takes
+  1,333 ns on `pmem-auto`, 1,331 ns on `file-dax` and 277 ns on `pmem-none`.
+  That is consistent with `CLWB` evicting on Cascade Lake
+  ([above](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows)):
+  the next operation finds the nodes a mutation wrote back no longer cached. This
+  is an inference: the benchmark counts no misses.
+- **On `/home` the computation is slower too.** It takes 13.3–13.5 µs against
+  5.2–5.6 µs on PMEM, and a lookup takes 1.2–1.3 µs. That matches the sieve's
+  computation after a blocking boundary
+  ([above](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence)).
+  Magpie has no clock probe, so this is an inference.
+- **The direct backend's mutations on `/home` have a heavy tail, not
+  explained.** In every repetition its updates' p90 is 9.4–25.5 ms and their
+  p99 35.6–43.6 ms, against `file-block`'s 2.6 ms and 2.8–3.0 ms. The medians
+  stay close: 2.41–2.67 ms against 2.21–2.23 ms per repetition. The inserts'
+  p99 is 17.0–32.0 ms against 3.1 ms. About 91 % of the update's excess mean
+  lies in the alloc and free phases, which are commits. The mean update,
+  6.7 ms, is 2.7 times the median, and the per-repetition means run 4.8, 6.7,
+  5.2, 8.7 and 8.2 ms. The sieve's `direct-block` steps earlier the same day
+  have no such tail: p90 is 1.18–1.20 times the median, against `file-block`'s
+  1.16. The direct backend writes whole 4 KiB units (`WRITE_UNIT`), which rules
+  out a sub-sector read-modify-write. The controller's cache, the candidate for
+  the [block-media regimes](#the-block-media-configuration-is-not-a-controlled-measurement-here),
+  is one here too, and is untested. The share is 99.5–99.8 % with the tail and
+  `file-block`'s 99.2–99.4 % without it, so the bracket does not depend on it.
+- An insert takes 2.14–2.19 ms (median) on Magpie's `/home` against
+  1.40–1.44 ms on the PC's NVMe, and 58.7 µs on Magpie's PMEM, so there the
+  disk takes 36–37 times as long as PMEM. Wall time
+  per insert during the load is 60.0 µs (`pmem-auto`), 127.6 µs (`file-dax`),
+  2,167 µs (`file-block`) and 2,664 µs (`direct-block`).
 
 **Height 2, not 3.** A third level needs the root, an internal node, to split,
 which takes more than 253 leaves of one block each; the region has 256 blocks in
@@ -1614,6 +1695,30 @@ Capacity 8, keys from [0, 600), seed 1, 50 kills per run, unpinned, at
   `direct` process death discards what was never written back, and the mutant
   loses every acknowledged mutation.
 
+Magpie used the same parameters, unpinned, at `82778885`
+(`results/20261014T110033Z-magpie-pwbtree-kill`). The directory has no
+provenance file; the revision is the commit its results were added on. PMEM ran
+on `/mnt/pmem0.0/sean`, `file` and `direct` on `/home/users/u7599095`:
+
+| Backend, Magpie | Ordinary provider | Elided-writeback mutant |
+|---|---|---|
+| `pmem` (DAX) | `OK`: 49 acknowledged-mutation checks, 0 lost | not run (process death leaves the cache, so it cannot discriminate) |
+| `file` on `/home` | `OK`: 44 checks, 0 lost | not run (cannot discriminate) |
+| `direct` on `/home` | `OK`: 19 checks, 0 lost | **`LOST`**: 37 of 37 lost; 1,969 puts acknowledged, none durable |
+
+- The PMEM children acknowledged 2,956 puts and ran almost the whole history
+  (597 keys, height 4, 124 nodes). On `/home`, where a boundary costs about
+  0.5 ms, the `file` children acknowledged 119 and the `direct` ones 54. The
+  sweep reclaimed 121 leaked chunks on 47 remounts (PMEM), 97 on 45 (`file`)
+  and 36 on 19 (`direct`).
+- **The direct run checked fewer acknowledgements.** 27 of its 50 children were
+  killed before they confirmed their wiring, that is, while still mounting,
+  against one on sean-tan-PC. That left 19 checks against the PC's 44. A direct
+  mount reads the whole region, and pwopsbench times a 1 MiB direct mount on
+  `/home` at 24.4 ms, longer than the loop's longest delay of 20 ms. Why 23
+  mounts finished sooner is not established. More iterations, or a longer delay
+  (the eighth argument), would check more; one check suffices for the verdict.
+
 The deterministic counterpart is `pwbtree_dio:`: a child on the direct backend
 is stopped at every phase mark of two mutations, an insert that splits a leaf,
 every internal node on its path and the root (height 3 to 4), and an update at
@@ -1628,9 +1733,12 @@ tree is not yet in the crash-image explorer (layer 1b).
 
 #### What these numbers cannot show
 
-- **PMEM.** What share of a mutation's time is persistence when a boundary is an
-  `SFENCE` rather than an `fdatasync`, and whether 95 `CLWB`s per mutation
-  matter, is what this workload exists to measure, and it needs Magpie. Not run.
+- **Power loss, and the order of `CLWB`s and `SFENCE`s.** Magpie measured the
+  PMEM share and the writebacks' cost (above). But its kill loop on DAX cannot
+  discriminate, and the tree is not in the crash-image explorer, so nothing here
+  tests the tree's writebacks on PMEM.
+- **The direct backend's tail on Magpie's `/home`.** It is observed in every
+  repetition and not explained (above).
 - **Five boundaries where the work needs two.** At height 2 a mutation's
   essential ordering is one fence over the new nodes, then one commit that
   allocates them, swaps the root and frees the old path. The other three
@@ -1658,9 +1766,9 @@ tree is not yet in the crash-image explorer (layer 1b).
 - **A node is a block.** The capacity follows the block size (252 keys at
   4 KiB); smaller nodes would need several per chunk and an allocator inside the
   tree.
-- **One host, one clock, height 2.** The `powersave` clock caveat and the
-  height limit are above; a run under `performance` or with a clock probe would
-  separate the clock from the storage.
+- **The clock, and height 2.** The PC's `powersave` caveat and the height limit
+  are above. Magpie has no cpufreq driver, but its block runs block too. A run
+  with a clock probe would separate the clock from the storage on either host.
 
 #### Reproducing the tree's figures, and on Magpie
 
@@ -1881,8 +1989,10 @@ spread of the medians; the p90s are in `summary.txt`. The work per operation is
 the sean-tan-PC table's on every configuration, with 0 lines on `file-dax` and
 `file-block`. The run is at commit `8b364dc2` (its `provenance.txt`), before
 the file backend's boundary changed on 2026-10-13, so the `file-dax` and
-`file-block` rows are the legacy boundary, hence the 0 lines; the change's
-effect on Magpie is not yet measured ([old against new](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)):
+`file-block` rows are the legacy boundary, hence the 0 lines. The change's
+effect on Magpie, and the whole table again in one sitting at the current
+boundary, are [below](#magpie-again-every-backend-in-one-sitting-2026-10-14)
+([old against new](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)):
 
 | Operation | `pmem-auto` | `pmem-none` | `file-dax` | `file-block` | `direct-block` |
 |---|---|---|---|---|---|
@@ -1985,6 +2095,68 @@ effect on Magpie is not yet measured ([old against new](#the-file-backend-a-rest
   one run. Not explained; the n = 64 differences above are well outside it.
 - **An empty commit is no boundary here either:** 13–14 ns against the empty
   window's 11–13 ns.
+
+#### Magpie again, every backend in one sitting (2026-10-14)
+
+Two campaigns ran the evening after, at the current file boundary, with the same
+host, pinning (node 0), directories and parameters as above:
+
+- `results/20261014T113013Z-magpie-pwops-bench`: the file backend's
+  boundary new against legacy (`file-dax`, `file-block` and their `-legacy`
+  variants), at `d45f5047`. It took 27 minutes, and all 20 runs ended `OK`.
+- `results/20261014T121109Z-magpie-pwops-bench`: all five configurations, at
+  `fc73b0a6`, whose engine code is `d45f5047`'s. It took 39 minutes from a start
+  load of 0.00, and all 25 runs ended `OK` (`pmem-none`'s `OK timing-only`).
+
+Both summaries recompute from their `runs.csv`. Every configuration now does
+the same work per operation, the sean-tan-PC table's, because the file backend
+writes its lines back at the boundary. The table is the second campaign's, in ns
+with the spread of the medians:
+
+| Operation | `pmem-auto` | `pmem-none` | `file-dax` | `file-block` | `direct-block` |
+|---|---|---|---|---|---|
+| `alloc-1` | 15,542 (0.3 %) | 14,006 (0.1 %) | 33,649 (1.6 %) | 455,040 (0.1 %) | 450,697 (0.6 %) |
+| `alloc-8` | 16,047 (0.3 %) | 14,094 (0.1 %) | 34,024 (1.0 %) | 455,574 (0.1 %) | 450,943 (0.2 %) |
+| `alloc-64` | 15,850 (0.3 %) | 14,101 (0.1 %) | 38,028 (0.6 %) | 383,906 (3.7 %) | 355,854 (0.3 %) |
+| `free-1` | 10,818 (0.3 %) | 9,717 (0.1 %) | 29,657 (1.9 %) | 438,727 (0.2 %) | 431,646 (0.6 %) |
+| `free-8` | 11,231 (0.3 %) | 9,779 (0.1 %) | 30,344 (1.4 %) | 439,329 (0.2 %) | 431,425 (0.3 %) |
+| `free-64` | 11,238 (0.4 %) | 9,781 (0.1 %) | 34,219 (0.3 %) | 367,833 (2.1 %) | 339,342 (0.3 %) |
+| `commit-empty` | 13 | 13 | 13 | 13 | 13 |
+| `timer` | 12 | 12 | 12 | 13 | 13 |
+| `mount-1mib` | 8,088 (16.2 %) | 9,131 (14.9 %) | 8,869 (14.8 %) | 31,780 (15.8 %) | 24,391,189 (0.0 %) |
+| `mount-64mib` | 5,755 (3.6 %) | 5,761 (0.8 %) | 7,538 (9.0 %) | 8,809 (48.7 %) | 525,819,999 (1.6 %) |
+| `recover-8` | 19,288 (8.1 %) | 14,653 (10.1 %) | 18,306 (8.5 %) | 176,296 (2.8 %) | 21,786,751 (0.1 %) |
+| `recover-24` | 35,798 (5.5 %) | 20,213 (7.9 %) | 25,025 (6.3 %) | 195,552 (1.9 %) | 24,814,042 (0.0 %) |
+| `replay-8` (derived) | 11,200 | 5,522 | 9,437 | 144,516 | −2,604,438 |
+| `replay-24` (derived) | 27,710 | 11,082 | 16,156 | 163,772 | 422,853 |
+
+- **Quote one sitting: Magpie's block storage moved 12–13 % overnight.** The
+  legacy file boundary's `alloc-1` on `/home` took 512,489 ns on 2026-10-13 and
+  451,646 ns on 2026-10-14, and `direct-block`'s took 517,780 against
+  450,697 ns. That is the [block-media regime
+  shift](#the-block-media-configuration-is-not-a-controlled-measurement-here)
+  again. The two evening campaigns agree to within 0.3 % on `/home` for every
+  allocation and free, and to within 0.8 % on DAX. PMEM moved too, though less:
+  `pmem-auto`'s `alloc-1` and `free-1` are 1.6 % lower than on 2026-10-13, and
+  `pmem-none`'s `alloc-1` 2.8 %, outside the spreads.
+- **On one host and one sitting, the disk takes 29 times as long as PMEM for an
+  allocation.** `alloc-1` takes 15.5 µs on `pmem-auto`, 33.6 µs with the file
+  backend on DAX (2.2 times), and 455.0 and 450.7 µs with the file and direct
+  backends on `/home`.
+- **The file backend's current boundary costs 2–4 % on DAX and under 1 % on
+  `/home`.** In the first campaign, against the legacy boundary interleaved
+  with it, the cost is +2.3 to +3.7 % at every size on DAX. On `/home` it is
+  +0.5 to +0.7 % at n = 1 and 8, outside the spreads, and inside them at
+  n = 64.
+- **Direct is cheaper than the file backend on `/home` in one sitting.** It is
+  1.0–1.8 % cheaper at n = 1 and 8, and 7.3–7.7 % at n = 64, where it saves a
+  write ([above](#basic-operations-what-an-allocation-a-free-a-mount-and-a-recovery-cost-2026-10-13)).
+  This is in line with the 2–6 % at 2 MiB
+  ([above](#cost-the-same-seam-call-a-different-persistence-point)).
+- **The writebacks are 10–13 % of a PMEM allocation or free.**
+  `pmem-auto − pmem-none` is 1,101–1,953 ns (9.9–13.0 %), as on 2026-10-13.
+- **The direct mount reproduces.** A direct mount of 1 MiB takes 24.4 ms and
+  of 64 MiB 526 ms (21.6 times), and `replay-8` again comes out at −2.6 ms.
 
 #### Commits of k entries: pwbench's figures
 
