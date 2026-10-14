@@ -371,7 +371,7 @@ Run from a clean tree at the commit under test; each campaign interleaves its
 configurations and pins to the DAX namespace's node.
 
 ```
-# Unit tests: the full binary (2,027 of 2,034 should pass since the B+Tree's 18
+# Unit tests: the full binary (2,029 of 2,036 should pass since the B+Tree's 20
 # were added, the 7 known failures failing), then the file backend's restriction
 # checks on their own, then the
 # opt-in PMEM DAX integration tests
@@ -1391,7 +1391,11 @@ capacity, checked on open), the root node's offset, the height, the key and
 node counts, and a mutation count that never decreases. Format publishes an
 empty root leaf, so the height is at least 1 and every mutation replaces at
 least one node. Leaves have no sibling links and there is no delete: nothing
-scans a range or merges nodes.
+scans a range or merges nodes. A chunk is block aligned, but PWRegion allows any
+block size that is a multiple of 8, so a node need not start on a cache line;
+its writebacks start on the line that holds its first word, as `persistRange()`
+aligns its range (tested at 4,104-byte blocks; until a review on 2026-10-14
+they started at the chunk and raised `PersistentOperationError` there).
 
 **Copy-on-write, because a node cannot go through the log.** A redo entry
 carries at most 8 bytes in a 32-byte slot, so a 4 KiB node would overflow a
@@ -1478,11 +1482,16 @@ repetitions of three measured rounds after the audited one, 5,000 keys and then
 5,000 operations per round, a 1 MiB region (256 × 4 KiB), seed 1, at 73f5aed2
 (`results/20261014T041846Z-sean-tan-PC-pwbtree-bench-cpus2-powersave`). After
 the load the tree holds 5,000 keys at height 2 in 33 nodes. Per operation, the
-median over repetitions of each run's statistic; the phases are means:
+median over repetitions of each run's statistic; the phases are means. The
+persistence share is the four persistence phases over the mean time of the
+whole operation (`rdtsc` around each `put()` or `get()`), as the sieve's is over
+a whole step's wall time, so what falls outside the marks counts against it.
+(The first summary divided by compute plus persistence instead, which made
+every mutation 99.5 %; it was regenerated from the same runs on 2026-10-14.)
 
 | Operation, backend | Median | p90 | compute | alloc | write | publish | free | persistence share |
 |---|---|---|---|---|---|---|---|---|
-| insert, `file` | 1,396 µs | 1,423 µs | 6.7 µs | 555 µs | 278 µs | 281 µs | 261 µs | 99.5 % |
+| insert, `file` | 1,396 µs | 1,423 µs | 6.7 µs | 555 µs | 278 µs | 281 µs | 261 µs | 99.4 % |
 | insert, `direct` | 1,444 µs | 1,471 µs | 6.6 µs | 559 µs | 303 µs | 262 µs | 268 µs | 99.5 % |
 | update, `file` | 1,395 µs | 1,423 µs | 6.5 µs | 561 µs | 277 µs | 281 µs | 274 µs | 99.5 % |
 | update, `direct` | 1,445 µs | 1,472 µs | 6.5 µs | 583 µs | 310 µs | 265 µs | 287 µs | 99.5 % |
@@ -1498,9 +1507,12 @@ operation of every round:
 | update | 5.000 (5–5) | 94.660 | 16.945 | 0 in 7,539 |
 | lookup | 0 | 0 | 0 | 0 in 7,461 |
 
-- **A mutation is persistence: 99.5 % of it, on both backends.** Descending,
-  planning and building the new node images take 6.5–6.7 µs of a 1.4 ms
-  mutation; the rest is boundaries. The sieve on PMEM is the other end
+- **A mutation's time is persistence: 99.4–99.5 % of it, on both backends.**
+  The persistence phases are 99.4 % of an insert's mean time on `file` and
+  99.5 % of every other mutation's. Descending, planning and building the new
+  node images take 6.5–6.7 µs of a 1.4 ms mutation, and what the marks leave
+  out under 2 µs more (mean less phases); the rest is boundaries. The sieve on
+  PMEM is the other end
   ([above](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence));
   the two bracket the interface.
 - **The boundary counts are the model's, to the operation.** Every update made
@@ -1557,9 +1569,14 @@ leaks), runs the invariants, and compares the whole tree with a DRAM map at the
 durable mutation count. Every acknowledged put must survive. The put in flight
 may or may not, and the last phase mark the child reached, kept in memory
 shared with the parent, says which: unpublished before the WRITE mark,
-published from the PUBLISH mark on. Capacity 8, keys from [0, 600), seed 1, 50
-kills per run, unpinned, at 62300c6c
-(`results/20261014T042933Z-sean-tan-PC-pwbtree-kill`):
+published from the PUBLISH mark on. Since a review on 2026-10-14 the loop says
+`OK` only if at least one kill came after an acknowledged mutation, so that an
+acknowledgement was checked; otherwise it ends `UNCHECKED` (exit 3). Before,
+one short iteration killed after the first publish but before the child stored
+its acknowledgement could pass having checked nothing. The runs below predate
+the rule and made 44 or 45 such checks each, so their verdicts stand.
+Capacity 8, keys from [0, 600), seed 1, 50 kills per run, unpinned, at
+62300c6c (`results/20261014T042933Z-sean-tan-PC-pwbtree-kill`):
 
 | Backend, sean-tan-PC NVMe | Ordinary provider | Elided-writeback mutant |
 |---|---|---|
@@ -1597,7 +1614,7 @@ tree is not yet in the crash-image explorer (layer 1b).
 
 #### What these numbers cannot show
 
-- **PMEM.** What share of a mutation is persistence when a boundary is an
+- **PMEM.** What share of a mutation's time is persistence when a boundary is an
   `SFENCE` rather than an `fdatasync`, and whether 95 `CLWB`s per mutation
   matter, is what this workload exists to measure, and it needs Magpie. Not run.
 - **Five boundaries where the work needs two.** At height 2 a mutation's
@@ -1647,8 +1664,8 @@ done; done
 ```
 
 ```
-# Magpie. Unit tests: the full binary (2,027 of 2,034 should pass, the 7 known
-# failures failing), then the B+Tree's 18
+# Magpie. Unit tests: the full binary (2,029 of 2,036 should pass, the 7 known
+# failures failing), then the B+Tree's 20
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
 bin/unittest.x86-64-linux 'pwbtree*'
 
@@ -1659,7 +1676,8 @@ PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean PWBB_BLOCK_DIR=/home/users/u7599095 \
     PWBB_NUMA_NODE=0 scripts/pwbtree-bench.sh campaign
 
 # The kill loop on DAX (cannot discriminate), through the file backend on /home,
-# and through the direct backend, ordinary and then the mutant (must end LOST)
+# and through the direct backend, ordinary and then the mutant (must end LOST);
+# UNCHECKED (exit 3) means no acknowledgement was checked: rerun with more iterations
 PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pwbtree-pmem
 PWBTREE_DIR=/home/users/u7599095 make pwbtree
 PWDIRECT_DIR=/home/users/u7599095 make pwbtree-direct
@@ -2967,7 +2985,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
-| `PWBTreeTest.v3` | 18 | the persistent B+Tree workload (2026-10-14): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, and a full region failing cleanly; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy; resume across real file-backed remounts (`pwbtree_bd:`); and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
+| `PWBTreeTest.v3` | 20 | the persistent B+Tree workload (2026-10-14): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, and a full region failing cleanly; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
 | `PWOpsTest.v3` | 6 | the basic-operation benchmark's expectations on the production PMEM boundary path: exact `CLWB`/`SFENCE` counts per allocation and free against the record, the steady state alternating them returns to, no event for an empty commit, no boundary for a clean mount, and one line per replayed entry under one fence for a recovery |
 | `PersistentSieveTest.v3` | 6 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check |
 | `FileMmapRegionTest.v3` | 6 | the file backend as a restriction of the PMEM model (2026-10-13): trace identity with the PMEM backend, every page written back before a fence covered by that fence's syncs, the file after every sync admitted by the model exactly (eager and marked-only images), an `O_DIRECT` re-read of every synced range, no sync under the elided-writeback mutant, and the legacy boundary unchanged; at 2 KiB and 4 KiB blocks, with the `fdatasync` and `msync` fences |
@@ -3159,9 +3177,9 @@ replaced nodes after it. Its harnesses:
 | Harness | Evidence layer | What it shows |
 |---|---|---|
 | `PWBTreeTest.v3` (`pwbtree:`, `pwbtree_bd:`) | 0 | Format, reattach and refusal; splits to height 3 and beyond; seeded histories against a DRAM map with the invariants after every mutation; leaks reclaimed; a full region fails cleanly; graceful remounts preserve and resume the tree |
-| `PWBTreeTest.v3` (`pwbtree:each_put_makes_k_plus_h_plus_1_boundaries`) | 0 | On the production PMEM boundary path over anonymous memory, counted: every put makes k + h + 1 fences, each commit the lines its record predicts, WRITE exactly the lines of its new nodes, and a lookup nothing |
+| `PWBTreeTest.v3` (`pwbtree:each_put_makes_k_plus_h_plus_1_boundaries`, `pwbtree:unaligned_block_size_writes_back_whole_lines`) | 0 | On the production PMEM boundary path over anonymous memory, counted: every put makes k + h + 1 fences, each commit the lines its record predicts, WRITE exactly the lines of its new nodes, and a lookup nothing; at 4 KiB and at 4,104-byte blocks |
 | `PWBTreeTest.v3` (`pwbtree_dio:`) | 3b | A child on the direct backend stopped at every phase mark of a root split (height 3 to 4) and of an update, then killed: the tree before the mutation up to the PUBLISH mark and after it from there on, and exactly the expected chunks reclaimed |
-| `test/pwbtree.main.v3` (`make pwbtree`, `make pwbtree-pmem`) | 3a | Random-timer `SIGKILL`, remount, invariants, the whole tree against a DRAM map; every acknowledged mutation survives, and the one in flight lands on the side its last phase mark allows. File: `OK` on sean-tan-PC, 2026-10-14. PMEM: not yet run |
+| `test/pwbtree.main.v3` (`make pwbtree`, `make pwbtree-pmem`) | 3a | Random-timer `SIGKILL`, remount, invariants, the whole tree against a DRAM map; every acknowledged mutation survives, and the one in flight lands on the side its last phase mark allows; `OK` needs at least one acknowledgement checked, else `UNCHECKED`. File: `OK` on sean-tan-PC, 2026-10-14. PMEM: not yet run |
 | `test/pwbtree.main.v3` (`make pwbtree-direct`, `make pwbtree-direct-mutant`) | 3b | The same loop on the direct backend: the ordinary build `OK`, the elided-writeback mutant `LOST` with every acknowledged mutation lost (see [the tree's crash behaviour](#crash-behaviour-of-the-tree)) |
 | `test/pwbtreebench.main.v3` (`scripts/pwbtree-bench.sh`) | — | Cost per operation; fails any run whose operations do other persistence work than k + h + 1 boundaries and the audited round's prepare calls and lines |
 
