@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 function exit_usage() {
-    echo "Usage: build.sh <wizeng|objdump|unittest|pmemtest|pwsieve|pwbench|pwsievebench|pwopsbench|pwbtreebench|pwreboot> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
+    echo "Usage: build.sh <wizeng|objdump|unittest|pmemtest|pwsieve|pwbench|pwsievebench|pwopsbench|pwbtreebench|pwbtree|pwreboot> <x86-linux|x86-64-darwin|x86-64-linux|jvm|wasm-wave>"
     exit 1
 }
 
@@ -58,6 +58,7 @@ PWBENCH_X86_64_LINUX="test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbe
 PWSIEVEBENCH_X86_64_LINUX="test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsievebench.main.v3"
 PWOPSBENCH_X86_64_LINUX="test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwopsbench.main.v3"
 PWBTREEBENCH_X86_64_LINUX="test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtreebench.main.v3"
+PWBTREE_X86_64_LINUX="test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtree.main.v3"
 SPECTEST_MODE="test/wasm-spec/*.v3 src/SpectestMode.v3"
 WASM_MODE="src/WasmMode.v3"
 WIZENG="src/wizeng.main.v3 src/modules/*.v3 src/modules/wizeng/*.v3"
@@ -189,6 +190,11 @@ elif [ "$PROGRAM" = "pwbtreebench" ]; then
         exit_usage
     fi
     SOURCES="$ENGINE $PWBTREEBENCH_X86_64_LINUX"
+elif [ "$PROGRAM" = "pwbtree" ]; then
+    if [[ "$TARGET" != "x86-64-linux" && "$TARGET" != "x86_64_linux" ]]; then
+        exit_usage
+    fi
+    SOURCES="$ENGINE $PWBTREE_X86_64_LINUX"
 elif [ "$PROGRAM" = "objdump" ]; then
     SOURCES="$ENGINE src/objdump.main.v3"
 else

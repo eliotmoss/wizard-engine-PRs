@@ -1,6 +1,6 @@
 all: x86-linux x86-64-linux jvm
 
-.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsievebench-pmem pwopsbench-pmem pwbtreebench pwbtreebench-pmem pwbtreebench-direct pwsieve-direct pwsieve-direct-mutant pwsieve-device
+.PHONY: clean x86-linux x86-64-linux jvm wasm-wave pmem-integration pwsieve pwsieve-pmem pwsieve-pmem-mutant pwbench-pmem pwbench-file pwbench-block pwbench-direct pwbench-device pwsievebench-pmem pwopsbench-pmem pwbtreebench pwbtreebench-pmem pwbtreebench-direct pwbtree pwbtree-pmem pwbtree-direct pwbtree-direct-mutant pwsieve-direct pwsieve-direct-mutant pwsieve-device
 clean:
 	rm -f TAGS bin/*
 	cp scripts/* bin/
@@ -36,6 +36,7 @@ PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwben
 PWSIEVEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsievebench.main.v3
 PWOPSBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwopsbench.main.v3
 PWBTREEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtreebench.main.v3
+PWBTREE_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtree.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -153,6 +154,44 @@ pwsieve-device: bin/pwsieve.x86-64-linux
 
 bin/pwsieve.x86-64-linux: $(ENGINE) $(PWSIEVE_X86_64_LINUX) $(X86_64) $(JIT) build.sh
 	./build.sh pwsieve x86-64-linux
+
+# Random-timer crash loop over the persistent B+Tree (test/pwbtree.main.v3), as
+# pwsieve's over the sieve: every acknowledged mutation must survive each kill.
+# PWBTREE_ARGS gives the iterations, seed and geometry; the file run needs block
+# storage (PWBTREE_DIR; tmpfs would test nothing durable), the direct runs
+# storage that honours O_DIRECT (PWDIRECT_DIR), the PMEM run the DAX mount. The
+# mutant on the direct backend must report LOST.
+PWBTREE_ARGS ?= 50 1 256 4096
+pwbtree: bin/pwbtree.x86-64-linux
+	@if [ -z "$(PWBTREE_DIR)" ]; then \
+		echo "PWBTREE_DIR must name a writable directory on block storage"; \
+		exit 2; \
+	fi
+	bin/pwbtree.x86-64-linux "$(PWBTREE_DIR)" $(PWBTREE_ARGS) file ordinary
+
+pwbtree-pmem: bin/pwbtree.x86-64-linux
+	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
+		echo "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"; \
+		exit 2; \
+	fi
+	bin/pwbtree.x86-64-linux "$(PWASM_PMEM_TEST_DIR)" $(PWBTREE_ARGS) pmem ordinary
+
+pwbtree-direct: bin/pwbtree.x86-64-linux
+	@if [ -z "$(PWDIRECT_DIR)" ]; then \
+		echo "PWDIRECT_DIR must name a writable directory on block storage that honours O_DIRECT"; \
+		exit 2; \
+	fi
+	bin/pwbtree.x86-64-linux "$(PWDIRECT_DIR)" $(PWBTREE_ARGS) direct ordinary
+
+pwbtree-direct-mutant: bin/pwbtree.x86-64-linux
+	@if [ -z "$(PWDIRECT_DIR)" ]; then \
+		echo "PWDIRECT_DIR must name a writable directory on block storage that honours O_DIRECT"; \
+		exit 2; \
+	fi
+	bin/pwbtree.x86-64-linux "$(PWDIRECT_DIR)" $(PWBTREE_ARGS) direct elide-clwb
+
+bin/pwbtree.x86-64-linux: $(ENGINE) $(PWBTREE_X86_64_LINUX) $(X86_64) $(JIT) build.sh
+	./build.sh pwbtree x86-64-linux
 
 # Persistence-boundary cost. Three configurations: the SFENCE boundary on DAX,
 # the fdatasync boundary on the same DAX media, and the fdatasync boundary on
