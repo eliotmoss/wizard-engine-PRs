@@ -1460,8 +1460,11 @@ lookups and half updates of uniformly chosen loaded keys (a YCSB-A-like mix),
 each kind timed apart. After each round the invariants run and the whole tree
 is compared with a DRAM map. Round 0 is unmeasured and audits every mark
 through counting backends (pwopsbench's): each commit one boundary and the
-lines its WAL record predicts (`commitLines()`), WRITE one boundary and exactly
-the lines the new nodes occupy, read back from them. Every operation of every
+lines its WAL record predicts (`commitLines()`, counted from the record's real
+offset: at a block size that is not a multiple of a line, 4,104 bytes say, a
+log slot starts inside a line and a record touches one more, which until a
+review on 2026-10-14 the prediction missed), WRITE one boundary and exactly the
+lines the new nodes occupy, read back from them. Every operation of every
 round must then make k + h + 1 boundaries, with k and h read from the durable
 root, and every measured operation exactly the boundaries, prepare calls and
 lines its counterpart made in round 0: each round replays the same seeded

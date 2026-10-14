@@ -375,10 +375,9 @@ class PWBTreeAnonPmemRegion extends PmemMmapRegion {
 
 // Checks every mark of a put() as it happens: COMPUTE does no persistence work;
 // ALLOC, PUBLISH and FREE are one commit each, so one fence and the lines its
-// record predicts (PWOps.latestRecord().commitLines()); WRITE one fence. The
-// prediction counts a record as recordLen / 64 lines, which holds only where the
-// log chunk starts on a line, so {recordLines} is false at other block sizes.
-class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps, recordLines: bool) {
+// record predicts (PWOps.latestRecord().commitLines(), from the record's real
+// offset, so at any block size); WRITE one fence.
+class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
         var lastLines = 0;
         var lastFences = 0;
         def marks = Array<int>.new(5);
@@ -405,10 +404,6 @@ class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps, rec
                         }
                         ALLOC, PUBLISH, FREE => {
                                 if (fences != 1) t.fail2("%s made %d fences, expected 1", p.name, fences);
-                                if (!recordLines) {
-                                        finish();
-                                        return;
-                                }
                                 def rec = PWOps.latestRecord(region);
                                 if (rec == null) t.fail1("%s: no valid record in the log", p.name);
                                 else if (lines != rec.commitLines()) {
@@ -416,10 +411,6 @@ class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps, rec
                                 }
                         }
                 }
-                finish();
-        }
-
-        private def finish() {
                 lastLines = ops.lines;
                 lastFences = ops.fences;
         }
@@ -457,7 +448,7 @@ def btreeBoundaryHistory(tc: PWBTreeTester, blockSize: u64) -> int {
         tc.region = PWRegion.new(PreparedRegionBackend.new(container), BT_BLOCKS,
                 Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
         def tree = tc.open(4);
-        def audit = PWBTreeMarkAudit.new(tc.t, tc.region, ops, blockSize % PWBTreeConst.LINE == 0);
+        def audit = PWBTreeMarkAudit.new(tc.t, tc.region, ops);
         var unaligned = 0;
         tree.onPhase = audit.mark;
         def ref = PWBTreeReference.new();
