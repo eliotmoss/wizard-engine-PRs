@@ -1,0 +1,839 @@
+// A persistent B+Tree of u64 keys and values over a PWRegion.
+//
+// This is a workload driver, not engine code, like PWSieve. The sieve computes
+// for ~150 us between boundaries and persists for ~15 us on PMEM; a tree
+// mutation computes little and persists a lot, so the two bracket the
+// interface from opposite ends. Nothing here touches WASM; the only interface
+// under test is PWRegion's.
+//
+// Layout. Every node is one chunk of one block (allocChunk(1)), so the tree
+// needs no object layer above the allocator. A root chunk, published at
+// PWRegion's userRoot, holds a TreeRoot; it is never freed.
+//
+//   root chunk:     [ChunkHeader][TreeRoot]
+//   leaf:           [ChunkHeader][tag][count][key, value] * count
+//   internal node:  [ChunkHeader][tag][count][child 0][key, child] * count
+//
+// tag is NODE_MAGIC with the node's level in its low half (0 = leaf). Child
+// offsets are region-relative. An internal node's key i separates child i, whose
+// keys are below it, from child i + 1, whose keys are at or above it. Leaves have
+// no sibling links: nothing here scans a range. capacity is the most keys a node
+// holds, the same for both kinds; by default the most an internal node of this
+// block size can hold, (blockSize - ChunkHeader.size) / 8 - 3 words over 2,
+// which is 252 at 4 KiB blocks. A smaller one can be asked for, so that tests
+// reach a deep tree with few keys; it is part of the geometry checked on open.
+//
+// Copy-on-write. A 4 KiB node cannot go through the log -- each redo entry
+// carries at most 8 bytes in a 32-byte slot -- so a mutation never writes a
+// reachable node. put() copies the path from the root to the leaf, with the
+// change and any splits, into freshly allocated chunks, writes them directly
+// through the persistent-operation seam and makes them durable, and only then
+// publishes them, in one transaction that swaps the root fields. This is the
+// sieve's bulk-data rule: an unpublished chunk is unreachable, so no reader,
+// and no recovery, can observe a half-written node.
+//
+// One mutation, at height h with k new nodes (k = h without a split):
+//
+//   COMPUTE  descend, find the leaf slot, and count the splits
+//   ALLOC    allocChunk(1) k times: k commits, k boundaries
+//   COMPUTE  build the k new nodes in DRAM, child offsets filled in
+//   WRITE    the nodes' direct stores, every line written back, one fence
+//   PUBLISH  the root fields and the free of the old root node: one commit
+//   FREE     the free of each other replaced node: h - 1 commits
+//
+// so k + h + 1 boundaries. freeChunk() commits whatever the shared transaction
+// already holds, so buffering the root swap before the first free makes the
+// swap and that free one transaction -- PWSieve's retirement recipe. A second
+// free cannot join them: freeChunk() always ends in its own commit, and the
+// allocator has no call that frees without committing. A crash between the
+// publish and the last free therefore leaves replaced nodes allocated and
+// unreachable, and a crash between an allocation and the publish leaves new
+// ones so: leaks, never an inconsistency, because every reachable node is
+// durable and allocated at every commit point. open() sweeps them.
+
+component PWBTreeConst {
+        def MAGIC = 0x42_54_52_45_45_52_30_31u64;       // "BTREER01"
+        def NODE_MAGIC = 0x4E_4F_44_45_00_00_00_00u64;  // "NODE", the level in the low half
+        def MAGIC_MASK = 0xFFFF_FFFF_0000_0000u64;
+        def LEVEL_MASK = 0x0000_0000_FFFF_FFFFu64;
+        def MIN_CAPACITY = 3;   // a split must leave both halves a key
+        def MAX_HEIGHT = 32;
+        def LINE = 64u64;
+
+        // The first cache line a node's stores touch: its payload starts after
+        // the chunk header, and a chunk is block aligned, but PWRegion only
+        // requires a block size to be a multiple of 8, so the payload need not
+        // start on a line. Aligned down, as persistRange() aligns its range
+        // (MmapRegionUtils.flushRange).
+        def nodeLineStart(offset: u64) -> u64 {
+                def start = offset + u64.!(ChunkHeader.size);
+                return start - start % LINE;
+        }
+
+        // The cache lines a node of {words} words in the chunk at {offset}
+        // touches, from nodeLineStart() to the line holding its last word.
+        def nodeLines(offset: u64, words: int) -> int {
+                def end = offset + u64.!(ChunkHeader.size) + u64.!(words) * 8u64;
+                return int.!((end - nodeLineStart(offset) + LINE - 1u64) / LINE);
+        }
+}
+
+// The phases of one put(), for a timing harness (test/pwbtreebench.main.v3). A
+// mark charges the time since the previous one to the phase it names. COMPUTE is
+// two stretches, ALLOC one mark per allocation and FREE one per further free, so
+// that a harness can attribute each commit's work to the commit; get() marks
+// COMPUTE once.
+enum PWBTreePhase {
+        COMPUTE,        // descend and plan; build the new nodes in DRAM
+        ALLOC,          // one allocChunk(1), its own commit
+        WRITE,          // every new node's direct stores, their writebacks, one fence
+        PUBLISH,        // root fields swapped and the old root node freed, one commit
+        FREE            // one further replaced node freed, its own commit
+}
+
+layout TreeRoot {
+        +0      magic:          u64;    // identity, so a foreign root is rejected rather than parsed
+        +8      blockSize:      u64;    // geometry: checked on open
+        +16     capacity:       u64;    // geometry: most keys a node holds
+        +24     rootNode:       u64;    // region-relative offset of the root node's chunk
+        +32     height:         u64;    // levels; 1 while the root is a leaf
+        +40     keyCount:       u64;    // keys in the tree
+        +48     nodeCount:      u64;    // nodes reachable from rootNode
+        +56     mutations:      u64;    // acknowledged mutations, over all runs; never decreases
+        =64;
+}
+
+// A node being built in DRAM, before it has been written.
+class PWBTreeImage(words: Array<u64>) {
+        var used: int;          // words of the node in use, from the tag
+        var offset: u64;        // region-relative offset of the chunk it goes to
+}
+
+// {requestedCapacity} 0 asks for the most a node of the region's block size holds.
+class PWBTree(region: PWRegion, requestedCapacity: int) {
+        private var writer: DirectRegionWriter;
+        private var ops: PersistentOperations;
+        private var rootOffset: u64;            // region-relative offset of the root chunk
+        private var cap: int;                   // keys per node
+        private var maxWords: int;              // words in a node's payload
+        private var reclaimed: int;
+        // Scratch for one mutation, allocated once.
+        private var pathNodes: Array<u64>;
+        private var pathSlots: Array<int>;
+        private var images: Array<PWBTreeImage>;
+        private var tmpKeys: Array<u64>;
+        private var tmpRefs: Array<u64>;
+        // What the last successful put() did, for a harness.
+        private var lastAllocated: int;
+        private var lastFreed: int;
+        private var lastLines: int;
+        private var lastInserted: bool;
+        private var lastNew: Array<u64>;
+        // Called as each phase ends; null except under a harness, so the tests
+        // and the crash loop run without it.
+        var onPhase: PWBTreePhase -> void;
+
+        new() {
+                if (region != null && region.backendRegion != null) {
+                        ops = X86_64PersistentOps.ensureFor(region.backendRegion);
+                        writer = DirectRegionWriter.new(ops, region.regionStart);
+                }
+        }
+
+        // ---------------------------------------------------------------
+        // Mount or initialize
+        // ---------------------------------------------------------------
+
+        // Attaches to the tree in this region, or lays out an empty one: a root
+        // chunk and an empty leaf. Either way it then reclaims every allocated
+        // chunk the tree does not reach. Fails on a foreign or different-geometry
+        // root and on a tree that fails checkInvariants().
+        def open() -> bool {
+                if (region == null || region.backendRegion == null || region.txn == null) return false;
+                if (region.requiresRecovery()) return false;
+                def header = u64.!(ChunkHeader.size);
+                if (region.blockSize <= header + 8u64 * 5u64) return false;
+                maxWords = int.!((region.blockSize - header) / 8u64);
+                def maxCap = (maxWords - 3) / 2;
+                cap = if(requestedCapacity == 0, maxCap, requestedCapacity);
+                if (cap < PWBTreeConst.MIN_CAPACITY || cap > maxCap) return false;
+                allocateScratch();
+
+                def regionBytes = region.numBlocks * region.blockSize;
+                def existing = region.getUserRoot();
+                if (existing != 0) {
+                        // Validate before trusting: the region cannot know what
+                        // published its root. No sum: existing + blockSize can
+                        // wrap past zero and pass. Block aligned and below
+                        // regionBytes, a whole number of blocks, the whole
+                        // block is in the region.
+                        if (existing % region.blockSize != 0 || existing >= regionBytes) return false;
+                        rootOffset = existing;
+                        if (rootGet(TreeRoot.magic.offset) != PWBTreeConst.MAGIC ||
+                                rootGet(TreeRoot.blockSize.offset) != region.blockSize ||
+                                rootGet(TreeRoot.capacity.offset) != u64.!(cap) ||
+                                checkInvariants() != null) {
+                                rootOffset = 0;
+                                return false;
+                        }
+                        reclaimed = reclaimLeaked();
+                        if (reclaimed < 0) {
+                                rootOffset = 0;
+                                return false;
+                        }
+                        return true;
+                }
+
+                // No root: nothing allocated is reachable, so everything
+                // allocated is a leak, including a root chunk and leaf from a
+                // format that crashed before setUserRoot().
+                reclaimed = reclaimLeaked();
+                if (reclaimed < 0) return false;
+                def rootChunk = region.allocChunk(1u32);
+                if (rootChunk.isNull()) return false;
+                def leafChunk = region.allocChunk(1u32);
+                if (leafChunk.isNull()) return false;
+                def leaf = region.offsetInRegion(leafChunk.addr);
+                // The empty leaf is durable before the commit that names it.
+                def img = images[0];
+                img.words[0] = PWBTreeConst.NODE_MAGIC;
+                img.words[1] = 0;
+                img.used = 2;
+                img.offset = leaf;
+                storeImage(img);
+                if (!region.backendRegion.persistRange(leaf + header, 16u64)) return false;
+                rootOffset = region.offsetInRegion(rootChunk.addr);
+                rootPut(TreeRoot.magic.offset, PWBTreeConst.MAGIC);
+                rootPut(TreeRoot.blockSize.offset, region.blockSize);
+                rootPut(TreeRoot.capacity.offset, u64.!(cap));
+                rootPut(TreeRoot.rootNode.offset, leaf);
+                rootPut(TreeRoot.height.offset, 1);
+                rootPut(TreeRoot.keyCount.offset, 0);
+                rootPut(TreeRoot.nodeCount.offset, 1);
+                rootPut(TreeRoot.mutations.offset, 0);
+                // setUserRoot() commits, so the root's fields and its
+                // publication are one transaction.
+                if (!region.setUserRoot(rootOffset)) {
+                        rootOffset = 0;
+                        return false;
+                }
+                return true;
+        }
+
+        // Chunks this mount reclaimed because the tree does not reach them.
+        def leaksReclaimed() -> int { return reclaimed; }
+
+        private def allocateScratch() {
+                def levels = PWBTreeConst.MAX_HEIGHT;
+                pathNodes = Array<u64>.new(levels);
+                pathSlots = Array<int>.new(levels);
+                // Two per level, for a split, and one for a new root.
+                images = Array<PWBTreeImage>.new(2 * levels + 1);
+                for (i < images.length) images[i] = PWBTreeImage.new(Array<u64>.new(maxWords));
+                tmpKeys = Array<u64>.new(cap + 1);
+                tmpRefs = Array<u64>.new(cap + 2);
+                lastNew = Array<u64>.new(images.length);
+        }
+
+        // Mark every node the tree reaches, and the root chunk, then free every
+        // used chunk on the region's memory-order chain that is not marked:
+        // PWSieve.reclaimLeaked(), with reachability from the tree instead of the
+        // descriptor table. Returns the number freed, or -1 if a free failed.
+        private def reclaimLeaked() -> int {
+                def marked = Array<bool>.new(int.!(region.numBlocks));
+                if (rootOffset != 0) {
+                        marked[int.!(rootOffset / region.blockSize)] = true;
+                        if (walk(marked) != null) return -1;
+                }
+                var freed = 0;
+                var entry = region.blockTableHandle[0];
+                var guard = region.numBlocks + 1u64;
+                while (!entry.isNull() && guard > 0u64) {
+                        guard--;
+                        def next = entry.getNext();
+                        if (entry.getUsed() && entry.getListNum() == ListKind.NONE.code) {
+                                // The chain ends in the end-of-region entry,
+                                // which has no block behind it.
+                                def block = region.blockIndexOf(entry);
+                                if (block < region.numBlocks && !marked[int.!(block)]) {
+                                        if (!region.freeChunk(ChunkHandle(region.regionStart + block * region.blockSize))) return -1;
+                                        freed++;
+                                }
+                        }
+                        entry = next;
+                }
+                return freed;
+        }
+
+        // ---------------------------------------------------------------
+        // Mutation
+        // ---------------------------------------------------------------
+
+        // Inserts {key} with {value}, or replaces the value of an existing key.
+        // Returns true once the mutation is published and every replaced node
+        // freed. False on a full region, a tree at MAX_HEIGHT, or a persistence
+        // failure; a mutation whose publish committed is durable even if a later
+        // free then fails.
+        def put(key: u64, value: u64) -> bool {
+                if (rootOffset == 0 || region.requiresRecovery()) return false;
+                def h = int.!(rootGet(TreeRoot.height.offset));
+                if (h < 1 || h > PWBTreeConst.MAX_HEIGHT) return false;
+
+                // Descend, remembering the path and the child slot at each level.
+                var node = rootGet(TreeRoot.rootNode.offset);
+                for (d < h) {
+                        pathNodes[d] = node;
+                        if (d < h - 1) {
+                                def j = childSlot(node, key);
+                                pathSlots[d] = j;
+                                node = innerChild(node, j);
+                        }
+                }
+                def leaf = pathNodes[h - 1];
+                def leafCount = int.!(nodeKeys(leaf));
+                def pos = leafLowerBound(leaf, leafCount, key);
+                def found = pos < leafCount && leafKey(leaf, pos) == key;
+
+                // Count the new nodes: a full node that receives an entry splits
+                // in two and passes a separator up; any other copy is one node.
+                var k = 0;
+                var carry = !found;
+                for (d = h - 1; d >= 0; d--) {
+                        if (carry && int.!(nodeKeys(pathNodes[d])) >= cap) {
+                                k += 2;
+                        } else {
+                                k += 1;
+                                carry = false;
+                        }
+                }
+                def rootSplit = carry;
+                if (rootSplit) {
+                        if (h + 1 > PWBTreeConst.MAX_HEIGHT) return false;
+                        k++;
+                }
+                if (onPhase != null) onPhase(PWBTreePhase.COMPUTE);
+
+                // Every new node is allocated before anything is built or written.
+                for (i < k) {
+                        def chunk = region.allocChunk(1u32);
+                        if (chunk.isNull()) {
+                                releaseImages(i);
+                                return false;
+                        }
+                        images[i].offset = region.offsetInRegion(chunk.addr);
+                        if (onPhase != null) onPhase(PWBTreePhase.ALLOC);
+                }
+
+                // Build bottom-up, so each parent copy names its new children.
+                var next = 0;
+                var split = false;
+                var leftOff: u64 = 0, rightOff: u64 = 0, sep: u64 = 0;
+                var n = leafCount;
+                for (i < pos) {
+                        tmpKeys[i] = leafKey(leaf, i);
+                        tmpRefs[i] = leafValue(leaf, i);
+                }
+                if (found) {
+                        tmpKeys[pos] = key;
+                        tmpRefs[pos] = value;
+                        for (i = pos + 1; i < leafCount; i++) {
+                                tmpKeys[i] = leafKey(leaf, i);
+                                tmpRefs[i] = leafValue(leaf, i);
+                        }
+                } else {
+                        tmpKeys[pos] = key;
+                        tmpRefs[pos] = value;
+                        for (i = pos; i < leafCount; i++) {
+                                tmpKeys[i + 1] = leafKey(leaf, i);
+                                tmpRefs[i + 1] = leafValue(leaf, i);
+                        }
+                        n = leafCount + 1;
+                }
+                if (n <= cap) {
+                        fillLeaf(images[next], 0, n);
+                        leftOff = images[next].offset;
+                        next++;
+                } else {
+                        def left = (n + 1) / 2;
+                        fillLeaf(images[next], 0, left);
+                        fillLeaf(images[next + 1], left, n);
+                        sep = tmpKeys[left];
+                        leftOff = images[next].offset;
+                        rightOff = images[next + 1].offset;
+                        next += 2;
+                        split = true;
+                }
+                for (d = h - 2; d >= 0; d--) {
+                        def inner = pathNodes[d];
+                        def j = pathSlots[d];
+                        def c = int.!(nodeKeys(inner));
+                        def level = u64.!(h - 1 - d);
+                        // Keys into tmpKeys[0, c), children into tmpRefs[0, c].
+                        if (!split) {
+                                for (i < c) tmpKeys[i] = innerKey(inner, i);
+                                for (i = 0; i <= c; i++) tmpRefs[i] = innerChild(inner, i);
+                                tmpRefs[j] = leftOff;
+                                n = c;
+                        } else {
+                                for (i < j) tmpKeys[i] = innerKey(inner, i);
+                                tmpKeys[j] = sep;
+                                for (i = j; i < c; i++) tmpKeys[i + 1] = innerKey(inner, i);
+                                for (i < j) tmpRefs[i] = innerChild(inner, i);
+                                tmpRefs[j] = leftOff;
+                                tmpRefs[j + 1] = rightOff;
+                                for (i = j + 1; i <= c; i++) tmpRefs[i + 1] = innerChild(inner, i);
+                                n = c + 1;
+                        }
+                        if (n <= cap) {
+                                fillInner(images[next], level, 0, n);
+                                leftOff = images[next].offset;
+                                next++;
+                                split = false;
+                        } else {
+                                // The middle key moves up; it stays in neither half.
+                                def m = n / 2;
+                                fillInner(images[next], level, 0, m);
+                                fillInner(images[next + 1], level, m + 1, n);
+                                sep = tmpKeys[m];
+                                leftOff = images[next].offset;
+                                rightOff = images[next + 1].offset;
+                                next += 2;
+                                split = true;
+                        }
+                }
+                var newRoot = leftOff;
+                var newHeight = h;
+                if (split) {
+                        def img = images[next];
+                        img.words[0] = PWBTreeConst.NODE_MAGIC | u64.!(h);
+                        img.words[1] = 1;
+                        img.words[2] = leftOff;
+                        img.words[3] = sep;
+                        img.words[4] = rightOff;
+                        img.used = 5;
+                        newRoot = img.offset;
+                        newHeight = h + 1;
+                        next++;
+                }
+                // The plan and the build count splits the same way; a mismatch
+                // is a bug, and the chunks allocated for it leak until open().
+                if (next != k) return false;
+                if (onPhase != null) onPhase(PWBTreePhase.COMPUTE);
+
+                // Durable before published. Each node's lines are written back
+                // as it is stored; persistRange() over the last ends in the one
+                // fence, which on every backend completes every outstanding
+                // writeback, not only its own range's -- the property the crash
+                // model's images depend on (X86_64TxnBackend.v3, persistRange).
+                var lines = 0;
+                for (i < k) {
+                        def img = images[i];
+                        storeImage(img);
+                        lines += imageLines(img);
+                        if (i < k - 1) writeBackImage(img);
+                }
+                def last = images[k - 1];
+                if (!region.backendRegion.persistRange(last.offset + u64.!(ChunkHeader.size),
+                        u64.!(last.used) * 8u64)) return false;
+                if (onPhase != null) onPhase(PWBTreePhase.WRITE);
+
+                // One transaction publishes the new nodes and frees the old root
+                // node. Buffered first, so freeChunk()'s commit carries them.
+                def keys = rootGet(TreeRoot.keyCount.offset);
+                rootPut(TreeRoot.rootNode.offset, newRoot);
+                rootPut(TreeRoot.height.offset, u64.!(newHeight));
+                rootPut(TreeRoot.keyCount.offset, if(found, keys, keys + 1u64));
+                rootPut(TreeRoot.nodeCount.offset, rootGet(TreeRoot.nodeCount.offset) + u64.!(k) - u64.!(h));
+                rootPut(TreeRoot.mutations.offset, rootGet(TreeRoot.mutations.offset) + 1u64);
+                if (!region.freeChunk(ChunkHandle(region.regionStart + pathNodes[0]))) {
+                        // freeChunk() validates before it commits. A refusal must
+                        // not leave the root swap buffered for an unrelated
+                        // commit to publish later; publishing it now leaks the
+                        // old root node, which the next open() reclaims.
+                        if (region.txn.isDirty()) region.txn.commit();
+                        return false;
+                }
+                if (onPhase != null) onPhase(PWBTreePhase.PUBLISH);
+                for (d = 1; d < h; d++) {
+                        if (!region.freeChunk(ChunkHandle(region.regionStart + pathNodes[d]))) return false;
+                        if (onPhase != null) onPhase(PWBTreePhase.FREE);
+                }
+                lastAllocated = k;
+                lastFreed = h;
+                lastLines = lines;
+                lastInserted = !found;
+                for (i < k) lastNew[i] = images[i].offset;
+                return true;
+        }
+
+        // Frees the first {count} chunks allocated for a mutation that cannot
+        // finish. They are unpublished, so freeing them is safe; one that cannot
+        // be freed leaks until the next open().
+        private def releaseImages(count: int) {
+                for (i < count) region.freeChunk(ChunkHandle(region.regionStart + images[i].offset));
+        }
+
+        // A leaf of tmpKeys/tmpRefs [from, to).
+        private def fillLeaf(img: PWBTreeImage, from: int, to: int) {
+                def w = img.words;
+                w[0] = PWBTreeConst.NODE_MAGIC;
+                w[1] = u64.!(to - from);
+                var o = 2;
+                for (i = from; i < to; i++) {
+                        w[o] = tmpKeys[i];
+                        w[o + 1] = tmpRefs[i];
+                        o += 2;
+                }
+                img.used = o;
+        }
+
+        // An internal node of keys tmpKeys[from, to) and children tmpRefs[from, to].
+        private def fillInner(img: PWBTreeImage, level: u64, from: int, to: int) {
+                def w = img.words;
+                w[0] = PWBTreeConst.NODE_MAGIC | level;
+                w[1] = u64.!(to - from);
+                w[2] = tmpRefs[from];
+                var o = 3;
+                for (i = from; i < to; i++) {
+                        w[o] = tmpKeys[i];
+                        w[o + 1] = tmpRefs[i + 1];
+                        o += 2;
+                }
+                img.used = o;
+        }
+
+        // Bulk stores through the persistent-operation seam, so a recorded
+        // trace sees them in the same total order as the log's.
+        private def storeImage(img: PWBTreeImage) {
+                def base = nodeAddr(img.offset);
+                def w = img.words;
+                for (i < img.used) writer.writeU64(base + u64.!(i) * 8u64, w[i]);
+        }
+
+        // The cache lines the node's stores touch, counted as they are
+        // written back: the same lines persistRange() covers for the last node.
+        private def imageLines(img: PWBTreeImage) -> int {
+                return PWBTreeConst.nodeLines(img.offset, img.used);
+        }
+
+        private def writeBackImage(img: PWBTreeImage) {
+                def end = img.offset + u64.!(ChunkHeader.size) + u64.!(img.used) * 8u64;
+                var line = PWBTreeConst.nodeLineStart(img.offset);
+                while (line < end) {
+                        ops.clwb(line);
+                        line += PWBTreeConst.LINE;
+                }
+        }
+
+        // ---------------------------------------------------------------
+        // Lookup
+        // ---------------------------------------------------------------
+
+        // The value of {key}, if it is in the tree.
+        def get(key: u64) -> (bool, u64) {
+                if (rootOffset == 0) return (false, 0);
+                def h = int.!(rootGet(TreeRoot.height.offset));
+                var node = rootGet(TreeRoot.rootNode.offset);
+                for (d = 0; d < h - 1; d++) node = innerChild(node, childSlot(node, key));
+                def c = int.!(nodeKeys(node));
+                def pos = leafLowerBound(node, c, key);
+                var result = (false, 0u64);
+                if (pos < c && leafKey(node, pos) == key) result = (true, leafValue(node, pos));
+                if (onPhase != null) onPhase(PWBTreePhase.COMPUTE);
+                return result;
+        }
+
+        // Every key and value in key order. Returns null, or why the image
+        // cannot be walked: forEach() trusts nothing it reads, so a corrupted or
+        // cyclic image ends the walk with a reason rather than recursing without
+        // bound. The height must be in [1, MAX_HEIGHT] and every node must carry
+        // the level its depth implies; levels strictly decrease on the way down,
+        // so the recursion is at most MAX_HEIGHT deep and a child pointer back to
+        // an ancestor, or to the node itself, is refused. It does not track
+        // reachability: a subtree reached twice is walked twice, boundedly.
+        // open() and the leak sweep walk with walkNode(), which refuses a node
+        // reached twice; PWBTreeReference.compare() refuses the repeated keys.
+        def forEach(f: (u64, u64) -> void) -> string {
+                if (rootOffset == 0) return "tree root not opened";
+                def h = rootGet(TreeRoot.height.offset);
+                if (h < 1 || h > u64.!(PWBTreeConst.MAX_HEIGHT)) return "height out of range";
+                return visit(rootGet(TreeRoot.rootNode.offset), int.!(h) - 1, f);
+        }
+
+        private def visit(node: u64, level: int, f: (u64, u64) -> void) -> string {
+                def err = nodeError(node, level);
+                if (err != null) return err;
+                def c = int.!(nodeKeys(node));
+                if (level == 0) {
+                        for (i < c) f(leafKey(node, i), leafValue(node, i));
+                        return null;
+                }
+                for (j = 0; j <= c; j++) {
+                        def e = visit(innerChild(node, j), level - 1, f);
+                        if (e != null) return e;
+                }
+                return null;
+        }
+
+        // Why {node} cannot be read as a node at {level}, or null: an offset in
+        // the region and block aligned, a node's tag carrying that level, and no
+        // more keys than the capacity. Checked before anything else is read
+        // from it, by both walks. The range check adds nothing to {node}, so a
+        // planted offset near 2^64 cannot wrap into range; aligned and below
+        // regionBytes, the whole block is in the region, and the capacity
+        // bound keeps every word read within it.
+        private def nodeError(node: u64, level: int) -> string {
+                def regionBytes = region.numBlocks * region.blockSize;
+                if (node == 0 || node >= regionBytes || node % region.blockSize != 0) {
+                        return "a node offset is outside the region or not block aligned";
+                }
+                def tag = nodeTag(node);
+                if ((tag & PWBTreeConst.MAGIC_MASK) != PWBTreeConst.NODE_MAGIC) return "node magic wrong";
+                if ((tag & PWBTreeConst.LEVEL_MASK) != u64.!(level)) {
+                        return "a node's level does not match its depth: the leaves are not all at the tree's height";
+                }
+                if (nodeKeys(node) > u64.!(cap)) return "a node holds more keys than the capacity";
+                return null;
+        }
+
+        // The number of separators at or below {key}: the child that holds it.
+        private def childSlot(node: u64, key: u64) -> int {
+                var lo = 0, hi = int.!(nodeKeys(node));
+                while (lo < hi) {
+                        def mid = (lo + hi) >> 1;
+                        if (innerKey(node, mid) <= key) lo = mid + 1;
+                        else hi = mid;
+                }
+                return lo;
+        }
+
+        // The first slot whose key is at or above {key}.
+        private def leafLowerBound(node: u64, count: int, key: u64) -> int {
+                var lo = 0, hi = count;
+                while (lo < hi) {
+                        def mid = (lo + hi) >> 1;
+                        if (leafKey(node, mid) < key) lo = mid + 1;
+                        else hi = mid;
+                }
+                return lo;
+        }
+
+        // ---------------------------------------------------------------
+        // Observation
+        // ---------------------------------------------------------------
+
+        def height() -> u64 { return if(rootOffset == 0, 0, rootGet(TreeRoot.height.offset)); }
+        def keyCount() -> u64 { return if(rootOffset == 0, 0, rootGet(TreeRoot.keyCount.offset)); }
+        def nodeCount() -> u64 { return if(rootOffset == 0, 0, rootGet(TreeRoot.nodeCount.offset)); }
+        def mutations() -> u64 { return if(rootOffset == 0, 0, rootGet(TreeRoot.mutations.offset)); }
+        def capacity() -> int { return cap; }
+        def rootChunk() -> u64 { return rootOffset; }
+        def rootNode() -> u64 { return if(rootOffset == 0, 0, rootGet(TreeRoot.rootNode.offset)); }
+
+        // The last successful put(): chunks allocated (the new nodes), nodes
+        // freed (the replaced path), the lines its node stores covered, and
+        // whether it inserted rather than replaced.
+        def lastNodesAllocated() -> int { return lastAllocated; }
+        def lastNodesFreed() -> int { return lastFreed; }
+        def lastNodeLines() -> int { return lastLines; }
+        def lastWasInsert() -> bool { return lastInserted; }
+        // Region-relative offset of the last put()'s new node {i}, i < lastNodesAllocated().
+        def lastNewNode(i: int) -> u64 { return lastNew[i]; }
+
+        // The words node {offset} holds from its tag on: 2 + 2 * count for a
+        // leaf, 3 + 2 * count for an internal node.
+        def nodeWords(offset: u64) -> int {
+                def c = int.!(nodeKeys(offset));
+                return if((nodeTag(offset) & PWBTreeConst.LEVEL_MASK) == 0, 2 + 2 * c, 3 + 2 * c);
+        }
+
+        // ---------------------------------------------------------------
+        // Invariants
+        // ---------------------------------------------------------------
+
+        // Returns null when the durable tree is consistent, otherwise the first
+        // violation found: keys strictly increasing in every node and within
+        // the separators above it; every node at the level its depth implies,
+        // so every leaf at depth height; no node reached twice; every node
+        // below the root at least half full (capacity / 2 keys: with no delete,
+        // a split leaves both halves that); the reached node and key counts
+        // equal to the root's; every reached node an allocated chunk, and not
+        // the root chunk.
+        def checkInvariants() -> string {
+                if (rootOffset == 0) return "tree root not opened";
+                if (rootGet(TreeRoot.magic.offset) != PWBTreeConst.MAGIC) return "root magic wrong";
+                if (rootGet(TreeRoot.blockSize.offset) != region.blockSize) return "block size changed";
+                if (rootGet(TreeRoot.capacity.offset) != u64.!(cap)) return "capacity changed";
+                def marked = Array<bool>.new(int.!(region.numBlocks));
+                marked[int.!(rootOffset / region.blockSize)] = true;
+                def rootEntry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + rootOffset));
+                if (rootEntry.isNull() || !rootEntry.getUsed()) return "the root chunk is not allocated";
+                return walk(marked);
+        }
+
+        // Walks the tree from rootNode, marking each node's block in {marked},
+        // and checks it as checkInvariants() describes. Returns null or the
+        // first violation.
+        private def walk(marked: Array<bool>) -> string {
+                def h = rootGet(TreeRoot.height.offset);
+                if (h < 1 || h > u64.!(PWBTreeConst.MAX_HEIGHT)) return "height out of range";
+                def totals = Array<u64>.new(2);         // keys, nodes
+                def err = walkNode(rootGet(TreeRoot.rootNode.offset), int.!(h) - 1, true,
+                        0, false, 0, false, marked, totals);
+                if (err != null) return err;
+                if (totals[0] != rootGet(TreeRoot.keyCount.offset)) return "key count does not match the tree";
+                if (totals[1] != rootGet(TreeRoot.nodeCount.offset)) return "node count does not match the tree";
+                return null;
+        }
+
+        private def walkNode(node: u64, level: int, isRoot: bool, lo: u64, hasLo: bool, hi: u64, hasHi: bool,
+                        marked: Array<bool>, totals: Array<u64>) -> string {
+                def err = nodeError(node, level);
+                if (err != null) return err;
+                def block = int.!(node / region.blockSize);
+                if (marked[block]) return "a node is reachable twice, or is the root chunk";
+                marked[block] = true;
+                def entry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + node));
+                if (entry.isNull() || !entry.getUsed() || entry.getListNum() != ListKind.NONE.code) {
+                        return "a reachable node is not an allocated chunk";
+                }
+                def count = nodeKeys(node);
+                def c = int.!(count);
+                if (!isRoot && c < cap / 2) return "a node below the root is less than half full";
+                totals[1] = totals[1] + 1u64;
+                if (level == 0) {
+                        var prev = 0u64;
+                        for (i < c) {
+                                def key = leafKey(node, i);
+                                if (i > 0 && key <= prev) return "leaf keys are not strictly increasing";
+                                if (hasLo && key < lo) return "a leaf key is below its separator";
+                                if (hasHi && key >= hi) return "a leaf key is at or above its separator";
+                                prev = key;
+                        }
+                        totals[0] = totals[0] + count;
+                        return null;
+                }
+                if (c == 0) return "an internal node has no key";
+                var prev = 0u64;
+                for (i < c) {
+                        def key = innerKey(node, i);
+                        if (i > 0 && key <= prev) return "separator keys are not strictly increasing";
+                        if (hasLo && key < lo) return "a separator is below the separator above it";
+                        if (hasHi && key >= hi) return "a separator is at or above the separator above it";
+                        prev = key;
+                }
+                for (j = 0; j <= c; j++) {
+                        def childLo = if(j == 0, lo, innerKey(node, j - 1));
+                        def childHasLo = j > 0 || hasLo;
+                        def childHi = if(j == c, hi, innerKey(node, j));
+                        def childHasHi = j < c || hasHi;
+                        def err = walkNode(innerChild(node, j), level - 1, false,
+                                childLo, childHasLo, childHi, childHasHi, marked, totals);
+                        if (err != null) return err;
+                }
+                return null;
+        }
+
+        // ---------------------------------------------------------------
+        // Region access
+        // ---------------------------------------------------------------
+
+        private def rootAddr() -> u64 {
+                return region.regionStart + rootOffset + u64.!(ChunkHeader.size);
+        }
+
+        private def rootGet(field: int) -> u64 {
+                return region.txn.readU64(rootAddr() + u64.view(field));
+        }
+
+        private def rootPut(field: int, v: u64) {
+                region.txn.writeU64(rootAddr() + u64.view(field), v);
+        }
+
+        // Nodes are never written through the transaction, so they are read
+        // straight from the region.
+        private def nodeAddr(offset: u64) -> u64 {
+                return region.regionStart + offset + u64.!(ChunkHeader.size);
+        }
+
+        private def word(offset: u64, w: int) -> u64 {
+                return PWRegionUtils.pointerFromU64(nodeAddr(offset) + u64.!(w) * 8u64).load<u64>();
+        }
+
+        private def nodeTag(offset: u64) -> u64 { return word(offset, 0); }
+        private def nodeKeys(offset: u64) -> u64 { return word(offset, 1); }
+        private def leafKey(offset: u64, i: int) -> u64 { return word(offset, 2 + 2 * i); }
+        private def leafValue(offset: u64, i: int) -> u64 { return word(offset, 3 + 2 * i); }
+        private def innerChild(offset: u64, j: int) -> u64 { return word(offset, 2 + 2 * j); }
+        private def innerKey(offset: u64, i: int) -> u64 { return word(offset, 3 + 2 * i); }
+}
+
+// A deterministic generator (splitmix64), so the tests, the benchmark and the
+// crash loop can regenerate a history from its seed.
+class PWBTreeRandom {
+        var state: u64;
+
+        new(seed: u64) { state = seed; }
+
+        def next() -> u64 {
+                state += 0x9E37_79B9_7F4A_7C15u64;
+                var z = state;
+                z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9u64;
+                z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EBu64;
+                return z ^ (z >> 31);
+        }
+
+        // Uniform enough in [0, n) for n far below 2^64.
+        def below(n: u64) -> u64 { return next() % n; }
+}
+
+// An independent DRAM map the tree is compared against: a hash map, with the
+// keys in insertion order for uniform choice.
+class PWBTreeReference {
+        def map = HashMap<u64, u64>.new(pwbtreeHash, u64.==);
+        def keys = Vector<u64>.new();
+
+        def put(key: u64, value: u64) {
+                if (!map.has(key)) keys.put(key);
+                map[key] = value;
+        }
+
+        def has(key: u64) -> bool { return map.has(key); }
+        def get(key: u64) -> u64 { return map[key]; }
+        def size() -> int { return keys.length; }
+
+        // Null when {tree} holds exactly this map's keys and values: the keys
+        // forEach() yields strictly increase, so none is held twice; every
+        // pair it holds is in the map; and it holds as many as the map.
+        // forEach() checks each node but not reachability, so a subtree
+        // reached twice is walked twice; it repeats its keys and fails the
+        // order here, even when it is the same size as the subtree it
+        // replaced and the count still matches.
+        def compare(tree: PWBTree) -> string {
+                def c = PWBTreeComparison.new(this);
+                def walked = tree.forEach(c.visit);
+                if (walked != null) return walked;
+                if (c.err != null) return c.err;
+                if (c.count != keys.length) return "the tree holds a different number of keys from the reference";
+                if (tree.keyCount() != u64.!(keys.length)) return "the tree's key count differs from the reference";
+                return null;
+        }
+}
+
+class PWBTreeComparison(ref: PWBTreeReference) {
+        var count = 0;
+        var last: u64;
+        var err: string;
+
+        def visit(k: u64, v: u64) {
+                if (err == null) {
+                        if (count > 0 && k <= last) err = "the tree's keys do not strictly increase in key order: a key repeats or is out of place";
+                        else if (!ref.map.has(k)) err = "the tree holds a key the reference does not";
+                        else if (ref.map[k] != v) err = "the tree's value for a key differs from the reference";
+                }
+                last = k;
+                count++;
+        }
+}
+
+def pwbtreeHash(k: u64) -> int { return int.view(k ^ (k >> 32)); }

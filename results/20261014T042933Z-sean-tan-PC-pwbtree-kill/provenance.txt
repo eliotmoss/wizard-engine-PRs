@@ -1,0 +1,20 @@
+---- revision
+commit 62300c6c2fc63c0075dae0708949dc30d875ef75
+subject  test(pmem): pwbtree, the random-timer kill loop over the B+Tree
+dirty    no (tracked files)
+---- host
+hostname pc-ubuntu.tail64e060.ts.net
+kernel   Linux 7.0.0-38-generic x86_64 GNU/Linux
+started  2026-10-14T04:29:33+00:00
+load     0.56 0.71 0.65
+governor      28 powersave 
+---- directory
+block    /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwbtree/bin/pwbtree-bench-block
+/dev/nvme1n1p3 ext4 rw,relatime
+NAME      TYPE ROTA MODEL
+nvme1n1p3 part    0 
+└─nvme1n1 disk    0 SOLIDIGM SSDPFKKW010X7
+---- parameters
+args /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwbtree/bin/pwbtree-bench-block 50 1 256 4096 <backend> <provider> (max delay 20000 us, capacity 8, key space 600: the defaults)
+unpinned
+finished 2026-10-14T04:29:36+00:00

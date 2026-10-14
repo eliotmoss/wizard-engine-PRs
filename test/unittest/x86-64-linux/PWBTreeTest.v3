@@ -1,0 +1,1070 @@
+// PWBTree tests
+//
+// Drives the persistent B+Tree over a PWRegion. Most tests use a 1 MiB region
+// (256 x 4096, the benchmark's) in an anonymous mapping and a capacity of 4
+// or 5 keys per node, so a few dozen keys reach a height of 3 or more; one
+// checks the default capacity, 252 at 4 KiB blocks. Contents are compared with
+// an independent DRAM map (PWBTreeReference) and checkInvariants() runs after
+// every mutation.
+//
+// Four groups: the tree itself (pwbtree:); the persistence work of each put()
+// on the production PMEM boundary path, counted exactly (pwbtree:, the
+// boundaries test); resume across a real file-backed remount (pwbtree_bd:); and
+// a process killed at every phase mark of a mutation on the direct backend,
+// where death loses whatever was not written back (pwbtree_dio:).
+
+def BT_BLOCKS = 256u64;
+def BT_BLOCK_SIZE = 4096u64;
+// A multiple of 8, as PWRegion requires, and not of a cache line: chunks, and
+// so node payloads, start at every 8-byte offset within a line.
+def BT_UNALIGNED_BLOCK_SIZE = 4104u64;
+
+def BTT = UnitTests.registerT("pwbtree:", _, PWBTreeTester.new, _);
+def BTX = [
+        BTT("open_formats_an_empty_tree",            test_btree_open_formats_an_empty_tree),
+        BTT("open_reattaches_existing",              test_btree_open_reattaches_existing),
+        BTT("open_rejects_foreign_root",             test_btree_open_rejects_foreign_root),
+        BTT("open_rejects_a_different_capacity",     test_btree_open_rejects_a_different_capacity),
+        BTT("default_capacity_fills_a_block",        test_btree_default_capacity_fills_a_block),
+        BTT("inserts_split_to_height_3",             test_btree_inserts_split_to_height_3),
+        BTT("updates_replace_values",                test_btree_updates_replace_values),
+        BTT("random_history_matches_reference",      test_btree_random_history_matches_reference),
+        BTT("odd_capacity_history_matches_reference", test_btree_odd_capacity_history_matches_reference),
+        BTT("reclaims_planted_leak",                 test_btree_reclaims_planted_leak),
+        BTT("open_without_root_reclaims_orphans",    test_btree_open_without_root_reclaims_orphans),
+        BTT("full_region_fails_cleanly",             test_btree_full_region_fails_cleanly),
+        BTT("each_put_makes_k_plus_h_plus_1_boundaries", test_btree_each_put_makes_k_plus_h_plus_1_boundaries),
+        BTT("unaligned_block_size_writes_back_whole_lines", test_btree_unaligned_block_size_writes_back_whole_lines),
+        BTT("survives_a_garbage_collection",         test_btree_survives_a_garbage_collection),
+        BTT("corrupted_image_fails_cleanly",         test_btree_corrupted_image_fails_cleanly),
+        ()
+];
+
+// Region memory outside the GC heap, where the tests would otherwise use the
+// volatile backend. That backend's region is an Array<byte> on the heap, and
+// Virgil's semispace collector moves it; PWRegion keeps regionStart, a raw
+// address, and the region and the tree compute every other address from it,
+// so after a collection both read the old space. On 2026-10-14 the full suite
+// crashed this way in pwbtree:reclaims_planted_leak: a collection during the
+// test left the root reading zeros, and forEach(), which then trusted the
+// height, recursed through garbage until the stack overflowed. An anonymous
+// mapping does not move. The region holds the Mapping, so the mapping's
+// finalizer cannot unmap it while the region is in use.
+class PWBTreeAnonRegion extends VolatileRegion {
+        var mapping: Mapping;
+
+        new(m: Mapping) super(CiRuntime.forgeRange<byte>(m.range.start, int.!(m.range.size()))) {
+                mapping = m;
+        }
+
+        def destroy() {
+                if (mapping != null) mapping.range.unmap();
+        }
+}
+
+class PWBTreeAnonBackend extends TxnRegionBackend {
+        def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+                def m = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+                if (m == null) return null;
+                return PWBTreeAnonRegion.new(m);
+        }
+        def isPersistent() -> bool { return false; }
+        def name() -> string { return "anonymous mapping (PWBTreeTest)"; }
+}
+
+def BT_ANON = PWBTreeAnonBackend.new();
+
+class PWBTreeTester(t: Tester) {
+        var region: PWRegion;
+
+        new() {
+                region = anonRegion(BT_BLOCKS);
+        }
+
+        def anonRegion(blocks: u64) -> PWRegion {
+                return PWRegion.new(BT_ANON, blocks, Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
+        }
+
+        def open(capacity: int) -> PWBTree {
+                def tree = PWBTree.new(region, capacity);
+                t.assertz(true, tree.open());
+                return tree;
+        }
+
+        def put(tree: PWBTree, ref: PWBTreeReference, key: u64, value: u64) {
+                if (!tree.put(key, value)) {
+                        t.fail1("put(%d) failed", key);
+                        return;
+                }
+                ref.put(key, value);
+        }
+
+        // Report the first invariant violation by name, as PWSieveTest does.
+        def checkOk(tree: PWBTree) -> bool {
+                def err = tree.checkInvariants();
+                if (err != null) {
+                        t.fail(err);
+                        return false;
+                }
+                return true;
+        }
+
+        def sameAs(tree: PWBTree, ref: PWBTreeReference) -> bool {
+                def err = ref.compare(tree);
+                if (err != null) {
+                        t.fail(err);
+                        return false;
+                }
+                return true;
+        }
+
+        def usedBlocks() -> u64 {
+                var used: u64 = 0;
+                for (i < region.numBlocks) {
+                        if (region.blockTableHandle[i].getUsed()) used++;
+                }
+                return used;
+        }
+}
+
+// A seeded history of {n} operations on {tree}: inserts of fresh keys, updates
+// of existing ones and lookups of present and absent keys, in roughly equal
+// parts, with the invariants checked and the lookups compared after every one.
+def btreeHistory(tc: PWBTreeTester, tree: PWBTree, ref: PWBTreeReference, seed: u64, n: int) {
+        def rng = PWBTreeRandom.new(seed);
+        for (i < n) {
+                def choice = rng.below(3);
+                if (choice == 0 || ref.size() == 0) {
+                        def key = rng.below(1000000);
+                        tc.put(tree, ref, key, rng.next());
+                } else if (choice == 1) {
+                        def key = ref.keys[int.!(rng.below(u64.!(ref.size())))];
+                        tc.put(tree, ref, key, rng.next());
+                } else {
+                        def key = rng.below(1000000);
+                        def got = tree.get(key);
+                        tc.t.assertz(ref.has(key), got.0);
+                        if (got.0) tc.t.assert_eq(ref.get(key), got.1);
+                        continue;
+                }
+                if (!tc.checkOk(tree)) return;
+        }
+        tc.sameAs(tree, ref);
+}
+
+
+// =============================================================================
+// Mounting
+// =============================================================================
+
+// A fresh region has no root; open() lays out a root chunk and an empty leaf and
+// publishes the root, so the next run finds the tree without being told where.
+def test_btree_open_formats_an_empty_tree(tc: PWBTreeTester) {
+        tc.t.assert_eq(0u64, tc.region.getUserRoot());
+        def tree = tc.open(0);
+        tc.t.assertz(true, tc.region.getUserRoot() != 0u64);
+        tc.t.assert_eq(tc.region.getUserRoot(), tree.rootChunk());
+        tc.t.assert_eq(1u64, tree.height());
+        tc.t.assert_eq(0u64, tree.keyCount());
+        tc.t.assert_eq(1u64, tree.nodeCount());
+        tc.t.assert_eq(0u64, tree.mutations());
+        tc.t.assert_eq(0, tree.leaksReclaimed());
+        tc.t.assertz(false, tree.get(7).0);
+        tc.checkOk(tree);
+        // Header, WAL and metadata blocks, the root chunk and the leaf.
+        tc.t.assert_eq(5u64, tc.usedBlocks());
+}
+
+// A second tree over the same region attaches to the existing root: the resume
+// path, without a remount.
+def test_btree_open_reattaches_existing(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        for (i < 40) tc.put(tree, ref, u64.!(i) * 7u64, u64.!(i));
+        def root = tc.region.getUserRoot();
+
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.t.assert_eq(root, tc.region.getUserRoot());
+        tc.t.assert_eq(0, again.leaksReclaimed());
+        tc.t.assert_eq(tree.height(), again.height());
+        tc.t.assert_eq(40u64, again.mutations());
+        tc.checkOk(again);
+        tc.sameAs(again, ref);
+}
+
+// A root that is not this tree's must be refused rather than parsed.
+def test_btree_open_rejects_foreign_root(tc: PWBTreeTester) {
+        def chunk = tc.region.allocChunk(1u32);
+        tc.t.assertz(false, chunk.isNull());
+        tc.t.assertz(true, tc.region.setUserRoot(tc.region.offsetInRegion(chunk.addr)));
+        tc.t.assertz(false, PWBTree.new(tc.region, 0).open());
+}
+
+// The capacity is geometry: a tree written with one must not be read with
+// another, nor with one a block cannot hold.
+def test_btree_open_rejects_a_different_capacity(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        for (i < 10) tc.put(tree, ref, u64.!(i), u64.!(i));
+        tc.t.assertz(false, PWBTree.new(tc.region, 5).open());
+        tc.t.assertz(false, PWBTree.new(tc.region, 0).open());
+        tc.t.assertz(false, PWBTree.new(tc.anonRegion(BT_BLOCKS), 2).open());
+        tc.t.assertz(false, PWBTree.new(tc.anonRegion(BT_BLOCKS), 253).open());
+        tc.t.assertz(true, PWBTree.new(tc.region, 4).open());
+}
+
+// At 4 KiB blocks a node holds 252 keys: the root leaf takes 252, and the 253rd
+// splits it into two leaves under a new root.
+def test_btree_default_capacity_fills_a_block(tc: PWBTreeTester) {
+        def tree = tc.open(0);
+        tc.t.assert_eq(252, tree.capacity());
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(17);
+        while (ref.size() < 252) tc.put(tree, ref, rng.next(), rng.next());
+        tc.t.assert_eq(1u64, tree.height());
+        tc.t.assert_eq(1u64, tree.nodeCount());
+        var key = rng.next();
+        while (ref.has(key)) key = rng.next();
+        tc.put(tree, ref, key, 1);
+        tc.t.assert_eq(2u64, tree.height());
+        tc.t.assert_eq(3u64, tree.nodeCount());
+        tc.t.assert_eq(3, tree.lastNodesAllocated());
+        tc.t.assert_eq(1, tree.lastNodesFreed());
+        tc.checkOk(tree);
+        tc.sameAs(tree, ref);
+}
+
+
+// =============================================================================
+// Mutation
+// =============================================================================
+
+// Ascending, descending and random keys each split leaves and internal nodes
+// and grow the root; the tree must stay valid after every insert.
+def test_btree_inserts_split_to_height_3(tc: PWBTreeTester) {
+        for (order < 3) {
+                tc.region = tc.anonRegion(BT_BLOCKS);
+                def tree = tc.open(4);
+                def ref = PWBTreeReference.new();
+                def rng = PWBTreeRandom.new(u64.!(order) + 1u64);
+                var heightSeen = 1u64;
+                for (i < 120) {
+                        var key: u64;
+                        if (order == 0) key = u64.!(i);
+                        else if (order == 1) key = u64.!(1000 - i);
+                        else key = rng.below(100000);
+                        tc.put(tree, ref, key, key * 3u64);
+                        if (!tc.checkOk(tree)) return;
+                        tc.t.assertz(true, tree.height() >= heightSeen);
+                        heightSeen = tree.height();
+                }
+                tc.t.assertz(true, tree.height() >= 3u64);
+                tc.sameAs(tree, ref);
+                for (k in ref.keys.copy()) {
+                        def got = tree.get(k);
+                        tc.t.assertz(true, got.0);
+                        tc.t.assert_eq(k * 3u64, got.1);
+                }
+        }
+}
+
+// Replacing a value copies the path and changes neither the key count nor the
+// shape; every replaced node is freed.
+def test_btree_updates_replace_values(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        for (i < 60) tc.put(tree, ref, u64.!(i) * 11u64, 0);
+        def height = tree.height();
+        def nodes = tree.nodeCount();
+        def used = tc.usedBlocks();
+        for (i < 60) {
+                tc.put(tree, ref, u64.!(i) * 11u64, u64.!(i) + 100u64);
+                tc.t.assertz(false, tree.lastWasInsert());
+                tc.t.assert_eq(int.!(height), tree.lastNodesAllocated());
+                tc.t.assert_eq(int.!(height), tree.lastNodesFreed());
+                if (!tc.checkOk(tree)) return;
+        }
+        tc.t.assert_eq(60u64, tree.keyCount());
+        tc.t.assert_eq(height, tree.height());
+        tc.t.assert_eq(nodes, tree.nodeCount());
+        tc.t.assert_eq(used, tc.usedBlocks());
+        tc.t.assert_eq(120u64, tree.mutations());
+        tc.sameAs(tree, ref);
+        tc.t.assert_eq(105u64, tree.get(55).1);
+}
+
+def test_btree_random_history_matches_reference(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        btreeHistory(tc, tree, ref, 42, 600);
+        tc.t.assertz(true, tree.height() >= 3u64);
+}
+
+// An odd capacity splits unevenly; the halves must still be at least half full.
+def test_btree_odd_capacity_history_matches_reference(tc: PWBTreeTester) {
+        def tree = tc.open(5);
+        def ref = PWBTreeReference.new();
+        btreeHistory(tc, tree, ref, 7, 600);
+        tc.t.assertz(true, tree.height() >= 3u64);
+}
+
+
+// =============================================================================
+// Leaks
+// =============================================================================
+
+// Exactly the state a crash between an allocation and the publishing commit, or
+// between the publish and a later free, leaves: a used chunk nothing reaches.
+def test_btree_reclaims_planted_leak(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        for (i < 30) tc.put(tree, ref, u64.!(i), u64.!(i));
+        def orphan = tc.region.allocChunk(1u32);
+        tc.t.assertz(false, orphan.isNull());
+        def before = tc.usedBlocks();
+
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.t.assert_eq(1, again.leaksReclaimed());
+        tc.t.assert_eq(before - 1u64, tc.usedBlocks());
+        tc.checkOk(again);
+        tc.sameAs(again, ref);
+        // Nothing left to reclaim on the next mount.
+        def third = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, third.open());
+        tc.t.assert_eq(0, third.leaksReclaimed());
+}
+
+// With no root nothing is reachable, so whatever is allocated -- here as a
+// format that crashed before setUserRoot() would leave it -- is reclaimed.
+def test_btree_open_without_root_reclaims_orphans(tc: PWBTreeTester) {
+        for (i < 3) tc.t.assertz(false, tc.region.allocChunk(1u32).isNull());
+        def tree = tc.open(0);
+        tc.t.assert_eq(3, tree.leaksReclaimed());
+        tc.t.assert_eq(5u64, tc.usedBlocks());
+        tc.checkOk(tree);
+}
+
+// When the region runs out, put() fails, returns what it allocated, and leaves
+// the tree as it was.
+def test_btree_full_region_fails_cleanly(tc: PWBTreeTester) {
+        tc.region = tc.anonRegion(16);
+        def tree = tc.open(3);
+        def ref = PWBTreeReference.new();
+        var failed = false;
+        for (i < 200) {
+                def key = u64.!(i) * 13u64;
+                if (!tree.put(key, key)) {
+                        failed = true;
+                        break;
+                }
+                ref.put(key, key);
+        }
+        tc.t.assertz(true, failed);
+        tc.checkOk(tree);
+        tc.sameAs(tree, ref);
+        def again = PWBTree.new(tc.region, 3);
+        tc.t.assertz(true, again.open());
+        tc.t.assert_eq(0, again.leaksReclaimed());
+        tc.sameAs(again, ref);
+}
+
+
+// The region must not move under the tree: a collection between mutations
+// leaves it, and the tree, exactly as they were (see PWBTreeAnonRegion).
+def test_btree_survives_a_garbage_collection(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        def start = tc.region.regionStart;
+        def rng = PWBTreeRandom.new(31);
+        for (round < 3) {
+                for (i < 40) tc.put(tree, ref, rng.below(5000), rng.next());
+                Target.forceGC();
+                tc.t.assert_eq(start, tc.region.regionStart);
+                tc.t.assert_eq(start, u64.view(Pointer.atElement(tc.region.backendRegion.range, 0) - Pointer.NULL));
+                if (!tc.checkOk(tree)) return;
+                if (!tc.sameAs(tree, ref)) return;
+        }
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.t.assert_eq(0, again.leaksReclaimed());
+        tc.sameAs(again, ref);
+}
+
+// A corrupted or cyclic image, which a region whose memory moved under it
+// also looks like, must be refused by open() and by forEach(), not walked
+// until the stack runs out: a root node that is its own child, a node at the
+// wrong level, a height beyond MAX_HEIGHT, one more than the tree's, and zero.
+// A child shared with its sibling is refused by open(); forEach() walks it
+// twice, boundedly, and compare() refuses the repeated keys, even when the
+// shared leaf is the same size as the one it displaced, so the count matches.
+// A root offset whose sum with the block size wraps past zero is refused by
+// open() rather than read. Each is planted, checked and undone, and the tree
+// then opens again.
+def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(37);
+        while (tree.height() < 3u64) tc.put(tree, ref, rng.below(100000), rng.next());
+        def root = tree.rootNode();
+        def height = tree.height();
+        // Child j of an internal node is word 2 + 2j of its payload.
+        def child0 = btreeChildAddr(tc.region, root, 0);
+        def child1 = btreeChildAddr(tc.region, root, 1);
+        def heightField = tc.region.regionStart + tree.rootChunk() + u64.!(ChunkHeader.size) + 32u64;
+
+        // The root node as its own child: a cycle.
+        var saved = btreeSwap(child0, root);
+        btreeRefused(tc, tree, ref, true, "a root node that is its own child");
+        btreeSwap(child0, saved);
+        // A grandchild where a child belongs: a node at the wrong level.
+        def grandchild = btreeLoad(btreeChildAddr(tc.region, btreeLoad(child0), 0));
+        saved = btreeSwap(child1, grandchild);
+        btreeRefused(tc, tree, ref, true, "a node at the wrong level");
+        btreeSwap(child1, saved);
+        // A child shared with its sibling: reached twice.
+        saved = btreeSwap(child1, btreeLoad(child0));
+        btreeRefused(tc, tree, ref, false, "a node reached twice");
+        btreeSwap(child1, saved);
+        // Heights the tree does not have.
+        def heights = [u64.!(PWBTreeConst.MAX_HEIGHT) + 1u64, height + 1u64, 0u64];
+        for (h in heights) {
+                tc.region.txn.writeU64(heightField, h);
+                tc.region.txn.commit();
+                btreeRefused(tc, tree, ref, true, "a height the tree does not have");
+        }
+        tc.region.txn.writeU64(heightField, height);
+        tc.region.txn.commit();
+        // A root offset, block aligned, whose sum with the block size wraps
+        // to zero; setUserRoot() would refuse it, so it is planted as a stray
+        // write would leave it.
+        def userRootField = tc.region.regionStart + u64.view(PWRegionHeader.userRoot.offset);
+        def wrapping = 0u64 - BT_BLOCK_SIZE;
+        tc.t.assert_eq(0xFFFF_FFFF_FFFF_F000u64, wrapping);
+        tc.region.txn.writeU64(userRootField, wrapping);
+        tc.region.txn.commit();
+        if (PWBTree.new(tc.region, 4).open()) tc.t.fail("open() accepted a root offset that wraps past zero");
+        tc.region.txn.writeU64(userRootField, tree.rootChunk());
+        tc.region.txn.commit();
+
+        // Undone, the tree is whole again.
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.checkOk(again);
+        tc.sameAs(again, ref);
+
+        // A leaf in place of its sibling of the same size, in a tree of its
+        // own: capacity 3 and keys 0 to 3 make a root over two leaves of two
+        // keys each. forEach() walks the shared leaf twice and yields as many
+        // keys as the tree holds, each in the reference with its value; only
+        // the order shows the repeat.
+        def small = tc.anonRegion(BT_BLOCKS);
+        def pair = PWBTree.new(small, 3);
+        tc.t.assertz(true, pair.open());
+        def pairRef = PWBTreeReference.new();
+        for (k < 4) tc.put(pair, pairRef, u64.!(k), 1000u64 + u64.!(k));
+        tc.t.assert_eq(2u64, pair.height());
+        def pairRoot = pair.rootNode();
+        tc.t.assert_eq(1u64, btreeNodeKeys(small, pairRoot));
+        def leaf0 = btreeChildAddr(small, pairRoot, 0);
+        def leaf1 = btreeChildAddr(small, pairRoot, 1);
+        tc.t.assert_eq(2u64, btreeNodeKeys(small, btreeLoad(leaf0)));
+        tc.t.assert_eq(2u64, btreeNodeKeys(small, btreeLoad(leaf1)));
+        saved = btreeSwap(leaf1, btreeLoad(leaf0));
+        if (PWBTree.new(small, 3).open()) tc.t.fail("open() accepted a leaf reached twice");
+        def counter = PWBTreeKeyCounter.new();
+        tc.t.assertz(true, pair.forEach(counter.visit) == null);
+        tc.t.assert_eq(pairRef.size(), counter.count);
+        if (pairRef.compare(pair) == null) tc.t.fail("compare() matched a leaf in place of its sibling of the same size");
+        btreeSwap(leaf1, saved);
+        tc.sameAs(pair, pairRef);
+        def pairAgain = PWBTree.new(small, 3);
+        tc.t.assertz(true, pairAgain.open());
+        tc.sameAs(pairAgain, pairRef);
+}
+
+// The address of child {j}'s offset in the internal node at {node}.
+def btreeChildAddr(region: PWRegion, node: u64, j: int) -> u64 {
+        return region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(2 + 2 * j);
+}
+
+// The key count of the node at {node}: word 1 of its payload.
+def btreeNodeKeys(region: PWRegion, node: u64) -> u64 {
+        return btreeLoad(region.regionStart + node + u64.!(ChunkHeader.size) + 8u64);
+}
+
+class PWBTreeKeyCounter {
+        var count = 0;
+        def visit(k: u64, v: u64) { count++; }
+}
+
+def btreeLoad(addr: u64) -> u64 {
+        return (Pointer.NULL + i64.view(addr)).load<u64>();
+}
+
+// Stores {v} at {addr} directly, as a stray write would; returns what was there.
+def btreeSwap(addr: u64, v: u64) -> u64 {
+        def old = btreeLoad(addr);
+        (Pointer.NULL + i64.view(addr)).store<u64>(v);
+        return old;
+}
+
+// open() must refuse the image; forEach() must refuse it too when {walkFails}
+// (it checks every node it reaches, but not reachability); compare() must not
+// match it either way.
+def btreeRefused(tc: PWBTreeTester, tree: PWBTree, ref: PWBTreeReference, walkFails: bool, what: string) {
+        if (PWBTree.new(tc.region, 4).open()) tc.t.fail1("open() accepted %s", what);
+        if (walkFails && tree.forEach(ignoreKeyValue) == null) tc.t.fail1("forEach() walked %s", what);
+        if (ref.compare(tree) == null) tc.t.fail1("compare() matched %s", what);
+}
+
+def ignoreKeyValue(k: u64, v: u64) { }
+
+// =============================================================================
+// Persistence work per operation, on the production PMEM boundary path
+// =============================================================================
+
+// A PMEM region over anonymous memory, as PWOpsTest's, with a provider that
+// counts writebacks and fences.
+class PWBTreeCountingOps extends X86_64PersistentOperations {
+        var lines = 0;
+        var fences = 0;
+
+        new(range: Range<byte>) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                lines++;
+        }
+
+        def sfence() {
+                fences++;
+        }
+}
+
+class PWBTreeAnonPmemRegion extends PmemMmapRegion {
+        new(mapping: Mapping) super(mapping, -1) { }
+
+        def destroy() {
+                cleanupBeforeDestroy();
+        }
+
+        def release() {
+                mapping.range.unmap();
+        }
+}
+
+// Checks every mark of a put() as it happens: COMPUTE does no persistence work;
+// ALLOC, PUBLISH and FREE are one commit each, so one fence and the lines its
+// record predicts (PWOps.latestRecord().commitLines(), from the record's real
+// offset, so at any block size); WRITE one fence.
+class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
+        var lastLines = 0;
+        var lastFences = 0;
+        def marks = Array<int>.new(5);
+        var writeLines = 0;
+
+        def reset() {
+                lastLines = ops.lines;
+                lastFences = ops.fences;
+                for (i < marks.length) marks[i] = 0;
+                writeLines = 0;
+        }
+
+        def mark(p: PWBTreePhase) {
+                def lines = ops.lines - lastLines;
+                def fences = ops.fences - lastFences;
+                marks[p.tag]++;
+                match (p) {
+                        COMPUTE => {
+                                if (lines != 0 || fences != 0) t.fail2("COMPUTE did persistence work: %d lines, %d fences", lines, fences);
+                        }
+                        WRITE => {
+                                if (fences != 1) t.fail1("WRITE made %d fences, expected 1", fences);
+                                writeLines = lines;
+                        }
+                        ALLOC, PUBLISH, FREE => {
+                                if (fences != 1) t.fail2("%s made %d fences, expected 1", p.name, fences);
+                                def rec = PWOps.latestRecord(region);
+                                if (rec == null) t.fail1("%s: no valid record in the log", p.name);
+                                else if (lines != rec.commitLines()) {
+                                        t.fail3("%s wrote back %d lines, its record predicts %d", p.name, lines, rec.commitLines());
+                                }
+                        }
+                }
+                lastLines = ops.lines;
+                lastFences = ops.fences;
+        }
+}
+
+// Every put() at height h with k new nodes makes k + h + 1 boundaries: k
+// allocations, one fence for the new nodes, the publish, and h - 1 further
+// frees. Its node writebacks are exactly the lines its new nodes occupy, read
+// back from the nodes; a lookup does nothing.
+def test_btree_each_put_makes_k_plus_h_plus_1_boundaries(tc: PWBTreeTester) {
+        btreeBoundaryHistory(tc, BT_BLOCK_SIZE);
+}
+
+// A block size that is not a multiple of a line: node payloads start mid-line,
+// and the writebacks must start on the line that holds the first word, as
+// persistRange()'s do. The production provider (and this counting one) raises
+// PersistentOperationError on a writeback that does not start on a line.
+def test_btree_unaligned_block_size_writes_back_whole_lines(tc: PWBTreeTester) {
+        def unaligned = btreeBoundaryHistory(tc, BT_UNALIGNED_BLOCK_SIZE);
+        tc.t.assertz(true, unaligned > 0);
+}
+
+// The history behind both: inserts, updates and lookups on the counted PMEM
+// boundary path at {blockSize}. Returns how many new nodes did not start on a
+// line, so a caller can check its geometry was exercised.
+def btreeBoundaryHistory(tc: PWBTreeTester, blockSize: u64) -> int {
+        def mapping = Mmap.reserve(BT_BLOCKS * blockSize, Mmap.PROT_READ | Mmap.PROT_WRITE);
+        if (mapping == null) {
+                tc.t.fail("could not reserve the test region");
+                return 0;
+        }
+        def container = PWBTreeAnonPmemRegion.new(mapping);
+        def ops = PWBTreeCountingOps.new(container.range);
+        container.setPersistentOperations(ops);
+        tc.region = PWRegion.new(PreparedRegionBackend.new(container), BT_BLOCKS,
+                Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
+        def tree = tc.open(4);
+        def audit = PWBTreeMarkAudit.new(tc.t, tc.region, ops);
+        var unaligned = 0;
+        tree.onPhase = audit.mark;
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(99);
+        var splits = 0, rootSplits = 0, updates = 0;
+        for (i < 400) {
+                def choice = rng.below(3);
+                if (choice == 2 && ref.size() > 0) {
+                        audit.reset();
+                        def key = ref.keys[int.!(rng.below(u64.!(ref.size())))];
+                        tc.t.assertz(true, tree.get(key).0);
+                        tc.t.assert_eq(0, ops.fences - audit.lastFences + ops.lines - audit.lastLines);
+                        tc.t.assert_eq(1, audit.marks[PWBTreePhase.COMPUTE.tag]);
+                        continue;
+                }
+                def key = if(choice == 1 && ref.size() > 0, ref.keys[int.!(rng.below(u64.!(ref.size())))], rng.below(100000));
+                def h0 = tree.height();
+                def n0 = tree.nodeCount();
+                audit.reset();
+                def fences0 = ops.fences;
+                tc.put(tree, ref, key, rng.next());
+                def k = tree.lastNodesAllocated(), h = tree.lastNodesFreed();
+                // k and h from the durable root alone: h replaced nodes, and
+                // the node count grows by k - h.
+                tc.t.assert_eq(int.!(h0), h);
+                tc.t.assert_eq(tree.nodeCount() - n0, u64.!(k - h));
+                tc.t.assert_eq(k + h + 1, ops.fences - fences0);
+                tc.t.assert_eq(2, audit.marks[PWBTreePhase.COMPUTE.tag]);
+                tc.t.assert_eq(k, audit.marks[PWBTreePhase.ALLOC.tag]);
+                tc.t.assert_eq(1, audit.marks[PWBTreePhase.WRITE.tag]);
+                tc.t.assert_eq(1, audit.marks[PWBTreePhase.PUBLISH.tag]);
+                tc.t.assert_eq(h - 1, audit.marks[PWBTreePhase.FREE.tag]);
+                var nodeLines = 0;
+                for (j < k) {
+                        def node = tree.lastNewNode(j);
+                        nodeLines += PWBTreeConst.nodeLines(node, tree.nodeWords(node));
+                        if ((node + u64.!(ChunkHeader.size)) % PWBTreeConst.LINE != 0) unaligned++;
+                }
+                tc.t.assert_eq(nodeLines, audit.writeLines);
+                tc.t.assert_eq(nodeLines, tree.lastNodeLines());
+                if (!tree.lastWasInsert()) updates++;
+                else if (k > h + 1) rootSplits++;
+                else if (k > h) splits++;
+                if (!tc.checkOk(tree)) break;
+        }
+        tc.sameAs(tree, ref);
+        // The history exercised every shape.
+        tc.t.assertz(true, splits > 0);
+        tc.t.assertz(true, rootSplits > 0);
+        tc.t.assertz(true, updates > 0);
+        tc.t.assertz(true, tree.height() >= 3u64);
+        tc.region.deallocate();
+        container.release();
+        return unaligned;
+}
+
+
+// =============================================================================
+// Resume across a real remount
+// =============================================================================
+
+def BTREE_BD_PATH = "/tmp/wiz_test_pwbtree_region";
+
+def BTBD = UnitTests.registerT("pwbtree_bd:", _, PWBTreeFileTester.new, _);
+def BTBDX = [
+        BTBD("resumes_after_remount",           test_btree_bd_resumes_after_remount),
+        BTBD("resume_is_idempotent",            test_btree_bd_resume_is_idempotent),
+        BTBD("invariants_hold_across_remounts", test_btree_bd_invariants_hold_across_remounts),
+        BTBD("unaligned_block_size_splits_and_resumes", test_btree_bd_unaligned_block_size_splits_and_resumes),
+        ()
+];
+
+class PWBTreeFileTester(t: Tester) {
+        var region: PWRegion;
+        var tree: PWBTree;
+        var blockSize = BT_BLOCK_SIZE;
+
+        new() {
+                RegionFileIO.unlink(BTREE_BD_PATH);
+                region = openRegion(true);
+                tree = PWBTree.new(region, 4);
+        }
+
+        private def openRegion(forceFormat: bool) -> PWRegion {
+                return PWRegion.new(X86_64Backends.getFileMapped(BTREE_BD_PATH), BT_BLOCKS,
+                        Array<Ref<MetaDataDesc>>.new(0), blockSize, forceFormat);
+        }
+
+        // Start again on a fresh file at {size}.
+        def reformat(size: u64) {
+                cleanup();
+                blockSize = size;
+                region = openRegion(true);
+                tree = PWBTree.new(region, 4);
+        }
+
+        // Close cleanly and mount the same file again, as a restart would.
+        def remount() {
+                if (region != null) region.deallocate();
+                region = openRegion(false);
+                tree = PWBTree.new(region, 4);
+                t.assertz(true, tree.open());
+                t.assert_eq(0, tree.leaksReclaimed());
+        }
+
+        def open() { t.assertz(true, tree.open()); }
+
+        def put(ref: PWBTreeReference, key: u64, value: u64) {
+                t.assertz(true, tree.put(key, value));
+                ref.put(key, value);
+        }
+
+        def checkOk() {
+                def err = tree.checkInvariants();
+                if (err != null) t.fail(err);
+        }
+
+        def sameAs(ref: PWBTreeReference) {
+                def err = ref.compare(tree);
+                if (err != null) t.fail(err);
+        }
+
+        def cleanup() {
+                if (region != null) {
+                        region.deallocate();
+                        region = null;
+                }
+                RegionFileIO.unlink(BTREE_BD_PATH);
+        }
+}
+
+def test_btree_bd_resumes_after_remount(tc: PWBTreeFileTester) {
+        tc.open();
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(5);
+        for (i < 80) tc.put(ref, rng.below(10000), u64.!(i));
+        def height = tc.tree.height();
+        tc.t.assertz(true, height >= 3u64);
+
+        tc.remount();
+        tc.t.assert_eq(height, tc.tree.height());
+        tc.t.assert_eq(80u64, tc.tree.mutations());
+        tc.checkOk();
+        tc.sameAs(ref);
+
+        // Continuing gives the same tree as an uninterrupted run would.
+        for (i < 80) tc.put(ref, rng.below(10000), u64.!(i) + 80u64);
+        tc.checkOk();
+        tc.sameAs(ref);
+        tc.t.assert_eq(160u64, tc.tree.mutations());
+        tc.cleanup();
+}
+
+// Remounting without doing any work must change nothing.
+def test_btree_bd_resume_is_idempotent(tc: PWBTreeFileTester) {
+        tc.open();
+        def ref = PWBTreeReference.new();
+        for (i < 50) tc.put(ref, u64.!(i) * 3u64, u64.!(i));
+        def root = tc.tree.rootNode();
+        for (k < 3) {
+                tc.remount();
+                tc.t.assert_eq(root, tc.tree.rootNode());
+                tc.t.assert_eq(50u64, tc.tree.mutations());
+                tc.checkOk();
+                tc.sameAs(ref);
+        }
+        tc.cleanup();
+}
+
+def test_btree_bd_invariants_hold_across_remounts(tc: PWBTreeFileTester) {
+        tc.open();
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(11);
+        for (round < 10) {
+                for (i < 12) {
+                        def update = ref.size() > 0 && rng.below(2) == 0;
+                        def key = if(update, ref.keys[int.!(rng.below(u64.!(ref.size())))], rng.below(5000));
+                        tc.put(ref, key, rng.next());
+                }
+                tc.checkOk();
+                tc.remount();
+                tc.checkOk();
+                tc.sameAs(ref);
+        }
+        tc.t.assert_eq(120u64, tc.tree.mutations());
+        tc.cleanup();
+}
+
+// The production file provider at a block size that is not a multiple of a
+// line: splits write nodes whose payloads start mid-line, and their writebacks
+// must start on a line or the provider raises PersistentOperationError.
+def test_btree_bd_unaligned_block_size_splits_and_resumes(tc: PWBTreeFileTester) {
+        tc.reformat(BT_UNALIGNED_BLOCK_SIZE);
+        tc.open();
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(17);
+        for (i < 80) {
+                tc.put(ref, rng.below(10000), u64.!(i));
+                tc.checkOk();
+        }
+        tc.t.assertz(true, tc.tree.height() >= 3u64);
+        tc.remount();
+        tc.checkOk();
+        tc.sameAs(ref);
+        tc.t.assert_eq(80u64, tc.tree.mutations());
+        tc.cleanup();
+}
+
+
+// =============================================================================
+// Killed at every phase mark, on the direct backend
+// =============================================================================
+
+// A child process builds a tree on the direct backend, starts one mutation, and
+// stops itself at the n-th mark of it; the parent SIGKILLs it, so whatever the
+// child had not written back is lost, as a crash loses unflushed lines. The
+// parent remounts, recovers and opens the tree. Before the PUBLISH mark the
+// tree must be the one before the mutation, and from it on the one after; the
+// chunks reclaimed must be exactly the new nodes allocated so far (before
+// PUBLISH) or the replaced nodes not yet freed (after it).
+
+def BTDIO_BLOCKS = 128u64;
+def BTDIO_CAPACITY = 4;
+def BTDIO_SEED = 23u64;
+def BTDIO_SIGKILL = 9;
+def BTDIO_SIGSTOP = 19;
+def BTDIO_WUNTRACED = 2;
+def BTDIO_FINISHED = 3;         // child status: the mutation ended before the mark
+
+def BTDIO = UnitTests.registerT("pwbtree_dio:", _, PWBTreeDirectTester.new, _);
+def BTDIOX = [
+        BTDIO("killed_at_every_mark_of_a_root_split", test_btree_dio_killed_at_every_mark_of_a_root_split),
+        BTDIO("killed_at_every_mark_of_an_update",    test_btree_dio_killed_at_every_mark_of_an_update),
+        ()
+];
+
+// The mutations a child performs: {pre} puts, then the target put.
+class PWBTreeScript {
+        def keys = Vector<u64>.new();
+        def values = Vector<u64>.new();
+        var pre = 0;            // keys[0, pre) build the tree; keys[pre] is the target
+
+        def add(key: u64, value: u64) {
+                keys.put(key);
+                values.put(value);
+        }
+
+        def reference(upTo: int) -> PWBTreeReference {
+                def ref = PWBTreeReference.new();
+                for (i < upTo) ref.put(keys[i], values[i]);
+                return ref;
+        }
+}
+
+// Counts the marks of the target put and stops the process at one of them.
+class PWBTreeMarkStopper(target: int) {
+        var seen = 0;
+        def phases = Vector<PWBTreePhase>.new();
+
+        def mark(p: PWBTreePhase) {
+                phases.put(p);
+                if (seen == target) {
+                        def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                        Linux.syscall(LinuxConst.SYS_kill, (pid, BTDIO_SIGSTOP));
+                }
+                seen++;
+        }
+}
+
+class PWBTreeDirectTester(t: Tester) {
+        def path = DirectIoTestPaths.path("wiz_test_pwbtree_dio");
+
+        def ready() -> bool {
+                if (path != null) return true;
+                t.fail("no candidate directory supports O_DIRECT (tried /tmp and bin)");
+                return false;
+        }
+
+        def openRegion(fresh: bool) -> PWRegion {
+                return PWRegion.new(DirectIoBackend.new(path, DirectIoTarget.FILE), BTDIO_BLOCKS,
+                        Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, fresh);
+        }
+
+        // Runs {script} on a fresh region with {hook} on the target put, in
+        // this process. Returns 0 on success, or where it failed.
+        def run(script: PWBTreeScript, hook: PWBTreePhase -> void) -> int {
+                def region = openRegion(true);
+                if (region.txn == null) return 10;
+                def tree = PWBTree.new(region, BTDIO_CAPACITY);
+                if (!tree.open()) return 11;
+                for (i < script.pre) {
+                        if (!tree.put(script.keys[i], script.values[i])) return 12;
+                }
+                tree.onPhase = hook;
+                if (!tree.put(script.keys[script.pre], script.values[script.pre])) return 13;
+                region.deallocate();
+                return 0;
+        }
+
+        // The phases of the target put, from a run in this process.
+        def phasesOf(script: PWBTreeScript) -> Array<PWBTreePhase> {
+                def stopper = PWBTreeMarkStopper.new(-1);
+                def status = run(script, stopper.mark);
+                RegionFileIO.unlink(path);
+                if (status != 0) {
+                        t.fail1("the uninterrupted script failed (%d)", status);
+                        return null;
+                }
+                return stopper.phases.extract();
+        }
+
+        // Fork a child that runs {script}, stopping at mark {target}; returns
+        // true once it is stopped and killed.
+        def killAtMark(script: PWBTreeScript, target: int) -> bool {
+                RegionFileIO.unlink(path);
+                def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+                if (pid == 0) {
+                        def stopper = PWBTreeMarkStopper.new(target);
+                        def status = run(script, stopper.mark);
+                        Linux.syscall(LinuxConst.SYS_exit_group, if(status == 0, BTDIO_FINISHED, status));
+                        return false;
+                }
+                if (pid < 0) {
+                        t.fail("fork failed");
+                        return false;
+                }
+                def waitStatus = Array<int>.new(1);
+                def waited = Linux.syscall(LinuxConst.SYS_wait4,
+                        (pid, Pointer.atElement(waitStatus, 0), BTDIO_WUNTRACED, Pointer.NULL)).0;
+                if (waited != pid || waitStatus[0] != BTDIO_SIGSTOP * 256 + 127) {
+                        t.fail3("mark %d: the child did not stop there (wait %d, status %d)", target, waited, waitStatus[0]);
+                        Linux.syscall(LinuxConst.SYS_kill, (pid, BTDIO_SIGKILL));
+                        Linux.syscall(LinuxConst.SYS_wait4, (pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL));
+                        return false;
+                }
+                Linux.syscall(LinuxConst.SYS_kill, (pid, BTDIO_SIGKILL));
+                Linux.syscall(LinuxConst.SYS_wait4, (pid, Pointer.atElement(waitStatus, 0), 0, Pointer.NULL));
+                if (waitStatus[0] != BTDIO_SIGKILL) {
+                        t.fail1("mark %d: the stopped child was not killed", target);
+                        return false;
+                }
+                return true;
+        }
+
+        // Kill at every mark of the target put and check what survives.
+        def killAtEveryMark(script: PWBTreeScript) {
+                def phases = phasesOf(script);
+                if (phases == null) return;
+                def before = script.reference(script.pre);
+                def after = script.reference(script.pre + 1);
+                for (target < phases.length) {
+                        if (!killAtMark(script, target)) break;
+                        var published = false;
+                        var allocated = 0, freed = 0;
+                        for (i = 0; i <= target; i++) {
+                                match (phases[i]) {
+                                        ALLOC => allocated++;
+                                        PUBLISH => published = true;
+                                        FREE => freed++;
+                                        _ => ;
+                                }
+                        }
+                        // Replaced nodes: one per PUBLISH and FREE mark of the
+                        // uninterrupted run.
+                        var replaced = 0;
+                        for (p in phases) if (p == PWBTreePhase.PUBLISH || p == PWBTreePhase.FREE) replaced++;
+                        def leaks = if(published, replaced - 1 - freed, allocated);
+
+                        def region = openRegion(false);
+                        def tree = PWBTree.new(region, BTDIO_CAPACITY);
+                        if (region.txn == null || !tree.open()) {
+                                t.fail1("mark %d: the killed child's region did not open", target);
+                                if (region.backendRegion != null) region.deallocate();
+                                break;
+                        }
+                        def err = tree.checkInvariants();
+                        if (err != null) t.fail2("mark %d: %s", target, err);
+                        def cmp = if(published, after, before).compare(tree);
+                        if (cmp != null) t.fail3("mark %d (%s): %s", target, phases[target].name, cmp);
+                        if (tree.leaksReclaimed() != leaks) {
+                                t.fail3("mark %d: reclaimed %d chunks, expected %d", target, tree.leaksReclaimed(), leaks);
+                        }
+                        tc_assertMutations(t, tree, u64.!(script.pre + if(published, 1, 0)), target);
+                        // The tree goes on working.
+                        if (!tree.put(0xFFFF_FFFFu64, 1)) t.fail1("mark %d: a later put failed", target);
+                        else if (tree.checkInvariants() != null) t.fail1("mark %d: a later put broke the tree", target);
+                        region.deallocate();
+                }
+                RegionFileIO.unlink(path);
+        }
+}
+
+def tc_assertMutations(t: Tester, tree: PWBTree, want: u64, target: int) {
+        if (tree.mutations() != want) t.fail3("mark %d: %d mutations survive, expected %d", target, tree.mutations(), want);
+}
+
+// Seeded inserts until one raises the height to 4; that insert, which splits a
+// leaf, every internal node on its path and the root, is the target.
+def btdioRootSplitScript() -> PWBTreeScript {
+        def script = PWBTreeScript.new();
+        def region = PWRegion.new(BT_ANON, BTDIO_BLOCKS,
+                Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
+        def tree = PWBTree.new(region, BTDIO_CAPACITY);
+        if (!tree.open()) return null;
+        def rng = PWBTreeRandom.new(BTDIO_SEED);
+        for (i < 1000) {
+                def key = rng.below(100000), value = rng.next();
+                def h = tree.height();
+                if (!tree.put(key, value)) return null;
+                script.add(key, value);
+                if (h == 3u64 && tree.height() == 4u64) {
+                        script.pre = script.keys.length - 1;
+                        return script;
+                }
+        }
+        return null;
+}
+
+def test_btree_dio_killed_at_every_mark_of_a_root_split(tc: PWBTreeDirectTester) {
+        if (!tc.ready()) return;
+        def script = btdioRootSplitScript();
+        if (script == null) return tc.t.fail("no insert of the seeded history raised the height to 4");
+        tc.killAtEveryMark(script);
+}
+
+// The same, for an update at height 4: a path copy with no split.
+def test_btree_dio_killed_at_every_mark_of_an_update(tc: PWBTreeDirectTester) {
+        if (!tc.ready()) return;
+        def script = btdioRootSplitScript();
+        if (script == null) return tc.t.fail("no insert of the seeded history raised the height to 4");
+        script.pre = script.keys.length;
+        script.add(script.keys[0], 0x5EED_u64);
+        tc.killAtEveryMark(script);
+}

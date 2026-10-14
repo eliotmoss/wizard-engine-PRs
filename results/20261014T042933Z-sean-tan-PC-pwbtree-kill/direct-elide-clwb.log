@@ -1,0 +1,66 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file [MUTANT in the children: cache-line writeback elided]
+region file /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwbtree/bin/pwbtree-bench-block/wizard-pwbtree-u1000-p539649-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iteration 0: LOST acknowledged mutations: 76 acknowledged, 0 durable
+iteration 1: LOST acknowledged mutations: 218 acknowledged, 0 durable
+iteration 2: LOST acknowledged mutations: 225 acknowledged, 0 durable
+iteration 3: LOST acknowledged mutations: 225 acknowledged, 0 durable
+iteration 4: LOST acknowledged mutations: 303 acknowledged, 0 durable
+iteration 5: LOST acknowledged mutations: 212 acknowledged, 0 durable
+iteration 6: LOST acknowledged mutations: 36 acknowledged, 0 durable
+iteration 8: LOST acknowledged mutations: 118 acknowledged, 0 durable
+iteration 9: LOST acknowledged mutations: 85 acknowledged, 0 durable
+iteration 10: LOST acknowledged mutations: 523 acknowledged, 0 durable
+iteration 11: LOST acknowledged mutations: 337 acknowledged, 0 durable
+iteration 12: LOST acknowledged mutations: 94 acknowledged, 0 durable
+iteration 13: LOST acknowledged mutations: 54 acknowledged, 0 durable
+iteration 14: LOST acknowledged mutations: 136 acknowledged, 0 durable
+iteration 15: LOST acknowledged mutations: 39 acknowledged, 0 durable
+iteration 16: LOST acknowledged mutations: 54 acknowledged, 0 durable
+iteration 17: LOST acknowledged mutations: 130 acknowledged, 0 durable
+iteration 18: LOST acknowledged mutations: 365 acknowledged, 0 durable
+iteration 19: LOST acknowledged mutations: 175 acknowledged, 0 durable
+iteration 20: LOST acknowledged mutations: 127 acknowledged, 0 durable
+iteration 21: LOST acknowledged mutations: 53 acknowledged, 0 durable
+iteration 22: LOST acknowledged mutations: 126 acknowledged, 0 durable
+iteration 23: LOST acknowledged mutations: 27 acknowledged, 0 durable
+iteration 25: LOST acknowledged mutations: 38 acknowledged, 0 durable
+iteration 26: LOST acknowledged mutations: 223 acknowledged, 0 durable
+iteration 27: LOST acknowledged mutations: 85 acknowledged, 0 durable
+iteration 28: LOST acknowledged mutations: 252 acknowledged, 0 durable
+iteration 29: LOST acknowledged mutations: 382 acknowledged, 0 durable
+iteration 30: LOST acknowledged mutations: 227 acknowledged, 0 durable
+iteration 31: LOST acknowledged mutations: 337 acknowledged, 0 durable
+iteration 32: LOST acknowledged mutations: 203 acknowledged, 0 durable
+iteration 34: LOST acknowledged mutations: 95 acknowledged, 0 durable
+iteration 35: LOST acknowledged mutations: 50 acknowledged, 0 durable
+iteration 36: LOST acknowledged mutations: 115 acknowledged, 0 durable
+iteration 37: LOST acknowledged mutations: 281 acknowledged, 0 durable
+iteration 38: LOST acknowledged mutations: 176 acknowledged, 0 durable
+iteration 39: LOST acknowledged mutations: 121 acknowledged, 0 durable
+iteration 40: LOST acknowledged mutations: 53 acknowledged, 0 durable
+iteration 43: LOST acknowledged mutations: 20 acknowledged, 0 durable
+iteration 44: LOST acknowledged mutations: 40 acknowledged, 0 durable
+iteration 45: LOST acknowledged mutations: 94 acknowledged, 0 durable
+iteration 46: LOST acknowledged mutations: 120 acknowledged, 0 durable
+iteration 47: LOST acknowledged mutations: 74 acknowledged, 0 durable
+iteration 48: LOST acknowledged mutations: 86 acknowledged, 0 durable
+iteration 49: LOST acknowledged mutations: 8 acknowledged, 0 durable
+iterations 50 of 50 requested, seed 1
+replayed a record 0, child finished early 0, children confirmed wiring 49
+puts acknowledged by children 6818; durable mutations 0
+acknowledged-mutation checks 45, lost 45; the put in flight durable 0, not durable 4
+killed between puts: 1
+killed in a put, before its first mark: 0
+killed after COMPUTE: 12
+killed after ALLOC: 16
+killed after WRITE: 9
+killed after PUBLISH: 7
+killed after FREE: 5
+leaked chunks reclaimed at mount: 0, on 0 mounts
+final tree: 0 keys, height 1 (at most 1 over the run), 1 nodes; matches the reference
+LOST
+retained region image: /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwbtree/bin/pwbtree-bench-block/wizard-pwbtree-u1000-p539649-0.region
+exit=1

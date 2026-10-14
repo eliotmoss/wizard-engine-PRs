@@ -1,0 +1,20 @@
+backend file (mmap + fdatasync)
+region file /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwbtree/bin/pwbtree-bench-block/wizard-pwbtree-u1000-p539487-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iterations 50 of 50 requested, seed 1
+replayed a record 50, child finished early 0, children confirmed wiring 50
+puts acknowledged by children 187; durable mutations 206
+acknowledged-mutation checks 45, lost 0; the put in flight durable 19, not durable 31
+killed between puts: 0
+killed in a put, before its first mark: 0
+killed after COMPUTE: 15
+killed after ALLOC: 16
+killed after WRITE: 8
+killed after PUBLISH: 7
+killed after FREE: 4
+leaked chunks reclaimed at mount: 95, on 44 mounts
+final tree: 169 keys, height 3 (at most 3 over the run), 34 nodes; matches the reference
+OK
+exit=0

@@ -1,0 +1,476 @@
+// Random-timer crash loop for the persistent B+Tree, as test/pwsieve.main.v3 is
+// for the sieve.
+//
+// A child forks, mounts the region, opens the tree (which reclaims what earlier
+// kills leaked), and applies mutations as fast as it can while the parent sleeps
+// a pseudo-random interval and sends SIGKILL. The parent then remounts from a
+// fresh mapping, runs production recovery, opens the tree, and checks it: its
+// invariants, its contents against an independent DRAM map, and that every
+// mutation the child had acknowledged survived. Repeat.
+//
+// The history. Mutation i is a pure function of the seed and i: a key drawn from
+// a bounded key space, so the history starts with inserts that split and grow
+// the tree and moves on to updates, and a random value. The tree's durable
+// mutation counter m says how many of them the region holds, so the expected
+// tree after a kill is the first m mutations applied to an empty map, and a
+// child resumes at mutation m.
+//
+// Acknowledgements, as pwsieve's. A put() that returns has published, so
+// recovery must reach at least that far. The child stores, in a page shared with
+// the parent, the mutation count it has acknowledged and the last phase mark of
+// the put in flight; a store to shared memory outlives the SIGKILL. A durable m
+// below the acknowledged count is a LOST restart: the loop counts it and the run
+// ends LOST rather than OK. A run in which no kill came after an acknowledgement
+// has checked nothing and ends UNCHECKED (exit 3), never OK. m may exceed it by one, the put in flight having
+// published before the kill, and never by more. The mark also says which m the
+// kill allows: before the WRITE mark the publish cannot have started, so m is
+// the acknowledged count; from the PUBLISH mark on it has committed, so m is one
+// more; between them, either.
+//
+// What this establishes, and not: as pwsieve's loop, process-crash consistency
+// under one kernel. On the file and PMEM backends a killed process loses nothing
+// that was stored, so the image after a kill is the model's eager one and the
+// elided-writeback mutant (elide-clwb, in the children only) is expected to
+// pass; on the direct backend process death discards the staging buffer, so
+// whatever was never written back is gone, and the mutant is expected to be
+// LOST. Not host power-loss proof.
+//
+// The runner never touches a file it did not create: it reserves a uniquely
+// named region inside the caller-assigned directory and removes only that file,
+// and only after a passing run.
+//
+// Usage: pwbtree.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize]
+//            [file|pmem|direct] [ordinary|elide-clwb] [max-delay-us] [capacity] [key-space]
+
+def SIGKILL = 9;
+def EXIT_CHILD_WIRING = 7;
+def MAX_MUTATIONS = 100000000u64;       // a child stops here if never killed
+
+enum TreeBackend(arg: string, label: string) {
+        FILE("file", "file (mmap + fdatasync)"),
+        PMEM("pmem", "pmem (MAP_SYNC + CLWB/SFENCE)"),
+        DIRECT("direct", "direct (pwrite + O_DIRECT + fdatasync) on a file")
+}
+
+component TreeLoopConfig {
+        def var directory: string;
+        def var path: string;
+        def var iterations = 50;
+        def var seed = 1u64;
+        def var blocks = 256u64;
+        def var blockSize = 4096u64;
+        def var backend = TreeBackend.FILE;
+        def var elideWriteback = false;
+        def var maxDelayNs = 20000000L;         // 20 ms
+        // A small node, so a short history splits often and grows tall in a
+        // small region; 0 asks for the block size's maximum.
+        def var capacity = 8;
+        def var keySpace = 600u64;
+        def MIN_DELAY_NS = 50000L;              // 50 us
+
+        def backendName() -> string {
+                def base = backend.label;
+                if (!elideWriteback) return base;
+                return Strings.format1("%s [MUTANT in the children: cache-line writeback elided]", base);
+        }
+
+        def reservePath(dir: string) -> bool {
+                directory = dir;
+                def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+                def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                for (attempt < 100) {
+                        path = StringBuilder.new()
+                                .puts(directory)
+                                .puts("/wizard-pwbtree-u")
+                                .putd(uid)
+                                .puts("-p")
+                                .putd(pid)
+                                .puts("-")
+                                .putd(attempt)
+                                .puts(".region")
+                                .toString();
+                        def fd = RegionFileIO.createExclusive(path);
+                        if (fd >= 0) {
+                                RegionFileIO.close(fd);
+                                return true;
+                        }
+                        if (fd != -LinuxConst.EEXIST) {
+                                path = null;
+                                return false;
+                        }
+                }
+                path = null;
+                return false;
+        }
+}
+
+// What a child has acknowledged, in a page it shares with the parent.
+component TreeAck {
+        def ACKED = 0;          // mutations durable as of the last put() that returned
+        def WIRING = 8;         // 1 once the child has checked its own mount
+        def STATE = 16;         // 0 between puts, 1 in a put before its first mark, 2 + the last mark's tag
+        def PUTS = 24;          // puts acknowledged by this child
+        private var page: Mapping;
+
+        def init() -> bool {
+                page = Mmap.map(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE,
+                        Mmap.MAP_SHARED | Mmap.MAP_ANONYMOUS, -1, 0u64);
+                return page != null;
+        }
+
+        def get(slot: int) -> u64 {
+                return (page.range.start + slot).load<u64>();
+        }
+
+        def set(slot: int, v: u64) {
+                (page.range.start + slot).store<u64>(v);
+        }
+
+        def mark(p: PWBTreePhase) {
+                set(STATE, 2u64 + u64.!(p.tag));
+        }
+}
+
+def STATE_NAMES = ["between puts", "in a put, before its first mark", "after COMPUTE", "after ALLOC",
+        "after WRITE", "after PUBLISH", "after FREE"];
+
+// Mutation {i} of the history: a pure function of the seed and i.
+def mutation(i: u64) -> (u64, u64) {
+        def rng = PWBTreeRandom.new(TreeLoopConfig.seed * 0x9E37_79B9_7F4A_7C15u64 + i);
+        def key = rng.below(TreeLoopConfig.keySpace);
+        return (key, rng.next());
+}
+
+var lastDirectBackend: DirectIoBackend;
+
+def openBackend(elide: bool) -> TxnRegionBackend {
+        var backend: TxnRegionBackend;
+        def path = TreeLoopConfig.path;
+        match (TreeLoopConfig.backend) {
+                PMEM => backend = X86_64Backends.getPersistent(path);
+                FILE => backend = X86_64Backends.getFileMapped(path);
+                DIRECT => backend = lastDirectBackend = DirectIoBackend.new(path, DirectIoTarget.FILE);
+        }
+        // Wrapped, not replaced: the real backend still opens the real file and
+        // takes the real mapping, and only the provider differs.
+        if (elide) return ElidedWritebackBackend.new(backend);
+        return backend;
+}
+
+def openRegion(fresh: bool, elide: bool) -> PWRegion {
+        return PWRegion.new(openBackend(elide), TreeLoopConfig.blocks,
+                Array<Ref<MetaDataDesc>>.new(0), TreeLoopConfig.blockSize, fresh);
+}
+
+// pwsieve's anti-fallback check, on every mount.
+def wiringError(region: BackendRegion, expectElided: bool) -> string {
+        if (region == null) return "the backend region could not be created";
+        match (TreeLoopConfig.backend) {
+                PMEM => if (!PmemMmapRegion.?(region)) return "pmem mode did not produce a PmemMmapRegion";
+                FILE => if (!FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
+                DIRECT => if (!DirectIoRegion.?(region) || DirectIoRegion.!(region).blockDevice) {
+                        return "direct mode did not produce a file-backed DirectIoRegion";
+                }
+        }
+        def elided = ElidedWritebackOperations.?(region.persistentOperations());
+        if (expectElided && !elided) return "elide-clwb did not install the elided-writeback provider";
+        if (!expectElided && elided) return "a production mount installed the elided-writeback provider";
+        return null;
+}
+
+// A struct timespec for nanosleep, built before the fork.
+def timespec(ns: long) -> Array<long> {
+        def ts = Array<long>.new(2);
+        ts[0] = ns / 1000000000L;
+        ts[1] = ns % 1000000000L;
+        return ts;
+}
+
+// Waits for {pid}, already sent SIGKILL; a wait interrupted by a signal is
+// retried, so a false return is a real wait4 failure.
+def reap(pid: long, status: Array<int>) -> bool {
+        while (true) {
+                def r = Linux.syscall(LinuxConst.SYS_wait4,
+                        (pid, Pointer.atElement(status, 0), 0, Pointer.NULL)).0;
+                if (r == pid) return true;
+                if (r != -LinuxConst.EINTR) return false;
+        }
+        return false;
+}
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        retained();
+        return 1;
+}
+
+def retained() {
+        if (TreeLoopConfig.path != null) {
+                System.puts("retained region image: ");
+                System.puts(TreeLoopConfig.path);
+                System.ln();
+        }
+}
+
+// The child: mount, check its own wiring, open the tree, and apply the history
+// from the durable mutation count on, publishing each acknowledgement. It never
+// closes cleanly; the parent is expected to kill it.
+def runChild() -> int {
+        def region = openRegion(false, TreeLoopConfig.elideWriteback);
+        if (region == null || region.backendRegion == null) return 2;
+        if (wiringError(region.backendRegion, TreeLoopConfig.elideWriteback) != null) return EXIT_CHILD_WIRING;
+        TreeAck.set(TreeAck.WIRING, 1);
+        def tree = PWBTree.new(region, TreeLoopConfig.capacity);
+        if (!tree.open()) return 3;
+        tree.onPhase = TreeAck.mark;
+        var m = tree.mutations();
+        while (m < MAX_MUTATIONS) {
+                def mu = mutation(m);
+                TreeAck.set(TreeAck.STATE, 1);
+                if (!tree.put(mu.0, mu.1)) return 4;
+                m++;
+                // STATE first: killed between the two stores, the parent sees
+                // a put that returned and was not yet acknowledged, which it allows.
+                TreeAck.set(TreeAck.STATE, 0);
+                TreeAck.set(TreeAck.ACKED, m);
+                TreeAck.set(TreeAck.PUTS, TreeAck.get(TreeAck.PUTS) + 1);
+        }
+        return 0;
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var v: u64 = 0;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                v = v * 10u64 + u64.!(c - '0');
+        }
+        return v;
+}
+
+def usage() -> int {
+        System.puts("Usage: pwbtree.x86-64-linux <writable-directory> [iterations] [seed] [blocks] [blockSize] [file|pmem|direct] [ordinary|elide-clwb] [max-delay-us] [capacity] [key-space]\n");
+        return 2;
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 1 || args[0] == null || args[0].length == 0) return usage();
+        if (args.length > 1) TreeLoopConfig.iterations = int.!(parseU64(args[1], 50));
+        if (args.length > 2) TreeLoopConfig.seed = parseU64(args[2], 1);
+        if (args.length > 3) TreeLoopConfig.blocks = parseU64(args[3], 256);
+        if (args.length > 4) TreeLoopConfig.blockSize = parseU64(args[4], 4096);
+        if (args.length > 5) {
+                def mode = args[5];
+                if (Strings.equal(mode, "pmem")) TreeLoopConfig.backend = TreeBackend.PMEM;
+                else if (Strings.equal(mode, "direct")) TreeLoopConfig.backend = TreeBackend.DIRECT;
+                else if (!Strings.equal(mode, "file")) {
+                        System.puts("backend must be \"file\", \"pmem\" or \"direct\"\n");
+                        return 2;
+                }
+        }
+        if (args.length > 6) {
+                if (Strings.equal(args[6], "elide-clwb")) TreeLoopConfig.elideWriteback = true;
+                else if (!Strings.equal(args[6], "ordinary")) {
+                        System.puts("writeback mode must be \"ordinary\" or \"elide-clwb\"\n");
+                        return 2;
+                }
+        }
+        if (args.length > 7) {
+                def us = parseU64(args[7], 0);
+                // The delay is drawn from [MIN_DELAY_NS, maxDelayNs), which a
+                // bound at or below the minimum leaves empty.
+                if (us == 0 || long.!(us) * 1000L <= TreeLoopConfig.MIN_DELAY_NS) {
+                        System.puts(Strings.format1("max-delay-us must exceed the minimum delay, %d us\n",
+                                TreeLoopConfig.MIN_DELAY_NS / 1000L));
+                        return 2;
+                }
+                TreeLoopConfig.maxDelayNs = long.!(us) * 1000L;
+        }
+        if (args.length > 8) TreeLoopConfig.capacity = int.!(parseU64(args[8], 8));
+        if (args.length > 9) {
+                TreeLoopConfig.keySpace = parseU64(args[9], 0);
+                if (TreeLoopConfig.keySpace == 0) {
+                        System.puts("key-space must be positive\n");
+                        return 2;
+                }
+        }
+        if (TreeLoopConfig.iterations < 1) {
+                System.puts("iterations must be positive\n");
+                return 2;
+        }
+        if (!TreeLoopConfig.reservePath(args[0])) {
+                System.puts("Could not reserve a unique region file in the supplied directory.\n");
+                return 2;
+        }
+        if (!TreeAck.init()) return fail("could not map the acknowledgement page");
+        Trace.OUT.put1("backend %s", TreeLoopConfig.backendName()).ln();
+        Trace.OUT.put1("region file %s", TreeLoopConfig.path).ln();
+
+        // Fresh region, empty tree, production provider.
+        var region = openRegion(true, false);
+        if (region == null || region.backendRegion == null) {
+                if (TreeLoopConfig.backend == TreeBackend.PMEM) {
+                        return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                }
+                if (lastDirectBackend != null && lastDirectBackend.lastError != null) {
+                        return fail(Strings.format1("DirectIoBackend.create failed: %s", lastDirectBackend.lastError));
+                }
+                return fail("could not create the region file");
+        }
+        def wiring = wiringError(region.backendRegion, false);
+        if (wiring != null) {
+                region.deallocate();
+                return fail(wiring);
+        }
+        var tree = PWBTree.new(region, TreeLoopConfig.capacity);
+        if (!tree.open()) return fail("could not lay out the tree");
+        Trace.OUT.put3("region %d blocks of %d bytes, capacity %d keys per node",
+                TreeLoopConfig.blocks, TreeLoopConfig.blockSize, tree.capacity()).ln();
+        Trace.OUT.put2("history: keys from [0, %d), seed %d", TreeLoopConfig.keySpace, TreeLoopConfig.seed).ln();
+        Trace.OUT.put1("kill delay up to %d us", TreeLoopConfig.maxDelayNs / 1000L).ln();
+        region.deallocate();
+
+        def ref = PWBTreeReference.new();
+        var applied = 0u64;     // mutations applied to ref
+        def rng = PWBTreeRandom.new(TreeLoopConfig.seed ^ 0x6B11_1000u64);
+        var replayed = 0, finished = 0, completed = 0, confirmed = 0;
+        var lost = 0, ackChecks = 0, inFlightDurable = 0, inFlightLost = 0;
+        var reclaimed = 0, reclaimingMounts = 0;
+        var finalHeight = 0u64, finalNodes = 0u64;
+        var ackedPuts = 0uL;
+        var maxHeight = 0u64;
+        def states = Array<int>.new(STATE_NAMES.length);
+
+        for (iteration < TreeLoopConfig.iterations) {
+                TreeAck.set(TreeAck.ACKED, applied);
+                TreeAck.set(TreeAck.WIRING, 0);
+                TreeAck.set(TreeAck.STATE, 0);
+                TreeAck.set(TreeAck.PUTS, 0);
+                // Everything that can fail or allocate happens before the fork:
+                // from it until the child is killed the parent makes system
+                // calls only, so no error path can leave a child running.
+                def delay = timespec(TreeLoopConfig.MIN_DELAY_NS +
+                        long.!(rng.below(u64.!(TreeLoopConfig.maxDelayNs - TreeLoopConfig.MIN_DELAY_NS))));
+                def waitStatus = Array<int>.new(1);
+                def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
+                if (pid < 0) return fail("fork failed");
+                if (pid == 0) {
+                        Linux.syscall(LinuxConst.SYS_exit_group, runChild());
+                        return 0;
+                }
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(delay, 0), Pointer.NULL));
+                Linux.syscall(LinuxConst.SYS_kill, (pid, SIGKILL));
+                if (!reap(pid, waitStatus)) return fail("wait4 did not reap the child (it has been sent SIGKILL)");
+                if (waitStatus[0] != SIGKILL) {
+                        def code = waitStatus[0] >> 8;
+                        Trace.OUT.put2("iteration %d: child exited %d", iteration, code).ln();
+                        if (code == EXIT_CHILD_WIRING) return fail("a child's own mount did not have the requested backend or provider");
+                        if (waitStatus[0] != 0) return fail("a child could not mount, open the tree or apply a mutation");
+                        finished++;
+                }
+                def acked = TreeAck.get(TreeAck.ACKED);
+                def state = int.!(TreeAck.get(TreeAck.STATE));
+                if (TreeAck.get(TreeAck.WIRING) == 1) confirmed++;
+                ackedPuts += TreeAck.get(TreeAck.PUTS);
+                if (state < 0 || state >= states.length) return fail("the child left an unknown state");
+                states[state]++;
+
+                // Verify from a fresh mapping in this process, with the
+                // production provider: production WAL recovery over whatever
+                // the child left, then the tree's own open and sweep.
+                region = openRegion(false, false);
+                if (region == null || region.backendRegion == null) return fail("could not remount after the kill");
+                def remountWiring = wiringError(region.backendRegion, false);
+                if (remountWiring != null) return fail(remountWiring);
+                if (region.lastRecovery == DualWalRecovery.REPLAYED) replayed++;
+                if (region.lastRecovery == DualWalRecovery.CORRUPT) return fail("WAL reported CORRUPT after an abrupt kill");
+                if (region.requiresRecovery()) return fail("remount latched recovery-required");
+                tree = PWBTree.new(region, TreeLoopConfig.capacity);
+                if (!tree.open()) {
+                        Trace.OUT.put2("iteration %d: killed %s", iteration, STATE_NAMES[state]).ln();
+                        return fail("could not reopen the tree: its root or its invariants are broken");
+                }
+                if (tree.leaksReclaimed() > 0) reclaimingMounts++;
+                reclaimed += tree.leaksReclaimed();
+                def err = tree.checkInvariants();
+                if (err != null) {
+                        Trace.OUT.put2("iteration %d: killed %s", iteration, STATE_NAMES[state]).ln();
+                        return fail(err);
+                }
+
+                def m = tree.mutations();
+                if (m < applied) return fail("the mutation count went backwards");
+                if (acked > applied) ackChecks++;
+                if (m < acked) {
+                        lost++;
+                        Trace.OUT.put3("iteration %d: LOST acknowledged mutations: %d acknowledged, %d durable",
+                                iteration, acked, m).ln();
+                } else if (m > acked + 1u64) {
+                        return fail(Strings.format2("%d mutations durable where at most %d had started", m, acked + 1u64));
+                } else {
+                        if (m == acked + 1u64) inFlightDurable++;
+                        else if (state != 0) inFlightLost++;
+                        // The mark says which the kill allows.
+                        def published = m == acked + 1u64;
+                        if ((state >= 1 && state <= 3 && published) || (state >= 5 && !published)) {
+                                return fail(StringBuilder.new().put1("killed %s, yet ", STATE_NAMES[state])
+                                        .put2("%d mutations are durable with %d acknowledged", m, acked).toString());
+                        }
+                }
+                // Bring the reference to m and compare.
+                while (applied < m) {
+                        def mu = mutation(applied);
+                        ref.put(mu.0, mu.1);
+                        applied++;
+                }
+                def cmp = ref.compare(tree);
+                if (cmp != null) {
+                        Trace.OUT.put2("iteration %d: killed %s", iteration, STATE_NAMES[state]).ln();
+                        return fail(cmp);
+                }
+                if (tree.height() > maxHeight) maxHeight = tree.height();
+                finalHeight = tree.height();
+                finalNodes = tree.nodeCount();
+                completed++;
+                region.deallocate();
+                region = null;
+        }
+
+        Trace.OUT.put3("iterations %d of %d requested, seed %d",
+                completed, TreeLoopConfig.iterations, TreeLoopConfig.seed).ln();
+        Trace.OUT.put3("replayed a record %d, child finished early %d, children confirmed wiring %d",
+                replayed, finished, confirmed).ln();
+        Trace.OUT.put2("puts acknowledged by children %d; durable mutations %d", ackedPuts, applied).ln();
+        Trace.OUT.put3("acknowledged-mutation checks %d, lost %d; the put in flight durable %d",
+                ackChecks, lost, inFlightDurable).put1(", not durable %d", inFlightLost).ln();
+        for (i < states.length) {
+                Trace.OUT.put2("killed %s: %d", STATE_NAMES[i], states[i]).ln();
+        }
+        Trace.OUT.put2("leaked chunks reclaimed at mount: %d, on %d mounts", reclaimed, reclaimingMounts).ln();
+        Trace.OUT.put3("final tree: %d keys, height %d (at most %d over the run)", ref.size(), finalHeight, maxHeight)
+                .put1(", %d nodes; matches the reference", finalNodes).ln();
+
+        if (lost > 0) {
+                System.puts("LOST\n");
+                retained();
+                return 1;
+        }
+        // OK claims that acknowledged mutations survived, so it needs at least
+        // one kill that came after an acknowledgement. Without one the run has
+        // shown nothing either way (a single short iteration, say, killed after
+        // the first publish but before the child stored its acknowledgement).
+        if (ackChecks == 0) {
+                System.puts("UNCHECKED: no kill came after an acknowledged mutation, so no acknowledgement was checked; raise the iterations or max-delay-us\n");
+                retained();
+                return 3;
+        }
+        if (!RegionFileIO.unlink(TreeLoopConfig.path)) {
+                System.puts("Could not remove the region file printed above.\n");
+                return 2;
+        }
+        System.puts("OK\n");
+        return 0;
+}

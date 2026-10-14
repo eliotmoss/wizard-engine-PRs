@@ -1,0 +1,805 @@
+// B+Tree operation cost: the persistent B+Tree (PWBTree) through the production
+// allocator and WAL, timed.
+//
+// The sieve (pwsievebench) is the compute-bound workload: ~150 us of DRAM work
+// between boundaries. A tree mutation computes little -- a descent and a copy of
+// one path -- and persists a lot: at height h with k new nodes, k allocations,
+// one fence over the new nodes, the publish and h - 1 further frees, so
+// k + h + 1 boundaries (PWBTree.v3). This is the persistence-bound point.
+//
+// Workload, per round, YCSB-like: a freshly formatted region; load {keys} random
+// distinct u64 keys with random values (each insert timed); then {ops} operations,
+// half lookups and half updates (each kind timed separately) of keys chosen
+// uniformly from the loaded ones, YCSB's workload A without a skew; then, outside
+// the timed window, PWBTree.checkInvariants() and a comparison of the whole tree
+// with an independent DRAM map, and every lookup's answer is checked against
+// it. A round that does not verify fails the run. Every round runs the same
+// seeded history, so it does the same work.
+//
+// Round 0 is unmeasured, and audits. At every mark PWBTree reports, the work
+// since the previous mark is checked: COMPUTE none; ALLOC, PUBLISH and FREE are
+// one commit each, so one boundary and the lines the record it wrote predicts
+// (PWOps.latestRecord().commitLines(), read through a second DualTxnWal); WRITE
+// one boundary and exactly the lines the new nodes occupy, read back from them.
+// Every operation of the measured rounds must then do exactly the work, in
+// boundaries, prepare calls and lines, that the same operation did in round 0;
+// and every operation of every round must make k + h + 1 boundaries, with h
+// the height before it and k derived from the node count after it, or none for
+// a lookup. A mismatch fails the run and keeps the region image. The record is
+// read only in round 0, as in pwopsbench: reading it after a measured commit
+// would pull into the cache lines that later commits store into.
+//
+// Backends and instrumentation follow pwopsbench (test/pwopsbench.main.v3), from
+// which the counting backends are duplicated rather than shared, so neither
+// program's code layout moves with the other's: every boundary, prepare call and
+// writeback request is counted on all three backends. writeback=none (pmem only)
+// issues no writeback instruction and keeps the fence, an eADR timing
+// approximation; the region is NOT durable and the run ends on a labelled line.
+// PWBTree's node writer resolves the installed provider, so none removes the
+// nodes' writebacks as well as the log's.
+//
+// Times are rdtsc cycles around each call, converted with a calibrated TSC
+// frequency; the phase figures are PWBTree's onPhase marks, means per operation.
+//
+// Usage: pwbtreebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [keys] [ops] [blocks] [blockSize] [writeback=<auto|none>] [seed=<n>]
+
+def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def RUSAGE_SELF = 0;
+def RU_MINFLT_OFFSET = 64;      // struct rusage: two timevals, then longs
+def RUSAGE_SIZE = 144;
+def MAX_SAMPLES = 1000000;
+def PHASES = 5;
+def PHASE_NAMES = ["compute", "alloc", "write", "publish", "free"];
+def KEY_SPACE = 0xFFFF_FFFF_FFFF_FFFFu64;
+
+enum TreeBenchBackend(arg: string, label: string) {
+        FILE("file", "file (mmap + fdatasync)"),
+        PMEM("pmem", "pmem (MAP_SYNC + CLWB/SFENCE)"),
+        DIRECT("direct", "direct (pwrite + O_DIRECT + fdatasync) on a file")
+}
+
+enum TreeBenchWriteback(arg: string, label: string) {
+        AUTO("auto", "auto (production CPUID selection)"),
+        NONE("none", "none -- no writeback, fence kept, approximates eADR timing, the region is NOT durable")
+}
+
+enum TreeOpKind(label: string) {
+        INSERT("insert"),
+        UPDATE("update"),
+        LOOKUP("lookup")
+}
+
+component TreeBenchConfig {
+        def var directory: string;
+        def var path: string;
+        def var backend = TreeBenchBackend.FILE;
+        def var writeback = TreeBenchWriteback.AUTO;
+        def var rounds = 5;             // measured, after the audit round
+        def var keys = 5000;
+        def var ops = 5000;
+        def var blocks = 256u64;
+        def var blockSize = 4096u64;
+        def var seed = 1u64;
+
+        // Reserve a private, uniquely named region file, exactly as pwbench,
+        // pwsievebench and pwopsbench do: O_EXCL so an earlier run's artifact
+        // is never silently replaced, and removal only of the file this run
+        // created.
+        def reservePath(dir: string) -> bool {
+                directory = dir;
+                def uid = Linux.syscall(LinuxConst.SYS_getuid, ()).0;
+                def pid = Linux.syscall(LinuxConst.SYS_getpid, ()).0;
+                for (attempt < 100) {
+                        path = StringBuilder.new()
+                                .puts(directory)
+                                .puts("/wizard-pwbtreebench-u")
+                                .putd(uid)
+                                .puts("-p")
+                                .putd(pid)
+                                .puts("-")
+                                .putd(attempt)
+                                .puts(".region")
+                                .toString();
+                        def fd = RegionFileIO.createExclusive(path);
+                        if (fd >= 0) {
+                                RegionFileIO.close(fd);
+                                return true;
+                        }
+                        if (fd != -LinuxConst.EEXIST) {
+                                path = null;
+                                return false;
+                        }
+                }
+                path = null;
+                return false;
+        }
+}
+
+// ---------------------------------------------------------------- clock
+
+component BenchClock {
+        def var cyclesPerUs = 0u64;
+
+        def nanos() -> long {
+                def ts = Array<long>.new(2);
+                Linux.syscall(LinuxConst.SYS_clock_gettime,
+                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                return ts[0] * 1000000000L + ts[1];
+        }
+
+        def sleepNanos(ns: long) {
+                def ts = Array<long>.new(2);
+                ts[0] = ns / 1000000000L;
+                ts[1] = ns % 1000000000L;
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atElement(ts, 0), Pointer.NULL));
+        }
+
+        // As pwbench: the tree has no invariant-TSC check, so the derived
+        // frequency is reported rather than assumed.
+        def calibrate() {
+                def c0 = Target.rdtsc();
+                def t0 = nanos();
+                sleepNanos(100000000L);         // 100 ms
+                def c1 = Target.rdtsc();
+                def t1 = nanos();
+                def elapsedNs = t1 - t0;
+                if (elapsedNs <= 0) return;
+                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesToNanos(cycles: u64) -> u64 {
+                if (cyclesPerUs == 0) return 0;
+                return (cycles * 1000u64) / cyclesPerUs;
+        }
+}
+
+// Minor page faults so far in this process, or -1 (as pwbench).
+def minorFaults() -> long {
+        def buf = Array<byte>.new(RUSAGE_SIZE);
+        if (Linux.syscall(LinuxConst.SYS_getrusage, (RUSAGE_SELF, Pointer.atContents(buf))).0 != 0) return -1;
+        var v = 0L;
+        for (i < 8) v |= long.view(u64.view(buf[RU_MINFLT_OFFSET + i]) << u6.view(8 * i));
+        return v;
+}
+
+// ------------------------------------------------------------ accumulator
+
+// Persistence work since the start of the run, as one operation's delta.
+type OpCounts(boundaries: int, prepares: int, lines: int) #unboxed {
+        def minus(that: OpCounts) -> OpCounts {
+                return OpCounts(boundaries - that.boundaries, prepares - that.prepares, lines - that.lines);
+        }
+        def equals(that: OpCounts) -> bool {
+                return boundaries == that.boundaries && prepares == that.prepares && lines == that.lines;
+        }
+}
+
+// Shared by the backends, the regions and the provider; counts every call, so
+// each operation and each phase is a difference.
+class OpCounter {
+        var boundaries = 0;     // SFENCE / fdatasync / direct write-back
+        var prepares = 0;       // file and direct prepareChangedRange() calls
+        var lines = 0;          // writeback requests
+
+        def notePersist() { boundaries++; }
+        def notePrepare() { prepares++; }
+        def noteLine() { lines++; }
+        def snapshot() -> OpCounts { return OpCounts(boundaries, prepares, lines); }
+}
+
+// One operation kind's samples, phases and work.
+class KindStats(kind: TreeOpKind) {
+        def samples = Vector<u64>.new();        // rdtsc cycles per operation
+        def phaseCycles = Array<u64>.new(PHASES);
+        var ops = 0;
+        var cycles = 0u64;
+        var boundaries = 0L;
+        var prepares = 0L;
+        var lines = 0L;
+        var splits = 0;                         // mutations that allocated more nodes than they replaced
+        var maxBoundaries = 0;
+        var minBoundaries = 0x7FFF_FFFF;
+
+        def note(c: u64, work: OpCounts, split: bool) {
+                ops++;
+                cycles += c;
+                if (samples.length < MAX_SAMPLES) samples.put(c);
+                boundaries += work.boundaries;
+                prepares += work.prepares;
+                lines += work.lines;
+                if (split) splits++;
+                if (work.boundaries > maxBoundaries) maxBoundaries = work.boundaries;
+                if (work.boundaries < minBoundaries) minBoundaries = work.boundaries;
+        }
+}
+
+// The phase hook, the round 0 audit and the measured rounds' accumulators.
+class TreeTimer(counter: OpCounter) {
+        def kinds = [KindStats.new(TreeOpKind.INSERT), KindStats.new(TreeOpKind.UPDATE), KindStats.new(TreeOpKind.LOOKUP)];
+        var recording = false;          // measured rounds, inside the operation loops
+        var auditing = false;           // round 0
+        var current: KindStats;
+        var region: PWRegion;
+        var mark = 0u64;
+        var markCounts: OpCounts;
+        var writeLines = 0;             // the WRITE mark's lines, for the check after the put
+        var auditError: string;
+        def marks = Array<int>.new(PHASES);
+
+        def startOp(kind: KindStats) {
+                current = kind;
+                for (i < PHASES) marks[i] = 0;
+                writeLines = -1;
+                markCounts = counter.snapshot();
+                mark = Target.rdtsc();
+        }
+
+        // PWBTree.onPhase: charge the time since the previous mark to {p}; in
+        // round 0, check the work since the previous mark.
+        def onPhase(p: PWBTreePhase) {
+                def now = Target.rdtsc();
+                if (recording) current.phaseCycles[p.tag] += now - mark;
+                marks[p.tag]++;
+                if (auditing) {
+                        def got = counter.snapshot();
+                        def d = got.minus(markCounts);
+                        markCounts = got;
+                        auditMark(p, d);
+                }
+                mark = Target.rdtsc();
+        }
+
+        private def auditMark(p: PWBTreePhase, d: OpCounts) {
+                if (auditError != null) return;
+                match (p) {
+                        COMPUTE => {
+                                if (d.boundaries != 0 || d.lines != 0) {
+                                        auditError = Strings.format2("COMPUTE did persistence work: %d boundaries, %d lines", d.boundaries, d.lines);
+                                }
+                        }
+                        WRITE => {
+                                if (d.boundaries != 1) auditError = Strings.format1("WRITE made %d boundaries, expected 1", d.boundaries);
+                                writeLines = d.lines;
+                        }
+                        ALLOC, PUBLISH, FREE => {
+                                if (d.boundaries != 1) {
+                                        auditError = Strings.format2("%s made %d boundaries, expected 1", p.name, d.boundaries);
+                                        return;
+                                }
+                                def rec = PWOps.latestRecord(region);
+                                if (rec == null) {
+                                        auditError = Strings.format1("%s: no valid record in the log after its commit", p.name);
+                                } else if (d.lines != rec.commitLines()) {
+                                        auditError = Strings.format3("%s wrote back %d lines; its record (%d entries) predicts ",
+                                                p.name, d.lines, rec.entryCount);
+                                        auditError = Strings.format2("%s%d", auditError, rec.commitLines());
+                                }
+                        }
+                }
+        }
+}
+
+// -------------------------------------------------- PMEM instrumentation
+
+// pwopsbench's CountingPersistentOperations: the production bodies, the
+// writeback selectable, each fence and line counted.
+class CountingPersistentOperations extends X86_64PersistentOperations {
+        def counter: OpCounter;
+
+        new(range: Range<byte>, counter: OpCounter) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                match (TreeBenchConfig.writeback) {
+                        AUTO => MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+                        NONE => ;       // still counted, so lines per operation stays checkable
+                }
+                counter.noteLine();
+        }
+
+        def sfence() {
+                MmapRegionUtils.storeFence();
+                counter.notePersist();
+        }
+}
+
+// Installs the provider inside create(): PWRegion, DualTxnWal and PWBTree's
+// node writer each resolve it once, so a later swap would miss.
+class CountingPmemBackend extends PmemMmapBackend {
+        def counter: OpCounter;
+
+        new(path: string, counter: OpCounter) super(path) { }
+
+        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+                if (newMapping == null) return null;
+                def region = PmemMmapRegion.new(newMapping, fd);
+                region.setPersistentOperations(CountingPersistentOperations.new(region.range, counter));
+                return region;
+        }
+}
+
+// -------------------------------------------------- file instrumentation
+
+class CountingFileRegion extends FileMmapRegion {
+        def counter: OpCounter;
+
+        new(mapping: Mapping, fd: int, counter: OpCounter) super(mapping, fd) {
+                wrapProvider(CountingStagingOperations.new(range, counter));
+        }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                counter.notePrepare();
+        }
+
+        def syncFileData() -> bool {
+                def success = RegionFileIO.fdatasync(fd);
+                counter.notePersist();
+                return success;
+        }
+}
+
+class CountingFileBackend extends FileMmapBackend {
+        def counter: OpCounter;
+
+        new(path: string, counter: OpCounter) super(path) { }
+
+        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+                if (newMapping == null) return null;
+                return CountingFileRegion.new(newMapping, fd, counter);
+        }
+}
+
+// ------------------------------------------------ direct instrumentation
+
+// The production staging provider with each writeback request counted, for
+// the direct and file regions: their marking provider forwards every request
+// to it, so the counts are the PMEM backend's for the same operations.
+class CountingStagingOperations extends DirectIoStagingOperations {
+        def counter: OpCounter;
+
+        new(range: Range<byte>, counter: OpCounter) super(range) { }
+
+        def clwb(cacheLine: u64) {
+                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
+                        cacheLine >= u64.!(range.length)) {
+                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+                }
+                counter.noteLine();
+        }
+}
+
+class CountingDirectRegion extends DirectIoRegion {
+        def counter: OpCounter;
+
+        new(mapping: Mapping, fd: int, blockDevice: bool, counter) super(mapping, fd, blockDevice) {
+                wrapProvider(CountingStagingOperations.new(range, counter));
+        }
+
+        def onRangePrepared(offset: u64, size: u64) {
+                counter.notePrepare();
+        }
+
+        def syncDevice() -> bool {
+                def success = performSync();
+                counter.notePersist();
+                return success;
+        }
+}
+
+class CountingDirectBackend extends DirectIoBackend {
+        def counter: OpCounter;
+
+        new(path: string, counter: OpCounter) super(path, DirectIoTarget.FILE) { }
+
+        def makeDirectRegion(mapping: Mapping, fd: int, blockDevice: bool) -> DirectIoRegion {
+                return CountingDirectRegion.new(mapping, fd, blockDevice, counter);
+        }
+}
+
+// ---------------------------------------------------------------- stats
+
+class Percentiles(sorted: Array<u64>) {
+        def at(p: int) -> u64 {
+                if (sorted.length == 0) return 0;
+                var i = (p * (sorted.length - 1)) / 100;
+                if (i < 0) i = 0;
+                if (i >= sorted.length) i = sorted.length - 1;
+                return sorted[i];
+        }
+}
+
+// ---------------------------------------------------------------- run
+
+def fail(msg: string) -> int {
+        System.puts("FAIL: ");
+        System.puts(msg);
+        System.ln();
+        if (TreeBenchConfig.path != null) {
+                System.puts("retained region image: ");
+                System.puts(TreeBenchConfig.path);
+                System.ln();
+        }
+        return 1;
+}
+
+var directBackend: CountingDirectBackend;
+
+def openRegion(counter: OpCounter) -> PWRegion {
+        var backend: TxnRegionBackend;
+        def path = TreeBenchConfig.path;
+        match (TreeBenchConfig.backend) {
+                PMEM => backend = CountingPmemBackend.new(path, counter);
+                FILE => backend = CountingFileBackend.new(path, counter);
+                DIRECT => backend = directBackend = CountingDirectBackend.new(path, counter);
+        }
+        return PWRegion.new(backend, TreeBenchConfig.blocks,
+                Array<Ref<MetaDataDesc>>.new(0), TreeBenchConfig.blockSize, true);
+}
+
+// The anti-fallback check pwbench, pwsievebench and pwopsbench make: a file
+// mapping reported as a PMEM result would invert the comparison, and so would
+// the mutant provider.
+def wiringError(got: BackendRegion) -> string {
+        if (got == null) return "the backend region could not be created";
+        match (TreeBenchConfig.backend) {
+                PMEM => if (!PmemMmapRegion.?(got)) return "pmem mode did not produce a PmemMmapRegion";
+                FILE => if (!FileMmapRegion.?(got)) return "file mode did not produce a FileMmapRegion";
+                DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) {
+                        return "direct mode did not produce a file-backed DirectIoRegion";
+                }
+        }
+        if (ElidedWritebackOperations.?(got.persistentOperations())) {
+                return "an elided-writeback provider is installed; this must be an ordinary build";
+        }
+        return null;
+}
+
+def discardReserved() {
+        if (TreeBenchConfig.path != null && RegionFileIO.unlink(TreeBenchConfig.path)) {
+                TreeBenchConfig.path = null;
+        }
+}
+
+// The work each operation of round 0 did; every later round must repeat it.
+var expected: Array<OpCounts>;
+var loadHeight = 0u64;
+var loadNodes = 0u64;
+var wallLoadNs = 0L, wallMixNs = 0L;
+var faultsLoad = 0L, faultsMix = 0L;
+var faultsKnown = true;
+
+// One operation: time it, check its work, and account it. Returns null, or
+// why it failed.
+def runOp(index: int, timer: TreeTimer, tree: PWBTree, kind: KindStats, key: u64, value: u64,
+                ref: PWBTreeReference) -> string {
+        def counter = timer.counter;
+        def isLookup = kind.kind == TreeOpKind.LOOKUP;
+        def h0 = tree.height(), n0 = tree.nodeCount();
+        def before = counter.snapshot();
+        timer.startOp(kind);
+        def c0 = Target.rdtsc();
+        var ok = true;
+        var got: (bool, u64);
+        if (isLookup) got = tree.get(key);
+        else ok = tree.put(key, value);
+        def c1 = Target.rdtsc();
+        def work = counter.snapshot().minus(before);
+        if (!ok) return Strings.format2("%s %d failed (region full or a persistence failure)", kind.kind.label, index);
+        if (timer.auditError != null) return Strings.format3("%s %d: %s", kind.kind.label, index, timer.auditError);
+
+        var split = false;
+        if (isLookup) {
+                if (!got.0 || got.1 != ref.get(key)) return Strings.format1("lookup %d returned a different value from the reference", index);
+                if (work.boundaries != 0 || work.lines != 0 || work.prepares != 0) {
+                        return Strings.format1("lookup %d did persistence work", index);
+                }
+        } else {
+                ref.put(key, value);
+                def h = int.!(h0);
+                def k = h + int.!(tree.nodeCount() - n0);
+                if (tree.lastNodesFreed() != h || tree.lastNodesAllocated() != k) {
+                        return Strings.format3("%s %d: the tree reports %d new nodes", kind.kind.label, index, tree.lastNodesAllocated());
+                }
+                if (tree.lastWasInsert() != (kind.kind == TreeOpKind.INSERT)) {
+                        return Strings.format2("%s %d was not the kind of mutation the workload asked for", kind.kind.label, index);
+                }
+                if (work.boundaries != k + h + 1) {
+                        return StringBuilder.new().put2("%s %d: ", kind.kind.label, index)
+                                .put3("%d boundaries at height %d with %d new nodes", work.boundaries, h, k)
+                                .put1(", expected %d", k + h + 1).toString();
+                }
+                split = k > h;
+                if (timer.auditing) {
+                        var lines = 0;
+                        for (i < k) {
+                                def node = tree.lastNewNode(i);
+                                lines += PWBTreeConst.nodeLines(node, tree.nodeWords(node));
+                        }
+                        if (timer.writeLines != lines) {
+                                return StringBuilder.new()
+                                        .put3("%s %d: WRITE wrote back %d lines", kind.kind.label, index, timer.writeLines)
+                                        .put1(", the new nodes occupy %d", lines).toString();
+                        }
+                        if (timer.marks[PWBTreePhase.ALLOC.tag] != k || timer.marks[PWBTreePhase.FREE.tag] != h - 1 ||
+                                timer.marks[PWBTreePhase.PUBLISH.tag] != 1 || timer.marks[PWBTreePhase.WRITE.tag] != 1) {
+                                return Strings.format2("%s %d: PWBTree's marks are not one per commit", kind.kind.label, index);
+                        }
+                }
+        }
+        if (timer.auditing) {
+                expected[index] = work;
+        } else if (!work.equals(expected[index])) {
+                def want = expected[index];
+                return StringBuilder.new().put2("%s %d: ", kind.kind.label, index)
+                        .put3("%d boundaries, %d prepares, %d lines", work.boundaries, work.prepares, work.lines)
+                        .put3("; round 0 did %d, %d, %d", want.boundaries, want.prepares, want.lines)
+                        .toString();
+        }
+        if (timer.recording) kind.note(c1 - c0, work, split);
+        return null;
+}
+
+// One round: a fresh region, the load, the mix, then the tree verified with the
+// timer off. Round 0 audits and records; the others are measured and must match
+// it. Returns null, or why the round failed.
+def runRound(round: int, timer: TreeTimer, counter: OpCounter) -> string {
+        if (!TreeBenchConfig.reservePath(TreeBenchConfig.directory)) {
+                return "could not reserve a unique region file in the supplied directory";
+        }
+        def region = openRegion(counter);
+        if (region == null || region.backendRegion == null) {
+                discardReserved();
+                if (TreeBenchConfig.backend == TreeBenchBackend.PMEM) {
+                        return "PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
+                }
+                if (directBackend != null && directBackend.lastError != null) {
+                        return Strings.format1("DirectIoBackend.create failed: %s", directBackend.lastError);
+                }
+                return "could not create the region file";
+        }
+        def wiring = wiringError(region.backendRegion);
+        if (wiring != null) {
+                region.deallocate();
+                discardReserved();
+                return wiring;
+        }
+        if (region.txn == null) {
+                region.deallocate();
+                return "the region did not format (geometry unsupported)";
+        }
+        def tree = PWBTree.new(region, 0);
+        if (!tree.open()) {
+                region.deallocate();
+                return "PWBTree.open() failed on a fresh region";
+        }
+        tree.onPhase = timer.onPhase;
+        timer.region = region;
+        timer.auditing = round == 0;
+        if (round == 0) {
+                expected = Array<OpCounts>.new(TreeBenchConfig.keys + TreeBenchConfig.ops);
+                Trace.OUT.put2("tree capacity %d keys per node, %d words per node", tree.capacity(),
+                        int.!((TreeBenchConfig.blockSize - u64.!(ChunkHeader.size)) / 8u64)).ln();
+        }
+
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(TreeBenchConfig.seed);
+        def insert = timer.kinds[TreeOpKind.INSERT.tag];
+        def update = timer.kinds[TreeOpKind.UPDATE.tag];
+        def lookup = timer.kinds[TreeOpKind.LOOKUP.tag];
+
+        // Load.
+        def f0 = minorFaults();
+        def t0 = BenchClock.nanos();
+        timer.recording = round > 0;
+        for (i < TreeBenchConfig.keys) {
+                var key = rng.next();
+                while (ref.has(key)) key = rng.next();
+                def err = runOp(i, timer, tree, insert, key, rng.next(), ref);
+                if (err != null) {
+                        timer.recording = false;
+                        region.deallocate();
+                        return err;
+                }
+        }
+        timer.recording = false;
+        def t1 = BenchClock.nanos();
+        def f1 = minorFaults();
+        if (round == 0) {
+                loadHeight = tree.height();
+                loadNodes = tree.nodeCount();
+                Trace.OUT.put3("after the load: %d keys, height %d, %d nodes", tree.keyCount(), loadHeight, loadNodes).ln();
+        }
+
+        // Mix: half lookups, half updates, of uniformly chosen loaded keys.
+        def n = u64.!(ref.size());
+        timer.recording = round > 0;
+        for (i < TreeBenchConfig.ops) {
+                def isUpdate = rng.below(2) == 0;
+                def key = ref.keys[int.!(rng.below(n))];
+                def value = rng.next();
+                def err = runOp(TreeBenchConfig.keys + i, timer, tree, if(isUpdate, update, lookup), key, value, ref);
+                if (err != null) {
+                        timer.recording = false;
+                        region.deallocate();
+                        return err;
+                }
+        }
+        timer.recording = false;
+        def t2 = BenchClock.nanos();
+        def f2 = minorFaults();
+        if (round > 0) {
+                wallLoadNs += t1 - t0;
+                wallMixNs += t2 - t1;
+                if (f0 >= 0 && f1 >= 0 && f2 >= 0) {
+                        faultsLoad += f1 - f0;
+                        faultsMix += f2 - f1;
+                } else {
+                        faultsKnown = false;
+                }
+        }
+
+        tree.onPhase = null;
+        def invariant = tree.checkInvariants();
+        if (invariant != null) {
+                region.deallocate();
+                return Strings.format1("the tree failed its invariants: %s", invariant);
+        }
+        def cmp = ref.compare(tree);
+        if (cmp != null) {
+                region.deallocate();
+                return Strings.format1("the tree differs from the reference: %s", cmp);
+        }
+        if (tree.height() != loadHeight) {
+                region.deallocate();
+                return "the mix changed the tree's height";
+        }
+        if (round == 0) {
+                Trace.OUT.put2("round 0 audited %d operations: every commit's lines matched its record, every WRITE its nodes; %d keys match the reference",
+                        TreeBenchConfig.keys + TreeBenchConfig.ops, ref.size()).ln();
+        }
+        region.deallocate();
+        if (!RegionFileIO.unlink(TreeBenchConfig.path)) return "could not remove the region file";
+        TreeBenchConfig.path = null;
+        return null;
+}
+
+def perOpX1000(total: long, ops: int) -> long {
+        if (ops <= 0) return 0;
+        return (1000L * total) / long.!(ops);
+}
+
+def report(timer: TreeTimer) {
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        for (k in timer.kinds) {
+                def sorted = Arrays.sort(k.samples.copy(), 0, k.samples.length, u64.<=);
+                def p = Percentiles.new(sorted);
+                def ops = k.ops;
+                def mean = if(ops > 0, BenchClock.cyclesToNanos(k.cycles) / u64.!(ops), 0u64);
+                def b = Trace.OUT.puts("op ").puts(k.kind.label)
+                        .put1(" samples %d", ops)
+                        .put3(" min_ns %d median_ns %d p90_ns %d",
+                                BenchClock.cyclesToNanos(p.at(0)),
+                                BenchClock.cyclesToNanos(p.at(50)),
+                                BenchClock.cyclesToNanos(p.at(90)))
+                        .put3(" p99_ns %d max_ns %d mean_ns %d",
+                                BenchClock.cyclesToNanos(p.at(99)),
+                                BenchClock.cyclesToNanos(p.at(100)),
+                                mean);
+                for (i < PHASES) {
+                        def ns = if(ops > 0, BenchClock.cyclesToNanos(k.phaseCycles[i]) / u64.!(ops), 0u64);
+                        b.puts(" ").puts(PHASE_NAMES[i]).put1("_ns %d", ns);
+                }
+                b.put3(" boundaries_x1000 %d prepares_x1000 %d lines_x1000 %d",
+                        perOpX1000(k.boundaries, ops), perOpX1000(k.prepares, ops), perOpX1000(k.lines, ops))
+                        .put3(" boundaries_min %d boundaries_max %d splits %d",
+                                if(ops > 0, k.minBoundaries, 0), k.maxBoundaries, k.splits)
+                        .ln();
+        }
+        def mixOps = timer.kinds[TreeOpKind.UPDATE.tag].ops + timer.kinds[TreeOpKind.LOOKUP.tag].ops;
+        def loadOps = timer.kinds[TreeOpKind.INSERT.tag].ops;
+        Trace.OUT.put2("wall ns per insert (load) %d, per operation (mix) %d",
+                if(loadOps > 0, wallLoadNs / long.!(loadOps), 0L),
+                if(mixOps > 0, wallMixNs / long.!(mixOps), 0L)).ln();
+        if (faultsKnown) {
+                Trace.OUT.put2("minor faults x1000 per insert (load) %d, per operation (mix) %d",
+                        perOpX1000(faultsLoad, loadOps), perOpX1000(faultsMix, mixOps)).ln();
+        }
+}
+
+def parseU64(s: string, dflt: u64) -> u64 {
+        if (s == null || s.length == 0) return dflt;
+        var v: u64 = 0;
+        for (i < s.length) {
+                def c = s[i];
+                if (c < '0' || c > '9') return dflt;
+                v = v * 10u64 + u64.!(c - '0');
+        }
+        return v;
+}
+
+// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+def cpuidWriteback() -> string {
+        if (Target.supportsClwb()) return "CLWB";
+        if (Target.supportsClflushOpt()) return "CLFLUSHOPT";
+        if (Target.supportsClflush()) return "CLFLUSH";
+        return "nothing";
+}
+
+def usage() -> int {
+        System.puts("Usage: pwbtreebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [keys] [ops] [blocks] [blockSize] [writeback=<auto|none>] [seed=<n>]\n");
+        return 2;
+}
+
+def main(args: Array<string>) -> int {
+        if (args.length < 2 || args[0] == null || args[0].length == 0) return usage();
+        // Rejected rather than defaulted: a file run reported as a PMEM one
+        // would invert the comparison this program exists to make.
+        if (Strings.equal(args[1], "pmem")) TreeBenchConfig.backend = TreeBenchBackend.PMEM;
+        else if (Strings.equal(args[1], "direct")) TreeBenchConfig.backend = TreeBenchBackend.DIRECT;
+        else if (!Strings.equal(args[1], "file")) {
+                System.puts("backend must be \"file\", \"pmem\" or \"direct\"\n");
+                return 2;
+        }
+        if (args.length > 2) TreeBenchConfig.rounds = int.!(parseU64(args[2], 5));
+        if (args.length > 3) TreeBenchConfig.keys = int.!(parseU64(args[3], 5000));
+        if (args.length > 4) TreeBenchConfig.ops = int.!(parseU64(args[4], 5000));
+        if (args.length > 5) TreeBenchConfig.blocks = parseU64(args[5], 256);
+        if (args.length > 6) TreeBenchConfig.blockSize = parseU64(args[6], 4096);
+        for (i = 7; i < args.length; i++) {
+                if (Strings.equal(args[i], "writeback=auto")) TreeBenchConfig.writeback = TreeBenchWriteback.AUTO;
+                else if (Strings.equal(args[i], "writeback=none")) TreeBenchConfig.writeback = TreeBenchWriteback.NONE;
+                else if (Strings.startsWith(args[i], "seed=")) {
+                        def s = Arrays.range(args[i], 5, args[i].length);
+                        TreeBenchConfig.seed = parseU64(s, 0);
+                        if (TreeBenchConfig.seed == 0) {
+                                System.puts("seed= must be a positive integer\n");
+                                return 2;
+                        }
+                } else {
+                        System.puts("after the positional arguments, expected writeback=<auto|none> or seed=<n>\n");
+                        return 2;
+                }
+        }
+        if (TreeBenchConfig.writeback != TreeBenchWriteback.AUTO && TreeBenchConfig.backend != TreeBenchBackend.PMEM) {
+                System.puts("writeback= applies only to the pmem backend\n");
+                return 2;
+        }
+        if (TreeBenchConfig.rounds < 1 || TreeBenchConfig.keys < 1 || TreeBenchConfig.ops < 1) {
+                System.puts("rounds, keys and ops must be positive\n");
+                return 2;
+        }
+        if (TreeBenchConfig.blocks < 16) {
+                System.puts("blocks must be at least 16\n");
+                return 2;
+        }
+        TreeBenchConfig.directory = args[0];
+
+        BenchClock.calibrate();
+        Trace.OUT.put1("backend %s", TreeBenchConfig.backend.label).ln();
+        Trace.OUT.put1("directory %s", TreeBenchConfig.directory).ln();
+        if (TreeBenchConfig.backend == TreeBenchBackend.PMEM) {
+                Trace.OUT.put2("writeback %s, CPUID selects %s",
+                        TreeBenchConfig.writeback.label, cpuidWriteback()).ln();
+        }
+        Trace.OUT.put3("region %d blocks of %d bytes, rounds %d measured after 1 audited",
+                TreeBenchConfig.blocks, TreeBenchConfig.blockSize, TreeBenchConfig.rounds).ln();
+        Trace.OUT.put3("workload per round: load %d keys, then %d operations, half lookups and half updates, seed %d",
+                TreeBenchConfig.keys, TreeBenchConfig.ops, TreeBenchConfig.seed).ln();
+
+        def counter = OpCounter.new();
+        def timer = TreeTimer.new(counter);
+        for (r < TreeBenchConfig.rounds + 1) {
+                def err = runRound(r, timer, counter);
+                if (err != null) return fail(Strings.format2("round %d: %s", r, err));
+        }
+        report(timer);
+        if (TreeBenchConfig.writeback == TreeBenchWriteback.NONE) {
+                System.puts("OK timing-only: writeback=none, the region was never durable\n");
+        } else {
+                System.puts("OK\n");
+        }
+        return 0;
+}

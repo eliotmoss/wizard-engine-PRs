@@ -10,15 +10,27 @@
 
 // The newest valid record in a region's log, read back after a commit: the
 // transaction that commit wrote.
-class PWOpsRecord(txnSeq: u64, entryCount: u32, recordLen: u32, distinctLines: int) {
+class PWOpsRecord(txnSeq: u64, entryCount: u32, recordLen: u32, recordOffset: u64, distinctLines: int) {
         // The cache lines one commit of this record writes back on PMEM. The
-        // record's own: its slot is 64-byte aligned and the WAL prepares
-        // recordLen bytes of it. Then, once applied, each line its after-images
-        // touch, once: DualTxnWal.prepareApplied() merges extents whose lines
-        // touch and prepares each merged range, which covers exactly the lines
-        // written.
+        // record's own: the WAL prepares the recordLen bytes from its slot's
+        // region-relative offset, recordOffset, and the provider writes back
+        // every line that range touches (MmapRegionUtils.flushRange). A slot
+        // starts on a line when the log chunk does, as at 4 KiB blocks, and then
+        // that is recordLen / 64 lines; PWRegion allows any block size that is a
+        // multiple of 8, and at others (4,104 bytes, say) a slot starts inside a
+        // line and the record touches one more. Then, once applied, each line
+        // its after-images touch, once: DualTxnWal.prepareApplied() merges
+        // extents whose lines touch and prepares each merged range, which covers
+        // exactly the lines written.
         def commitLines() -> int {
-                return int.!(recordLen / u32.!(MmapRegionUtils.CACHE_LINE_SIZE)) + distinctLines;
+                return recordLines() + distinctLines;
+        }
+
+        def recordLines() -> int {
+                def line = MmapRegionUtils.CACHE_LINE_SIZE;
+                def first = recordOffset - recordOffset % line;
+                def end = recordOffset + u64.view(recordLen);
+                return int.!((end - first + line - 1u64) / line);
         }
 }
 
@@ -54,7 +66,7 @@ component PWOps {
                         if (!seen) lines.put(line);
                         entryAddr += u64.!(LogEntry.size);
                 }
-                return PWOpsRecord.new(seq, count, header.recordLen, lines.length);
+                return PWOpsRecord.new(seq, count, header.recordLen, addr - region.regionStart, lines.length);
         }
 
         // Leave {raw}, a formatted and cleanly closed region, with one committed

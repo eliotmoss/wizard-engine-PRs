@@ -1,0 +1,59 @@
+bin/pwbtree.x86-64-linux "/home/users/u7599095" 50 1 256 4096 direct elide-clwb
+backend direct (pwrite + O_DIRECT + fdatasync) on a file [MUTANT in the children: cache-line writeback elided]
+region file /home/users/u7599095/wizard-pwbtree-u7599095-p204867-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iteration 1: LOST acknowledged mutations: 47 acknowledged, 0 durable
+iteration 2: LOST acknowledged mutations: 127 acknowledged, 0 durable
+iteration 3: LOST acknowledged mutations: 83 acknowledged, 0 durable
+iteration 4: LOST acknowledged mutations: 97 acknowledged, 0 durable
+iteration 5: LOST acknowledged mutations: 53 acknowledged, 0 durable
+iteration 6: LOST acknowledged mutations: 1 acknowledged, 0 durable
+iteration 8: LOST acknowledged mutations: 47 acknowledged, 0 durable
+iteration 10: LOST acknowledged mutations: 98 acknowledged, 0 durable
+iteration 11: LOST acknowledged mutations: 62 acknowledged, 0 durable
+iteration 13: LOST acknowledged mutations: 7 acknowledged, 0 durable
+iteration 14: LOST acknowledged mutations: 43 acknowledged, 0 durable
+iteration 15: LOST acknowledged mutations: 6 acknowledged, 0 durable
+iteration 16: LOST acknowledged mutations: 21 acknowledged, 0 durable
+iteration 17: LOST acknowledged mutations: 31 acknowledged, 0 durable
+iteration 18: LOST acknowledged mutations: 74 acknowledged, 0 durable
+iteration 19: LOST acknowledged mutations: 36 acknowledged, 0 durable
+iteration 20: LOST acknowledged mutations: 104 acknowledged, 0 durable
+iteration 21: LOST acknowledged mutations: 55 acknowledged, 0 durable
+iteration 22: LOST acknowledged mutations: 60 acknowledged, 0 durable
+iteration 23: LOST acknowledged mutations: 26 acknowledged, 0 durable
+iteration 26: LOST acknowledged mutations: 103 acknowledged, 0 durable
+iteration 27: LOST acknowledged mutations: 18 acknowledged, 0 durable
+iteration 28: LOST acknowledged mutations: 85 acknowledged, 0 durable
+iteration 29: LOST acknowledged mutations: 92 acknowledged, 0 durable
+iteration 30: LOST acknowledged mutations: 75 acknowledged, 0 durable
+iteration 31: LOST acknowledged mutations: 131 acknowledged, 0 durable
+iteration 32: LOST acknowledged mutations: 69 acknowledged, 0 durable
+iteration 34: LOST acknowledged mutations: 43 acknowledged, 0 durable
+iteration 35: LOST acknowledged mutations: 14 acknowledged, 0 durable
+iteration 36: LOST acknowledged mutations: 12 acknowledged, 0 durable
+iteration 37: LOST acknowledged mutations: 105 acknowledged, 0 durable
+iteration 38: LOST acknowledged mutations: 27 acknowledged, 0 durable
+iteration 39: LOST acknowledged mutations: 40 acknowledged, 0 durable
+iteration 40: LOST acknowledged mutations: 17 acknowledged, 0 durable
+iteration 46: LOST acknowledged mutations: 23 acknowledged, 0 durable
+iteration 47: LOST acknowledged mutations: 28 acknowledged, 0 durable
+iteration 48: LOST acknowledged mutations: 9 acknowledged, 0 durable
+iterations 50 of 50 requested, seed 1
+replayed a record 0, child finished early 0, children confirmed wiring 47
+puts acknowledged by children 1969; durable mutations 0
+acknowledged-mutation checks 37, lost 37; the put in flight durable 0, not durable 9
+killed between puts: 4
+killed in a put, before its first mark: 0
+killed after COMPUTE: 17
+killed after ALLOC: 16
+killed after WRITE: 11
+killed after PUBLISH: 1
+killed after FREE: 1
+leaked chunks reclaimed at mount: 0, on 0 mounts
+final tree: 0 keys, height 1 (at most 1 over the run), 1 nodes; matches the reference
+LOST
+retained region image: /home/users/u7599095/wizard-pwbtree-u7599095-p204867-0.region
+make: *** [Makefile:188: pwbtree-direct-mutant] Error 1
