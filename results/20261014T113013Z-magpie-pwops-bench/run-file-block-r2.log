@@ -1,0 +1,19 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /home/users/u7599095
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 385525 median_ns 454258 p90_ns 760005 p99_ns 1008998 max_ns 41751148 mean_ns 519856 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 379107 median_ns 438309 p90_ns 754317 p99_ns 995327 max_ns 41817282 mean_ns 507042 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 380813 median_ns 455285 p90_ns 761489 p99_ns 1018553 max_ns 41793502 mean_ns 522350 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 373002 median_ns 439272 p90_ns 757170 p99_ns 1002789 max_ns 56794048 mean_ns 508672 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 312543 median_ns 376755 p90_ns 656300 p99_ns 889843 max_ns 41321693 mean_ns 439823 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 305436 median_ns 370560 p90_ns 542224 p99_ns 837890 max_ns 41795270 mean_ns 407177 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 7 median_ns 13 p90_ns 13 p99_ns 15 max_ns 35 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 9 median_ns 19 p90_ns 20 p99_ns 20 max_ns 28 mean_ns 18 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 13437 median_ns 30328 p90_ns 39810 p99_ns 53873 max_ns 66813 mean_ns 31580 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 112086 median_ns 172278 p90_ns 197244 p99_ns 692183 max_ns 712160 mean_ns 184765 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 133369 median_ns 193594 p90_ns 226348 p99_ns 704648 max_ns 724240 mean_ns 205540 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 6618 median_ns 8827 p90_ns 9344 p99_ns 11234 max_ns 12642 mean_ns 8748 boundaries 0 prepares 0 lines 0
+OK

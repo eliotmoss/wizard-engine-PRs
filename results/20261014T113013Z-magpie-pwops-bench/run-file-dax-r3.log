@@ -1,0 +1,19 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /mnt/pmem0.0/sean
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 32554 median_ns 33795 p90_ns 35809 p99_ns 37335 max_ns 377163 mean_ns 34188 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 28937 median_ns 29876 p90_ns 31643 p99_ns 33117 max_ns 267822 mean_ns 30162 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 33017 median_ns 34175 p90_ns 36163 p99_ns 37808 max_ns 118201 mean_ns 34563 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 29194 median_ns 30421 p90_ns 32109 p99_ns 33819 max_ns 100353 mean_ns 30690 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 36409 median_ns 37911 p90_ns 39905 p99_ns 41675 max_ns 158320 mean_ns 38292 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 32789 median_ns 34176 p90_ns 35897 p99_ns 37585 max_ns 1357305 mean_ns 34476 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 8 median_ns 13 p90_ns 13 p99_ns 14 max_ns 27 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 6 median_ns 12 p90_ns 13 p99_ns 13 max_ns 2639 mean_ns 12 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 8299 median_ns 8870 p90_ns 10597 p99_ns 12247 max_ns 27717 mean_ns 9481 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 17555 median_ns 18312 p90_ns 20115 p99_ns 21809 max_ns 23074 mean_ns 18829 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 24198 median_ns 25128 p90_ns 26873 p99_ns 29338 max_ns 45071 mean_ns 25722 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 6400 median_ns 8153 p90_ns 8353 p99_ns 9090 max_ns 10870 mean_ns 7946 boundaries 0 prepares 0 lines 0
+OK

@@ -1,0 +1,19 @@
+backend file (mmap + msync/fdatasync)
+boundary legacy
+directory /mnt/pmem0.0/sean
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 31710 median_ns 32803 p90_ns 34717 p99_ns 36300 max_ns 364876 mean_ns 33187 boundaries 1 prepares 5 lines 0
+op free-1 samples 50000 entries 10 min_ns 28260 median_ns 29023 p90_ns 30740 p99_ns 32264 max_ns 123454 mean_ns 29326 boundaries 1 prepares 4 lines 0
+op alloc-8 samples 50000 entries 16 min_ns 31717 median_ns 33026 p90_ns 34984 p99_ns 36591 max_ns 121332 mean_ns 33396 boundaries 1 prepares 6 lines 0
+op free-8 samples 50000 entries 10 min_ns 28306 median_ns 29367 p90_ns 31036 p99_ns 32573 max_ns 118333 mean_ns 29639 boundaries 1 prepares 5 lines 0
+op alloc-64 samples 50000 entries 16 min_ns 35568 median_ns 37105 p90_ns 39061 p99_ns 40895 max_ns 1430455 mean_ns 37486 boundaries 1 prepares 6 lines 0
+op free-64 samples 50000 entries 10 min_ns 32149 median_ns 33549 p90_ns 35196 p99_ns 36897 max_ns 103213 mean_ns 33806 boundaries 1 prepares 5 lines 0
+op commit-empty samples 50000 entries 0 min_ns 6 median_ns 13 p90_ns 13 p99_ns 15 max_ns 28 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 6 median_ns 12 p90_ns 13 p99_ns 13 max_ns 5078 mean_ns 12 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 8380 median_ns 8721 p90_ns 10522 p99_ns 11931 max_ns 14154 mean_ns 9335 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 17142 median_ns 17709 p90_ns 19547 p99_ns 21378 max_ns 21598 mean_ns 18319 boundaries 1 prepares 8 lines 0
+op recover-24 samples 200 entries 24 min_ns 23274 median_ns 24051 p90_ns 25779 p99_ns 28755 max_ns 58174 mean_ns 24757 boundaries 1 prepares 24 lines 0
+op mount-64mib samples 200 entries 0 min_ns 6368 median_ns 8166 p90_ns 8334 p99_ns 8768 max_ns 68902 mean_ns 8236 boundaries 0 prepares 0 lines 0
+OK

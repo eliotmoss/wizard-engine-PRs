@@ -1,0 +1,76 @@
+---- ns per operation; each cell the median over repetitions of a run's statistic
+repetitions: file-dax 5 file-block 5 file-dax-legacy 5 file-block-legacy 5
+
+---- median
+operation               file-dax        file-block   file-dax-legacy file-block-legacy
+alloc-1                    33795            454525             32735            451646
+alloc-8                    34245            455405             33026            452159
+alloc-64                   37911            384410             36714            377504
+free-1                     29876            438724             28981            436556
+free-8                     30407            439326             29504            436833
+free-64                    34150            366870             33373            367949
+commit-empty                  13                13                13                13
+timer                         12                13                12                13
+mount-1mib                  8895             31716              8838             31395
+mount-64mib                 7546              9197              7615             28803
+recover-8                  18312            175337             17884            173767
+recover-24                 25128            196877             24160            193167
+
+---- p90
+operation               file-dax        file-block   file-dax-legacy file-block-legacy
+alloc-1                    35809            760293             34669            751150
+alloc-8                    36204            761710             34984            749209
+alloc-64                   39917            655418             38669            616401
+free-1                     31643            754982             30740            747022
+free-8                     32109            757076             31163            748698
+free-64                    35889            582904             35036            625993
+commit-empty                  13                13                13                13
+timer                         13                13                13                20
+mount-1mib                 10643             40851             10623             40931
+mount-64mib                 7773              9637              7807             29592
+recover-8                  20143            197244             19739            200510
+recover-24                 27379            227046             25928            218673
+
+---- spread of the per-run medians, (max - min) / median, %
+operation               file-dax        file-block   file-dax-legacy file-block-legacy
+alloc-1                     0.7%              0.2%              0.8%              0.1%
+alloc-8                     1.1%              0.1%              0.6%              0.1%
+alloc-64                    0.4%              2.6%              1.5%              3.6%
+free-1                      1.1%              0.2%              0.3%              0.1%
+free-8                      2.4%              0.0%              1.4%              0.1%
+free-64                     1.0%              2.1%              1.6%              1.9%
+commit-empty                0.0%              0.0%              0.0%              0.0%
+timer                       8.3%             46.2%              0.0%             53.8%
+mount-1mib                 14.7%             10.8%              2.0%             16.8%
+mount-64mib                 8.5%             46.7%              8.1%              9.2%
+recover-8                   8.8%              1.8%              1.8%              2.5%
+recover-24                  5.8%              2.6%              0.6%              2.9%
+
+---- work per operation, checked on every operation: entries / boundaries / lines written back
+operation               file-dax        file-block   file-dax-legacy file-block-legacy
+alloc-1              16 / 1 / 15       16 / 1 / 15        16 / 1 / 0        16 / 1 / 0
+alloc-8              16 / 1 / 17       16 / 1 / 17        16 / 1 / 0        16 / 1 / 0
+alloc-64             16 / 1 / 17       16 / 1 / 17        16 / 1 / 0        16 / 1 / 0
+free-1               10 / 1 / 11       10 / 1 / 11        10 / 1 / 0        10 / 1 / 0
+free-8               10 / 1 / 13       10 / 1 / 13        10 / 1 / 0        10 / 1 / 0
+free-64              10 / 1 / 13       10 / 1 / 13        10 / 1 / 0        10 / 1 / 0
+commit-empty           0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+timer                  0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+mount-1mib             0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+mount-64mib            0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+recover-8              8 / 1 / 8         8 / 1 / 8         8 / 1 / 0         8 / 1 / 0
+recover-24           24 / 1 / 24       24 / 1 / 24        24 / 1 / 0        24 / 1 / 0
+
+---- derived, from the medians
+operation               file-dax        file-block   file-dax-legacy file-block-legacy
+replay-8                    9417            143621              9046            142372
+replay-24                  16233            165161             15322            161772
+64mib/1mib                  0.8x              0.3x              0.9x              0.9x
+
+Each operation is its own committed transaction except commit-empty (production commits nothing for
+it: no boundary) and timer (an empty rdtsc window, the floor under every figure). mount-* opens a
+cleanly closed region; recover-k opens a 1 MiB region whose log holds one committed, unapplied
+transaction of k entries, so replay-k = recover-k - mount-1mib. lines counts writeback requests
+(pmem, direct and file; 0 on file-*-legacy, the file boundary before 2026-10-13, which makes none).
+pmem-none drops CLWB and keeps SFENCE: an approximation of eADR timing, never durable. A difference
+is real only outside both spreads.

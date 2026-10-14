@@ -1,0 +1,19 @@
+backend file (mmap + msync/fdatasync)
+boundary legacy
+directory /mnt/pmem0.0/sean
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 31606 median_ns 32752 p90_ns 34669 p99_ns 36201 max_ns 207223 mean_ns 33099 boundaries 1 prepares 5 lines 0
+op free-1 samples 50000 entries 10 min_ns 28287 median_ns 28981 p90_ns 30722 p99_ns 32161 max_ns 316986 mean_ns 29284 boundaries 1 prepares 4 lines 0
+op alloc-8 samples 50000 entries 16 min_ns 31856 median_ns 33047 p90_ns 35007 p99_ns 36578 max_ns 115503 mean_ns 33429 boundaries 1 prepares 6 lines 0
+op free-8 samples 50000 entries 10 min_ns 28559 median_ns 29640 p90_ns 31308 p99_ns 32889 max_ns 115299 mean_ns 29910 boundaries 1 prepares 5 lines 0
+op alloc-64 samples 50000 entries 16 min_ns 35389 median_ns 36623 p90_ns 38590 p99_ns 40454 max_ns 112408 mean_ns 36997 boundaries 1 prepares 6 lines 0
+op free-64 samples 50000 entries 10 min_ns 32131 median_ns 33250 p90_ns 34925 p99_ns 36642 max_ns 1380467 mean_ns 33560 boundaries 1 prepares 5 lines 0
+op commit-empty samples 50000 entries 0 min_ns 7 median_ns 13 p90_ns 13 p99_ns 15 max_ns 1951 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 6 median_ns 12 p90_ns 13 p99_ns 13 max_ns 22 mean_ns 12 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 8367 median_ns 8838 p90_ns 10528 p99_ns 11317 max_ns 11768 mean_ns 9367 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 17228 median_ns 17865 p90_ns 19699 p99_ns 24072 max_ns 33734 mean_ns 18578 boundaries 1 prepares 8 lines 0
+op recover-24 samples 200 entries 24 min_ns 23237 median_ns 24090 p90_ns 25963 p99_ns 28830 max_ns 92414 mean_ns 25067 boundaries 1 prepares 24 lines 0
+op mount-64mib samples 200 entries 0 min_ns 5766 median_ns 7579 p90_ns 7706 p99_ns 8758 max_ns 9970 mean_ns 7348 boundaries 0 prepares 0 lines 0
+OK
