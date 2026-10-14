@@ -1,0 +1,18 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/users/u7599095
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 385317 median_ns 453149 p90_ns 829401 p99_ns 1092337 max_ns 46423449 mean_ns 545959 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 373841 median_ns 433841 p90_ns 793555 p99_ns 1070380 max_ns 53415352 mean_ns 517975 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 385507 median_ns 450857 p90_ns 821659 p99_ns 1077416 max_ns 84874915 mean_ns 546459 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 377236 median_ns 431325 p90_ns 792135 p99_ns 1064493 max_ns 39566083 mean_ns 516023 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 300217 median_ns 355854 p90_ns 680831 p99_ns 967877 max_ns 40747619 mean_ns 423006 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 294327 median_ns 339376 p90_ns 649961 p99_ns 947051 max_ns 44606605 mean_ns 405933 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 7 median_ns 13 p90_ns 13 p99_ns 15 max_ns 28 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 8 median_ns 18 p90_ns 19 p99_ns 19 max_ns 48 mean_ns 17 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 24219397 median_ns 24391821 p90_ns 24415935 p99_ns 24433088 max_ns 31748608 mean_ns 24443113 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 18644755 median_ns 21788877 p90_ns 21832683 p99_ns 30082593 max_ns 30107260 mean_ns 22009395 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 24749003 median_ns 24814931 p90_ns 24836302 p99_ns 24909252 max_ns 26957551 mean_ns 24825459 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 508355957 median_ns 525286936 p90_ns 542348790 p99_ns 591815185 max_ns 625349679 mean_ns 529475720 boundaries 0 prepares 0 lines 0
+OK
