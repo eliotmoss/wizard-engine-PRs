@@ -35,19 +35,53 @@ def BTX = [
         BTT("full_region_fails_cleanly",             test_btree_full_region_fails_cleanly),
         BTT("each_put_makes_k_plus_h_plus_1_boundaries", test_btree_each_put_makes_k_plus_h_plus_1_boundaries),
         BTT("unaligned_block_size_writes_back_whole_lines", test_btree_unaligned_block_size_writes_back_whole_lines),
+        BTT("survives_a_garbage_collection",         test_btree_survives_a_garbage_collection),
         ()
 ];
+
+// Region memory outside the GC heap, where the tests would otherwise use the
+// volatile backend. That backend's region is an Array<byte> on the heap, and
+// Virgil's semispace collector moves it; PWRegion keeps regionStart, a raw
+// address, and the region and the tree compute every other address from it,
+// so after a collection both read the old space. On 2026-10-14 the full suite
+// crashed this way in pwbtree:reclaims_planted_leak: a collection during the
+// test left the root reading zeros, and forEach(), which then trusted the
+// height, recursed through garbage until the stack overflowed. An anonymous
+// mapping does not move. The region holds the Mapping, so the mapping's
+// finalizer cannot unmap it while the region is in use.
+class PWBTreeAnonRegion extends VolatileRegion {
+        var mapping: Mapping;
+
+        new(m: Mapping) super(CiRuntime.forgeRange<byte>(m.range.start, int.!(m.range.size()))) {
+                mapping = m;
+        }
+
+        def destroy() {
+                if (mapping != null) mapping.range.unmap();
+        }
+}
+
+class PWBTreeAnonBackend extends TxnRegionBackend {
+        def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+                def m = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
+                if (m == null) return null;
+                return PWBTreeAnonRegion.new(m);
+        }
+        def isPersistent() -> bool { return false; }
+        def name() -> string { return "anonymous mapping (PWBTreeTest)"; }
+}
+
+def BT_ANON = PWBTreeAnonBackend.new();
 
 class PWBTreeTester(t: Tester) {
         var region: PWRegion;
 
         new() {
-                region = volatileRegion(BT_BLOCKS);
+                region = anonRegion(BT_BLOCKS);
         }
 
-        def volatileRegion(blocks: u64) -> PWRegion {
-                return PWRegion.new(Backends.getVolatile(), blocks,
-                        Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
+        def anonRegion(blocks: u64) -> PWRegion {
+                return PWRegion.new(BT_ANON, blocks, Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
         }
 
         def open(capacity: int) -> PWBTree {
@@ -174,8 +208,8 @@ def test_btree_open_rejects_a_different_capacity(tc: PWBTreeTester) {
         for (i < 10) tc.put(tree, ref, u64.!(i), u64.!(i));
         tc.t.assertz(false, PWBTree.new(tc.region, 5).open());
         tc.t.assertz(false, PWBTree.new(tc.region, 0).open());
-        tc.t.assertz(false, PWBTree.new(tc.volatileRegion(BT_BLOCKS), 2).open());
-        tc.t.assertz(false, PWBTree.new(tc.volatileRegion(BT_BLOCKS), 253).open());
+        tc.t.assertz(false, PWBTree.new(tc.anonRegion(BT_BLOCKS), 2).open());
+        tc.t.assertz(false, PWBTree.new(tc.anonRegion(BT_BLOCKS), 253).open());
         tc.t.assertz(true, PWBTree.new(tc.region, 4).open());
 }
 
@@ -209,7 +243,7 @@ def test_btree_default_capacity_fills_a_block(tc: PWBTreeTester) {
 // and grow the root; the tree must stay valid after every insert.
 def test_btree_inserts_split_to_height_3(tc: PWBTreeTester) {
         for (order < 3) {
-                tc.region = tc.volatileRegion(BT_BLOCKS);
+                tc.region = tc.anonRegion(BT_BLOCKS);
                 def tree = tc.open(4);
                 def ref = PWBTreeReference.new();
                 def rng = PWBTreeRandom.new(u64.!(order) + 1u64);
@@ -314,7 +348,7 @@ def test_btree_open_without_root_reclaims_orphans(tc: PWBTreeTester) {
 // When the region runs out, put() fails, returns what it allocated, and leaves
 // the tree as it was.
 def test_btree_full_region_fails_cleanly(tc: PWBTreeTester) {
-        tc.region = tc.volatileRegion(16);
+        tc.region = tc.anonRegion(16);
         def tree = tc.open(3);
         def ref = PWBTreeReference.new();
         var failed = false;
@@ -335,6 +369,27 @@ def test_btree_full_region_fails_cleanly(tc: PWBTreeTester) {
         tc.sameAs(again, ref);
 }
 
+
+// The region must not move under the tree: a collection between mutations
+// leaves it, and the tree, exactly as they were (see PWBTreeAnonRegion).
+def test_btree_survives_a_garbage_collection(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        def start = tc.region.regionStart;
+        def rng = PWBTreeRandom.new(31);
+        for (round < 3) {
+                for (i < 40) tc.put(tree, ref, rng.below(5000), rng.next());
+                Target.forceGC();
+                tc.t.assert_eq(start, tc.region.regionStart);
+                tc.t.assert_eq(start, u64.view(Pointer.atElement(tc.region.backendRegion.range, 0) - Pointer.NULL));
+                if (!tc.checkOk(tree)) return;
+                if (!tc.sameAs(tree, ref)) return;
+        }
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.t.assert_eq(0, again.leaksReclaimed());
+        tc.sameAs(again, ref);
+}
 
 // =============================================================================
 // Persistence work per operation, on the production PMEM boundary path
@@ -849,7 +904,7 @@ def tc_assertMutations(t: Tester, tree: PWBTree, want: u64, target: int) {
 // leaf, every internal node on its path and the root, is the target.
 def btdioRootSplitScript() -> PWBTreeScript {
         def script = PWBTreeScript.new();
-        def region = PWRegion.new(Backends.getVolatile(), BTDIO_BLOCKS,
+        def region = PWRegion.new(BT_ANON, BTDIO_BLOCKS,
                 Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
         def tree = PWBTree.new(region, BTDIO_CAPACITY);
         if (!tree.open()) return null;
