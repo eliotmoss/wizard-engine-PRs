@@ -1,0 +1,19 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /mnt/pmem0.0/sean
+tsc cycles per microsecond 2294
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 32495 median_ns 33731 p90_ns 35743 p99_ns 37453 max_ns 337813 mean_ns 34131 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 28749 median_ns 29719 p90_ns 31477 p99_ns 33135 max_ns 466668 mean_ns 30025 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 32789 median_ns 34002 p90_ns 36013 p99_ns 37986 max_ns 134899 mean_ns 34404 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 29021 median_ns 30171 p90_ns 31931 p99_ns 33653 max_ns 129883 mean_ns 30489 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 36350 median_ns 37959 p90_ns 39973 p99_ns 41799 max_ns 119547 mean_ns 38324 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 32804 median_ns 34278 p90_ns 36003 p99_ns 37870 max_ns 1444936 mean_ns 34580 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 7 median_ns 13 p90_ns 13 p99_ns 15 max_ns 2286 mean_ns 13 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 6 median_ns 12 p90_ns 13 p99_ns 13 max_ns 22 mean_ns 12 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 9770 median_ns 10142 p90_ns 11854 p99_ns 13190 max_ns 13726 mean_ns 10730 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 19367 median_ns 19884 p90_ns 21675 p99_ns 22883 max_ns 25446 mean_ns 20459 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 25980 median_ns 26597 p90_ns 28399 p99_ns 31748 max_ns 57639 mean_ns 27400 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 5812 median_ns 7578 p90_ns 7726 p99_ns 10632 max_ns 12263 mean_ns 7392 boundaries 0 prepares 0 lines 0
+OK

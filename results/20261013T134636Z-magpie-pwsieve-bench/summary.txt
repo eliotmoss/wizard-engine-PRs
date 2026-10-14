@@ -1,0 +1,22 @@
+---- per step, median over repetitions (ns unless noted; steps per run in the log)
+config                  reps      wall    wall range    median  compute    alloc   bitmap  publish   retire  persist  bound   lines faults
+file-dax                   5    526015 525668-527366    526401   426824    30521    27501    16534    24845    99401   4.00     0.0  12.81
+file-dax-legacy            5    521583 520900-522229    521743   427269    29636    19752    21097    24020    94505   4.00     0.0  12.81
+file-dax-msync             5    531497 529666-531671    531542   426785    32829    30343    16571    24878   104621   7.67     0.0  12.81
+file-block                 5   2676095 2660137-2680215   2675514  1116709   468136   646324   212609   222866  1549935   4.00     0.0  12.81
+file-block-legacy          5   2576325 2561982-2576902   2560622  1126948   468413   273849   446072   259421  1447755   4.00     0.0  12.81
+file-block-msync           5   2805259 2791542-2847649   2777786  1120268   518166   734174   206227   222022  1680589   7.67     0.0  12.81
+
+---- shares
+file-dax                persistence phases (alloc+bitmap+publish+retire)  18.9 % of a step
+file-dax-legacy         persistence phases (alloc+bitmap+publish+retire)  18.1 % of a step
+file-dax-msync          persistence phases (alloc+bitmap+publish+retire)  19.7 % of a step
+file-block              persistence phases (alloc+bitmap+publish+retire)  57.9 % of a step
+file-block-legacy       persistence phases (alloc+bitmap+publish+retire)  56.2 % of a step
+file-block-msync        persistence phases (alloc+bitmap+publish+retire)  59.9 % of a step
+
+Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median
+step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence
+boundaries per step (syncs per step on file-*-msync, one per run of marked pages); lines =
+cache-line writebacks per step (pmem only); faults = minor faults per step. A difference of a
+few percent is real only outside the wall range of both.
