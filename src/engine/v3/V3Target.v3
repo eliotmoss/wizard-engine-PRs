@@ -16,6 +16,7 @@ component Target {
 	def ticksNs() => u64.view(u32.view(System.ticksNs()));
 	def rdtsc() => u64.view(u32.view(System.ticksNs()));
 	def getRdtsc() => rdtsc;
+	def rdtscOrdered() => rdtsc();
 	def cpuid(leaf: u64, subleaf: u64) -> (u64, u64, u64, u64) { return (0, 0, 0, 0); }
 	def getCpuid() -> ((u64, u64) -> (u64, u64, u64, u64)) { return cpuid; }
 	def clflush(addr: long) { }

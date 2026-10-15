@@ -119,6 +119,13 @@ component Target {
 	def getRdtsc() -> (void -> u64) {
 		return RDTSC_FUNC.get();
 	}
+	// RDTSC between two LFENCEs (Intel SDM, RDTSC): earlier instructions have
+	// executed before the read and later ones wait for it, so a window between
+	// two reads holds exactly the code between them. Earlier stores and
+	// writebacks are not waited for.
+	def rdtscOrdered() -> u64 {
+		return RDTSC_ORDERED_FUNC.get()();
+	}
 	def cpuid(leaf: u64, subleaf: u64) -> (u64, u64, u64, u64) {
 		return CPUID_FUNC.get()(leaf, subleaf);
 	}
@@ -522,6 +529,18 @@ def genRdtsc(ic: X86_64InterpreterCode, w: DataWriter) {
 	asm.rdtsc();
 	asm.q.shl_r_i(X86_64Regs.RDX, 32);
 	asm.q.or_r_r(X86_64Regs.RAX, X86_64Regs.RDX); // XXX: use V3 return register symbolic constant
+	asm.ret();
+}
+
+def RDTSC_ORDERED_FUNC = X86_64PreGenFunc<void, u64>.new("rdtsc-ordered", null, genRdtscOrdered);
+
+def genRdtscOrdered(ic: X86_64InterpreterCode, w: DataWriter) {
+	def asm = X86_64Assemblers.create64(w);
+	asm.lfence();
+	asm.rdtsc();
+	asm.lfence();
+	asm.q.shl_r_i(X86_64Regs.RDX, 32);
+	asm.q.or_r_r(X86_64Regs.RAX, X86_64Regs.RDX);
 	asm.ret();
 }
 

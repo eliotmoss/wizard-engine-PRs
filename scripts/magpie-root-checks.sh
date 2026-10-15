@@ -28,16 +28,32 @@
 #    request stable writes? dmsetup table and dmsetup info -c (crypt keys are
 #    not shown without --showkeys, which is not used), lsblk, and every block
 #    device's queue/stable_writes.
+# 5. Core clock on block storage. The clock probe found that a thread that
+#    blocks on /home comes back at 1.0 GHz against 3.6 GHz busy, which fits
+#    the C1E idle state ("a minimum performance state when it is idle"), and
+#    only turbostat can say which state the core entered. Probed sieve runs
+#    (file and direct) and a B+Tree run (file) on /home, pinned to one CPU,
+#    once with that CPU's idle states as they are and once with C1E and C6
+#    disabled on it alone, interleaved. turbostat records each run's busy
+#    clock and idle-state residency, and perf stat its cycles, reference cycles
+#    (at the TSC rate) and instructions; either is skipped if it does not run.
+#    On this CPU model intel_idle switches off the hardware's own promotion of
+#    C1 to C1E, so disabling the C1E state is enough to keep the core out of it.
 #
-# Nothing here changes the host: the controller and drive queries are "show"
-# and "get" operations, the device-mapper queries only read tables; tracing is switched on only around each run and the
-# previous state and buffer size are restored; the benchmarks run as the
-# checkout's owner in that owner's own directories. Results go to
+# Only section 5 changes the host, and only CPU PWROOT_CPU's C1E and C6
+# settings, for the length of its runs: each is restored after every run, and
+# again on exit if the script stops early. Otherwise the controller and drive
+# queries are "show" and "get" operations, the device-mapper queries only read
+# tables; tracing is switched on only around each run and the previous state
+# and buffer size are restored; the benchmarks run as the checkout's owner in
+# that owner's own directories. Results go to
 # results/<stamp>-<host>-root-checks/, owned by that account.
 #
 # Overrides: PWASM_PMEM_TEST_DIR (default /mnt/pmem0.0/sean), PWROOT_USER (the
 # account to run the benchmarks as; default the sudo caller), PWROOT_BLOCK_DIR
-# (default that account's home), PWROOT_DEVICE (default sda).
+# (default that account's home), PWROOT_DEVICE (default sda), PWROOT_CPU (the
+# CPU section 5 pins to, default 2, on node 0 like the earlier clock runs),
+# PWROOT_CLOCK_REPS (default 2; 0 skips section 5).
 
 set -uo pipefail
 
@@ -55,6 +71,11 @@ OUT=$REPO/results/$(date -u +%Y%m%dT%H%M%SZ)-$(hostname -s)-root-checks
 as_user() { runuser -u "$U" -- "$@"; }
 rule() { printf -- '---- %s\n' "$*"; }
 say() { printf '%s\n' "$*"; }
+
+# Each section that changes state appends its restore function here.
+CLEANUP=()
+cleanup() { local f; for f in "${CLEANUP[@]}"; do "$f"; done; }
+trap cleanup EXIT
 
 [ -x "$BENCH" ] || { echo "$BENCH is missing; build it first as $U: make bin/pwbench.x86-64-linux" >&2; exit 2; }
 as_user mkdir -p "$OUT" || { echo "could not create $OUT as $U" >&2; exit 2; }
@@ -148,7 +169,7 @@ else
         { echo "$OLD_KB" > "$T/buffer_size_kb"; } 2>/dev/null
         echo "$OLD_ON" > "$T/tracing_on"
     }
-    trap restore EXIT
+    CLEANUP+=(restore)
     echo 16384 > "$T/buffer_size_kb"
 
     # trace_run <event> <name> <command...>: trace only while the command runs.
@@ -174,6 +195,79 @@ else
     trace_run fs_dax/dax_writeback_one dax-1mib "$BENCH" "$PMEM_DIR" file 200 8 20 2048
 fi
 
+# ------------------------------------------------------------ 5. core clock
+
+CPU=${PWROOT_CPU:-2}
+CLOCK_REPS=${PWROOT_CLOCK_REPS:-2}
+SIEVE=$REPO/bin/pwsievebench.x86-64-linux
+BTREE=$REPO/bin/pwbtreebench.x86-64-linux
+CPUIDLE=/sys/devices/system/cpu/cpu$CPU/cpuidle
+TURBOSTAT=$(command -v turbostat || true)
+PERF=$(command -v perf || true)
+PERF_EVENTS=cycles,ref-cycles,instructions
+
+IDLE_SAVED=()
+# shallow_idle: disable C1E and C6 on $CPU, remembering each one's setting.
+shallow_idle() {
+    local s
+    for s in "$CPUIDLE"/state*; do
+        case "$(cat "$s/name")" in
+            C1E|C6) IDLE_SAVED+=("$s=$(cat "$s/disable")"); echo 1 > "$s/disable" ;;
+        esac
+    done
+}
+restore_idle() {
+    local e
+    for e in "${IDLE_SAVED[@]}"; do echo "${e#*=}" > "${e%=*}/disable"; done
+    IDLE_SAVED=()
+}
+CLEANUP+=(restore_idle)
+
+# measure <name> <command...>: run as $U pinned to $CPU, under turbostat and
+# perf stat where they run.
+measure() {
+    local name=$1 rc=0; shift
+    local cmd=(runuser -u "$U" -- taskset -c "$CPU" "$@")
+    [ -n "$PERF" ] && cmd=("$PERF" stat -x, -e "$PERF_EVENTS" -o "$OUT/$name.perf" -- "${cmd[@]}")
+    [ -n "$TURBOSTAT" ] && cmd=("$TURBOSTAT" --quiet --cpu "$CPU" --out "$OUT/$name.turbostat" -- "${cmd[@]}")
+    "${cmd[@]}" > "$OUT/$name.log" 2>&1 || rc=$?
+    chown "$U" "$OUT/$name".*
+    say "  $name: exit $rc ($(tail -1 "$OUT/$name.log"))"
+}
+
+if [ "$CLOCK_REPS" = 0 ]; then
+    say "5. core clock: skipped (PWROOT_CLOCK_REPS=0)"
+elif [ ! -x "$SIEVE" ] || [ ! -x "$BTREE" ]; then
+    say "5. core clock: skipped; build both benchmarks first as $U: make bin/pwsievebench.x86-64-linux bin/pwbtreebench.x86-64-linux"
+elif [ ! -d "$CPUIDLE" ]; then
+    say "5. core clock: skipped; CPU $CPU has no cpuidle directory"
+else
+    {
+        rule "cpuidle driver: $(cat /sys/devices/system/cpu/cpuidle/current_driver 2>/dev/null)"
+        rule "CPU $CPU idle states before section 5: state, name, exit latency (us), disable"
+        for s in "$CPUIDLE"/state*; do
+            say "$(basename "$s") $(cat "$s/name") $(cat "$s/latency") $(cat "$s/disable")"
+        done
+        rule "turbostat: ${TURBOSTAT:-not installed}"
+        if [ -n "$TURBOSTAT" ] && ! "$TURBOSTAT" --quiet -- true 2>&1; then TURBOSTAT=; say "does not run; skipped"; fi
+        rule "perf: ${PERF:-not installed}"
+        if [ -n "$PERF" ] && ! "$PERF" stat -e "$PERF_EVENTS" -- true 2>&1; then PERF=; say "does not run; skipped"; fi
+    } > "$OUT/clock-setup.txt" 2>&1
+    chown "$U" "$OUT/clock-setup.txt"
+    CDIR=$BLOCK_DIR/pwroot-clock
+    as_user mkdir -p "$CDIR"
+    say "5. core clock on $CDIR, CPU $CPU, $CLOCK_REPS repetitions (turbostat: ${TURBOSTAT:-none}, perf: ${PERF:-none})"
+    for r in $(seq 1 "$CLOCK_REPS"); do
+        for idle in default shallow; do
+            [ "$idle" = shallow ] && shallow_idle
+            measure "clock-sieve-file-$idle-r$r"   "$SIEVE" "$CDIR" file   20 8 256 4096 clock=probe
+            measure "clock-sieve-direct-$idle-r$r" "$SIEVE" "$CDIR" direct 20 8 256 4096 clock=probe
+            measure "clock-btree-file-$idle-r$r"   "$BTREE" "$CDIR" file   3 5000 5000 256 4096 seed=1
+            restore_idle
+        done
+    done
+fi
+
 # ------------------------------------------------------------ summary
 
 {
@@ -195,6 +289,34 @@ fi
         [ -f "$OUT/$name.trace" ] || continue
         say "$name:"
         grep -o 'pglen 0x[0-9a-f]*' "$OUT/$name.trace" | sort | uniq -c | sed 's/^/  /'
+    done
+    rule "core clock (5): CPU $CPU, idle states as they are (default) and with C1E and C6 disabled (shallow)"
+    say "probe: implied MHz busy, after the sieve, after the bitmap boundary; op: median ns;"
+    say "turbostat: CPU $CPU over the run; perf: cycles over reference cycles at the TSC rate"
+    for f in "$OUT"/clock-*.log; do
+        [ -f "$f" ] || continue
+        b=${f%.log}
+        say "$(basename "$b"):"
+        probe=$(sed -nE 's/^clock (busy|after sieve|after bitmap): .*implied MHz ([0-9]+).*/\1 \2/p' "$f" | paste -sd, - | sed "s/,/, /g")
+        [ -n "$probe" ] && say "  probe MHz: $probe"
+        ops=$(sed -nE 's/^op (insert|update) .* median_ns ([0-9]+) .*/\1 \2/p' "$f" | paste -sd, - | sed "s/,/, /g")
+        [ -n "$ops" ] && say "  op median ns: $ops"
+        [ -f "$b.turbostat" ] && awk -v cpu="$CPU" '
+            /Bzy_MHz/ { for (i = 1; i <= NF; i++) col[$i] = i; next }
+            ("CPU" in col) && $col["CPU"] == cpu {
+                line = "  turbostat:"
+                n = split("Avg_MHz Busy% Bzy_MHz POLL% C1% C1E% C6%", want, " ")
+                for (i = 1; i <= n; i++) if (want[i] in col) line = line " " want[i] " " $col[want[i]]
+                print line
+            }' "$b.turbostat"
+        [ -f "$b.perf" ] && awk -F, -v khz="$(awk '/^tsc kHz/ { print $3 }' "$f")" '
+            $3 ~ /^cycles/ { c = $1 } $3 ~ /^ref-cycles/ { r = $1 } $3 ~ /^instructions/ { n = $1 }
+            END {
+                if (c + 0 > 0 && r + 0 > 0 && khz + 0 > 0)
+                    printf "  perf: unhalted MHz %d, instructions per cycle %.2f\n", c * khz / r / 1000, n / c
+                else
+                    print "  perf: cycles " c ", ref-cycles " r ", tsc kHz " khz
+            }' "$b.perf"
     done
     rule "block stack (B2): device-mapper targets, and devices requesting stable writes"
     say "targets: $(dmsetup table 2>/dev/null | awk '{ print $4 }' | sort | uniq -c | tr -s ' \n' ' ')"

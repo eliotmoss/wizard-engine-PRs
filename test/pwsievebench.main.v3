@@ -37,8 +37,9 @@
 // a boundary, so under msync a fence of several runs counts as several.
 //
 // Times are rdtsc cycles converted with a calibrated TSC frequency, reported
-// with the frequency. rdtsc is not ordered with CLWB, but every step ends in a
-// commit's fence and lasts microseconds, so the step and phase figures are
+// with the frequency. Each read sits between two LFENCEs (Target.rdtscOrdered),
+// which order it with instructions but not with stores or CLWB; every step ends
+// in a commit's fence and lasts microseconds, so the step and phase figures are
 // wall time, not in-window figures like pwbench's "boundary" ones.
 //
 // clock=probe reads the core clock, without root, where each phase ends: a
@@ -49,7 +50,7 @@
 //
 // Usage: pwsievebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [warmup] [blocks] [blockSize] [writeback=<auto|clwb|clflushopt|none>] [boundary=<fdatasync|msync|legacy>] [clock=probe]
 
-def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def CLOCK_MONOTONIC_RAW = 4;    // LinuxConst declares no CLOCK_* constants.
 def RUSAGE_SELF = 0;
 def RU_MINFLT_OFFSET = 64;      // struct rusage: two timevals, then longs
 def RUSAGE_SIZE = 144;
@@ -128,12 +129,12 @@ component SieveBenchConfig {
 // ---------------------------------------------------------------- clock
 
 component BenchClock {
-        def var cyclesPerUs = 0u64;
+        def var tscKhz = 0u64;          // TSC cycles per millisecond
 
         def nanos() -> long {
                 def ts = Array<long>.new(2);
                 Linux.syscall(LinuxConst.SYS_clock_gettime,
-                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                        (CLOCK_MONOTONIC_RAW, Pointer.atElement(ts, 0)));
                 return ts[0] * 1000000000L + ts[1];
         }
 
@@ -147,19 +148,24 @@ component BenchClock {
         // As pwbench: the tree has no invariant-TSC check, so the derived
         // frequency is reported rather than assumed.
         def calibrate() {
-                def c0 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
                 def t0 = nanos();
                 sleepNanos(100000000L);         // 100 ms
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 def t1 = nanos();
                 def elapsedNs = t1 - t0;
                 if (elapsedNs <= 0) return;
-                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+                tscKhz = ((c1 - c0) * 1000000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesPerUs() -> u64 {
+                return tscKhz / 1000u64;
         }
 
         def cyclesToNanos(cycles: u64) -> u64 {
-                if (cyclesPerUs == 0) return 0;
-                return (cycles * 1000u64) / cyclesPerUs;
+                if (tscKhz == 0) return 0;
+                // Whole milliseconds first, so that no product can overflow.
+                return (cycles / tscKhz) * 1000000u64 + ((cycles % tscKhz) * 1000000u64) / tscKhz;
         }
 }
 
@@ -314,7 +320,7 @@ class StepTimer {
         def startStep() -> u64 {
                 stepProbeCycles = 0;
                 markIndex = 0;
-                mark = Target.rdtsc();
+                mark = Target.rdtscOrdered();
                 return mark;
         }
 
@@ -322,7 +328,7 @@ class StepTimer {
         // With clock=probe, a probe pair then runs, and the mark moves past
         // it, so the probes are charged to no phase.
         def onPhase(p: PWSievePhase) {
-                var now = Target.rdtsc();
+                var now = Target.rdtscOrdered();
                 if (recording) {
                         phaseCycles[p.tag] += now - mark;
                         if (ClockProbe.enabled) {
@@ -331,7 +337,7 @@ class StepTimer {
                                 } else {
                                         marksChanged = true;
                                 }
-                                def done = Target.rdtsc();
+                                def done = Target.rdtscOrdered();
                                 stepProbeCycles += done - now;
                                 now = done;
                         }
@@ -622,7 +628,7 @@ def runRound(round: int, timer: StepTimer) -> string {
         for (s = 0u64; s < measured; s++) {
                 def c0 = timer.startStep();
                 def ok = sieve.step();
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 if (!ok) {
                         timer.recording = false;
                         region.deallocate();
@@ -669,7 +675,8 @@ def report(timer: StepTimer) {
         def p = Percentiles.new(sorted);
         def steps = timer.steps;
         Trace.OUT.put1("steps measured %d", steps).ln();
-        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs()).ln();
+        Trace.OUT.put1("tsc kHz %d", BenchClock.tscKhz).ln();
         if (steps > 0 && timer.wallNs > 0) {
                 Trace.OUT.put1("wall ns per step %d", timer.wallNs / long.!(steps)).ln();
         }
@@ -707,7 +714,7 @@ def reportClockPoint(label: string, point: ClockPoint, busyTicks: u64) -> u64 {
         def median = p.at(50);
         def excess = Arrays.sort(point.excess.copy(), 0, point.excess.length, long.<=);
         def ex = if(excess.length > 0, excess[(excess.length - 1) / 2], 0L);
-        def mhz = if(median > 0, (u64.!(PROBE_OPS) * BenchClock.cyclesPerUs) / median, 0u64);
+        def mhz = if(median > 0, (u64.!(PROBE_OPS) * BenchClock.tscKhz) / (median * 1000u64), 0u64);
         def ofBusy = if(median > 0 && busyTicks > 0, (1000u64 * busyTicks) / median, 1000u64);
         Trace.OUT.puts("clock ").puts(label)
                 .put3(": ticks median %d p10 %d p90 %d", median, p.at(10), p.at(90))

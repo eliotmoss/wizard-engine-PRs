@@ -79,7 +79,7 @@
 // capacity and the file offsets the per-commit writes land at, while blocks
 // changes only the region's size. Varying blocks alone isolates region size.
 
-def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def CLOCK_MONOTONIC_RAW = 4;    // LinuxConst declares no CLOCK_* constants.
 def RUSAGE_SELF = 0;
 def RU_MINFLT_OFFSET = 64;      // struct rusage: two timevals, then longs
 def RUSAGE_SIZE = 144;
@@ -165,12 +165,12 @@ component BenchConfig {
 // ---------------------------------------------------------------- clock
 
 component BenchClock {
-        def var cyclesPerUs = 0u64;
+        def var tscKhz = 0u64;          // TSC cycles per millisecond
 
         def nanos() -> long {
                 def ts = Array<long>.new(2);
                 Linux.syscall(LinuxConst.SYS_clock_gettime,
-                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                        (CLOCK_MONOTONIC_RAW, Pointer.atElement(ts, 0)));
                 return ts[0] * 1000000000L + ts[1];
         }
 
@@ -185,21 +185,29 @@ component BenchClock {
         // than a clock_gettime and would otherwise be measuring the clock. The
         // conversion to nanoseconds is therefore only as good as this
         // calibration, and the tree has no invariant-TSC check, so the derived
-        // frequency is reported rather than assumed.
+        // frequency is reported rather than assumed. The reference is
+        // CLOCK_MONOTONIC_RAW, which NTP does not slew, and the frequency is
+        // kept in kHz: a whole number of cycles per microsecond lost up to one
+        // part in 2,300 at 2.3 GHz.
         def calibrate() {
-                def c0 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
                 def t0 = nanos();
                 sleepNanos(100000000L);         // 100 ms
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 def t1 = nanos();
                 def elapsedNs = t1 - t0;
                 if (elapsedNs <= 0) return;
-                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+                tscKhz = ((c1 - c0) * 1000000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesPerUs() -> u64 {
+                return tscKhz / 1000u64;
         }
 
         def cyclesToNanos(cycles: u64) -> u64 {
-                if (cyclesPerUs == 0) return 0;
-                return (cycles * 1000u64) / cyclesPerUs;
+                if (tscKhz == 0) return 0;
+                // Whole milliseconds first, so that no product can overflow.
+                return (cycles / tscKhz) * 1000000u64 + ((cycles % tscKhz) * 1000000u64) / tscKhz;
         }
 }
 
@@ -547,7 +555,8 @@ def report(timer: BoundaryTimer, measured: int, wallNs: long, faults: long) {
                 Trace.OUT.put2("boundaries per commit x1000 %d, clwb lines %d",
                         (1000 * timer.persistCalls) / measured, timer.clwbLines).ln();
         }
-        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs()).ln();
+        Trace.OUT.put1("tsc kHz %d", BenchClock.tscKhz).ln();
         Trace.OUT.put3("boundary cycles: min %d median %d p90 %d",
                 p.at(0), p.at(50), p.at(90)).ln();
         Trace.OUT.put2("boundary cycles: p99 %d max %d", p.at(99), p.at(100)).ln();

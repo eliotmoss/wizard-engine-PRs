@@ -38,12 +38,13 @@
 // PWBTree's node writer resolves the installed provider, so none removes the
 // nodes' writebacks as well as the log's.
 //
-// Times are rdtsc cycles around each call, converted with a calibrated TSC
-// frequency; the phase figures are PWBTree's onPhase marks, means per operation.
+// Times are rdtsc cycles around each call, each read between two LFENCEs
+// (Target.rdtscOrdered), converted with a calibrated TSC frequency; the phase
+// figures are PWBTree's onPhase marks, means per operation.
 //
 // Usage: pwbtreebench.x86-64-linux <writable-directory> <file|pmem|direct> [rounds] [keys] [ops] [blocks] [blockSize] [writeback=<auto|none>] [seed=<n>]
 
-def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def CLOCK_MONOTONIC_RAW = 4;    // LinuxConst declares no CLOCK_* constants.
 def RUSAGE_SELF = 0;
 def RU_MINFLT_OFFSET = 64;      // struct rusage: two timevals, then longs
 def RUSAGE_SIZE = 144;
@@ -118,12 +119,12 @@ component TreeBenchConfig {
 // ---------------------------------------------------------------- clock
 
 component BenchClock {
-        def var cyclesPerUs = 0u64;
+        def var tscKhz = 0u64;          // TSC cycles per millisecond
 
         def nanos() -> long {
                 def ts = Array<long>.new(2);
                 Linux.syscall(LinuxConst.SYS_clock_gettime,
-                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                        (CLOCK_MONOTONIC_RAW, Pointer.atElement(ts, 0)));
                 return ts[0] * 1000000000L + ts[1];
         }
 
@@ -137,19 +138,24 @@ component BenchClock {
         // As pwbench: the tree has no invariant-TSC check, so the derived
         // frequency is reported rather than assumed.
         def calibrate() {
-                def c0 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
                 def t0 = nanos();
                 sleepNanos(100000000L);         // 100 ms
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 def t1 = nanos();
                 def elapsedNs = t1 - t0;
                 if (elapsedNs <= 0) return;
-                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+                tscKhz = ((c1 - c0) * 1000000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesPerUs() -> u64 {
+                return tscKhz / 1000u64;
         }
 
         def cyclesToNanos(cycles: u64) -> u64 {
-                if (cyclesPerUs == 0) return 0;
-                return (cycles * 1000u64) / cyclesPerUs;
+                if (tscKhz == 0) return 0;
+                // Whole milliseconds first, so that no product can overflow.
+                return (cycles / tscKhz) * 1000000u64 + ((cycles % tscKhz) * 1000000u64) / tscKhz;
         }
 }
 
@@ -231,13 +237,13 @@ class TreeTimer(counter: OpCounter) {
                 for (i < PHASES) marks[i] = 0;
                 writeLines = -1;
                 markCounts = counter.snapshot();
-                mark = Target.rdtsc();
+                mark = Target.rdtscOrdered();
         }
 
         // PWBTree.onPhase: charge the time since the previous mark to {p}; in
         // round 0, check the work since the previous mark.
         def onPhase(p: PWBTreePhase) {
-                def now = Target.rdtsc();
+                def now = Target.rdtscOrdered();
                 if (recording) current.phaseCycles[p.tag] += now - mark;
                 marks[p.tag]++;
                 if (auditing) {
@@ -246,7 +252,7 @@ class TreeTimer(counter: OpCounter) {
                         markCounts = got;
                         auditMark(p, d);
                 }
-                mark = Target.rdtsc();
+                mark = Target.rdtscOrdered();
         }
 
         private def auditMark(p: PWBTreePhase, d: OpCounts) {
@@ -480,12 +486,12 @@ def runOp(index: int, timer: TreeTimer, tree: PWBTree, kind: KindStats, key: u64
         def h0 = tree.height(), n0 = tree.nodeCount();
         def before = counter.snapshot();
         timer.startOp(kind);
-        def c0 = Target.rdtsc();
+        def c0 = Target.rdtscOrdered();
         var ok = true;
         var got: (bool, u64);
         if (isLookup) got = tree.get(key);
         else ok = tree.put(key, value);
-        def c1 = Target.rdtsc();
+        def c1 = Target.rdtscOrdered();
         def work = counter.snapshot().minus(before);
         if (!ok) return Strings.format2("%s %d failed (region full or a persistence failure)", kind.kind.label, index);
         if (timer.auditError != null) return Strings.format3("%s %d: %s", kind.kind.label, index, timer.auditError);
@@ -672,7 +678,8 @@ def perOpX1000(total: long, ops: int) -> long {
 }
 
 def report(timer: TreeTimer) {
-        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs()).ln();
+        Trace.OUT.put1("tsc kHz %d", BenchClock.tscKhz).ln();
         for (k in timer.kinds) {
                 def sorted = Arrays.sort(k.samples.copy(), 0, k.samples.length, u64.<=);
                 def p = Percentiles.new(sorted);

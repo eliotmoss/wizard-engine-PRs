@@ -530,6 +530,20 @@ the kill loop's result on a second host.
    CPU?), `lsblk`, the dm uuids and every block device's `queue/stable_writes`,
    in `block-stack.txt` and a line of `summary.txt`:
    `sudo env PWROOT_USER=u7599095 <checkout>/scripts/magpie-root-checks.sh`.
+6. **Magpie's core clock on block storage (2026-10-15).** The same script's
+   section 5 is the intervention the clock probe could not make on Magpie
+   ([below](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence)): probed sieve runs
+   (`file` and `direct`) and a B+Tree run (`file`) on `/home`, pinned to CPU 2,
+   interleaved between that CPU's idle states as they are and C1E and C6
+   disabled on it alone (restored after each run), under `turbostat` (busy
+   clock and idle-state residency) and `perf stat` (cycles over reference
+   cycles, instructions). If the 1.0 GHz after a boundary is C1E, the default
+   runs show C1E residency and the probe's drop goes away with C1E off; the
+   B+Tree's clock is then measured rather than inferred. On this model
+   intel_idle switches off the hardware's own promotion of C1 to C1E
+   (`disable_promotion_to_c1e` for Skylake-X, which covers Cascade Lake), so
+   the disabled state is enough. Results in `clock-*.log`, `.turbostat`,
+   `.perf` and a block of `summary.txt`. Not yet run.
 
 ---
 
@@ -2710,9 +2724,23 @@ one medium is not wrong on the other, merely pointless.
 - Samples are `rdtsc`, converted with a TSC frequency calibrated per run against
   `CLOCK_MONOTONIC` (2294 cycles/µs on every run here). There is no invariant-TSC
   check in the tree, so that conversion is an assumption, stated rather than
-  hidden. `rdtsc` is also not ordered with `CLWB`, so a timed writeback reports
-  what lands inside its window, not what it costs; only wall-time differences
-  measure the writebacks (2026-09-28).
+  hidden; Magpie's recorded CPU flags (each campaign's `provenance.txt`)
+  include `constant_tsc` and `nonstop_tsc`, which together are the invariant
+  TSC it assumes. `rdtsc` is also not ordered with `CLWB`, so a timed writeback
+  reports what lands inside its window, not what it costs; only wall-time
+  differences measure the writebacks (2026-09-28).
+- **The timer from 2026-10-15.** Every bench now calibrates against
+  `CLOCK_MONOTONIC_RAW`, which NTP does not slew, and keeps the frequency in
+  kHz (`tsc kHz` in the log; the `tsc cycles per microsecond` line stays for
+  the scripts), where a whole number of cycles per µs rounded away up to one
+  part in 2,294. pwopsbench, pwsievebench and pwbtreebench also read the TSC
+  between two `LFENCE`s (`Target.rdtscOrdered`, the SDM's sequence), so earlier
+  instructions have executed before a read and later ones wait for it; stores
+  and `CLWB` are still not waited for. pwbench keeps its unordered reads, which
+  the boundary analysis above is about. Every result before that date used the
+  old conversion and unordered reads. The ordered reads' cost is not yet
+  measured in a campaign; in one uncommitted smoke run on sean-tan-PC (tmpfs,
+  CPU 2) pwopsbench's `timer` median went from 5 to 11 ns.
 - The absolute `fdatasync` figures are properties of this host's storage stack,
   not of the design. The ratios are the portable result.
 
