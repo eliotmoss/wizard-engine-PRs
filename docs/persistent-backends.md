@@ -1728,15 +1728,117 @@ must be exactly the new nodes allocated so far or the replaced nodes not yet
 freed. What these runs show, and not, is what the sieve's
 [show](#crash-behaviour-process-death-is-the-crash): process-crash consistency,
 discriminating on the direct backend at a coarse grain (4 KiB units, drain-all
-fences), and nothing about `CLWB`/`SFENCE` or power loss. Unlike the sieve, the
-tree is not yet in the crash-image explorer (layer 1b).
+fences), and nothing about `CLWB`/`SFENCE` or power loss. The crash-image
+explorer (layer 1b) checks those, and is in the next section.
+
+#### What says the tree is consistent, and how far it reaches (2026-10-15)
+
+Every check above ends in the same two calls. `PWBTree.checkInvariants()`
+walks the durable tree from its root and returns the first violation:
+
+- the root chunk is allocated, and its magic, block size and capacity are
+  unchanged;
+- every node's offset is block aligned and in the region; its tag carries the
+  node magic and the level its depth implies, so every leaf is at the tree's
+  height; and it holds no more keys than the capacity;
+- keys strictly increase in every node and lie within the separators above it;
+- no node is reached twice;
+- every node below the root is at least half full, which splits alone keep,
+  since there is no delete;
+- every reachable node is an allocated chunk; and
+- the keys and nodes it reaches equal the counts in the root.
+
+`open()` runs it before trusting a tree, then frees every allocated chunk the
+tree does not reach. `PWBTreeReference.compare()` compares every key and value
+with an independent DRAM map. The unit tests run both after every mutation,
+`pwbtreebench` after every round, and the kill loop after every kill, at the
+durable mutation count.
+
+**Each check fires.** `pwbtree:corrupted_image_fails_cleanly` plants the damage
+a walk must survive: a cycle, a node at the wrong level, a shared child, heights
+the tree does not have, and a root offset that wraps. `pwbtree:checker_names_each_violation`
+plants each of the 21 violations `checkInvariants()` can report, in a tree of
+height 3. It asserts which check names each, and that `open()` refuses it:
+- keys out of order, below their separator, and at or above it, in leaves and
+  in internal nodes;
+- an internal node with no key, a node below half full, and one over capacity;
+- a wrong node magic, an offset unaligned and one past the region, and a node
+  at the wrong level;
+- a node reached twice, and a reachable node in a freed chunk;
+- key and node counts one too many, and heights of 0 and `MAX_HEIGHT + 1`;
+- the root's magic, block size and capacity changed, and its chunk freed.
+
+A build with the half-full check deleted fails the test, which names the check
+that caught the plant instead. One half of one message is not planted: the root
+chunk reached as a child. Its first word is the tree's magic, so the node magic
+check refuses it first.
+
+**Consistent is not durable.** The direct backend's elided-writeback mutant
+above passed `checkInvariants()` and the comparison at every remount, holding an
+empty tree, and still lost every acknowledged mutation. The acknowledgement
+check caught it. The integrity checks cannot, because an older tree is a
+consistent one.
+
+**The tree in the crash-image explorer.** `persistent_btree:`
+(`test/unittest/x86-64-linux/PersistentBTreeTest.v3`) does for the tree what
+`persistent_sieve:` does for the sieve:
+- **What it records.** One put's `STORE`/`CLWB`/`SFENCE` order, over a
+  recording PMEM region of 32 blocks of 2 KiB at capacity 3. It then mounts the
+  images a crash could leave through production recovery.
+- **The two puts.** An insert that splits a leaf and the root, taking the tree
+  from height 2 to 3: 5 new nodes, 8 boundaries and 4,601 events. And an update
+  at height 3: 3 new nodes, 7 boundaries and 2,967 events.
+- **The property.** The allocator's invariants, then `open()`, then
+  `checkInvariants()`. Then the allocator again after the sweep's frees, and a
+  second mount that finds nothing to reclaim. The contents must equal the tree
+  before the put or after it, as the durable mutation count says. Up to the
+  WRITE mark only the tree before is allowed, and from the PUBLISH mark on only
+  the tree after.
+- **The container.** Images are mounted in an anonymous mapping, not in
+  `openArray()`'s heap array. The tree allocates while it is checked, a
+  collection can move a heap array, and `PWRegion` keeps the raw address.
+
+How far each check reaches. A cut permits the product, over the lines the trace
+writes, of each line's range of durable store prefixes. The log record is
+written a byte at a time, so the insert's cuts permit up to about 2^70 images
+each, and all but 72 of its 4,602 cuts permit more than 16:
+
+- **Every cut, bounded.** The sweep takes 4 images a cut, in the explorer's
+  order. That order starts from the floor image, with every line at what the
+  fences force, and varies the lowest lines first. It accepted 18,167 images
+  for the insert and 11,730 for the update, and reports itself truncated.
+  `persistent_sieve:`'s sweeps are bounded the same way.
+- **The final cut, complete.** All 36 images the completed insert permits, and
+  all 20 the update permits, hold the tree after the put.
+- **Durable before published, complete.** From the WRITE mark to the end of the
+  put, every new node's lines are at their floor, with nothing pending, at
+  every cut. An image's lines range from the floor up, so no image at those
+  cuts lacks a byte of a new node. This shows the tree's own ordering claim for
+  every image without enumerating them.
+- **The negative control.** The insert's trace loses its 10 node writebacks, the
+  `CLWB`s between the build and the WRITE mark. That leaves 97 of 107 `CLWB`s,
+  with the 8 `SFENCE`s unchanged. The mutant fails both complete checks:
+  - the line check, at the WRITE mark itself;
+  - the sweep, at event 4,207 of 4,591, inside the publish's commit, with "the
+    tree could not reopen after recovery".
+
+  The kill loop cannot show this on PMEM or on a file, where the mutant passes.
+
+What this does not show:
+- The rest of the property (the log, the allocator, the contents) is checked
+  only on the sample, except at the final cut and at the cuts that permit 4
+  images or fewer: 33 of the insert's 4,602 cuts and 27 of the update's 2,968.
+- It covers two puts at one geometry, not the benchmark's 4 KiB blocks and 252
+  keys a node.
+- It takes the bytes before the put as durable, as `persistent_sieve:` does.
+- As for all of layer 1b, it assumes the hardware obeys the model.
 
 #### What these numbers cannot show
 
-- **Power loss, and the order of `CLWB`s and `SFENCE`s.** Magpie measured the
-  PMEM share and the writebacks' cost (above). But its kill loop on DAX cannot
-  discriminate, and the tree is not in the crash-image explorer, so nothing here
-  tests the tree's writebacks on PMEM.
+- **Power loss on real hardware.** Magpie measured the PMEM share and the
+  writebacks' cost (above), and its kill loop on DAX cannot discriminate. The
+  tree's writeback placement is checked in the explorer under the baseline
+  model (above), for two puts at a small geometry. No run cuts power.
 - **The direct backend's tail on Magpie's `/home`.** It is observed in every
   repetition and not explained (above).
 - **Five boundaries where the work needs two.** At height 2 a mutation's
@@ -3262,7 +3364,7 @@ the test sources already use ("layer 1b", "layer 3").
 |---|---|---|---|
 | 0. Functional | Each component behaves correctly when nothing crashes: the cache's read and write-behind paths, allocation, splitting and coalescing, record validation, input rejection. | `region_transaction:`; `pwregion:`, including seeded 64-step mixed histories checked after every operation; the `dual_wal:` validation cases; `txn_backend:`; `pwsieve:`; `pwbtree:`. | Anything about crashes. |
 | 1a. Abstract WAL protocol | `DualTxnWal`, `RegionTransaction` and `PWRegion` preserve acknowledged updates at every abstract persistence boundary, and a failed or indeterminate boundary latches recovery-required instead of claiming durability. | `ShadowDurableRegion` (see below): separate live and durable bytes, with fail-before-copy, copy-then-fail and partial-copy outcomes; the `dual_wal:` crash and fault matrix; injection in `region_transaction:` and `pwregion_recovery:`. | One outcome per persistence call: no eviction, no asynchronous `CLWB`, one partial outcome rather than every subset of lines. |
-| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistent_trace:`, `persistent_image:`, `persistent_explore:`), checked against the WAL contract (`persistent_recovery:`), the allocator invariants (`persistent_alloc:`) and the sieve's cross-object invariants (`persistent_sieve:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `persistent_control:` keeps it sensitive to flush placement. See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios, budgeted at mid-record cuts. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. Speaks for the direct and file backends through their restriction arguments; for the file backend on block storage only under assumptions B2–B5, of which nothing guarantees B2. |
+| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistent_trace:`, `persistent_image:`, `persistent_explore:`), checked against the WAL contract (`persistent_recovery:`), the allocator invariants (`persistent_alloc:`), the sieve's cross-object invariants (`persistent_sieve:`) and the B+Tree's (`persistent_btree:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `persistent_control:` keeps it sensitive to flush placement. See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios, budgeted at mid-record cuts. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. Speaks for the direct and file backends through their restriction arguments; for the file backend on block storage only under assumptions B2–B5, of which nothing guarantees B2. |
 | 2. Backend translation | Each backend maps the abstract operations to the intended mechanism and propagates its result. | Instruction encodings and the native CPUID/writeback/fence smoke path (`persistent_ops:`); `fdatasync` ordering and real `EBADF` injection at the file-sync seam (`pwregion_bd:`); marking, coalescing, drain, the `O_DIRECT` probe and device refusals (`direct_io:`); fence coverage of every requested page and an `O_DIRECT` re-read of every synced range (`file_mmap:`); `MAP_SYNC` integration on Magpie's fsdax (`pmem_dax:`, opt-in). | Whether the protocol is correct; anything a crash loses. |
 | 3a. Process crash, nothing lost | The allocator, WAL and workload recover after the process dies without a clean close, both at named protocol boundaries and at arbitrary points over long histories. | Thirteen abrupt-termination tests at named boundaries (`pwregion_bd:`); the random-timer `pwsieve` kill loop on the file and PMEM backends, which requires every acknowledged step to survive; the `pwbtree` kill loop, which requires every acknowledged mutation to survive, on the file backend (2026-10-14; on PMEM not yet run). | Flush placement. Process death on an mmap backend loses nothing, because the page cache or the CPU cache keeps every store, so the surviving image is the model's eager one. The elided-writeback mutant passes here (measured 2026-09-18, again 2026-09-27, on the file backend after its 2026-10-13 change, and under the B+Tree on 2026-10-14). |
 | 3b. Real loss of unwritten data | On real hardware, under a crash that discards what was never written back, the production write-back placement is needed (the mutant loses acknowledged state) and suffices at the crash points reached (the ordinary build loses none). | Stage 2c warm reset over reserved DRAM (`pwreboot`: `SURVIVED` and `LOST`, 3 of 3 each); the `pwsieve` and `pwbtree` kill loops on the direct backend, at random crash points (see [Crash behaviour](#crash-behaviour-process-death-is-the-crash) and [the tree's](#crash-behaviour-of-the-tree)); `pwbtree_dio:`, a child killed at every phase mark of two tree mutations. | Stage 2c has one crash point per run, and DRAM stands in for PMEM. The direct backend works in 4 KiB units with drain-all fences, and says nothing about `CLWB`/`SFENCE`. |
