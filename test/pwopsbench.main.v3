@@ -15,8 +15,8 @@
 //   mount-64mib   the same at 64 MiB
 //   recover-<k>   PWRegion.new() over a 1 MiB region whose log holds one
 //                 committed, unapplied transaction of k u64 entries, k = 8, 24
-//   timer         two back-to-back rdtsc reads: the floor under every figure,
-//                 and the empty commit's comparison
+//   timer         two back-to-back reads of the timer (rdtscOrdered): the floor
+//                 under every figure, and the empty commit's comparison
 //
 // A commit of k entries is pwbench's measurement and is not repeated here.
 //
@@ -46,7 +46,9 @@
 // 1 MiB clean mount and the recoveries alternate sample by sample, so the
 // difference between them is the replay.
 //
-// Times are rdtsc cycles around the call, converted with a calibrated TSC
+// Times are rdtsc cycles around the call, each read between two LFENCEs
+// (Target.rdtscOrdered), so the window holds the call's instructions and no
+// others (a store may still drain after it), converted with a calibrated TSC
 // frequency. The counting backends are pwsievebench's, duplicated rather than
 // shared so that neither program's code layout moves with the other's: on
 // PMEM a provider counts each fence and writeback, and writeback=none issues
@@ -63,7 +65,7 @@
 //
 // Usage: pwopsbench.x86-64-linux <writable-directory> <file|pmem|direct> [ops] [warmup] [mounts] [mountWarmup] [writeback=<auto|none>] [boundary=<fdatasync|legacy>]
 
-def CLOCK_MONOTONIC = 1;        // LinuxConst declares no CLOCK_* constants.
+def CLOCK_MONOTONIC_RAW = 4;    // LinuxConst declares no CLOCK_* constants.
 def MAX_SAMPLES = 200000;
 def RW = BackendProt.READ.mask | BackendProt.WRITE.mask;
 
@@ -144,12 +146,12 @@ component OpsBenchConfig {
 // ---------------------------------------------------------------- clock
 
 component BenchClock {
-        def var cyclesPerUs = 0u64;
+        def var tscKhz = 0u64;          // TSC cycles per millisecond
 
         def nanos() -> long {
                 def ts = Array<long>.new(2);
                 Linux.syscall(LinuxConst.SYS_clock_gettime,
-                        (CLOCK_MONOTONIC, Pointer.atElement(ts, 0)));
+                        (CLOCK_MONOTONIC_RAW, Pointer.atElement(ts, 0)));
                 return ts[0] * 1000000000L + ts[1];
         }
 
@@ -163,19 +165,24 @@ component BenchClock {
         // As pwbench: the tree has no invariant-TSC check, so the derived
         // frequency is reported rather than assumed.
         def calibrate() {
-                def c0 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
                 def t0 = nanos();
                 sleepNanos(100000000L);         // 100 ms
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 def t1 = nanos();
                 def elapsedNs = t1 - t0;
                 if (elapsedNs <= 0) return;
-                cyclesPerUs = ((c1 - c0) * 1000u64) / u64.!(elapsedNs);
+                tscKhz = ((c1 - c0) * 1000000u64) / u64.!(elapsedNs);
+        }
+
+        def cyclesPerUs() -> u64 {
+                return tscKhz / 1000u64;
         }
 
         def cyclesToNanos(cycles: u64) -> u64 {
-                if (cyclesPerUs == 0) return 0;
-                return (cycles * 1000u64) / cyclesPerUs;
+                if (tscKhz == 0) return 0;
+                // Whole milliseconds first, so that no product can overflow.
+                return (cycles / tscKhz) * 1000000u64 + ((cycles % tscKhz) * 1000000u64) / tscKhz;
         }
 }
 
@@ -507,8 +514,8 @@ def format(counter: OpCounter, blocks: u64) -> (PWRegion, string) {
 def runTimer() {
         def stats = OpStats.new("timer").expect(OpCounts(0, 0, 0), 0);
         for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
-                def c0 = Target.rdtsc();
-                def c1 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
+                def c1 = Target.rdtscOrdered();
                 if (i >= OpsBenchConfig.warmup) stats.put(c1 - c0);
         }
         stats.report();
@@ -522,18 +529,18 @@ def runAllocFree(counter: OpCounter, region: PWRegion, n: u32) -> string {
                 var inspect: PWRegion;          // warm-up only: read the record back
                 if (!measured) inspect = region;
                 var before = counter.snapshot();
-                def c0 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
                 def chunk = region.allocChunk(n);
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 if (chunk.isNull()) return Strings.format2("%s %d returned no chunk", alloc.name, i);
                 var err = alloc.check(i, counter.snapshot().minus(before), inspect);
                 if (err != null) return err;
                 if (measured) alloc.put(c1 - c0);
 
                 before = counter.snapshot();
-                def c2 = Target.rdtsc();
+                def c2 = Target.rdtscOrdered();
                 def ok = region.freeChunk(chunk);
-                def c3 = Target.rdtsc();
+                def c3 = Target.rdtscOrdered();
                 if (!ok) return Strings.format2("%s %d failed", free.name, i);
                 err = free.check(i, counter.snapshot().minus(before), inspect);
                 if (err != null) return err;
@@ -551,9 +558,9 @@ def runEmptyCommit(counter: OpCounter, region: PWRegion) -> string {
         if (region.txn.isDirty()) return "the transaction is not empty before the empty commits";
         for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
                 def before = counter.snapshot();
-                def c0 = Target.rdtsc();
+                def c0 = Target.rdtscOrdered();
                 def ok = region.txn.commit();
-                def c1 = Target.rdtsc();
+                def c1 = Target.rdtscOrdered();
                 if (!ok) return Strings.format1("commit-empty %d failed", i);
                 def err = stats.check(i, counter.snapshot().minus(before), null);
                 if (err != null) return err;
@@ -568,9 +575,9 @@ def runEmptyCommit(counter: OpCounter, region: PWRegion) -> string {
 def mountClean(counter: OpCounter, stats: OpStats, i: int, blocks: u64) -> string {
         def backend = makeBackend(counter);
         def before = counter.snapshot();
-        def c0 = Target.rdtsc();
+        def c0 = Target.rdtscOrdered();
         def region = open(backend, blocks, false);
-        def c1 = Target.rdtsc();
+        def c1 = Target.rdtscOrdered();
         def got = counter.snapshot().minus(before);
         var err = openError(backend, region, DualWalRecovery.CLEAN);
         if (err == null) err = stats.check(i, got, null);
@@ -595,9 +602,9 @@ def mountRecovering(counter: OpCounter, stats: OpStats, i: int, k: int, base: u6
 
         def backend = makeBackend(counter);
         def before = counter.snapshot();
-        def c0 = Target.rdtsc();
+        def c0 = Target.rdtscOrdered();
         def region = open(backend, SMALL_BLOCKS, false);
-        def c1 = Target.rdtsc();
+        def c1 = Target.rdtscOrdered();
         def got = counter.snapshot().minus(before);
         var err = openError(backend, region, DualWalRecovery.REPLAYED);
         if (err == null) err = stats.check(i, got, null);
@@ -753,7 +760,8 @@ def main(args: Array<string>) -> int {
                 Trace.OUT.put2("writeback %s, CPUID selects %s",
                         OpsBenchConfig.writeback.label, cpuidWriteback()).ln();
         }
-        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs).ln();
+        Trace.OUT.put1("tsc cycles per microsecond %d", BenchClock.cyclesPerUs()).ln();
+        Trace.OUT.put1("tsc kHz %d", BenchClock.tscKhz).ln();
         Trace.OUT.put2("operations %d after %d warm-up", OpsBenchConfig.ops, OpsBenchConfig.warmup)
                 .put2(", mounts %d after %d warm-up", OpsBenchConfig.mounts, OpsBenchConfig.mountWarmup).ln();
         Trace.OUT.put3("blocks of %d bytes; regions of %d blocks, and %d for mount-64mib",
