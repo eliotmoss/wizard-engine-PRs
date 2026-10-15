@@ -1,0 +1,23 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /home/sean-tan/.t3/worktrees/wizard-engine-PRs/pwsieve-pc-perf/bin/pwsieve-bench-block
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+wall ns per step 1078945
+step ns: mean 1079076
+step ns: min 1038446 median 1067237 p90 1093409
+step ns: p99 1142264 max 7795450
+phase compute ns per step 154933
+phase alloc ns per step 241019
+phase bitmap ns per step 226968
+phase publish ns per step 224901
+phase retire ns per step 231243
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12810
+OK
