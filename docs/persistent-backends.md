@@ -344,14 +344,45 @@ every operation.
 ### Do the quoted sieve figures change?
 
 The sieve section's 86 % (sean-tan-PC's NVMe, 85.6 %, `performance`) and 55 %
-(Magpie's `/home`, 54.6 %) were measured with the legacy boundary. On
-sean-tan-PC under `powersave` the share is 67.7 % against 67.9 %, unchanged
-within its spread, while the median step is 1.3 % longer. Nothing here suggests
-the 86 % would move by more than a point under `performance`, but that is
-inferred: the rerun needs root to set the governor. Magpie's `/home` is a
-different storage path (LVM on a write-through RAID controller, where the
-boundary is the controller's acknowledgement, not a flush) and was not
-re-measured; until it is, the 55 % stands for the legacy boundary only.
+(Magpie's `/home`, 54.6 %) were measured with the legacy boundary. Both hosts
+have since run the sieve with the current boundary and the legacy one
+interleaved, in one sitting each. Wall time per step and the persistence phases,
+each the median over repetitions, and the share:
+
+| Host, storage, governor | current boundary | legacy boundary | results |
+|---|---|---|---|
+| sean-tan-PC, NVMe, `performance` | 1,080 µs, 924 µs (85.6 %) | 1,085 µs, 927 µs (85.5 %) | `20261015T052543Z-sean-tan-PC-pwsieve-bench-cpus2-performance-file-ab` |
+| sean-tan-PC, NVMe, `powersave` | 1,540 µs, 1,042 µs (67.7 %) | 1,528 µs, 1,038 µs (67.9 %) | `20261013T124441Z-…-powersave-file-ab` ([above](#cost-old-against-new-sean-tan-pc-2026-10-13)) |
+| Magpie, `/home` | 2,676 µs, 1,550 µs (57.9 %) | 2,576 µs, 1,448 µs (56.2 %) | `20261013T134636Z-magpie-pwsieve-bench` |
+| Magpie, `/home` | 2,679 µs, 1,552 µs (57.9 %) | 2,583 µs, 1,443 µs (55.9 %) | `20261014T025706Z-magpie-pwsieve-bench` |
+
+- **On sean-tan-PC the 86 % stands.** The `performance` campaign ran at
+  `b358dbf0` with the sieve section's protocol: `file-block`,
+  `file-block-legacy` and `direct-block` interleaved, five repetitions, pinned
+  to CPU 2, on the NVMe root, with the governor `performance` on all 28 CPUs
+  and EPP `performance`. The share is 85.6 % with the current boundary,
+  85.5 % with the legacy one and 86.0 % through the direct backend, as on
+  2026-09-28. The wall ranges overlap (1,078.8–1,083.5 against
+  1,082.3–1,085.2 µs), although the current boundary is the faster in every
+  repetition, by 0.1–0.6 %. Every phase is within 6 µs of legacy's. A step is
+  1.6 % shorter than on 2026-09-28 (1,080 against 1,097 µs): the computation by
+  1.9 % (155.1 against 158.1 µs) and the persistence phases by 1.5 % (924
+  against 938 µs). The kernel was 7.0.0-34 then and 7.0.0-38 now.
+- **On Magpie the current boundary costs `/home` 2 points**, and both sittings
+  agree. The step is 3.7–3.9 % longer, outside both ranges in each sitting, and
+  the persistence phases 102–109 µs longer. The work moved as on sean-tan-PC,
+  from the publish commit to the bitmap's fence, which now also writes the
+  allocation's after-image pages. Here, though, the bitmap's fence grows by
+  372–378 µs (646–647 against 269–274 µs), while the publish shrinks by only
+  229–233 µs and the retire by 37–39 µs; on sean-tan-PC each moved by 10 µs or
+  less. A plausible reading, untested, is that behind the write-through
+  controller each page written costs time of its own, where the NVMe charges
+  per flush. The two runs were at `cede598e` and `42edc6ff`.
+- So the sieve section's 55 % (2026-09-28) belongs to the legacy boundary and
+  to that sitting. At the current boundary, quote 57.9 % (file) and 58.3 %
+  (direct, `20261014T025706Z`), and compare boundaries only within a sitting:
+  Magpie's block storage moves between sittings
+  ([below](#magpie-again-every-backend-in-one-sitting-2026-10-14)).
 
 ### Crash behaviour
 
@@ -490,7 +521,9 @@ the kill loop's result on a second host.
    sets it first (a udev rule). Then rerun the A/B above to price it.
 4. **The A/B under `performance`**, to compare with the 86 % directly:
    `echo performance | sudo tee /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor`,
-   then the campaigns above, then set it back to `powersave`.
+   then the campaigns above, then set it back to `powersave`. Done for the
+   sieve on 2026-10-15 ([above](#do-the-quoted-sieve-figures-change)), with
+   every CPU's governor set; pwbench and pwopsbench have not been rerun.
 5. **Magpie's block stack, for B2.** `scripts/magpie-root-checks.sh` now also
    records, read-only, `dmsetup table` and `dmsetup info -c` (is `/home`'s LVM
    volume `linear` and unencrypted, so that no layer copies pages with the
