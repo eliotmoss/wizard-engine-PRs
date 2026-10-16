@@ -1,0 +1,63 @@
+---- findmnt -T /home/users/u7599095
+TARGET SOURCE                          FSTYPE OPTIONS
+/home  /dev/mapper/ubuntu--vg-lv--home ext4   rw,relatime
+---- lsblk -o NAME,TYPE,FSTYPE,SIZE,MOUNTPOINT
+NAME                      TYPE FSTYPE        SIZE MOUNTPOINT
+loop0                     loop squashfs     63.8M /snap/core20/2866
+loop1                     loop squashfs    115.2M /snap/lxd/40911
+loop2                     loop squashfs       74M /snap/core22/2955
+loop3                     loop squashfs       74M /snap/core22/2437
+loop4                     loop squashfs     50.3M /snap/snapd/27738
+loop5                     loop squashfs     44.7M /snap/snapd/28254
+loop6                     loop squashfs     63.8M /snap/core20/2922
+loop8                     loop squashfs    115.3M /snap/lxd/40575
+sda                       disk             931.5G 
+├─sda1                    part                 1M 
+├─sda2                    part ext4            1G 
+└─sda3                    part LVM2_member 930.5G 
+  ├─ubuntu--vg-ubuntu--lv lvm  ext4          400G /
+  ├─ubuntu--vg-lv--log    lvm  ext4           10G /var/log
+  └─ubuntu--vg-lv--home   lvm  ext4        520.5G /home
+sdb                       disk               7.3T 
+├─sdb1                    part ext4          3.6T 
+└─sdb2                    part ext4          3.6T 
+sdc                       disk ext4        894.3G 
+nvme1n1                   disk ext4          1.8T 
+nvme0n1                   disk               1.4T 
+└─nvme0n1p1               part ext4          1.4T 
+pmem1                     disk ext4        744.2G 
+pmem0                     disk ext4        744.2G /mnt/pmem0.0
+---- dmsetup table (target per segment: linear, striped, crypt, raid, ...)
+ubuntu--vg-lv--home: 0 1091584000 linear 8:3 859834368
+ubuntu--vg-lv--log: 0 20971520 linear 8:3 838862848
+ubuntu--vg-ubuntu--lv: 0 838860800 linear 8:3 2048
+---- dmsetup info -c
+Name                  Maj Min Stat Open Targ Event  UUID                                                                
+ubuntu--vg-lv--home   252   2 L--w    1    1      0 LVM-42wRML5bZ422IhN3czkSprhqRMCk6fk1I8B32d6qMtrzHOoloBiz1CXzRVKiPvfe
+ubuntu--vg-lv--log    252   1 L--w    1    1      0 LVM-42wRML5bZ422IhN3czkSprhqRMCk6fk1U2RceBFdQ2wmoF8mV0yn4dg3Zt2O5Kp6
+ubuntu--vg-ubuntu--lv 252   0 L--w    1    1      0 LVM-42wRML5bZ422IhN3czkSprhqRMCk6fk1Mrw2idLJJl33tnb6wZbl3PUd3dYsjepG
+---- dm uuids (CRYPT- for dm-crypt, LVM- for LVM)
+dm-0 ubuntu--vg-ubuntu--lv LVM-42wRML5bZ422IhN3czkSprhqRMCk6fk1Mrw2idLJJl33tnb6wZbl3PUd3dYsjepG
+dm-1 ubuntu--vg-lv--log LVM-42wRML5bZ422IhN3czkSprhqRMCk6fk1U2RceBFdQ2wmoF8mV0yn4dg3Zt2O5Kp6
+dm-2 ubuntu--vg-lv--home LVM-42wRML5bZ422IhN3czkSprhqRMCk6fk1I8B32d6qMtrzHOoloBiz1CXzRVKiPvfe
+---- queue/stable_writes per block device (1 = the device requests stable pages)
+dm-0 0
+dm-1 0
+dm-2 0
+loop0 0
+loop1 0
+loop2 0
+loop3 0
+loop4 0
+loop5 0
+loop6 0
+loop7 0
+loop8 0
+loop9 0
+nvme0n1 0
+nvme1n1 0
+pmem0 0
+pmem1 0
+sda 0
+sdb 0
+sdc 0

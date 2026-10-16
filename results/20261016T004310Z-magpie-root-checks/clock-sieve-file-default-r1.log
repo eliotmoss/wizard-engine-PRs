@@ -1,0 +1,34 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /home/users/u7599095/pwroot-clock
+region 256 blocks of 4096 bytes, rounds 20
+clock probe on: 4096 dependent single-cycle operations per probe; references busy and after a 250000 ns sleep
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+tsc kHz 2294592
+wall ns per step 2452233
+step ns: mean 2452060
+step ns: min 1243516 median 2427866 p90 3000255
+step ns: p99 3497890 max 7929399
+phase compute ns per step 1067648
+phase alloc ns per step 407689
+phase bitmap ns per step 542995
+phase publish ns per step 209221
+phase retire ns per step 224382
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12874
+clock busy: ticks median 2646 p10 2646 p90 2648, implied MHz 3552, x1000 of busy 1000, first-probe excess ticks 0, samples 1000
+clock after sleep: ticks median 9526 p10 9522 p90 9530, implied MHz 986, x1000 of busy 277, first-probe excess ticks -2, samples 200
+clock after sieve: ticks median 5294 p10 2646 p90 6350, implied MHz 1775, x1000 of busy 499, first-probe excess ticks 0, samples 3180
+clock after alloc: ticks median 9520 p10 2646 p90 9528, implied MHz 987, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock after bitmap: ticks median 9526 p10 5956 p90 9530, implied MHz 986, x1000 of busy 277, first-probe excess ticks 2, samples 3180
+clock after count: ticks median 9518 p10 2648 p90 9528, implied MHz 987, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock after publish: ticks median 6354 p10 2648 p90 9528, implied MHz 1479, x1000 of busy 416, first-probe excess ticks 0, samples 3180
+clock after retire: ticks median 9522 p10 3528 p90 9528, implied MHz 987, x1000 of busy 277, first-probe excess ticks 0, samples 3180
+clock probe ns per step 39859 (removed from the figures above)
+OK

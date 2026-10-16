@@ -1,0 +1,15 @@
+backend file (mmap + fdatasync)
+directory /home/users/u7599095/pwroot-clock
+region 256 blocks of 4096 bytes, rounds 3 measured after 1 audited
+workload per round: load 5000 keys, then 5000 operations, half lookups and half updates, seed 1
+tree capacity 252 keys per node, 508 words per node
+after the load: 5000 keys, height 2, 33 nodes
+round 0 audited 10000 operations: every commit's lines matched its record, every WRITE its nodes; 5000 keys match the reference
+tsc cycles per microsecond 2294
+tsc kHz 2294606
+op insert samples 15000 min_ns 757749 median_ns 2175475 p90_ns 2678024 p99_ns 3120678 max_ns 58098958 mean_ns 2173767 compute_ns 13455 alloc_ns 910436 write_ns 615833 publish_ns 245662 free_ns 387578 boundaries_x1000 4905 prepares_x1000 16430 lines_x1000 94876 boundaries_min 3 boundaries_max 6 splits 93
+op update samples 7539 min_ns 1748728 median_ns 2247270 p90_ns 2620608 p99_ns 2857910 max_ns 58488780 mean_ns 2244282 compute_ns 13475 alloc_ns 932155 write_ns 638135 publish_ns 249613 free_ns 410078 boundaries_x1000 5000 prepares_x1000 16945 lines_x1000 94660 boundaries_min 5 boundaries_max 5 splits 0
+op lookup samples 7461 min_ns 871 median_ns 1357 p90_ns 1601 p99_ns 1767 max_ns 10671 mean_ns 1376 compute_ns 1272 alloc_ns 0 write_ns 0 publish_ns 0 free_ns 0 boundaries_x1000 0 prepares_x1000 0 lines_x1000 0 boundaries_min 0 boundaries_max 0 splits 0
+wall ns per insert (load) 2176015, per operation (mix) 1130339
+minor faults x1000 per insert (load) 17030, per operation (mix) 8741
+OK

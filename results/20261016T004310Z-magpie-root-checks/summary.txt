@@ -1,0 +1,68 @@
+---- block requests issued by pwbench (device, flags): count
+flags containing F are flushes (or FUA); expected none if the device is write-through
+block-direct:
+   2211   8,0 WS
+  flush-flagged requests from pwbench: 0
+block-file:
+   2211   8,0 WS
+  flush-flagged requests from pwbench: 0
+---- dax_writeback_one pglen (pages per writeback): count
+expected: 0x200 (a whole 2 MiB entry) at 2 MiB, 0x1 at 1 MiB, about once per commit
+dax-2mib:
+      226 pglen 0x200
+dax-1mib:
+      456 pglen 0x1
+---- core clock (5): CPU 2, idle states as they are (default) and with C1E and C6 disabled (shallow)
+probe: implied MHz busy, after the sieve, after the bitmap boundary; op: median ns;
+turbostat: CPU 2 over the run; perf: cycles over reference cycles at the TSC rate
+clock-btree-file-default-r1:
+  op median ns: insert 2190390, update 2252152
+  turbostat: Avg_MHz 374 Busy% 37.30 Bzy_MHz 1006 POLL% 0.02 C1% 0.22 C1E% 45.98 C6% 18.23
+  perf: unhalted MHz 1002, instructions per cycle 1.51
+clock-btree-file-default-r2:
+  op median ns: insert 2195498, update 2257892
+  turbostat: Avg_MHz 375 Busy% 37.31 Bzy_MHz 1006 POLL% 0.02 C1% 0.22 C1E% 46.28 C6% 17.92
+  perf: unhalted MHz 1002, instructions per cycle 1.51
+clock-btree-file-shallow-r1:
+  op median ns: insert 2179201, update 2250241
+  turbostat: Avg_MHz 373 Busy% 36.40 Bzy_MHz 1026 POLL% 0.05 C1% 70.73 C1E% 0.00 C6% 0.00
+  perf: unhalted MHz 1022, instructions per cycle 1.53
+clock-btree-file-shallow-r2:
+  op median ns: insert 2175475, update 2247270
+  turbostat: Avg_MHz 375 Busy% 36.55 Bzy_MHz 1027 POLL% 0.05 C1% 70.62 C1E% 0.00 C6% 0.00
+  perf: unhalted MHz 1024, instructions per cycle 1.53
+clock-sieve-direct-default-r1:
+  probe MHz: busy 3552, after sieve 1677, after bitmap 986
+  turbostat: Avg_MHz 1132 Busy% 61.23 Bzy_MHz 1852 POLL% 0.01 C1% 0.07 C1E% 22.35 C6% 16.36
+  perf: unhalted MHz 1894, instructions per cycle 1.89
+clock-sieve-direct-default-r2:
+  probe MHz: busy 3552, after sieve 1678, after bitmap 986
+  turbostat: Avg_MHz 1132 Busy% 61.31 Bzy_MHz 1851 POLL% 0.01 C1% 0.07 C1E% 22.86 C6% 15.75
+  perf: unhalted MHz 1893, instructions per cycle 1.90
+clock-sieve-direct-shallow-r1:
+  probe MHz: busy 3552, after sieve 3156, after bitmap 3153
+  turbostat: Avg_MHz 1444 Busy% 46.37 Bzy_MHz 3123 POLL% 0.03 C1% 54.99 C1E% 0.00 C6% 0.00
+  perf: unhalted MHz 3127, instructions per cycle 1.92
+clock-sieve-direct-shallow-r2:
+  probe MHz: busy 3552, after sieve 3156, after bitmap 3156
+  turbostat: Avg_MHz 1453 Busy% 46.66 Bzy_MHz 3122 POLL% 0.03 C1% 54.69 C1E% 0.00 C6% 0.00
+  perf: unhalted MHz 3125, instructions per cycle 1.92
+clock-sieve-file-default-r1:
+  probe MHz: busy 3552, after sieve 1775, after bitmap 986
+  turbostat: Avg_MHz 1277 Busy% 66.76 Bzy_MHz 1918 POLL% 0.01 C1% 0.09 C1E% 22.61 C6% 10.53
+  perf: unhalted MHz 1961, instructions per cycle 1.89
+clock-sieve-file-default-r2:
+  probe MHz: busy 3552, after sieve 1678, after bitmap 986
+  turbostat: Avg_MHz 1270 Busy% 66.46 Bzy_MHz 1915 POLL% 0.01 C1% 0.09 C1E% 22.69 C6% 10.77
+  perf: unhalted MHz 1958, instructions per cycle 1.88
+clock-sieve-file-shallow-r1:
+  probe MHz: busy 3552, after sieve 3356, after bitmap 3356
+  turbostat: Avg_MHz 1791 Busy% 51.69 Bzy_MHz 3472 POLL% 0.04 C1% 49.86 C1E% 0.00 C6% 0.00
+  perf: unhalted MHz 3462, instructions per cycle 1.91
+clock-sieve-file-shallow-r2:
+  probe MHz: busy 3552, after sieve 3452, after bitmap 3452
+  turbostat: Avg_MHz 1795 Busy% 51.70 Bzy_MHz 3480 POLL% 0.04 C1% 49.86 C1E% 0.00 C6% 0.00
+  perf: unhalted MHz 3469, instructions per cycle 1.91
+---- block stack (B2): device-mapper targets, and devices requesting stable writes
+targets:  3 linear 
+stable_writes=1: 

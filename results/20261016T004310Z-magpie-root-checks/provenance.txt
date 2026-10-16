@@ -1,0 +1,11 @@
+---- provenance
+commit   49812234c0f1272d5c0df1cee295e11170017f07
+host     magpie.gpu
+kernel   Linux 6.8.0-137-generic x86_64 GNU/Linux
+started  2026-10-16T00:43:10+00:00
+run by   u1817699 for u7599095
+block    /home/users/u7599095 (ext4   /dev/mapper/ubuntu--vg-lv--home)
+dax      /mnt/pmem0.0/sean (ext4   /dev/pmem0 rw,relatime,dax=always)
+sda rotational 1
+sda write_cache write through
+sda fua 0

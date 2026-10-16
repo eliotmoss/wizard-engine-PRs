@@ -1,0 +1,674 @@
+---- storcli: /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64
+---- /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64 /c0 show
+Generating detailed summary of the adapter, it may take a while to complete.
+
+CLI Version = 007.2313.0000.0000 Mar 07, 2023
+Operating system = Linux 6.8.0-137-generic
+Controller = 0
+Status = Success
+Description = None
+
+Product Name = PERC H740P Adapter 
+Serial Number = 0B40075
+SAS Address =  52cea7f07d5f2d00
+PCI Address = 00:1a:00:00
+System Time = 10/16/2026 11:43:11
+Mfg. Date = 11/06/20
+Controller Time = 10/16/2026 00:42:52
+FW Package Build = 51.13.1-3662
+BIOS Version = 7.13.00.0_0x070D0301
+FW Version = 5.130.00-3337
+Driver Name = megaraid_sas
+Driver Version = 07.727.03.00-rc1
+Current Personality = eHBA-Mode
+Vendor Id = 0x1000
+Device Id = 0x16
+SubVendor Id = 0x1028
+SubDevice Id = 0x1FCB
+Host Interface = PCI-E
+Device Interface = SAS-12G
+Bus Number = 26
+Device Number = 0
+Function Number = 0
+Domain ID = 0
+Security Protocol = None
+JBOD Drives = 3
+
+JBOD LIST :
+=========
+
+---------------------------------------------------------------------------------
+ID EID:Slt DID State Intf Med       Size SeSz Model               Vendor   Port  
+---------------------------------------------------------------------------------
+ 0 64:0      0 Onln  SATA HDD 931.512 GB 512B ST1000NM004A-2MN130 ATA      00 x1 
+ 1 64:1      1 Onln  SATA HDD   7.277 TB 512B ST8000NM0205-2FF112 ATA      00 x1 
+ 2 64:2      2 Onln  SAS  SSD 894.252 GB 512B KPM5XRUG960G        TOSHIBA  00 x1 
+---------------------------------------------------------------------------------
+
+ID=JBOD Target ID|EID=Enclosure Device ID|Slt=Slot No|DID=Device ID|Onln=Online
+Offln=Offline|Intf=Interface|Med=Media Type|SeSz=Sector Size
+SED=Self Encryptive Drive|PI=Protection Info|Sp=Spun|U=Up|D=Down
+
+Physical Drives = 3
+
+PD LIST :
+=======
+
+---------------------------------------------------------------------------------
+EID:Slt DID State DG       Size Intf Med SED PI SeSz Model               Sp Type 
+---------------------------------------------------------------------------------
+64:0      0 Onln  -  931.512 GB SATA HDD N   N  512B ST1000NM004A-2MN130 U  JBOD 
+64:1      1 Onln  -    7.277 TB SATA HDD N   N  512B ST8000NM0205-2FF112 U  JBOD 
+64:2      2 Onln  -  894.252 GB SAS  SSD N   N  512B KPM5XRUG960G        U  JBOD 
+---------------------------------------------------------------------------------
+
+EID=Enclosure Device ID|Slt=Slot No|DID=Device ID|DG=DriveGroup
+DHS=Dedicated Hot Spare|UGood=Unconfigured Good|GHS=Global Hotspare
+UBad=Unconfigured Bad|Sntze=Sanitize|Onln=Online|Offln=Offline|Intf=Interface
+Med=Media Type|SED=Self Encryptive Drive|PI=Protection Info
+SeSz=Sector Size|Sp=Spun|U=Up|D=Down|T=Transition|F=Foreign
+UGUnsp=UGood Unsupported|UGShld=UGood shielded|HSPShld=Hotspare shielded
+CFShld=Configured shielded|Cpybck=CopyBack|CBShld=Copyback Shielded
+UBUnsp=UBad Unsupported|Rbld=Rebuild
+
+Enclosures = 1
+
+Enclosure LIST :
+==============
+
+--------------------------------------------------------------------
+EID State Slots PD PS Fans TSs Alms SIM Port# ProdID VendorSpecific 
+--------------------------------------------------------------------
+ 64 OK        8  3  0    0   0    0   0 -     BP14G+      ?         
+--------------------------------------------------------------------
+
+EID=Enclosure Device ID | PD=Physical drive count | PS=Power Supply count
+TSs=Temperature sensor count | Alms=Alarm count | SIM=SIM Count | ProdID=Product ID
+
+
+BBU_Info :
+========
+
+----------------------------------------------
+Model State   RetentionTime Temp Mode MfgDate 
+----------------------------------------------
+BBU   Optimal 0 hour(s)     25C  -    0/00/00 
+----------------------------------------------
+
+
+
+---- /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64 /c0/vall show all
+CLI Version = 007.2313.0000.0000 Mar 07, 2023
+Operating system = Linux 6.8.0-137-generic
+Controller = 0
+Status = Success
+Description = No VD's have been configured.
+
+
+---- /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64 /c0 show jbod
+CLI Version = 007.2313.0000.0000 Mar 07, 2023
+Operating system = Linux 6.8.0-137-generic
+Controller = 0
+Status = Failure
+Description = None
+
+Detailed Status :
+===============
+
+-------------------------------------------
+Ctrl_Prop Value                            
+-------------------------------------------
+JBOD      Controller does not support JBOD 
+-------------------------------------------
+
+
+
+---- /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64 /c0/eall/sall show all
+CLI Version = 007.2313.0000.0000 Mar 07, 2023
+Operating system = Linux 6.8.0-137-generic
+Controller = 0
+Status = Success
+Description = Show Drive Information Succeeded.
+
+
+Drive /c0/e64/s0 :
+================
+
+---------------------------------------------------------------------------------
+EID:Slt DID State DG       Size Intf Med SED PI SeSz Model               Sp Type 
+---------------------------------------------------------------------------------
+64:0      0 Onln  -  931.512 GB SATA HDD N   N  512B ST1000NM004A-2MN130 U  JBOD 
+---------------------------------------------------------------------------------
+
+EID=Enclosure Device ID|Slt=Slot No|DID=Device ID|DG=DriveGroup
+DHS=Dedicated Hot Spare|UGood=Unconfigured Good|GHS=Global Hotspare
+UBad=Unconfigured Bad|Sntze=Sanitize|Onln=Online|Offln=Offline|Intf=Interface
+Med=Media Type|SED=Self Encryptive Drive|PI=Protection Info
+SeSz=Sector Size|Sp=Spun|U=Up|D=Down|T=Transition|F=Foreign
+UGUnsp=UGood Unsupported|UGShld=UGood shielded|HSPShld=Hotspare shielded
+CFShld=Configured shielded|Cpybck=CopyBack|CBShld=Copyback Shielded
+UBUnsp=UBad Unsupported|Rbld=Rebuild
+
+
+Drive /c0/e64/s0 - Detailed Information :
+=======================================
+
+Drive /c0/e64/s0 State :
+======================
+Shield Counter = 0
+Media Error Count = 0
+Other Error Count = 0
+Drive Temperature =  23C (73.40 F)
+Predictive Failure Count = 0
+S.M.A.R.T alert flagged by drive = No
+
+
+Drive /c0/e64/s0 Device attributes :
+==================================
+SN =             WJB09LE7
+Manufacturer Id = ATA     
+Model Number = ST1000NM004A-2MN130
+NAND Vendor = NA
+WWN = 5000C500D06E36E6
+Firmware Revision =     CAJC
+Raw size = 931.512 GB [0x74706db0 Sectors]
+Coerced size = 931.000 GB [0x74600000 Sectors]
+Non Coerced size = 931.012 GB [0x74606db0 Sectors]
+Device Speed = 6.0Gb/s
+Link Speed = 6.0Gb/s
+NCQ setting = Enabled
+Write Cache = Disabled
+Logical Sector Size = 512B
+Physical Sector Size = 512B
+Connector Name = 00 x1
+
+
+Drive /c0/e64/s0 Policies/Settings :
+==================================
+Enclosure position = 1
+Connected Port Number = 1(path0) 
+Sequence Number = 2
+Commissioned Spare = No
+Emergency Spare = No
+Last Predictive Failure Event Sequence Number = 0
+Successful diagnostics completion on = N/A
+FDE Type = None
+SED Capable = No
+SED Enabled = No
+Secured = No
+Cryptographic Erase Capable = Yes
+Sanitize Support = Not supported
+Locked = No
+Needs EKM Attention = No
+PI Eligible = No
+Certified = Yes
+Wide Port Capable = No
+Multipath = No
+
+Port Information :
+================
+
+-----------------------------------------
+Port Status Linkspeed SAS address        
+-----------------------------------------
+   0 Active 6.0Gb/s   0x32cea7f07d5f2d01 
+-----------------------------------------
+
+
+Inquiry Data = 
+5a 0c ff 3f 37 c8 10 00 00 00 00 00 3f 00 00 00 
+00 00 00 00 20 20 20 20 20 20 20 20 20 20 20 20 
+4a 57 30 42 4c 39 37 45 00 00 00 00 00 00 20 20 
+20 20 41 43 43 4a 54 53 30 31 30 30 4d 4e 30 30 
+41 34 32 2d 4e 4d 33 31 20 30 20 20 20 20 20 20 
+20 20 20 20 20 20 20 20 20 20 20 20 20 20 01 80 
+00 40 00 2f 00 40 00 02 00 02 07 00 ff 3f 10 00 
+3f 00 10 fc fb 00 01 7d ff ff ff 0f 00 00 07 00 
+
+
+
+Drive /c0/e64/s1 :
+================
+
+-------------------------------------------------------------------------------
+EID:Slt DID State DG     Size Intf Med SED PI SeSz Model               Sp Type 
+-------------------------------------------------------------------------------
+64:1      1 Onln  -  7.277 TB SATA HDD N   N  512B ST8000NM0205-2FF112 U  JBOD 
+-------------------------------------------------------------------------------
+
+EID=Enclosure Device ID|Slt=Slot No|DID=Device ID|DG=DriveGroup
+DHS=Dedicated Hot Spare|UGood=Unconfigured Good|GHS=Global Hotspare
+UBad=Unconfigured Bad|Sntze=Sanitize|Onln=Online|Offln=Offline|Intf=Interface
+Med=Media Type|SED=Self Encryptive Drive|PI=Protection Info
+SeSz=Sector Size|Sp=Spun|U=Up|D=Down|T=Transition|F=Foreign
+UGUnsp=UGood Unsupported|UGShld=UGood shielded|HSPShld=Hotspare shielded
+CFShld=Configured shielded|Cpybck=CopyBack|CBShld=Copyback Shielded
+UBUnsp=UBad Unsupported|Rbld=Rebuild
+
+
+Drive /c0/e64/s1 - Detailed Information :
+=======================================
+
+Drive /c0/e64/s1 State :
+======================
+Shield Counter = 0
+Media Error Count = 0
+Other Error Count = 0
+Drive Temperature =  25C (77.00 F)
+Predictive Failure Count = 0
+S.M.A.R.T alert flagged by drive = No
+
+
+Drive /c0/e64/s1 Device attributes :
+==================================
+SN =             ZA1J91ZN
+Manufacturer Id = ATA     
+Model Number = ST8000NM0205-2FF112
+NAND Vendor = NA
+WWN = 5000C500C61A4251
+Firmware Revision =     PB53
+Raw size = 7.277 TB [0x3a3812ab0 Sectors]
+Coerced size = 7.276 TB [0x3a3700000 Sectors]
+Non Coerced size = 7.276 TB [0x3a3712ab0 Sectors]
+Device Speed = 6.0Gb/s
+Link Speed = 6.0Gb/s
+NCQ setting = Enabled
+Write Cache = Disabled
+Logical Sector Size = 512B
+Physical Sector Size = 4 KB
+Connector Name = 00 x1
+
+
+Drive /c0/e64/s1 Policies/Settings :
+==================================
+Enclosure position = 0
+Connected Port Number = 0(path0) 
+Sequence Number = 2
+Commissioned Spare = No
+Emergency Spare = No
+Last Predictive Failure Event Sequence Number = 0
+Successful diagnostics completion on = N/A
+FDE Type = None
+SED Capable = No
+SED Enabled = No
+Secured = No
+Cryptographic Erase Capable = Yes
+Sanitize Support = Not supported
+Locked = No
+Needs EKM Attention = No
+PI Eligible = No
+Certified = Yes
+Wide Port Capable = No
+Multipath = No
+
+Port Information :
+================
+
+-----------------------------------------
+Port Status Linkspeed SAS address        
+-----------------------------------------
+   0 Active 6.0Gb/s   0x32cea7f07d5f2d00 
+-----------------------------------------
+
+
+Inquiry Data = 
+5a 0c ff 3f 37 c8 10 00 00 00 00 00 3f 00 00 00 
+00 00 00 00 20 20 20 20 20 20 20 20 20 20 20 20 
+41 5a 4a 31 31 39 4e 5a 00 00 00 00 00 00 20 20 
+20 20 42 50 33 35 54 53 30 38 30 30 4d 4e 32 30 
+35 30 32 2d 46 46 31 31 20 32 20 20 20 20 20 20 
+20 20 20 20 20 20 20 20 20 20 20 20 20 20 01 80 
+00 40 00 2f 00 40 00 02 00 02 07 00 ff 3f 10 00 
+3f 00 10 fc fb 00 01 7d ff ff ff 0f 00 00 07 00 
+
+
+
+Drive /c0/e64/s2 :
+================
+
+------------------------------------------------------------------------------
+EID:Slt DID State DG       Size Intf Med SED PI SeSz Model            Sp Type 
+------------------------------------------------------------------------------
+64:2      2 Onln  -  894.252 GB SAS  SSD N   N  512B KPM5XRUG960G     U  JBOD 
+------------------------------------------------------------------------------
+
+EID=Enclosure Device ID|Slt=Slot No|DID=Device ID|DG=DriveGroup
+DHS=Dedicated Hot Spare|UGood=Unconfigured Good|GHS=Global Hotspare
+UBad=Unconfigured Bad|Sntze=Sanitize|Onln=Online|Offln=Offline|Intf=Interface
+Med=Media Type|SED=Self Encryptive Drive|PI=Protection Info
+SeSz=Sector Size|Sp=Spun|U=Up|D=Down|T=Transition|F=Foreign
+UGUnsp=UGood Unsupported|UGShld=UGood shielded|HSPShld=Hotspare shielded
+CFShld=Configured shielded|Cpybck=CopyBack|CBShld=Copyback Shielded
+UBUnsp=UBad Unsupported|Rbld=Rebuild
+
+
+Drive /c0/e64/s2 - Detailed Information :
+=======================================
+
+Drive /c0/e64/s2 State :
+======================
+Shield Counter = 0
+Media Error Count = 0
+Other Error Count = 0
+Drive Temperature =  31C (87.80 F)
+Predictive Failure Count = 0
+S.M.A.R.T alert flagged by drive = No
+
+
+Drive /c0/e64/s2 Device attributes :
+==================================
+SN = 21D0A131TNTF
+Manufacturer Id = TOSHIBA 
+Model Number = KPM5XRUG960G    
+NAND Vendor = NA
+WWN = 58CE38EE2150FF2C
+Firmware Revision = B028
+Firmware Release Number = N/A
+Raw size = 894.252 GB [0x6fc81ab0 Sectors]
+Coerced size = 893.750 GB [0x6fb80000 Sectors]
+Non Coerced size = 893.752 GB [0x6fb81ab0 Sectors]
+Device Speed = 12.0Gb/s
+Link Speed = 12.0Gb/s
+Write Cache = Disabled
+Logical Sector Size = 512B
+Physical Sector Size = 4 KB
+Connector Name = 00 x1
+
+
+Drive /c0/e64/s2 Policies/Settings :
+==================================
+Enclosure position = 0
+Connected Port Number = 2(path0) 
+Sequence Number = 2
+Commissioned Spare = No
+Emergency Spare = No
+Last Predictive Failure Event Sequence Number = 0
+Successful diagnostics completion on = N/A
+FDE Type = None
+SED Capable = No
+SED Enabled = No
+Secured = No
+Cryptographic Erase Capable = Yes
+Sanitize Support = Not supported
+Locked = No
+Needs EKM Attention = No
+PI Eligible = No
+Certified = Yes
+Wide Port Capable = No
+Multipath = No
+
+Port Information :
+================
+
+-----------------------------------------
+Port Status Linkspeed SAS address        
+-----------------------------------------
+   0 Active 12.0Gb/s  0x58ce38ee2150ff2e 
+   1 Active 12.0Gb/s  0x0                
+-----------------------------------------
+
+
+Inquiry Data = 
+00 00 06 12 5b 00 10 02 54 4f 53 48 49 42 41 20 
+4b 50 4d 35 58 52 55 47 39 36 30 47 20 20 20 20 
+42 30 32 38 32 31 44 30 41 31 33 31 54 4e 54 46 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+
+
+
+
+---- /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64 /c0/cv show all
+CLI Version = 007.2313.0000.0000 Mar 07, 2023
+Operating system = Linux 6.8.0-137-generic
+Controller = 0
+Status = Failure
+Description = None
+
+Detailed Status :
+===============
+
+----------------------------------------------------
+Ctrl Status Property ErrMsg                   ErrCd 
+----------------------------------------------------
+   0 Failed -        Cachevault doesn't exist   255 
+----------------------------------------------------
+
+
+
+---- /home/users/u7599095/perccli/opt/MegaRAID/perccli/perccli64 /c0/bbu show all
+CLI Version = 007.2313.0000.0000 Mar 07, 2023
+Operating system = Linux 6.8.0-137-generic
+Controller = 0
+Status = Success
+Description = None
+
+
+BBU_Info :
+========
+
+----------------------
+Property      Value   
+----------------------
+Type          BBU     
+Voltage       3932 mV 
+Current       0 mA    
+Temperature   25 C    
+Battery State Optimal 
+----------------------
+
+
+BBU_Firmware_Status :
+===================
+
+-------------------------------------------------
+Property                                   Value 
+-------------------------------------------------
+Charging Status                            None  
+Voltage                                    OK    
+Temperature                                OK    
+Learn Cycle Requested                      No    
+Learn Cycle Active                         No    
+Learn Cycle Status                         OK    
+Learn Cycle Timeout                        No    
+I2C Errors Detected                        No    
+Battery Pack Missing                       No    
+Replacement required                       No    
+Remaining Capacity Low                     No    
+Periodic Learn Required                    No    
+Transparent Learn                          No    
+No space to cache offload                  No    
+Pack is about to fail & should be replaced No    
+Cache Offload premium feature required     No    
+Module microcode update required           No    
+-------------------------------------------------
+
+
+GasGaugeStatus :
+==============
+
+-------------------------------------
+Property                   Value     
+-------------------------------------
+GasGauge StatusCode        0x38      
+Fully Discharged           N/A       
+Fully Charged              N/A       
+Discharging                N/A       
+Initialized                N/A       
+Remaining Time Alarm       N/A       
+Terminate Discharge Alarm  N/A       
+Over Temperature           N/A       
+Charging Terminated        N/A       
+Over Charged               N/A       
+Relative State of Charge   98%       
+Charger System State       Off       
+Remaining Capacity         534       
+Full Charge Capacity       543       
+Is SOH Good                Yes       
+Battery backup charge time 0 hour(s) 
+-------------------------------------
+
+
+BBU_Capacity_Info :
+=================
+
+--------------------------------------
+Property                 Value        
+--------------------------------------
+Relative State of Charge 99%          
+Absolute State of charge 0%           
+Remaining Capacity       534 mAh      
+Full Charge Capacity     543 mAh      
+Run time to empty        Unavailable  
+Average time to empty    Unavailable  
+Average Time to full     Unavailable  
+Cycle Count              23           
+Max Error                0%           
+Remaining Capacity Alarm 0 mAh        
+Remaining Time Alarm     0 minutes(s) 
+--------------------------------------
+
+
+BBU_Design_Info :
+===============
+
+--------------------------------
+Property                Value   
+--------------------------------
+Date of Manufacture     00/00/0 
+Design Capacity         0 mAh   
+Design Voltage          0 mV    
+Specification Info      0       
+Serial Number           0       
+Pack Stat Configuration 0       
+Manufacture Name        0x1285  
+Device Name                     
+Device Chemistry                
+Battery FRU             N/A     
+Transparent Learn       1       
+App Data                0       
+Module Version          0.16    
+--------------------------------
+
+
+BBU_Properties :
+==============
+
+-------------------------------------------
+Property             Value                 
+-------------------------------------------
+Auto Learn Period    90d (7776000 seconds) 
+Learn Delay Interval 0 hour(s)             
+Auto-Learn Mode      Transparent           
+-------------------------------------------
+
+
+
+---- sdparm --get=WCE /dev/sda (the cache bit the controller presents to Linux)
+sdparm not installed
+---- smartctl --scan
+/dev/sda -d scsi # /dev/sda, SCSI device
+/dev/sdb -d scsi # /dev/sdb, SCSI device
+/dev/sdc -d scsi # /dev/sdc, SCSI device
+/dev/bus/0 -d megaraid,0 # /dev/bus/0 [megaraid_disk_00], SCSI device
+/dev/bus/0 -d megaraid,1 # /dev/bus/0 [megaraid_disk_01], SCSI device
+/dev/bus/0 -d megaraid,2 # /dev/bus/0 [megaraid_disk_02], SCSI device
+/dev/nvme0 -d nvme # /dev/nvme0, NVMe device
+/dev/nvme1 -d nvme # /dev/nvme1, NVMe device
+---- smartctl -d megaraid,0 -i -g wcache /dev/bus/0
+smartctl 7.4 2023-08-01 r5530 [x86_64-linux-6.8.0-137-generic] (local build)
+Copyright (C) 2002-23, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF INFORMATION SECTION ===
+Model Family:     Seagate Exos 7E8
+Device Model:     ST1000NM004A-2MN130
+Serial Number:    WJB09LE7
+LU WWN Device Id: 5 000c50 0d06e36e6
+Add. Product Id:  DELL(tm)
+Firmware Version: CAJC
+User Capacity:    1,000,204,886,016 bytes [1.00 TB]
+Sector Size:      512 bytes logical/physical
+Rotation Rate:    7200 rpm
+Form Factor:      3.5 inches
+Device is:        In smartctl database 7.3/5528
+ATA Version is:   ACS-4 (minor revision not indicated)
+SATA Version is:  SATA 3.3, 6.0 Gb/s (current: 6.0 Gb/s)
+Local Time is:    Fri Oct 16 11:43:11 2026 AEDT
+SMART support is: Available - device has SMART capability.
+SMART support is: Enabled
+Write cache is:   Disabled
+
+---- smartctl -d megaraid,1 -i -g wcache /dev/bus/0
+smartctl 7.4 2023-08-01 r5530 [x86_64-linux-6.8.0-137-generic] (local build)
+Copyright (C) 2002-23, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF INFORMATION SECTION ===
+Model Family:     Seagate Enterprise Capacity 3.5 HDD
+Device Model:     ST8000NM0205-2FF112
+Serial Number:    ZA1J91ZN
+LU WWN Device Id: 5 000c50 0c61a4251
+Add. Product Id:  DELL(tm)
+Firmware Version: PB53
+User Capacity:    8,001,563,222,016 bytes [8.00 TB]
+Sector Sizes:     512 bytes logical, 4096 bytes physical
+Rotation Rate:    7200 rpm
+Form Factor:      3.5 inches
+Device is:        In smartctl database 7.3/5528
+ATA Version is:   ACS-3 T13/2161-D revision 5
+SATA Version is:  SATA 3.1, 6.0 Gb/s (current: 6.0 Gb/s)
+Local Time is:    Fri Oct 16 11:43:11 2026 AEDT
+SMART support is: Available - device has SMART capability.
+SMART support is: Enabled
+Write cache is:   Disabled
+
+---- smartctl -d megaraid,2 -i -g wcache /dev/bus/0
+smartctl 7.4 2023-08-01 r5530 [x86_64-linux-6.8.0-137-generic] (local build)
+Copyright (C) 2002-23, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF INFORMATION SECTION ===
+Vendor:               TOSHIBA
+Product:              KPM5XRUG960G
+Revision:             B028
+Compliance:           SPC-4
+User Capacity:        960,197,124,096 bytes [960 GB]
+Logical block size:   512 bytes
+Physical block size:  4096 bytes
+LU is resource provisioned, LBPRZ=1
+Rotation Rate:        Solid State Device
+Form Factor:          2.5 inches
+Logical Unit id:      0x58ce38ee2150ff2d
+Serial number:        21D0A131TNTF
+Device type:          disk
+Transport protocol:   SAS (SPL-4)
+Local Time is:        Fri Oct 16 11:43:11 2026 AEDT
+SMART support is:     Available - device has SMART capability.
+SMART support is:     Enabled
+Temperature Warning:  Disabled or Not Supported
+Writeback Cache is:   Disabled
+
+---- smartctl -i -g wcache /dev/sda
+smartctl 7.4 2023-08-01 r5530 [x86_64-linux-6.8.0-137-generic] (local build)
+Copyright (C) 2002-23, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF INFORMATION SECTION ===
+Model Family:     Seagate Exos 7E8
+Device Model:     ST1000NM004A-2MN130
+Serial Number:    WJB09LE7
+LU WWN Device Id: 5 000c50 0d06e36e6
+Add. Product Id:  DELL(tm)
+Firmware Version: CAJC
+User Capacity:    1,000,204,886,016 bytes [1.00 TB]
+Sector Size:      512 bytes logical/physical
+Rotation Rate:    7200 rpm
+Form Factor:      3.5 inches
+Device is:        In smartctl database 7.3/5528
+ATA Version is:   ACS-4 (minor revision not indicated)
+SATA Version is:  SATA 3.3, 6.0 Gb/s (current: 6.0 Gb/s)
+Local Time is:    Fri Oct 16 11:43:11 2026 AEDT
+SMART support is: Available - device has SMART capability.
+SMART support is: Enabled
+Write cache is:   Disabled
+
