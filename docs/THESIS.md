@@ -165,8 +165,9 @@ Two findings that arrived unplanned and are better material than the headline:
   worst of both worlds" on the media; the corrected reading is a stronger
   statement of the thesis, because the abstraction hides not just the medium
   but a mapping granularity the backend neither chooses nor observes. Inferred
-  from timing and `filefrag`; kernel-side confirmation
-  (`fs_dax:dax_writeback_one`) needs root and is pending.
+  from timing and `filefrag`, and confirmed in the kernel on 2026-10-16:
+  `fs_dax:dax_writeback_one` writes back one whole 2 MiB entry per commit at
+  2 MiB and two 4 KiB pages at 1 MiB ([root sitting](persistent-backends.md#magpies-root-sitting-2026-10-16)).
 - **Whole commits, not boundaries, decide the comparison once the boundary is
   small.** At 1 MiB and 24 entries the file backend on DAX committed *faster*
   than the PMEM backend (28.9 µs against 37.3 µs) — **an artefact of the PMEM
@@ -271,7 +272,7 @@ boundary per commit, and the cost lands in a different system call on each host:
 
 | Host | Device as Linux sees it | Boundary | `pwrite` | `fdatasync` |
 |---|---|---|---|---|
-| Magpie `/home` | MegaRAID SAS3508 volume, `write through`, no FUA | 129 µs | ~144 µs | ~1.7 µs |
+| Magpie `/home` | disk passed through a MegaRAID SAS3508 (Dell PERC H740P, eHBA), `write through`, no FUA | 129 µs | ~144 µs | ~1.7 µs |
 | sean-tan-PC `$HOME` | Solidigm NVMe, volatile write cache, FUA | 241 µs | ~23 µs | ~233 µs |
 
 On Magpie the barrier is empty — Linux sees a write-through device and sends no
@@ -282,9 +283,13 @@ and whether the barrier does anything at all.
 
 It also corrects the block-media column of everything above. `/home` reports a
 7,200 rpm drive, and a write acknowledged in ~130 µs has not reached a platter:
-every `file-block` figure is the latency to a RAID controller's acknowledgement.
-Whether that acknowledgement is power-safe depends on the controller's
-configuration and is not established (it needs `storcli` and an administrator).
+every `file-block` figure is the latency to an acknowledgement given before the
+platter is written. The root sitting of 2026-10-16 found the controller in eHBA
+mode with no virtual drive and `sda` passed through with its own write cache
+disabled, and Dell documents write-through as the only cache policy for such
+disks. So what acknowledges the write is not identified, and whether it is
+power-safe is still not established
+([What acknowledges a write on `/home`](persistent-backends.md#what-acknowledges-a-write-on-home)).
 Chapter 6 must say so where it quotes a block figure, and should present the PC
 as the host where the flush demonstrably reaches a device with a volatile cache.
 
@@ -353,10 +358,15 @@ Chapter 6 should present it as a control. On Raptor Lake the cause is
 established by intervention: under `powersave` the clock after a block-storage
 boundary is 29–33 % of busy and the computation 2.9–3.2× PMEM's, and changing
 only the governor to `performance` keeps the clock at 100 % and the slowdown at
-1.02×. On Magpie, which has no OS frequency control to change, it is observed,
-not intervened on. Two limits must be stated: which idle state Magpie's core
-enters is not shown (the 1.0 GHz floor fits C1E, but could be the platform's own
-choice, and only `turbostat` would separate them), and the probe itself makes
+1.02×. On Magpie, which has no OS frequency control to change, it was observed
+and then, in the root sitting of 2026-10-16, intervened on: with C1E and C6
+disabled on the core, the clock after a boundary stays at 3.15–3.45 GHz, the
+computation falls from 1,068–1,113 µs to 448–504 µs (PMEM 426 µs), and the
+sieve's share on `/home` rises from 57 % to 72 %
+([The clock after a blocking boundary is the idle states](persistent-backends.md#the-clock-after-a-blocking-boundary-is-the-idle-states)).
+A B+Tree run's core stays at about 1.0 GHz with both states disabled, for a
+reason not established. Two limits must be stated: which of C1E and C6 lowers
+the clock is not separated, and the probe itself makes
 the computation it measures up to 3.6 % faster under `powersave`, because its
 busy time raises the utilisation the governor sees. Chapter 6 must say all this
 wherever it quotes a Magpie block figure for a workload that computes between
@@ -608,7 +618,8 @@ here; the cost results of figures 6–6e sit beside it.
    `live <= window + 1`.
 4. The coverage statement above, in substance unchanged.
 5. The hardware boundary: no power loss, ADR assumed against a clean DIMM
-   audit, and a write-through controller behind every block-storage figure.
+   audit, and every block-storage figure acknowledged before the platter is
+   written, by a component not yet identified (2026-10-16).
 
 ---
 
@@ -659,7 +670,7 @@ cannot be written around missing numbers.
 | ~~Flush-placement negative control~~ | done 2026-09-18 | **Complete, both predictions held.** The mutant passes on Magpie with a bit-identical durable answer while the explorer rejects it. The thesis spine is now demonstrated. Figure 7 is ready to draw. |
 | ~~Persistence-boundary cost characterisation~~ | done 2026-09-18 | **Complete, 72 runs committed in `results/`, all claims verified against the CSVs.** ~3 orders of magnitude between the boundary primitives on identical media; exactly 1.000 boundaries per commit everywhere. Findings: the file backend on DAX is 7–8.6× slower than on block storage at 2 MiB — caused by whole-2 MiB-entry flushing, not the media (region-size sweep 2026-09-23: ~5 µs at 1 MiB) — on PMEM record construction outweighs the boundary by 29× (**corrected 2026-09-28**: an in-window figure; the writebacks cost 14–43 % of a commit once `CLWB`'s eviction on Cascade Lake is counted), `SFENCE` flat in transaction size while `CLWB` is linear at 72–73.5 cycles/line — and `fdatasync`-on-DAX is bimodal, so quote ratios as orders of magnitude, never to 3 s.f. |
 | ~~File-backed crash model, stated~~ | done 2026-09-18 | **Complete, no code.** Written in [PMEM Crash Model](pmem-crash-model.md#the-file-backed-model-is-simpler-but-not-trivial): pre-boundary cuts still fan out, the asynchronous-flush dimension disappears, the unit is a page, the atomicity contract names the filesystem. The direct backend's model, a checked restriction of the PMEM one, followed on 2026-09-24. See below. |
-| ~~Third backend: direct I/O~~ | done 2026-09-24, hardware 2026-09-27 | **Added after the plan, before the freeze.** `DirectIoRegion`: private staging buffer, `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a file or a raw block device. Same trace as the PMEM backend; every post-`fdatasync` file image checked exactly against the PMEM model; kill-loop mutant `LOST` / ordinary `OK` on Magpie and the PC; and the finding that Magpie's block storage is a write-through RAID controller, so every `file-block` figure is a controller round trip. See "Where the persistence point is" above. |
+| ~~Third backend: direct I/O~~ | done 2026-09-24, hardware 2026-09-27 | **Added after the plan, before the freeze.** `DirectIoRegion`: private staging buffer, `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a file or a raw block device. Same trace as the PMEM backend; every post-`fdatasync` file image checked exactly against the PMEM model; kill-loop mutant `LOST` / ordinary `OK` on Magpie and the PC; and the finding that Magpie's block storage acknowledges before the platter, so every `file-block` figure is a round trip to that acknowledgement (first read as the RAID controller's; on 2026-10-16 the controller was found passing `sda` through, write-through, and what acknowledges is not identified). See "Where the persistence point is" above. |
 | ~~Stage 2c — reserved-DRAM warm reboot~~ | done 2026-09-24 | **Complete, the experiment discriminates.** Ordinary build `SURVIVED` and mutant `LOST` (every acknowledged step) in 3 of 3 pairs, with the reset issued from inside the process. On the way, two host facts that the write-up needs: the firmware wipes RAM after a `sysrq` reset unless the kernel's memory-overwrite request is cleared, and a seconds-long window before the reset lets every unflushed line reach memory. |
 | ~~`CLWB` eviction and the batched apply~~ | done 2026-09-28 | **Added after the plan, before the freeze; the one production change since the triage.** Follows up the PMEM backend's unexplained per-entry slope. On Cascade Lake `CLWB` evicts, and the within-commit store into a just-written-back line was ~95 % of the writebacks' cost (established by intervention, timing only). Writing each after-image line back once at the end of the apply is now production, with 7 new tests and four mutants each caught: 43 % faster at 24 entries on Magpie, 7–8 % on Raptor Lake, where `CLWB` does not evict. See "Boundary cost" above. |
 | ~~Sieve-step cost (`pwsievebench`)~~ | done 2026-09-28 | **Added after the plan, before the freeze.** The only cost measurement of a program rather than a harness-chosen transaction: persistence is 9–11 % of a step on PMEM and 55–86 % on block storage, and blocking costs the computation after it clock speed, observed without root on 2026-09-29 with a clock probe added before the freeze. See "What a program pays" above. |
@@ -887,7 +898,8 @@ Seven, and they need real hours budgeted.
    `fdatasync` on the same DAX media 927 µs, `fdatasync` on block storage
    148 µs. A fourth bar since 2026-09-27: `direct-block`, 129 µs against
    `file-block`'s 137 µs in the same campaign; label both block bars as a
-   write-through RAID controller, which is what they measure.
+   pass-through disk behind a write-through controller, acknowledged before
+   the platter (2026-10-16), which is what they measure.
    Plot on a log axis; a linear one cannot show 2,000× and 6.3× on the
    same figure. State the 2 MiB region geometry on the figure: the
    `fdatasync`-on-DAX bar is conditional on it (see 6c). Better: draw it as
@@ -904,7 +916,8 @@ Seven, and they need real hours budgeted.
    never quotable without a transaction size.
 6d. Where the boundary's time goes, per host (2026-09-27): the direct backend's
    boundary split into `pwrite` and `fdatasync`, Magpie (~144 µs / ~1.7 µs,
-   write-through RAID controller) beside sean-tan-PC (~23 µs / ~233 µs, NVMe
+   pass-through disk behind a write-through controller) beside sean-tan-PC
+   (~23 µs / ~233 µs, NVMe
    with a volatile cache), with the mmap file backend's single `fdatasync` on the
    same filesystems (137 µs, 237 µs) as a reference bar. Stacked bars, linear
    axis. The figure's point is that the persistence point, not the interface,
@@ -977,3 +990,5 @@ Figure 7 is the whole argument in one picture.
   finding no longer needs root: the probe observed it on 2026-09-29. `turbostat`
   during a sieve run on `/home` would add only which idle state the core
   enters, so ask for it only if it costs nothing extra in the same sitting.
+  Done 2026-10-16, with `turbostat` and C1E and C6 disabled for half the runs
+  ([root sitting](persistent-backends.md#magpies-root-sitting-2026-10-16)).

@@ -81,7 +81,7 @@ halves are means (totals over boundaries), from the timing region's split.
 
 | Host | Target | What Linux reports | `direct` boundary | `pwrite` | `fdatasync` | `file` backend, same filesystem |
 |---|---|---|---|---|---|---|
-| Magpie | ext4 on LVM on `sda`, behind a Broadcom MegaRAID SAS3508 | rotational, `write through`, no FUA | **128.7 µs** | ~144 µs | **~1.7 µs** | 136.6 µs |
+| Magpie | ext4 on LVM on `sda`, a pass-through disk on a Broadcom MegaRAID SAS3508 (Dell PERC H740P, eHBA) | rotational, `write through`, no FUA | **128.7 µs** | ~144 µs | **~1.7 µs** | 136.6 µs |
 | sean-tan-PC | ext4 on Solidigm NVMe `nvme1n1` | `write back`, FUA, volatile write cache present (VWC 0x7), atomic write unit 512 B | **241.4 µs** | ~23 µs | **~233 µs** | 237.3 µs |
 | sean-tan-PC | raw `/dev/pmem0` (memmap-reserved DRAM, pmem driver, no BTT) | `write back`, no FUA | 0.66 µs | 0.52 µs | 0.14 µs | — |
 
@@ -99,20 +99,23 @@ write-through device, so `fdatasync` has no flush to send and returns in about
 volatile write cache, the write takes about 23 µs, and the flush carries 91 %.
 The code, the seam call and the WAL's single boundary per commit are identical.
 
-**2. Magpie's block numbers are the latency to a RAID controller's
-acknowledgement, not to a disk.** `sda` reports itself as a 7,200 rpm drive,
-whose average rotational latency alone is about 4 ms; a write acknowledged in
-~130 µs has not reached a platter. `sda` sits behind the MegaRAID controller,
-which reports `write through` and no FUA, so the durability point Linux sees is
-the controller's acknowledgement. This applies to every `file-block` figure on
-this page, not only to the direct backend. Whether that acknowledgement is
-power-safe depends on how the controller exposes `sda` — a virtual drive with a
-battery- or flash-backed cache, or a pass-through drive whose own volatile cache
-is hidden from Linux — and has not been determined (`storcli /c0/v0 show all`,
-needs an administrator). The regime switches of the
+**2. Magpie's block numbers are the latency to an early acknowledgement, not
+to a disk.** `sda` reports itself as a 7,200 rpm drive, whose average rotational
+latency alone is about 4 ms; a write acknowledged in ~130 µs has not reached a
+platter. `sda` sits behind the MegaRAID controller, which reports
+`write through` and no FUA, so the durability point Linux sees is an
+acknowledgement from below the kernel. This applies to every `file-block`
+figure on this page, not only to the direct backend. This section first read it
+as the controller's; the
+[root sitting of 2026-10-16](#what-acknowledges-a-write-on-home) found the
+controller (a Dell PERC H740P) in eHBA mode with no virtual drive, `sda` passed
+through with its own write cache disabled, and write-through documented as the
+only policy for such disks. So what acknowledges the write is not identified,
+and whether the acknowledgement is power-safe is still not established. The
+regime switches of the
 [block-media configuration](#the-block-media-configuration-is-not-a-controlled-measurement-here)
-are consistent with the controller's cache state changing between sittings; that
-is a candidate, not a finding.
+were offered as consistent with the controller's cache state changing between
+sittings; with no cache documented in the path, that candidate is withdrawn.
 
 **3. Bypassing the page cache changes little on either host.** At 2 MiB the
 direct and file backends are within 8 % of each other at every size, and in
@@ -129,9 +132,10 @@ after each writeback: exactly 2 extra minor faults per commit for `file-block`
 the count is **1 per commit at 2 MiB and 2 at 1 MiB**: at 2 MiB both dirtied
 pages sit under one 2 MiB DAX entry, so one fault re-dirties both. That is
 independent, root-free corroboration of the
-[region-size mechanism](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries);
-the `fs_dax:dax_writeback_one` confirmation is still pending. At these device
-latencies the faults are negligible.
+[region-size mechanism](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries),
+which the `fs_dax:dax_writeback_one` tracepoint has since observed directly
+([2026-10-16](#fdatasync-on-dax-writes-back-whole-2-mib-entries-observed)). At
+these device latencies the faults are negligible.
 
 **5. The 1 MiB penalty on Magpie is below the page cache.** At 512 × 2048 both
 block configurations are slower than at 512 × 4096 (direct 149–176 µs, file
@@ -200,8 +204,8 @@ In short: on fsdax the restriction needs the baseline profile and the kernel's
 `fsync` contract; on block storage it also needs every 64-byte line to reach
 the device as it stood at one instant (B2), which no specification promises and
 which holds by construction only under stable writes, which sean-tan-PC's NVMe
-does not request (Magpie's devices are not yet checked; see the last
-follow-up below).
+does not request, and nor does any of Magpie's block devices
+([checked 2026-10-16](#b2-on-magpie)).
 
 Before the change the backend set a flag in `prepareChangedRange`, called
 `fdatasync` in `persistChanges`, and synced a `persistRange` with an `msync` of
@@ -545,6 +549,8 @@ the kill loop's result on a second host.
    CPU?), `lsblk`, the dm uuids and every block device's `queue/stable_writes`,
    in `block-stack.txt` and a line of `summary.txt`:
    `sudo env PWROOT_USER=u7599095 <checkout>/scripts/magpie-root-checks.sh`.
+   Run 2026-10-16: `linear`, unencrypted, and no device requests stable writes
+   ([below](#b2-on-magpie)).
 6. **Magpie's core clock on block storage (2026-10-15).** The same script's
    section 5 is the intervention the clock probe could not make on Magpie
    ([below](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence)): probed sieve runs
@@ -558,7 +564,228 @@ the kill loop's result on a second host.
    intel_idle switches off the hardware's own promotion of C1 to C1E
    (`disable_promotion_to_c1e` for Skylake-X, which covers Cascade Lake), so
    the disabled state is enough. Results in `clock-*.log`, `.turbostat`,
-   `.perf` and a block of `summary.txt`. Not yet run.
+   `.perf` and a block of `summary.txt`. Run 2026-10-16: the drop is the idle
+   states, and the B+Tree's core runs at about 1.0 GHz either way
+   ([below](#the-clock-after-a-blocking-boundary-is-the-idle-states)).
+
+## Magpie's root sitting (2026-10-16)
+
+A Magpie administrator ran `scripts/magpie-root-checks.sh` with sudo on
+2026-10-16, for `u7599095` (`results/20261016T004310Z-magpie-root-checks`;
+script and benchmarks at `49812234`, kernel 6.8.0-137). It answers follow-ups 5
+and 6 above, and the three questions the rest of this page left for root: what
+acknowledges a write on `/home`, whether `fdatasync` on DAX writes back whole
+2 MiB entries, and which idle state a core enters after a blocking boundary.
+Every figure below is from the files in that directory; the sieve's shares are
+its persistence phases over wall time per step, as in every sieve campaign.
+
+### What acknowledges a write on `/home`
+
+**The controller passes `sda` through.** PERCCLI (`controller.txt`) reports a
+Dell PERC H740P Adapter (Broadcom's SAS3508 under Dell's subsystem ID, so the
+same card the rest of this page calls a MegaRAID SAS3508), firmware
+5.130.00-3337, in the **eHBA** personality, with **no virtual drive
+configured**. All three drives are online as non-RAID (JBOD) disks. Slot 0 is a
+Seagate Exos 7E8 `ST1000NM004A`: 1 TB, 7,200 rpm, SATA, 512-byte sectors.
+`smartctl` reads the same serial number through the controller and from
+`/dev/sda`, so `sda` is that drive. The other two are an 8 TB Seagate disk and a
+960 GB Toshiba SAS SSD. `/home` is a `linear` LVM volume on `sda3`
+(`block-stack.txt`).
+
+**Every cache the reports show is off or battery-backed.** All three drives'
+own write caches are `Disabled`, in PERCCLI and in `smartctl`'s reading of each
+drive. The controller has a battery (`BBU`, state `Optimal`, 98–99 % charge, no
+replacement required) and no CacheVault. Dell documents write-through as the
+only cache policy for non-RAID disks
+([PERC 10 User's Guide, "Non-RAID disk"](https://www.dell.com/support/manuals/en-ae/perc-h745/perc10_ug/non-raid-disk?guid=guid-1fedc318-388d-41c2-b90e-d36a304ff232&lang=en-us)),
+so on Dell's account the controller's cache is not in `/home`'s path. `sdparm`
+is not installed on Magpie, so the cache bit the controller presents to Linux
+was not read directly; Linux reports it as `write through`.
+
+**`fdatasync` sends no flush.** With `block:block_rq_issue` traced during
+pwbench (2 MiB, 8 entries, 2,000 commits after 200 warm-up), each backend
+issued 2,211 requests to `sda`, every one `WS` (a synchronous write), none
+flagged as a flush or FUA. The inference from `fdatasync`'s ~1.7 µs
+([above](#cost-the-same-seam-call-a-different-persistence-point)) is now
+observed: a write-through device is sent no flush, and the write carries the
+boundary.
+
+**Yet each write is acknowledged before the platter can have it.** 2,199 of each
+backend's 2,211 requests are the same 8 KiB at sector 1,553,156,104, one per
+boundary: the two adjacent 4 KiB units a boundary writes, coalesced as before. Each
+is issued a median 210 µs after the one before (p10 201, p90 237 µs; the file
+backend 214 µs), and the boundary's median is 177.3 µs (file 171.7 µs). A
+7,200 rpm disc turns once every 8.3 ms, and a sector just written has to come
+round again before it can be rewritten, so a rewrite that reached the platter
+would take about 8 ms, some 47 times the boundary. Something below Linux
+acknowledges the write before the platter has it, and none of the reports names
+it. Two candidates, both untested:
+
+- **A non-volatile cache inside the drive** that its write-cache setting does not
+  govern, such as an on-disc media cache. A 2015 SNIA presentation describes
+  such caches as giving "write cache enabled performance with the data security
+  of write cache disabled", and says the new ones are "embedded in the base
+  product and very likely cannot be disabled"
+  ([*Cache Assist in Hard Drives*, slides 5 and 7](https://snia.org/sites/default/files/emerald/EPA_Storage_Stakeholders_Nov-2015/Cache_Assist.pdf)).
+  Nothing here shows that this model has one.
+- **The controller caching non-RAID writes** despite the documented policy. Its
+  cache is battery-backed.
+
+Either would survive a power cut. One that would not, a volatile cache in the
+drive that ignores its own `Disabled` setting, is not ruled out by anything
+here. So **whether `/home`'s acknowledgements are power-safe is still not
+established**, but the question has moved: the controller's configuration is
+now known, and what is open is what this drive does with a write its own cache
+setting says it does not cache. Seagate's documentation for the model is the
+cheap next step; a power cut is not available on Magpie (Stage 3 in
+`ROADMAP.md`).
+
+**What this changes on this page.** "A RAID controller's acknowledgement" was
+the right reading of what Linux could see, but the controller is not acting as
+a RAID controller for `/home`, and on Dell's account its cache is not involved.
+Every `file-block` and `direct-block` figure on Magpie is the latency to an
+acknowledgement given before the platter is written, by a component not yet
+identified. The controller's cache changing state between sittings is no
+longer a candidate for
+[the two block-media regimes](#the-block-media-configuration-is-not-a-controlled-measurement-here).
+
+A side observation: the two traced runs' region files, each created and removed
+in turn, occupied the same sectors. That is the premise of the untested
+sticky-placement candidate for those regimes
+([below](#region-size-at-fixed-block-size-and-the-numa-penalty-at-1-mib)); one
+observation shows that reuse happens, not that it selects the regime.
+
+### `fdatasync` on DAX writes back whole 2 MiB entries: observed
+
+`fs_dax:dax_writeback_one` traced during pwbench on `/mnt/pmem0.0/sean`, file
+backend, 8 entries, 200 commits after 20 warm-up, so 220 commits a run:
+
+| Region | Events | `pglen` | `pgoff` | Events per commit |
+|---|---|---|---|---|
+| 2 MiB (512 × 4096) | 226 | every one `0x200` (512 pages: one 2 MiB entry) | every one 0 | 1.03 |
+| 1 MiB (512 × 2048) | 456 | every one `0x1` (one 4 KiB page) | 225 at page 0, 221 at page 1, 10 at pages 250–255 | 2.07 |
+
+This is [the region-size mechanism's](#region-size-fdatasync-on-dax-flushes-whole-2-mib-entries)
+prediction exactly. At 2 MiB every `fdatasync` writes back the whole entry the
+region's first 2 MiB sits under; at 1 MiB, where the kernel uses 4 KiB entries,
+it writes back the two dirtied pages and nothing else. The mechanism is now
+observed in the kernel rather than inferred from timing. The ten events at
+pages 250–255 come one to three times a run, not per commit.
+
+The runs were not pinned. They ran on CPU 87, which turbostat lists in package
+1, and the namespace is on node 0; the 2 MiB boundary's median, 1,146.4 µs,
+matches the cross-socket figure at 8 entries (1,145.5 µs,
+[below](#region-size-at-fixed-block-size-and-the-numa-penalty-at-1-mib)), and
+the 1 MiB one is 10.2 µs. Both ran under tracing, so neither is for comparison.
+
+### B2 on Magpie
+
+`/home` is `dm-2`, one `linear` target on `sda3` (8:3). All three of Magpie's
+device-mapper volumes are `linear`, with `LVM-` uuids and none `CRYPT-`. No
+block device on the host has `queue/stable_writes` set: not `sda`, not `dm-2`,
+not the NVMe drives or the pmem devices. So no layer copies a page with the
+CPU, and none holds a page stable while it is written. B2 holds by
+construction on Magpie no more than on sean-tan-PC's NVMe, and the file
+backend's restriction on `/home` rests on the platform's DMA read granularity
+there too
+([PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)).
+
+### The clock after a blocking boundary is the idle states
+
+Section 5 of the script ran probed sieve steps (`file` and `direct`, 256 × 4096,
+20 rounds of 159 measured steps, the geometry of every earlier Magpie sieve
+campaign) and a B+Tree run (`file`) on `/home`, pinned to CPU 2. Each ran twice,
+interleaving CPU 2's idle states as they are (POLL, C1, C1E and C6, all
+enabled, with exit latencies 0, 2, 10 and 133 µs) with C1E and C6 disabled on
+that CPU alone. Per sieve step, each repetition, in µs, with the probe's own
+time removed as in
+[the clock campaign](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence):
+
+| Backend | Idle states | Wall per step | Compute | Persistence phases | Share | Clock after the sieve; after each boundary | C1E; C6 residency |
+|---|---|---|---|---|---|---|---|
+| `file` | as they are | 2,452.2 / 2,491.4 | 1,067.6 / 1,071.2 | 1,384.3 / 1,419.9 | 56.5 / 57.0 % | 1,678–1,775 MHz; 986–987 MHz | 22.6–22.7 %; 10.5–10.8 % |
+| `file` | C1E, C6 off | 1,603.6 / 1,604.6 | 448.5 / 448.3 | 1,155.0 / 1,156.2 | 72.0 / 72.1 % | 3,356–3,452 MHz at every mark | 0; 0 (C1 49.9 %) |
+| `direct` | as they are | 2,571.3 / 2,561.5 | 1,112.9 / 1,107.2 | 1,458.1 / 1,454.0 | 56.7 / 56.8 % | 1,677–1,678 MHz; 986–987 MHz | 22.4–22.9 %; 15.8–16.4 % |
+| `direct` | C1E, C6 off | 1,790.7 / 1,780.6 | 504.3 / 503.1 | 1,286.3 / 1,277.4 | 71.8 / 71.7 % | 3,153–3,156 MHz at every mark | 0; 0 (C1 54.7–55.0 %) |
+
+The busy reference is 3,552 MHz in every run. One `file` run's publish mark
+read 1,479 MHz; every other boundary mark with the states enabled read
+986–987 MHz.
+
+- **The 1.0 GHz after a boundary is the idle states.** With them as they are,
+  the probe reproduces the clock campaign of 2026-09-29: 1.0 GHz after every
+  boundary and 1.7–1.8 GHz at the end of the sieve, against 3.55 GHz busy, while
+  turbostat puts the core in C1E for 22–23 % of the run and C6 for 11–16 %.
+  With C1E and C6 disabled on that core and nothing else changed, the clock
+  reads 3.15–3.45 GHz at every mark, 89–97 % of busy, and the core idles in C1
+  instead. This is established by intervention, as the governor established it
+  on Raptor Lake. C1E and C6 were disabled together, so which of the two lowers
+  the clock is not separated.
+- **The computation comes back almost to PMEM's.** It is 448 µs (`file`) and
+  503–504 µs (`direct`) against 1,068–1,113 µs with the states enabled; on PMEM
+  the same geometry computes for 426.2 µs (`20261014T025706Z`, another
+  sitting). Part of the remaining 5 % and 18 % is the clock, still 3–11 %
+  under the busy reference; the rest is not separated.
+- **The persistence phases shrink too**, by 17–19 % (`file`) and 12 % (`direct`).
+  Part of each boundary is CPU work, the kernel's included, and it ran at
+  1.0 GHz as well. That is an inference: the phases are not split into CPU and
+  device time.
+- **A step costs 30–36 % less, and the share rises from 57 % to 72 %.** The
+  clock campaign's conclusion, that on block storage the measured share
+  understates what durability costs a program, now has a size. With the states
+  enabled the `file` step spends 1,068–1,071 µs computing what takes 448 µs
+  without them (`direct`: 1,107–1,113 against 503–504 µs), and the ~600 µs
+  between is caused by blocking in the boundaries but counted as computation. Counting it with the persistence phases gives 80–82 % of the
+  step on both backends against the measured 57 %. That is an attribution, not
+  a measurement: it assumes the idle states are the only difference in the
+  computation.
+- **The setting is the host's, not the program's.** Every other Magpie figure
+  on this page ran with all idle states enabled, so a block-storage share there
+  is a property of the host's power configuration as well as of the workload.
+- **Disabling the states does not hold the clock up after a longer idle.** The
+  250 µs sleep reference still reads 1,972–1,973 MHz as its median with C1E and
+  C6 disabled, and 986 MHz at its p90: a core idle in C1 for 250 µs sometimes
+  comes back at the lowest clock all the same. Something besides the idle state
+  lowers the clock, which fits the B+Tree below.
+
+### The B+Tree's clock
+
+The B+Tree run (`file`; each round loads 5,000 keys and then runs 5,000
+operations, half lookups and half updates; three rounds after one audited,
+seed 1) measures the clock
+under [its computation on `/home`](#a-second-workload-what-a-btree-mutation-costs-2026-10-14),
+which had been inferred:
+
+| Idle states | Busy clock (turbostat; perf) | Busy | C1; C1E; C6 | Insert median | Update median | Compute per mutation | Lookup median |
+|---|---|---|---|---|---|---|---|
+| as they are | 1,006; 1,002 MHz | 37.3 % | 0.2; 46.0–46.3; 17.9–18.2 % | 2,190.4 / 2,195.5 µs | 2,252.2 / 2,257.9 µs | 13.5–13.6 µs | 1,368–1,371 ns |
+| C1E, C6 off | 1,026–1,027; 1,022–1,024 MHz | 36.4–36.6 % | 70.6–70.7; 0; 0 % | 2,179.2 / 2,175.5 µs | 2,250.2 / 2,247.3 µs | 13.5 µs | 1,340–1,357 ns |
+
+- **The core runs at about 1.0 GHz either way.** Disabling C1E and C6 moves its
+  busy clock by 2 % and each operation's median by under 1 %, and the
+  computation per mutation stays at 13.5–13.6 µs (13.3–13.5 µs in the campaign
+  of 2026-10-14) against 5.2–5.6 µs on PMEM. So the B+Tree's slower computation
+  on `/home` fits a 1.0 GHz clock, but not the idle-state exit that slows the
+  sieve.
+- **What holds it there is not explained.** Magpie has no cpufreq driver, so the
+  platform chooses the frequency. One untested candidate is a
+  utilisation-driven policy in the platform: the B+Tree's core is busy 36–37 %
+  of its run against the sieve's 46–52 % with the same states disabled, and the
+  sleep reference shows the clock falling without C1E or C6.
+
+### What the sitting leaves open
+
+- What acknowledges a write on `/home` before the platter, and whether it is
+  power-safe.
+- Which of C1E and C6 lowers the clock after a boundary, and why the B+Tree's
+  core stays at 1.0 GHz with both disabled.
+- The script restores C1E and C6 after every run and on exit, but records CPU
+  2's idle states only before section 5. `cat
+  /sys/devices/system/cpu/cpu2/cpuidle/state*/disable` (no root) shows whether
+  they are back on; recording them after the runs too is a one-line change to
+  the script.
+- Two repetitions per condition. Each pair agrees to within 1.6 % on wall time
+  per step.
 
 ---
 
@@ -708,10 +935,13 @@ is the whole entry whatever was written, and the NUMA penalty is a **constant
 supports this: the cross-socket penalty falls from ~220 µs to ~1 µs, in
 proportion to the lines flushed (see [below](#region-size-at-fixed-block-size-and-the-numa-penalty-at-1-mib)).
 
-**What this does and does not establish.** The mechanism is inferred from
-timing and file layout, not observed in the kernel. The direct confirmation is
-the `fs_dax:dax_writeback_one` tracepoint, whose `pglen` should read 512 (a
-2 MiB entry) at 2 MiB and 1 (a 4 KiB page) at 1 MiB; it needs root. The PMEM
+**What this does and does not establish.** The mechanism was inferred from
+timing and file layout. The direct confirmation is the
+`fs_dax:dax_writeback_one` tracepoint, whose `pglen` should read 512 (a 2 MiB
+entry) at 2 MiB and 1 (a 4 KiB page) at 1 MiB, and it does: in the root sitting
+of 2026-10-16 every writeback at 2 MiB was one whole entry, once per commit, and
+every one at 1 MiB a single page, twice per commit
+([observed](#fdatasync-on-dax-writes-back-whole-2-mib-entries-observed)). The PMEM
 backend and block storage at 1 MiB are covered by the matched-geometry campaign
 below, and the NUMA penalty at 1 MiB by the follow-up after it. Not yet
 measured: the prediction that a commit dirtying *k* separate 2 MiB entries costs about *k* × 927 µs —
@@ -1405,14 +1635,18 @@ P-core), medians over repetitions:
 
 On Raptor Lake the cause is therefore established by intervention: changing
 only the governor removes both the clock drop and the slowdown. On Magpie, which
-has no OS control to change, it is observed rather than intervened on. Which
-idle state Magpie's core enters is still not shown: the 1.0 GHz floor fits
-C1E, but could equally be the platform's own frequency choice, and only
-`turbostat` (root) would separate them. The consequence stands as before. On
-block storage a durable step costs more than its boundaries: the 55–57 %
-persistence share on Magpie understates what blocking costs the program, and
-pwbench, which issues boundaries back to back with almost no computation between
-them, cannot see it.
+has no frequency control for the OS to change, it was observed rather than
+intervened on until the
+[root sitting of 2026-10-16](#the-clock-after-a-blocking-boundary-is-the-idle-states)
+disabled C1E and C6 on the core. Then the clock after every boundary stayed at
+3.15–3.45 GHz instead of 1.0 GHz, the computation fell to 448 µs (`file`) and
+503–504 µs (`direct`), and the step to 1.60 and 1.78–1.79 ms, so on Magpie too
+the cause is established by intervention: the idle states. The consequence
+stands as before. On block storage a durable step costs more than its
+boundaries: the 55–57 % persistence share on Magpie understates what blocking
+costs the program (by the attribution in that section, the boundaries account
+for 80–82 % of the step), and pwbench, which issues boundaries back to back with
+almost no computation between them, cannot see it.
 
 **Still open: Magpie's per-boundary pattern.** On `/home` the sieve's boundaries
 cost 180–680 µs against pwbench's back-to-back median of 150–176 µs on the same
@@ -1687,7 +1921,10 @@ lookups in ns; the phases are means.
   5.2–5.6 µs on PMEM, and a lookup takes 1.2–1.3 µs. That matches the sieve's
   computation after a blocking boundary
   ([above](#a-real-workload-what-a-sieve-step-costs-and-how-much-is-persistence)).
-  Magpie has no clock probe, so this is an inference.
+  pwbtreebench has no clock probe, so this was an inference; turbostat has
+  since measured the core's busy clock over a B+Tree run on `/home` at about
+  1.0 GHz, and found it unchanged with C1E and C6 disabled, unlike the sieve's
+  ([2026-10-16](#the-btrees-clock)).
 - **The direct backend's mutations on `/home` have a heavy tail, not
   explained.** In every repetition its updates' p90 is 9.4–25.5 ms and their
   p99 35.6–43.6 ms, against `file-block`'s 2.6 ms and 2.8–3.0 ms. The medians
@@ -1933,6 +2170,9 @@ What this does not show:
 - **The clock, and height 2.** The PC's `powersave` caveat and the height limit
   are above. Magpie has no cpufreq driver, but its block runs block too. A run
   with a clock probe would separate the clock from the storage on either host.
+  On Magpie turbostat has since measured the clock, about 1.0 GHz busy with the
+  idle states enabled or not ([2026-10-16](#the-btrees-clock)), but not what
+  sets it.
 
 #### Reproducing the tree's figures, and on Magpie
 
@@ -2416,7 +2656,10 @@ creates and unlinks a file of the same size, so ext4 may hand the next run the
 blocks the last one freed, which would make physical placement on the shared
 LVM volume sticky across runs until other traffic takes those blocks. Running
 `filefrag -v` on the `/home` region file in each regime would test it without
-root.
+root. Reuse does happen: on 2026-10-16 two traced runs' region files, each
+created and removed in turn, occupied the same sectors
+([root sitting](#what-acknowledges-a-write-on-home)). Whether it selects the
+regime is still untested.
 
 **The NUMA penalty is proportional to what `fdatasync` flushes.** Node 1
 against node 0:
@@ -2688,6 +2931,16 @@ taking the rest. The "queued block device" above is therefore a RAID
 controller, and every figure in this section is the latency to its
 acknowledgement. Its cache state changing between sittings is a candidate for
 the two regimes; nothing has tested it.
+
+**And what it is not (2026-10-16).** The controller is a Dell PERC H740P in
+eHBA mode with no virtual drive, `sda` is passed through to Linux with its own
+write cache disabled, and Dell documents write-through as the only cache
+policy for such disks. So "a RAID controller" above is the card, not a RAID
+volume, and the acknowledgement comes from below Linux before the platter is
+written, from a component not yet identified
+([root sitting](#what-acknowledges-a-write-on-home)). With no cache documented
+in the path, the controller's cache state is withdrawn as a candidate for the
+two regimes; what moves `/home` between them is open.
 
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear

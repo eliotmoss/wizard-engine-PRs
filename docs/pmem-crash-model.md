@@ -953,13 +953,14 @@ half and miss an earlier store to the first, which is no prefix. With stable
 writes the page cannot change while it is written, and B2 holds by
 construction. sean-tan-PC's storage path (ext4 on an NVMe partition) copies no
 pages, so there B2 is the platform's DMA read granularity. Magpie's (ext4 on an
-LVM volume on the RAID controller) should not either, if the volume is linear
-and unencrypted, as its name suggests; that is not yet checked.
-`scripts/magpie-root-checks.sh` now records `dmsetup table` and `dmsetup info -c`
-(the volume's targets: `linear`, not `crypt` or `raid`) and every block
-device's `queue/stable_writes`; without root, `lsblk -o NAME,TYPE` (a `crypt`
-type) and `/sys/block/dm-*/dm/uuid` (a `CRYPT-` prefix) already rule out
-encryption, and `stable_writes` is world-readable.
+LVM volume on `sda`, a disk the RAID controller passes through) copies none
+either: `scripts/magpie-root-checks.sh`, run on 2026-10-16, found `/home`'s
+volume a single `linear` target with an `LVM-` uuid, no `crypt` target
+anywhere, and no block device on the host requesting stable writes
+(`results/20261016T004310Z-magpie-root-checks/block-stack.txt`;
+[Persistent Backends](persistent-backends.md#b2-on-magpie)). So on both hosts
+B2 is the platform's DMA read granularity, and on neither does it hold by
+construction.
 
 *Sector atomicity, flushes, filesystems.* A 512-byte sector holds eight whole
 lines, so under B3 every line is old or new. The model admits either, line by
