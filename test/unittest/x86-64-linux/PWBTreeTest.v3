@@ -37,6 +37,7 @@ def BTX = [
         BTT("unaligned_block_size_writes_back_whole_lines", test_btree_unaligned_block_size_writes_back_whole_lines),
         BTT("survives_a_garbage_collection",         test_btree_survives_a_garbage_collection),
         BTT("corrupted_image_fails_cleanly",         test_btree_corrupted_image_fails_cleanly),
+        BTT("checker_names_each_violation",          test_btree_checker_names_each_violation),
         ()
 ];
 
@@ -520,6 +521,198 @@ def btreeRefused(tc: PWBTreeTester, tree: PWBTree, ref: PWBTreeReference, walkFa
 }
 
 def ignoreKeyValue(k: u64, v: u64) { }
+
+// checkInvariants() is what the kill loop, the benchmark and every test above
+// trust to say a tree is consistent, so each of its checks must be shown to
+// fire. corrupted_image_fails_cleanly plants the damage a walk must survive;
+// this plants one violation per check, in a tree of height 3, and asserts which
+// check names it, not merely that one did: a planted fault caught by an earlier
+// check would pass while showing nothing about the one it was aimed at. open()
+// must refuse each too. Each is undone before the next, and the tree then opens
+// with nothing to reclaim and matches the reference. The one check not planted
+// is the root chunk as a child: its first word is TreeRoot.magic, so the node
+// magic check refuses it first.
+def test_btree_checker_names_each_violation(tc: PWBTreeTester) {
+        def tree = tc.open(4);
+        def ref = PWBTreeReference.new();
+        def rng = PWBTreeRandom.new(37);
+        while (tree.height() < 3u64) tc.put(tree, ref, rng.below(100000), rng.next());
+        if (!tc.checkOk(tree)) return;
+        // R, the root at level 2, over A and B at level 1; A over leaves L0 and
+        // L1. Below the root every node holds at least capacity / 2 = 2 keys.
+        def r = tree.rootNode();
+        def a = btreeLoad(btreeChildAddr(tc.region, r, 0));
+        def b = btreeLoad(btreeChildAddr(tc.region, r, 1));
+        def l0 = btreeLoad(btreeChildAddr(tc.region, a, 0));
+        def l1 = btreeLoad(btreeChildAddr(tc.region, a, 1));
+        tc.t.assertz(true, btreeNodeKeys(tc.region, r) >= 1u64);
+        tc.t.assertz(true, btreeNodeKeys(tc.region, a) >= 2u64);
+        tc.t.assertz(true, btreeNodeKeys(tc.region, l0) >= 2u64);
+        tc.t.assertz(true, btreeNodeKeys(tc.region, l1) >= 2u64);
+        def rSep = btreeLoad(btreeInnerKeyAddr(tc.region, r, 0));
+        def aSep = btreeLoad(btreeInnerKeyAddr(tc.region, a, 0));
+        def aLast = int.!(btreeNodeKeys(tc.region, a)) - 1;
+        def l0Last = int.!(btreeNodeKeys(tc.region, l0)) - 1;
+
+        // Keys and separators: the search order.
+        var at = btreeLeafKeyAddr(tc.region, l0, 0);
+        var saved = btreeSwap(at, btreeLoad(btreeLeafKeyAddr(tc.region, l0, 1)));
+        def second = btreeSwap(btreeLeafKeyAddr(tc.region, l0, 1), saved);
+        btreeViolation(tc, tree, "leaf keys are not strictly increasing");
+        btreeSwap(btreeLeafKeyAddr(tc.region, l0, 1), second);
+        btreeSwap(at, saved);
+
+        at = btreeLeafKeyAddr(tc.region, l1, 0);
+        saved = btreeSwap(at, aSep - 1u64);
+        btreeViolation(tc, tree, "a leaf key is below its separator");
+        btreeSwap(at, saved);
+
+        at = btreeLeafKeyAddr(tc.region, l0, l0Last);
+        saved = btreeSwap(at, aSep);
+        btreeViolation(tc, tree, "a leaf key is at or above its separator");
+        btreeSwap(at, saved);
+
+        at = btreeInnerKeyAddr(tc.region, a, 0);
+        saved = btreeSwap(at, btreeLoad(btreeInnerKeyAddr(tc.region, a, 1)));
+        def aSecond = btreeSwap(btreeInnerKeyAddr(tc.region, a, 1), saved);
+        btreeViolation(tc, tree, "separator keys are not strictly increasing");
+        btreeSwap(btreeInnerKeyAddr(tc.region, a, 1), aSecond);
+        btreeSwap(at, saved);
+
+        at = btreeInnerKeyAddr(tc.region, b, 0);
+        saved = btreeSwap(at, rSep - 1u64);
+        btreeViolation(tc, tree, "a separator is below the separator above it");
+        btreeSwap(at, saved);
+
+        at = btreeInnerKeyAddr(tc.region, a, aLast);
+        saved = btreeSwap(at, rSep);
+        btreeViolation(tc, tree, "a separator is at or above the separator above it");
+        btreeSwap(at, saved);
+
+        // Node counts. The root is exempt from half full, so an empty one
+        // reaches the internal-node check.
+        at = btreeNodeKeysAddr(tc.region, r);
+        saved = btreeSwap(at, 0);
+        btreeViolation(tc, tree, "an internal node has no key");
+        btreeSwap(at, saved);
+
+        at = btreeNodeKeysAddr(tc.region, l0);
+        saved = btreeSwap(at, 1);
+        btreeViolation(tc, tree, "a node below the root is less than half full");
+        btreeSwap(at, saved);
+
+        saved = btreeSwap(at, 5);
+        btreeViolation(tc, tree, "a node holds more keys than the capacity");
+        btreeSwap(at, saved);
+
+        // Node identity.
+        at = btreeWordAddr(tc.region, l0, 0);
+        saved = btreeSwap(at, 0);
+        btreeViolation(tc, tree, "node magic wrong");
+        btreeSwap(at, saved);
+
+        at = btreeChildAddr(tc.region, a, 0);
+        saved = btreeSwap(at, l0 + 8u64);
+        btreeViolation(tc, tree, "a node offset is outside the region or not block aligned");
+        btreeSwap(at, BT_BLOCKS * BT_BLOCK_SIZE);
+        btreeViolation(tc, tree, "a node offset is outside the region or not block aligned");
+        btreeSwap(at, saved);
+
+        at = btreeChildAddr(tc.region, r, 1);
+        saved = btreeSwap(at, l0);
+        btreeViolation(tc, tree, "a node's level does not match its depth: the leaves are not all at the tree's height");
+        btreeSwap(at, saved);
+
+        at = btreeChildAddr(tc.region, a, 1);
+        saved = btreeSwap(at, l0);
+        btreeViolation(tc, tree, "a node is reachable twice, or is the root chunk");
+        btreeSwap(at, saved);
+
+        // Reachable but free: a copy of L0 in a chunk allocated and then freed,
+        // which a free that committed before the publish that should have
+        // dropped its node would leave. Freeing changes the block table, not
+        // the payload, so the copy still reads as a leaf at level 0.
+        def chunk = tc.region.allocChunk(1u32);
+        tc.t.assertz(false, chunk.isNull());
+        def copy = tc.region.offsetInRegion(chunk.addr);
+        for (w < tree.nodeWords(l0)) {
+                btreeSwap(btreeWordAddr(tc.region, copy, w), btreeLoad(btreeWordAddr(tc.region, l0, w)));
+        }
+        tc.t.assertz(true, tc.region.freeChunk(chunk));
+        at = btreeChildAddr(tc.region, a, 0);
+        saved = btreeSwap(at, copy);
+        btreeViolation(tc, tree, "a reachable node is not an allocated chunk");
+        btreeSwap(at, saved);
+
+        // The root's fields, through the log as the tree writes them.
+        def MAGIC = TreeRoot.magic.offset, BLOCK = TreeRoot.blockSize.offset, CAP = TreeRoot.capacity.offset;
+        def HEIGHT = TreeRoot.height.offset, KEYS = TreeRoot.keyCount.offset, NODES = TreeRoot.nodeCount.offset;
+        var field = btreeSetRootField(tc, tree, KEYS, tree.keyCount() + 1u64);
+        btreeViolation(tc, tree, "key count does not match the tree");
+        btreeSetRootField(tc, tree, KEYS, field);
+
+        field = btreeSetRootField(tc, tree, NODES, tree.nodeCount() + 1u64);
+        btreeViolation(tc, tree, "node count does not match the tree");
+        btreeSetRootField(tc, tree, NODES, field);
+
+        field = btreeSetRootField(tc, tree, HEIGHT, u64.!(PWBTreeConst.MAX_HEIGHT) + 1u64);
+        btreeViolation(tc, tree, "height out of range");
+        btreeSetRootField(tc, tree, HEIGHT, 0);
+        btreeViolation(tc, tree, "height out of range");
+        btreeSetRootField(tc, tree, HEIGHT, field);
+
+        field = btreeSetRootField(tc, tree, MAGIC, 0);
+        btreeViolation(tc, tree, "root magic wrong");
+        btreeSetRootField(tc, tree, MAGIC, field);
+
+        field = btreeSetRootField(tc, tree, BLOCK, BT_BLOCK_SIZE + 8u64);
+        btreeViolation(tc, tree, "block size changed");
+        btreeSetRootField(tc, tree, BLOCK, field);
+
+        field = btreeSetRootField(tc, tree, CAP, 5);
+        btreeViolation(tc, tree, "capacity changed");
+        btreeSetRootField(tc, tree, CAP, field);
+
+        // Undone, the tree is whole again, with nothing to reclaim.
+        def again = PWBTree.new(tc.region, 4);
+        tc.t.assertz(true, again.open());
+        tc.t.assert_eq(0, again.leaksReclaimed());
+        tc.checkOk(again);
+        tc.sameAs(again, ref);
+
+        // The root chunk freed, in a tree of its own: not undone.
+        def small = tc.anonRegion(BT_BLOCKS);
+        def lone = PWBTree.new(small, 4);
+        tc.t.assertz(true, lone.open());
+        for (k < 6) lone.put(u64.!(k), u64.!(k));
+        tc.t.assertz(true, small.freeChunk(ChunkHandle(small.regionStart + lone.rootChunk())));
+        tc.t.assert_string("the root chunk is not allocated", lone.checkInvariants());
+        if (PWBTree.new(small, 4).open()) tc.t.fail("open() accepted a tree whose root chunk is free");
+}
+
+// checkInvariants() must name {want}, and open() must refuse the tree.
+def btreeViolation(tc: PWBTreeTester, tree: PWBTree, want: string) {
+        tc.t.assert_string(want, tree.checkInvariants());
+        if (PWBTree.new(tc.region, 4).open()) tc.t.fail1("open() accepted a tree that fails with: %s", want);
+}
+
+// Word {w} of the payload of the node at {node}: 0 the tag, 1 the key count;
+// a leaf's key i is word 2 + 2i, an internal node's key i word 3 + 2i.
+def btreeWordAddr(region: PWRegion, node: u64, w: int) -> u64 {
+        return region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(w);
+}
+def btreeNodeKeysAddr(region: PWRegion, node: u64) -> u64 { return btreeWordAddr(region, node, 1); }
+def btreeLeafKeyAddr(region: PWRegion, node: u64, i: int) -> u64 { return btreeWordAddr(region, node, 2 + 2 * i); }
+def btreeInnerKeyAddr(region: PWRegion, node: u64, i: int) -> u64 { return btreeWordAddr(region, node, 3 + 2 * i); }
+
+// Sets root field {field} through the log and commits; returns what was there.
+def btreeSetRootField(tc: PWBTreeTester, tree: PWBTree, field: int, v: u64) -> u64 {
+        def addr = tc.region.regionStart + tree.rootChunk() + u64.!(ChunkHeader.size) + u64.view(field);
+        def old = tc.region.txn.readU64(addr);
+        tc.region.txn.writeU64(addr, v);
+        tc.region.txn.commit();
+        return old;
+}
 
 // =============================================================================
 // Persistence work per operation, on the production PMEM boundary path
