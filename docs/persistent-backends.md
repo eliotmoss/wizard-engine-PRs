@@ -2115,9 +2115,10 @@ consistent one.
   before the put or after it, as the durable mutation count says. Up to the
   WRITE mark only the tree before is allowed, and from the PUBLISH mark on only
   the tree after.
-- **The container.** Images are mounted in an anonymous mapping, not in
-  `openArray()`'s heap array. The tree allocates while it is checked, a
-  collection can move a heap array, and `PWRegion` keeps the raw address.
+- **The container.** Images are mounted in an anonymous mapping, not in a
+  heap array, which `openArray()` used until 2026-10-19. The tree allocates
+  while it is checked, a collection can move a heap array, and `PWRegion`
+  keeps the raw address.
 
 How far each check reaches. A cut permits the product, over the lines the trace
 writes, of each line's range of durable store prefixes. The log record is

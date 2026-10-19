@@ -623,21 +623,27 @@ outcomes and invariants for many of these scenarios.
 
 ### Which container an image is mounted in
 
-`PersistentImageMounts` offers two, and the tests a third; the choice is a
-modelling decision rather than an implementation detail:
+`PersistentImageMounts` offers three; the choice is a modelling decision
+rather than an implementation detail:
 
 | Mount | Container | Boundaries | Use |
 |---|---|---|---|
-| `openArray()` | byte array on Virgil's heap, which the collector moves (below) | succeed without reaching the writeback/fence hooks | only recovery's effect on the bytes matters; costs no syscalls, which is what makes a sweep over thousands of images affordable |
-| `PersistentAnonMounts.openRegion()` (tests, 2026-10-19) | anonymous mapping (`PWBTreeAnonRegion` behind `PreparedRegionBackend`), which does not move | succeed without reaching the writeback/fence hooks | as `openArray()`, where the mounted code allocates; costs an `mmap` and a `munmap` per image |
+| `openArray()` | anonymous mapping (`AnonMappedRegion`), which does not move; until 2026-10-19 a byte array on Virgil's heap, which the collector moves (below) | succeed without reaching the writeback/fence hooks | only recovery's effect on the bytes matters; costs an `mmap` and a `munmap` per image |
+| `openFailing(failAt)` (2026-10-19) | the same mapping (`InjectedFailureRegion`) | as `openArray()`'s, except that boundary number `failAt` fails | a persistence failure during the mount (below) |
 | `openMapped(record)` | `PmemMmapRegion` | translate into cache-line writebacks and fences on the region's provider | the mounted run must itself be modelled; with `record` set, its stores, `CLWB`s and fences are captured as a trace |
 
-**The array moves (2026-10-19).** `openArray()`'s byte array is an ordinary
+The tests' `PersistentAnonMounts.openRegion()` opens an image through
+`PersistentImageBackend`, that is `openArray()`; until that moved, it opened
+it in the tree explorer's mapping (`PWBTreeAnonRegion`).
+
+**The array moves (2026-10-19).** `openArray()`'s byte array was an ordinary
 heap object, and Virgil's semispace collector moves it, while `PWRegion` and
 `DualTxnWal` keep the region's start as a raw address. A collection during a
-mount leaves them reading and writing the old copy. The same hazard, in the
-volatile backend's array, aborted a full test run in `pwbtree:` on 2026-10-14
-(`docs/ROADMAP.md`, `PWBTreeTest.v3`). The tree's explorer mounted its images
+mount leaves them reading the old copy, while their stores, which go through
+the region's range, reach the moved one; the next collection reuses the old
+copy's memory. The same hazard, in the volatile backend's array, aborted a
+full test run in `pwbtree:` on 2026-10-14 (`docs/ROADMAP.md`,
+`PWBTreeTest.v3`). The tree's explorer mounted its images
 in an anonymous mapping from the start, and
 since 2026-10-19 so do the sieve's (`persistent_sieve:`, and
 `persistent_control:` through the same property) and the format scenario
@@ -646,17 +652,36 @@ boundaries are the array's, so what a check concludes is unchanged; it costs
 an `mmap` and a `munmap` per image, which took the six `persistent_sieve:`
 tests it had before (19,394 images) from 3.08 s to 3.23 s, medians of nine
 interleaved runs on sean-tan-PC. `persistent_sieve:mounted_image_survives_a_collection`
-forces a collection under a mounted image, and fails on the array. Still on
-heap arrays: `PersistentImageBackend`, so `PersistentAllocatorProperty` and the
-other `persistent_alloc:` sweeps, and `InjectedFailureRegion`, below.
+forces a collection under a mounted image, and fails on the array. Later the
+same day `openArray()` itself moved to an anonymous mapping, and
+`InjectedFailureRegion` with it (`openFailing()`), so neither
+`PersistentImageBackend`, and with it `PersistentAllocatorProperty` and every
+`persistent_alloc:` sweep, nor `runDualWalWithFailure()` and
+`runPWRegionWithFailure()` mount an image in a heap array any more.
+`persistent_alloc:mounted_image_survives_a_collection` and
+`persistent_recovery:failing_mount_survives_a_collection` force a collection
+under each, and fail on the array. Without their address check, over the
+array, two allocations made after the collection returned the same block, so
+the image handed on held one used extent too few, while the invariant walk,
+which reads through `regionStart`, found nothing wrong; and a complete record
+written after the collection did not replay on a remount, because the WAL
+computes its checksum by reading the record back through the raw address. The move gives
+an `mmap` and a `munmap` to each of the 9,594 images the twelve
+`persistent_alloc:` tests it had before mounted in heap arrays, which took them
+from 2.03 s to 2.15 s, and to the 218 the thirteen `persistent_recovery:`
+tests mounted in them, which stayed at 0.59 s; `persistent_sieve:` and
+`persistent_control:`, already on mappings, did not change (medians of nine
+interleaved runs pinned to one core of sean-tan-PC). No crash-image property
+mounts an image in a heap array now; `pwsieve:` and the `pwregion:` groups
+still run on the volatile backend's (`docs/ROADMAP.md`).
 
-The array mount is sound for a recovery whose *result* is being checked: the
+The plain mount is sound for a recovery whose *result* is being checked: the
 simulator, not the backend, already decided which bytes survived the crash, and
 recovery's own persistence boundaries are what the next section models. It
 cannot by itself express a crash during recovery — that is what the mapped,
 recording mount is for — nor a persistence *failure*, which
-`InjectedFailureRegion` adds: an array container whose boundaries fail once, at
-a chosen call.
+`InjectedFailureRegion` adds (`openFailing()`): the same container, with
+boundaries that fail once, at a chosen call.
 
 ## Crash during recovery
 
