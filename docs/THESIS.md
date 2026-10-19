@@ -529,7 +529,7 @@ test at another layer:
 
 | The explorer assumes | Discharged by |
 |---|---|
-| The trace contains every persistent store | The `persistent_ops:` store audit: complete byte coverage of `format()` with its padding holes asserted as holes, and allocator after-images strictly after the commit boundary. The Immix line marks are the one stated exception (Chapter 3) |
+| The trace contains every persistent store | The `persistent_ops:` store audit: complete byte coverage of `format()` with its padding holes asserted as holes, and allocator after-images strictly after the commit boundary. The Immix line marks, the one stated exception until 2026-10-19, now cross the seam too, as stores with no writeback or fence of their own (`persistent_ops:immix_line_marks_cross_the_seam`) |
 | The trace is inside the model's domain | `validate()` on every explored trace; `persistent_trace:` pins the seven defects it rejects, each at the right event |
 | The provider's `clwb`/`sfence` are `CLWB`/`SFENCE` | `persistent_ops:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
 | The search finds every admitted image | The reduced search equals the full branching search at every cut of three traces; an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
@@ -594,7 +594,8 @@ Chapter 6 should state coverage in these terms and no stronger:
 - **Not explored by the model:** the explicit-flush and clean-close scrub paths
   (covered at layers 1a and 3a only), exact-fit allocation (layer 3a only; the
   explorer records a split allocation and a coalescing free), the Immix line
-  marks (outside the seam),
+  marks (transient; their stores cross the seam since 2026-10-19, but no
+  explored scenario makes one),
   the file backend (model stated, not implemented) and the emitted instructions
   (milestone 9, cut).
 - **Not attainable:** power loss on the target medium (layer 4).
@@ -607,7 +608,8 @@ it up.
 1. The baseline crash model, and why it is PMEM-shaped
    ([PMEM Crash Model](pmem-crash-model.md)).
 2. Recording through the seam: the provider, the store audit that makes the
-   trace complete, `validate()`, and the Immix exception.
+   trace complete, `validate()`, and the Immix line marks, which cross the seam
+   with no writeback or fence of their own.
 3. From a cut to its images: the crash machine, the lazy and eager brackets,
    full search against the reduction, and the check that the two agree
    (figures 4 and 5).
@@ -696,9 +698,11 @@ Each gets one sentence in future work, no more.
   host module, so there is currently no runtime story. Wizard is motivation and
   context, not a contribution — **Eliot should be told this explicitly now**
   rather than discovering it in the draft.
-- Closing the `ImmixPWRegion` line-mark hole in the seam. It must instead be
-  *stated* in Chapter 3, since the verification argument rests on the seam
-  being complete and this is the one acknowledged exception.
+- ~~Closing the `ImmixPWRegion` line-mark hole in the seam.~~ Closed
+  2026-10-19: the marks' stores cross the seam, still transient, with no
+  writeback or fence of their own
+  (`persistent_ops:immix_line_marks_cross_the_seam`), so the active path has no
+  acknowledged exception left to state.
 - Crash-model milestones 8–9 (regular/seeded test tiers, emitted-instruction
   validation).
 - Any further `MultiTxnWal` or `SingleTxnWal` work; they appear in Chapter 3 as
@@ -816,8 +820,8 @@ Witcher, Vinter and Mumak", rather than presenting it as a contribution.
    PMEM backends emit the same trace, so one exploration covers both (see
    [What discharges the explorer's assumptions](#what-discharges-the-explorers-assumptions)).
    *Cost:* the kernel and the emitted instructions are invisible, and Vinter
-   sees both; the trace is complete only by the store audit, with the Immix
-   line marks excepted; and no loads are recorded. Read CrashMonkey before
+   sees both; the trace is complete only by the store audit, which since
+   2026-10-19 includes the Immix line marks; and no loads are recorded. Read CrashMonkey before
    claiming anything "across media", since it is the block-level counterpart.
 2. **The oracle knows what was acknowledged.** At each cut the recovered state
    is checked against the acknowledgement contract, the allocator's structural

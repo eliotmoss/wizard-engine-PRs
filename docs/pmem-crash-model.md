@@ -236,16 +236,25 @@ whole region; `DualTxnWal` uses the same helper. Normal allocator transactions
 continue through `RegionTransaction` to the instrumented `DualTxnWal` for both
 their records and their applied after-images.
 
-Two categories remain outside the seam, both deliberately:
+One category remains outside the seam, deliberately:
 
-- **Immix line marks** (`LineMarkHandle.setMark`, `resetAllLineMarks`) are
-  explicitly transient. They bypass the WAL and the persistence boundaries by
-  design and must be rebuilt after a crash, so they are not persistent state
-  the explorer should model. They are now the only direct stores left in the
-  allocator, and `persistent_ops:immix_line_marks_emit_no_events` pins that.
 - **`SingleTxnWal` and `MultiTxnWal`** are retained comparison implementations
   that are not wired into the commit path, so their stores can never appear in
   a trace of a running region.
+
+**Immix line marks** (`LineMarkHandle.setMark`, `resetAllLineMarks`) cross the
+seam but are still transient. Until 2026-10-19 they were stored through a
+forged `Ref<LineMark>`, the last direct stores in the allocator; since then
+`setMark` takes the region's `DirectRegionWriter`, like the other non-cached
+setters, so every mark store is a 1-byte `STORE` in the trace. They still
+bypass the WAL and the persistence boundaries by design: marking and resetting
+issue no `CLWB` or `SFENCE`, and the marks must be rebuilt after a crash, so
+they are not persistent state the explorer should model. In the model a mark
+store becomes durable only if its line is written back for another reason:
+background eviction, or a writeback of other bytes on the same line.
+`persistent_ops:immix_line_marks_cross_the_seam` pins one store per mark, at
+the mark's region-relative offset with the reset value, and no `CLWB` or
+`SFENCE`.
 
 Keeping the direct writer and `RegionTransaction` as separate types with
 distinct setter names (`setUsed(w, …)` versus `setUsedCached(txn, …)`) is a

@@ -3575,6 +3575,7 @@ These are zero-allocation wrappers around raw memory addresses:
 `ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. The persisted line-mark metadata descriptor's `unitSize` controls the line size, and its `fixedBytes` prefix precedes the per-line table; the built-in `MemRegions` descriptor defaults to a 256-byte line size and no prefix.
 
 - `resetAllLineMarks()` — clears all line marks at the start of a GC cycle. Line marks are explicitly transient GC state: mark/reset operations bypass `RegionTransaction` and issue no persistence boundary. A caller mounting after a crash must rebuild them; the allocator does not currently do that automatically.
+- Since 2026-10-19 the marks' stores go through the persistent-operation seam, as every other store the allocator makes does. `LineMarkHandle.setMark(w, v)` takes the region's `DirectRegionWriter` (`lineMarkWriter()`), like the other non-cached setters, and `resetAllLineMarks()` passes it; before, both stored through a forged `Ref<LineMark>`. A recorded trace therefore shows each mark as a 1-byte `STORE`, and marking and resetting add no `CLWB` or `SFENCE` (`persistent_ops:immix_line_marks_cross_the_seam`). `getMark()` still reads through the forged ref, since the seam records no loads.
 
 ---
 
@@ -3661,7 +3662,10 @@ asynchronous writeback completion, crash cuts, or schedule exploration yet.
 Its scope is to prove that real active-WAL execution emits the expected ordered
 operations. `PWRegion.format()` and its direct header/block-table/descriptor
 stores, non-cached allocator setters, retained comparison WALs, and transient
-Immix line marks remain outside the store seam pending a later audit.
+Immix line marks remain outside the store seam pending a later audit. (Since the
+store audit of 2026-08-14 `format()` and the non-cached setters go through the
+seam, and since 2026-10-19 the line marks' stores do too, still with no
+writeback or fence of their own; only the comparison WALs remain outside.)
 
 The platform wrapper classes each have a dedicated construction test. Immix
 coverage checks copied and remounted descriptors, descriptor-prefix-aware line
