@@ -552,9 +552,13 @@ does. These are permanent tests:
 - the recovery property turns an unmet survival claim into a counterexample;
 - the trace validator rejects seven defects, each at the right event;
 - the model-conformance check rejects a flipped byte of the WAL header magic;
-  and
 - the explorer catches the elided-writeback mutant 708 events into 1,401 (710
-  until 2026-10-19, when an over-budget cut began checking its extremes first).
+  until 2026-10-19, when an over-budget cut began checking its extremes first);
+  and
+- since 2026-10-19, it catches a recovery that skips the record checksum and so
+  replays a torn record, on the sieve step at cut 385, at 12 images per cut.
+  At the sieve tests' own 4 per cut it does not, and neither did the old
+  prefix odometer at up to 256 vectors per cut.
 
 These were one-off mutation runs:
 

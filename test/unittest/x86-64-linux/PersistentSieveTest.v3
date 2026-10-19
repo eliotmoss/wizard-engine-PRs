@@ -36,6 +36,7 @@ def PSTX = [
 	PST("retiring_step_images_stay_consistent", test_psieve_retiring_step_images_stay_consistent),
 	PST("property_detects_a_damaged_image",  test_psieve_property_detects_a_damaged_image),
 	PST("mounted_image_survives_a_collection", test_psieve_mounted_image_survives_a_collection),
+	PST("unchecked_record_checksum_is_caught", test_psieve_unchecked_record_checksum_is_caught),
 	()
 ];
 
@@ -338,4 +339,55 @@ def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
 	def violation = sieve.checkInvariants();
 	if (violation != null) tc.t.fail(violation);
 	region.deallocate();
+}
+
+// A negative control for recovery rather than for flush placement. With
+// DualTxnWalMutants.skipRecordChecksum set, recovery does not compare a
+// record's checksum, so it replays a torn record whose header, trailer and
+// entries happen to be complete. The sweep of a sieve step must reject that
+// recovery, and with the checksum compared the same images must pass.
+//
+// The failing image is an extreme: at cut 385 one of the cut's seven
+// changeable lines, at offset 3456 in the WAL's log block, holds its last
+// content and every other line its floor, the ninth image the selection takes.
+// The prefix odometer missed the mutant at 4, 12, 64 and 256 vectors per cut
+// (measured 2026-10-20 on the explorer before the line classes). The selection reaches the image only once
+// the budget covers enough of a cut's extremes, which BUDGET's 4 does not:
+// measured on 2026-10-19, this sweep passes at budgets 2 to 4, fails at cut
+// 660 at 6 and 8, and at cut 385 at 10 and 12. Hence 12, two above the
+// smallest budget that catches it at cut 385.
+def test_psieve_unchecked_record_checksum_is_caught(tc: PersistentSieveTester) {
+	if (!tc.openRecordingSieve()) {
+		tc.t.fail("could not lay out a recording sieve");
+		return;
+	}
+	def trace = tc.recordStep("pwsieve_step_sieve");
+	tc.cleanup();
+	if (trace == null) return;
+	def budget = 12;
+	def property = tc.sieveProperty("sieve invariants survive every crash schedule of a step");
+
+	DualTxnWalMutants.skipRecordChecksum = true;
+	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, budget, property);
+	DualTxnWalMutants.skipRecordChecksum = false;
+	tc.t.assertz(false, result.ok());
+	def cx = result.counterexample;
+	if (cx == null) {
+		tc.t.fail("recovery without the record checksum produced no counterexample");
+		return;
+	}
+	tc.t.asserti(385, cx.crashAfter);
+	tc.t.assert_string("used block is linked into a free list (block 2)", cx.detail);
+	tc.t.assertz(true, Strings.startsWith(cx.selectionNote(), "image 9 of 12 chosen from 4147200 distinct images"));
+
+	// The note is enough to find the image again.
+	def replay = PersistentExplorer.selectCrashImages(trace, tc.mounted, cx.crashAfter, budget,
+		result.exploration.seed);
+	tc.t.assertz(true, replay.images[8].sameBytes(cx.durableImage()));
+
+	// With the checksum compared, that image recovers into a consistent sieve,
+	// and so does every image the same sweep checks up to that cut.
+	tc.t.assertz(true, property.check(cx.durableImage()) == null);
+	def ordinary = PersistentExplorer.checkCutRange(trace, tc.mounted, 0, cx.crashAfter, budget, property);
+	if (!ordinary.ok()) tc.t.fail(ordinary.toArtifact());
 }

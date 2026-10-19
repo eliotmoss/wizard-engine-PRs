@@ -52,6 +52,17 @@ component DualTxnWalConstants {
         def ALIGNMENT = 64u64;
 }
 
+// A deliberately broken recovery, for negative-control tests only. Nothing
+// outside the tests sets it, and with it clear validateSlot() is unchanged.
+// With {skipRecordChecksum} set, validateSlot() accepts a record whose stored
+// checksum does not match its bytes, so recovery replays a torn record whose
+// header, trailer and entries happen to be well formed.
+// persistent_sieve:unchecked_record_checksum_is_caught shows the crash-image
+// explorer rejecting that recovery.
+component DualTxnWalMutants {
+        var skipRecordChecksum = false;
+}
+
 // Outcome of DualTxnWal.recover(). Distinguishes nothing to replay, a
 // successful replay, an unusable log, and a replay whose data persist failed.
 enum DualWalRecovery {
@@ -557,7 +568,8 @@ class DualTxnWal {
                 if (recordLoadU32(trailerAddr, TxnCommitTrailer.entryCount.offset) != entryCount) return 0u64;
                 if (recordLoadU64(trailerAddr, TxnCommitTrailer.logEpoch.offset) != 0u64) return 0u64;  // reserved
                 if (recordLoadU64(trailerAddr, TxnCommitTrailer.txnSeq.offset) != txnSeq) return 0u64;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return 0u64;
+                if (!DualTxnWalMutants.skipRecordChecksum &&
+                        recordLoadU64(trailerAddr, TxnCommitTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return 0u64;
 
                 var entryAddr = absStart + u64.!(TxnRecordHeader.size);
                 for (i < entryCount) {

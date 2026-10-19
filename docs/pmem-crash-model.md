@@ -507,6 +507,26 @@ so a small budget left every higher line at its floor.
 `persistent_explore:over_budget_selection_takes_extremes_then_seeded_random`
 pins the order, the dedupe, and the replay from a seed.
 
+**A recovery that skips the record checksum (2026-10-19).** The flag
+`DualTxnWalMutants.skipRecordChecksum`, which only a test sets, makes
+`validateSlot()` accept a record whose stored checksum does not match its bytes,
+so recovery replays a torn record whose header, trailer and entries happen to be
+well formed. `persistent_sieve:unchecked_record_checksum_is_caught` sweeps every
+cut of a sieve step at 12 images per cut with the flag set and must fail. The
+first failing image is at cut 385, one of its 4,147,200 distinct images: the
+ninth the selection takes there, with the line at offset 3456 of the WAL's log
+block alone at its last content and the cut's six other changeable lines at
+their floor. Its mount reports `used block is linked into a free list (block
+2)`. With the checksum compared, that image recovers into a consistent sieve,
+and the sweep passes over cuts 0 to 385. The catch depends on the budget. On
+2026-10-19 the same sweep passed at 2, 3 and 4 images per cut, and 4 is the
+sieve tests' own budget; it failed at cut 660 at 6 and 8, at cut 385 at 10 and
+12, and at cut 289 at 16 and 64. The prefix odometer, run on 2026-10-20 on the
+pre-change explorer with the same flag, passed at 4, 12, 64 and 256 vectors per cut,
+checking 5,776, 14,927, 36,605 and 126,076 distinct images. The selection
+therefore reaches an image the odometer did not, but at the budget the sieve
+tests use it does not catch this mutant either.
+
 This is also where the model's shape becomes visible. A completed fence removes
 freedom: after the WAL's commit boundary the record is durable on every
 schedule, so that cut has exactly one image, while the cut one event later — the
