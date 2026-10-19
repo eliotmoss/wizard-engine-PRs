@@ -80,6 +80,10 @@ class DualTxnWal {
         def var logChunkSize: u64;
         def backendRegion: BackendRegion;
         private var persistentOperations: PersistentOperations;
+        // Every load this WAL makes from the region -- header and slot
+        // validation, the replay, the checksums, and the transaction's cache
+        // misses -- goes through this reader, which shares the provider.
+        private var reader: DirectRegionReader;
 
         def var logChunkOffset: u64;
         def var slotBytes: u64;
@@ -111,6 +115,7 @@ class DualTxnWal {
                         return;
                 }
                 persistentOperations = X86_64PersistentOps.ensureFor(backendRegion);
+                reader = DirectRegionReader.new(persistentOperations, regionStart);
                 if (slotBytes < alignedRecordLen(0u32)) {
                         Trace.OUT.put1("log chunk too small for dual-transaction WAL slots (%d bytes)", blockSize).ln();
                         return;
@@ -381,19 +386,19 @@ class DualTxnWal {
         // --- Read (cache-miss fallthrough) ---
 
         def readU8(offset: u64) -> u8 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u8>();
+                return reader.loadU8(regionStart + offset);
         }
 
         def readI16(offset: u64) -> i16 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i16>();
+                return reader.loadI16(regionStart + offset);
         }
 
         def readU64(offset: u64) -> u64 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u64>();
+                return reader.loadU64(regionStart + offset);
         }
 
         def readI64(offset: u64) -> i64 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i64>();
+                return reader.loadI64(regionStart + offset);
         }
 
         // --- Recovery ---
@@ -653,6 +658,12 @@ class DualTxnWal {
                 var ptr = start;
                 def end = start + len;
                 def skipEnd = skipStart + skipLen;
+                // The loop loads every byte of [start, end) outside the skipped
+                // field, and nothing else: observe those two ranges first.
+                def lo = if(skipStart < start, start, if(skipStart > end, end, skipStart));
+                def hi = if(skipEnd < lo, lo, if(skipEnd > end, end, skipEnd));
+                reader.observe(start, lo - start);
+                reader.observe(hi, end - hi);
                 while (ptr < end) {
                         var b: u64 = 0u64;
                         if (!(ptr >= skipStart && ptr < skipEnd)) {
@@ -675,27 +686,27 @@ class DualTxnWal {
         }
 
         def headerAt() -> Ref<DualWalHeader> {
-                return Ref<DualWalHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(logChunkAddr), DualWalHeader.size));
+                return reader.forgeDualWalHeader(logChunkAddr);
         }
 
         def recordHeaderAt(addr: u64) -> Ref<TxnRecordHeader> {
-                return Ref<TxnRecordHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), TxnRecordHeader.size));
+                return reader.forgeRecordHeader(addr);
         }
 
         def commitTrailerAt(addr: u64) -> Ref<TxnCommitTrailer> {
-                return Ref<TxnCommitTrailer>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), TxnCommitTrailer.size));
+                return reader.forgeCommitTrailer(addr);
         }
 
         def logEntryAt(addr: u64) -> Ref<LogEntry> {
-                return Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LogEntry.size));
+                return reader.forgeLogEntry(addr);
         }
 
         private def headerLoadU64(offset: int) -> u64 {
-                return PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).load<u64>();
+                return reader.loadU64(logChunkAddr + u64.view(offset));
         }
 
         private def headerLoadU32(offset: int) -> u32 {
-                return PWRegionUtils.pointerFromU64(logChunkAddr + u64.view(offset)).load<u32>();
+                return reader.loadU32(logChunkAddr + u64.view(offset));
         }
 
         private def headerStoreU64(offset: int, value: u64) {
@@ -707,19 +718,19 @@ class DualTxnWal {
         }
 
         private def recordLoadU64(addr: u64, offset: int) -> u64 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u64>();
+                return reader.loadU64(addr + u64.view(offset));
         }
 
         private def recordLoadU32(addr: u64, offset: int) -> u32 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u32>();
+                return reader.loadU32(addr + u64.view(offset));
         }
 
         private def recordLoadU16(addr: u64, offset: int) -> u16 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u16>();
+                return reader.loadU16(addr + u64.view(offset));
         }
 
         private def recordLoadU8(addr: u64, offset: int) -> u8 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u8>();
+                return reader.loadU8(addr + u64.view(offset));
         }
 
         private def recordStoreU64(addr: u64, offset: int, value: u64) {

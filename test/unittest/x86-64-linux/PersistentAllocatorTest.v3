@@ -73,8 +73,8 @@ class PersistentAllocatorTester(t: Tester) {
 		while (!current.isNull() && steps <= int.!(BLOCKS)) {
 			def index = mount.blockIndexOf(current);
 			if (index == BLOCKS) break;
-			if (current.getUsed() && current.getListNum() == ListKind.NONE.code) used++;
-			current = current.getNext();
+			if (current.getUsed(mount.reader()) && current.getListNum(mount.reader()) == ListKind.NONE.code) used++;
+			current = current.getNext(mount.reader());
 			steps++;
 		}
 		mount.deallocate();

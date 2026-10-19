@@ -506,7 +506,7 @@ def test_pwregion_format_mount_roundtrip(tc: DirectIoTester) {
                 return tc.cleanup();
         }
         tc.t.assert(again.lastRecovery == DualWalRecovery.CLEAN, "a clean close did not remount clean");
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(), "the allocation did not survive remount");
+        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the allocation did not survive remount");
         def err = PersistentAllocatorInvariants.check(again);
         if (err != null) tc.t.fail1("allocator invariants: %s", err);
         tc.cleanup();
@@ -535,7 +535,7 @@ def test_commit_sync_failure_latches_and_remount_replays(tc: DirectIoTester) {
                 return tc.cleanup();
         }
         tc.t.assert(again.lastRecovery == DualWalRecovery.REPLAYED, "the written record was not replayed");
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(), "the replayed allocation is missing");
+        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the replayed allocation is missing");
         def err = PersistentAllocatorInvariants.check(again);
         if (err != null) tc.t.fail1("allocator invariants: %s", err);
         tc.cleanup();
@@ -562,7 +562,7 @@ def test_sigkill_after_commit_boundary_recovers(tc: DirectIoTester) {
                 return tc.cleanup();
         }
         tc.t.assert(again.lastRecovery == DualWalRecovery.REPLAYED, "the killed child's record was not replayed");
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(), "the committed allocation is missing");
+        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the committed allocation is missing");
         def err = PersistentAllocatorInvariants.check(again);
         if (err != null) tc.t.fail1("allocator invariants: %s", err);
         tc.cleanup();
@@ -628,7 +628,7 @@ def test_mutant_loses_acknowledged_commit_on_sigkill(tc: DirectIoTester) {
                         tc.t.fail("could not remount after the kill");
                         return tc.cleanup();
                 }
-                def survived = again.blockTableHandle[2u64].getUsed();
+                def survived = again.blockTableHandle[2u64].getUsed(again.reader());
                 if (elide && survived) tc.t.fail("the mutant's acknowledged allocation survived its death");
                 if (!elide && !survived) tc.t.fail("the production allocation did not survive");
                 def err = PersistentAllocatorInvariants.check(again);

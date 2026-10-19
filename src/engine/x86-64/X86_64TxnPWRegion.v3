@@ -158,32 +158,34 @@ type BlockEntryHandle(addr: u64) #unboxed {
                 return i64.view(other.addr) - i64.view(this.addr);
         }
 
-        def getRef() -> Ref<BlockEntry> {
-                return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), BlockEntry.size));
+        // Direct getters take the region's reader as the direct setters take
+        // its writer, so every load from the block table is observable.
+        def getRef(r: DirectRegionReader) -> Ref<BlockEntry> {
+                return r.forgeBlockEntry(addr);
         }
 
-        def getListNum() -> i16 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNum.offset)).load<i16>();
+        def getListNum(r: DirectRegionReader) -> i16 {
+                return r.loadI16(addr + u64.view(BlockEntry.listNum.offset));
         }
 
-        def getUsed() -> bool {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.used.offset)).load<u8>() == 1u8;
+        def getUsed(r: DirectRegionReader) -> bool {
+                return r.loadU8(addr + u64.view(BlockEntry.used.offset)) == 1u8;
         }
 
-        def getPrev() -> BlockEntryHandle {
-                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.prev.offset)).load<i64>());
+        def getPrev(r: DirectRegionReader) -> BlockEntryHandle {
+                return toHandle(r.loadI64(addr + u64.view(BlockEntry.prev.offset)));
         }
 
-        def getNext() -> BlockEntryHandle {
-                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.next.offset)).load<i64>());
+        def getNext(r: DirectRegionReader) -> BlockEntryHandle {
+                return toHandle(r.loadI64(addr + u64.view(BlockEntry.next.offset)));
         }
 
-        def getListPrev() -> BlockEntryHandle {
-                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listPrev.offset)).load<i64>());
+        def getListPrev(r: DirectRegionReader) -> BlockEntryHandle {
+                return toHandle(r.loadI64(addr + u64.view(BlockEntry.listPrev.offset)));
         }
 
-        def getListNext() -> BlockEntryHandle {
-                return toHandle(PWRegionUtils.pointerFromU64(addr + u64.view(BlockEntry.listNext.offset)).load<i64>());
+        def getListNext(r: DirectRegionReader) -> BlockEntryHandle {
+                return toHandle(r.loadI64(addr + u64.view(BlockEntry.listNext.offset)));
         }
 
         def getListNumCached(cache: RegionTransaction) -> i16 {
@@ -266,24 +268,26 @@ type ChunkHandle(addr: u64) #unboxed {
                 return addr == 0;
         }
 
-        def getRef() -> Ref<ChunkHeader> {
-                return Ref<ChunkHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), ChunkHeader.size));
+        def getRef(r: DirectRegionReader) -> Ref<ChunkHeader> {
+                return r.forgeChunkHeader(addr);
         }
 
-        def getOffset() -> u64 {
-                return getRef().offset;
+        // One field each, rather than through getRef(), so a reader's
+        // observer sees the eight bytes loaded and not the whole header.
+        def getOffset(r: DirectRegionReader) -> u64 {
+                return r.loadU64(addr + u64.view(ChunkHeader.offset.offset));
         }
 
-        def getLimit() -> u64 {
-                return getRef().limit;
+        def getLimit(r: DirectRegionReader) -> u64 {
+                return r.loadU64(addr + u64.view(ChunkHeader.limit.offset));
         }
 
-        def getChunkLimit() -> u64 {
-                return getRef().chunk_limit;
+        def getChunkLimit(r: DirectRegionReader) -> u64 {
+                return r.loadU64(addr + u64.view(ChunkHeader.chunk_limit.offset));
         }
 
-        def getLinemarks() -> u64 {
-                return getRef().linemarks;
+        def getLinemarks(r: DirectRegionReader) -> u64 {
+                return r.loadU64(addr + u64.view(ChunkHeader.linemarks.offset));
         }
 
         def setOffset(w: DirectRegionWriter, v: u64) {
@@ -330,12 +334,12 @@ type LineMarkTableHandle(addr: u64, size: u64) #unboxed {
 }
 
 type LineMarkHandle(addr: u64) #unboxed {
-        def getRef() -> Ref<LineMark> {
-                return Ref<LineMark>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LineMark.size));
+        def getRef(r: DirectRegionReader) -> Ref<LineMark> {
+                return r.forgeLineMark(addr);
         }
 
-        def getMark() -> u8 {
-                return getRef().mark;
+        def getMark(r: DirectRegionReader) -> u8 {
+                return r.loadU8(addr + u64.view(LineMark.mark.offset));
         }
 
         def setMark(w: DirectRegionWriter, v: u8) {
@@ -401,6 +405,119 @@ class DirectRegionWriter {
 
         def writeOffsetU64(offset: u64, val: u64) {
                 ops.storeU64(offset, val);
+        }
+}
+
+// Direct loads from the persistent image, the counterpart of
+// DirectRegionWriter. A load is the same Pointer.load it always was; when the
+// region's provider carries a PersistentLoadObserver, the reader first reports
+// the bytes it is about to load, region-relative, and the observer may rewrite
+// them (see PersistentLoadObserver). In production the observer is null, and
+// a load costs reading that field and a branch that is never taken.
+//
+// Every load the allocator, the WAL and the workloads make from a region goes
+// through a reader, including reads of bytes the same run stored itself; a
+// load that does not is invisible to a crash search that branches on what is
+// read. Refs are forged through the per-layout forge* helpers, which observe
+// the whole layout once, so a Ref's fields may then be read directly.
+//
+// Addresses are absolute, as DirectRegionWriter's are; the observer takes
+// region-relative offsets, so the translation lives here.
+class DirectRegionReader {
+        private def ops: PersistentOperations;
+        def regionStart: u64;
+
+        new(ops, regionStart) { }
+
+        def loadU8(addr: u64) -> u8 {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, 1u64);
+                return PWRegionUtils.pointerFromU64(addr).load<u8>();
+        }
+
+        def loadU16(addr: u64) -> u16 {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, 2u64);
+                return PWRegionUtils.pointerFromU64(addr).load<u16>();
+        }
+
+        def loadU32(addr: u64) -> u32 {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, 4u64);
+                return PWRegionUtils.pointerFromU64(addr).load<u32>();
+        }
+
+        def loadU64(addr: u64) -> u64 {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, 8u64);
+                return PWRegionUtils.pointerFromU64(addr).load<u64>();
+        }
+
+        // Read BlockEntry.listNum
+        def loadI16(addr: u64) -> i16 {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, 2u64);
+                return PWRegionUtils.pointerFromU64(addr).load<i16>();
+        }
+
+        // Read BlockEntry.prev, next, listPrev, listNext
+        def loadI64(addr: u64) -> i64 {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, 8u64);
+                return PWRegionUtils.pointerFromU64(addr).load<i64>();
+        }
+
+        // Region-relative form, for header fields whose offsets already are
+        // (mirrors writeOffsetU64).
+        def loadOffsetU64(offset: u64) -> u64 {
+                return loadU64(regionStart + offset);
+        }
+
+        // Report [addr, addr + length) before a loop loads it byte by byte.
+        def observe(addr: u64, length: u64) {
+                if (length != 0u64) note(addr, length);
+        }
+
+        def forgeBlockEntry(addr: u64) -> Ref<BlockEntry> {
+                return Ref<BlockEntry>.of(forge(addr, BlockEntry.size));
+        }
+
+        def forgeChunkHeader(addr: u64) -> Ref<ChunkHeader> {
+                return Ref<ChunkHeader>.of(forge(addr, ChunkHeader.size));
+        }
+
+        def forgeLineMark(addr: u64) -> Ref<LineMark> {
+                return Ref<LineMark>.of(forge(addr, LineMark.size));
+        }
+
+        def forgeMetaDataDesc(addr: u64) -> Ref<MetaDataDesc> {
+                return Ref<MetaDataDesc>.of(forge(addr, MetaDataDesc.size));
+        }
+
+        def forgeDualWalHeader(addr: u64) -> Ref<DualWalHeader> {
+                return Ref<DualWalHeader>.of(forge(addr, DualWalHeader.size));
+        }
+
+        def forgeRecordHeader(addr: u64) -> Ref<TxnRecordHeader> {
+                return Ref<TxnRecordHeader>.of(forge(addr, TxnRecordHeader.size));
+        }
+
+        def forgeCommitTrailer(addr: u64) -> Ref<TxnCommitTrailer> {
+                return Ref<TxnCommitTrailer>.of(forge(addr, TxnCommitTrailer.size));
+        }
+
+        def forgeLogEntry(addr: u64) -> Ref<LogEntry> {
+                return Ref<LogEntry>.of(forge(addr, LogEntry.size));
+        }
+
+        private def forge(addr: u64, size: int) -> Range<byte> {
+                note(addr, u64.!(size));
+                return CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), size);
+        }
+
+        private def note(addr: u64, length: u64) {
+                def o = ops.loadObserver;
+                if (o != null) o.observe(addr - regionStart, length);
         }
 }
 
@@ -575,6 +692,7 @@ class PWRegion {
         // writer at an interesting moment and killing it while idle.
         def var lastRecovery = DualWalRecovery.CLEAN;
         private var writer: DirectRegionWriter;
+        private var regionReader: DirectRegionReader;
 
         new(backend: TxnRegionBackend, numBlocks, metaDataDescs, blockSize: u64, forceFormat: bool) {
                 var size = numBlocks * blockSize;
@@ -596,7 +714,11 @@ class PWRegion {
                 // Resolve before init(): format() writes the header, sentinels,
                 // block table and descriptors through this writer well before
                 // ensureWal() constructs the WAL and its own provider reference.
-                writer = DirectRegionWriter.new(X86_64PersistentOps.ensureFor(backendRegion), regionStart);
+                def ops = X86_64PersistentOps.ensureFor(backendRegion);
+                writer = DirectRegionWriter.new(ops, regionStart);
+                // The reader shares the provider, so an observer installed on
+                // it before this constructor sees init()'s first load.
+                regionReader = DirectRegionReader.new(ops, regionStart);
                 init(blockSize, forceFormat);
         }
 
@@ -674,8 +796,7 @@ class PWRegion {
                         format(blockSize);
                         return;
                 }
-                var hdr = getHeader();
-                if (hdr.magic == PWRegions.MAGIC) {
+                if (headerGetU64(PWRegionHeader.magic.offset) == PWRegions.MAGIC) {
                         mount(blockSize);
                 } else {
                         format(blockSize);
@@ -691,32 +812,34 @@ class PWRegion {
                 }
         }
 
-        // Mounts an existing, fully formatted region
+        // Mounts an existing, fully formatted region. The header is read one
+        // field at a time through the reader, so a load observer sees exactly
+        // the fields a mount depends on.
         private def mount(blockSize: u64) {
-                def hdr = getHeader();
-
-                if (blockSize != hdr.blockSize) {
+                def storedBlockSize = headerGetU64(PWRegionHeader.blockSize.offset);
+                if (blockSize != storedBlockSize) {
                         Trace.OUT.put2("blockSize mismatch: requested %d, stored %d",
-                                blockSize, hdr.blockSize).ln();
+                                blockSize, storedBlockSize).ln();
                         return;
                 }
 
-                if (this.numBlocks != hdr.numBlocks) {
+                def storedNumBlocks = headerGetU64(PWRegionHeader.numBlocks.offset);
+                if (this.numBlocks != storedNumBlocks) {
                         Trace.OUT.put2("numBlocks mismatch: requested %d, stored %d",
-                                this.numBlocks, hdr.numBlocks).ln();
+                                this.numBlocks, storedNumBlocks).ln();
                         return;
                 }
 
-                sentinels = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.sentinels))), u64.!(BlockLists.MAX_LISTS));
+                sentinels = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(headerGetU64(PWRegionHeader.sentinels.offset)))), u64.!(BlockLists.MAX_LISTS));
                 smallSentinel = sentinels[u64.!(ListKind.SMALL_FREE.code)];
                 largeSentinel = sentinels[u64.!(ListKind.LARGE_FREE.code)];
 
-                def numBlockTableEntries = hdr.numBlocks + 1;
+                def numBlockTableEntries = storedNumBlocks + 1;
                 def blockTableSize = numBlockTableEntries * u64.!(BlockEntry.size);
 
-                blockTableHandle = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(hdr.blockTable))), numBlockTableEntries);
+                blockTableHandle = BlockTableHandle(u64.view(Pointer.atElement(rng, int.!(headerGetU64(PWRegionHeader.blockTable.offset)))), numBlockTableEntries);
 
-                var logChunkOffset = hdr.logChunk;
+                var logChunkOffset = headerGetU64(PWRegionHeader.logChunk.offset);
                 if (logChunkOffset == 0) logChunkOffset = blockSize; // defensive: field unset -> block 1
                 logChunk = ChunkHandle(regionStart + logChunkOffset);
                 ensureWal(logChunk.addr, blockSize, false);
@@ -742,6 +865,10 @@ class PWRegion {
         // Initialize list sentinels just after the region header
         private def headerSetU64(offset: int, value: u64) {
                 writer.writeOffsetU64(u64.view(offset), value);
+        }
+
+        private def headerGetU64(offset: int) -> u64 {
+                return regionReader.loadOffsetU64(u64.view(offset));
         }
 
         private def formatSentinels() {
@@ -916,8 +1043,16 @@ class PWRegion {
                 backendRegion.persistRange(u64.view(PWRegionHeader.magic.offset), 8u64);
         }
 
+        // The region's direct reader. Loads through it bypass the transaction's
+        // write-behind cache, as the raw getters always did.
+        def reader() -> DirectRegionReader {
+                return regionReader;
+        }
+
+        // A copy of the whole header, observed as one load.
         def getHeader() -> Ref<PWRegionHeader> {
                 var copy = Array<byte>.new(PWRegionHeader.size);
+                regionReader.observe(regionStart, u64.!(PWRegionHeader.size));
                 def base = PWRegionUtils.pointerFromU64(regionStart);
                 for (i < PWRegionHeader.size) {
                         copy[i] = (base + i).load<byte>();
@@ -926,16 +1061,12 @@ class PWRegion {
         }
 
         def getMetaDataDesc(i: u64) -> Ref<MetaDataDesc> {
-                var hdr = getHeader();
-                return Ref<MetaDataDesc>.of(CiRuntime.forgeRange<byte>(
-                        PWRegionUtils.pointerFromU64(regionStart + hdr.metaDataDescs + i * u64.!(MetaDataDesc.size)),
-                        MetaDataDesc.size));
+                def descs = headerGetU64(PWRegionHeader.metaDataDescs.offset);
+                return regionReader.forgeMetaDataDesc(regionStart + descs + i * u64.!(MetaDataDesc.size));
         }
 
         def blockEntryAt(offset: u64) -> Ref<BlockEntry> {
-                return Ref<BlockEntry>.of(CiRuntime.forgeRange<byte>(
-                        PWRegionUtils.pointerFromU64(regionStart + offset),
-                        BlockEntry.size));
+                return regionReader.forgeBlockEntry(regionStart + offset);
         }
 
         def createChunk(startEntry: BlockEntryHandle, numBlocks: u32) -> ChunkHandle {
@@ -1156,8 +1287,10 @@ class PWRegion {
                 }
                 // The writer's provider holds a range over memory that destroy()
                 // is about to unmap; drop it so a stale direct store fails
-                // deterministically instead of writing into unmapped pages.
+                // deterministically instead of writing into unmapped pages. The
+                // reader likewise, for a stale direct load.
                 writer = null;
+                regionReader = null;
                 if (backendRegion != null) {
                         backendRegion.destroy();
                         backendRegion = null;
@@ -1193,8 +1326,8 @@ class ImmixPWRegion extends PWRegion {
         def var lineSize: u64;
 
         private def getLineMarks() -> LineMarkTableHandle {
-                var hdr = getHeader();
-                for (i < hdr.numDescs) {
+                def numDescs = reader().loadOffsetU64(u64.view(PWRegionHeader.numDescs.offset));
+                for (i < numDescs) {
                         var r = getMetaDataDesc(u64.!(i));
                         if (r.kind == ImmixPWRegions.ImmixLineMarkMetaKind) {
                                 lineSize = u64.!(r.unitSize);

@@ -50,7 +50,11 @@ class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
 // mount that records what the code under test does to it.
 class PersistentImageMount(region: BackendRegion, recorder: RecordingPersistentOperations) {
 
-	// The bytes as they stand now, frozen into an image.
+	// The bytes as they stand now, frozen into an image. A raw copy, outside
+	// the load seam on purpose: it runs after the code under test has
+	// finished, and properties read the frozen copy, so it is not a load
+	// recovery makes and no load observer should see it. The same holds for
+	// the copies taken after an allocator check below.
 	def freeze() -> PersistentDurableImage {
 		def after = Array<byte>.new(region.range.length);
 		for (i < after.length) after[i] = region.range[i];
@@ -480,6 +484,9 @@ component PersistentAllocatorInvariants {
 	// a latched mount is not a licence to leave a broken chain behind.
 	def checkStructure(region: PWRegion) -> string {
 		if (region == null || region.backendRegion == null) return "region did not mount";
+		// Every load goes through the region's reader, so a load observer
+		// sees the entries this walk visits.
+		def r = region.reader();
 		def entryCount = int.!(region.numBlocks + 1u64);
 		def memorySeen = Array<bool>.new(entryCount);
 		def freeByIndex = Array<bool>.new(entryCount);
@@ -497,13 +504,13 @@ component PersistentAllocatorInvariants {
 			def arrayIndex = int.!(index);
 			if (memorySeen[arrayIndex]) return at("block appears twice in memory order", index);
 			memorySeen[arrayIndex] = true;
-			if (previous.addr != current.getPrev().addr) return at("memory-order back link is wrong", index);
+			if (previous.addr != current.getPrev(r).addr) return at("memory-order back link is wrong", index);
 
-			def next = current.getNext();
+			def next = current.getNext(r);
 			if (index == region.numBlocks) {
-				if (!current.getUsed()) return "region marker is not marked used";
-				if (current.getListNum() != ListKind.NONE.code) return "region marker is on a free list";
-				if (!next.isNull() || !current.getListPrev().isNull() || !current.getListNext().isNull()) {
+				if (!current.getUsed(r)) return "region marker is not marked used";
+				if (current.getListNum(r) != ListKind.NONE.code) return "region marker is on a free list";
+				if (!next.isNull() || !current.getListPrev(r).isNull() || !current.getListNext(r).isNull()) {
 					return "region marker has non-null links";
 				}
 				reachedEnd = true;
@@ -513,21 +520,21 @@ component PersistentAllocatorInvariants {
 
 			def nextIndex = region.blockIndexOf(next);
 			if (nextIndex <= index) return at("memory-order block indices are not increasing", index);
-			if (current.addr != next.getPrev().addr) return at("memory-order forward link is not mirrored", index);
+			if (current.addr != next.getPrev(r).addr) return at("memory-order forward link is not mirrored", index);
 
-			if (current.getUsed()) {
-				def kind = current.getListNum();
+			if (current.getUsed(r)) {
+				def kind = current.getListNum(r);
 				if (kind != ListKind.NONE.code && kind != ListKind.METADATA.code) {
 					return at("used block carries a free-list kind", index);
 				}
-				if (!current.getListPrev().isNull() || !current.getListNext().isNull()) {
+				if (!current.getListPrev(r).isNull() || !current.getListNext(r).isNull()) {
 					return at("used block is linked into a free list", index);
 				}
 			} else {
 				def extentBlocks = nextIndex - index;
 				def expected = if(extentBlocks == 1u64, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code);
-				if (current.getListNum() != expected) return at("free block is on the wrong free list", index);
-				if (!previous.isNull() && !previous.getUsed()) {
+				if (current.getListNum(r) != expected) return at("free block is on the wrong free list", index);
+				if (!previous.isNull() && !previous.getUsed(r)) {
 					return at("adjacent free extents were not coalesced", index);
 				}
 				freeByIndex[arrayIndex] = true;
@@ -555,8 +562,9 @@ component PersistentAllocatorInvariants {
 	private def walkFreeList(region: PWRegion, sentinel: BlockEntryHandle, kind: ListKind,
 		listed: Array<bool>) -> string {
 
+		def r = region.reader();
 		var previous = sentinel;
-		var current = sentinel.getListNext();
+		var current = sentinel.getListNext(r);
 		var steps = 0;
 		while (!current.isNull()) {
 			if (steps > int.!(region.numBlocks)) return "free-list cycle detected";
@@ -566,12 +574,12 @@ component PersistentAllocatorInvariants {
 			def arrayIndex = int.!(index);
 			if (listed[arrayIndex]) return at("block appears more than once on the free lists", index);
 			listed[arrayIndex] = true;
-			if (current.getListNum() != kind.code) return at("free block is on the wrong list", index);
-			if (current.getUsed()) return at("used block appears on a free list", index);
-			if (previous.addr != current.getListPrev().addr) return at("free-list back link is wrong", index);
+			if (current.getListNum(r) != kind.code) return at("free block is on the wrong list", index);
+			if (current.getUsed(r)) return at("used block appears on a free list", index);
+			if (previous.addr != current.getListPrev(r).addr) return at("free-list back link is wrong", index);
 
 			previous = current;
-			current = current.getListNext();
+			current = current.getListNext(r);
 			steps++;
 		}
 		return null;

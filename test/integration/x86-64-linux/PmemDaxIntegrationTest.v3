@@ -73,7 +73,7 @@ def test_pmem_clean_remount_and_wal_replay(tc: PmemDaxIntegrationTester) {
 		cleanMount.deallocate();
 		return;
 	}
-	tc.t.assertz(true, cleanMount.blockTableHandle[allocatedBlock].getUsed());
+	tc.t.assertz(true, cleanMount.blockTableHandle[allocatedBlock].getUsed(cleanMount.reader()));
 	tc.t.assertz(false, cleanMount.requiresRecovery());
 	cleanMount.deallocate();
 
@@ -116,7 +116,7 @@ def test_pmem_clean_remount_and_wal_replay(tc: PmemDaxIntegrationTester) {
 
 	tc.t.assert_eq(0xa5u8,
 		PWRegionUtils.pointerFromU64(recovered.regionStart + payloadOffset).load<u8>());
-	tc.t.assertz(true, recovered.blockTableHandle[allocatedBlock].getUsed());
+	tc.t.assertz(true, recovered.blockTableHandle[allocatedBlock].getUsed(recovered.reader()));
 	tc.t.assertz(false, recovered.requiresRecovery());
 	recovered.deallocate();
 }

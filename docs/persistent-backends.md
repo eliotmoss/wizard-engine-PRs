@@ -3168,6 +3168,19 @@ x86-64 provider performs ordinary native scalar stores and reaches the existing
 writeback/fence hooks. A recording provider mutates the same live byte image and
 retains typed `STORE`/`CLWB`/`SFENCE` events for deterministic tests.
 
+Loads have a seam of their own since 2026-10-19. The provider carries a
+nullable `loadObserver: PersistentLoadObserver`, null in production, whose one
+method, `observe(offset, length)`, is called with region-relative offsets
+*before* the bytes are loaded and may rewrite them. Every load the allocator,
+the WAL and the workloads make from a region is made, or observed first,
+through a `DirectRegionReader` over the region's provider (the counterpart of
+`DirectRegionWriter`): typed `load*` methods, `observe()` for byte loops, and
+per-layout `forge*` helpers that observe a layout's bytes before forging its
+`Ref`. With no observer, a reader load is the same `Pointer.load` as before,
+behind a call and a never-taken branch. The contract, what goes through the
+reader and what stays raw, and the cost are in
+[PMEM Crash Model](pmem-crash-model.md#loads-2026-10-19).
+
 `BackendProt` mirrors Linux `PROT_*` flags: `NONE(0) READ(1) WRITE(2) EXEC(4)`.
 
 ### Implementations
@@ -3418,8 +3431,8 @@ callers; allocation and free entry points reject work after the latch is set.
 ```
 readU8(addr)
   if cache.has(addr) → return cached value
-  // fall through to live region memory
-  return Pointer.load<u8>(regionStart + offset)
+  // fall through to live region memory, through the WAL's reader
+  return wal.readU8(offset) → reader.loadU8(regionStart + offset)
 ```
 
 **Constraint:** Only aligned accesses are cached. There is no support for sub-word reads that span a cached boundary.
@@ -3528,6 +3541,8 @@ format(blockSize)
   backendRegion.persistRange(magic, 8)       -- then the magic's line alone
 
 mount(blockSize)
+  -- header fields are read one at a time through the region's
+  -- DirectRegionReader (magic in init(), then these), since 2026-10-19
   verify blockSize and numBlocks match header
   restore block table handle
   locate log chunk via header.logChunk       -- fall back to block 1 if unset (0)
@@ -3562,8 +3577,8 @@ sweep fails at that cut.
 These are zero-allocation wrappers around raw memory addresses:
 
 - `BlockTableHandle` — indexable view of the block table
-- `BlockEntryHandle` — single block entry; `.getCached(txn)` / `.setCached(txn)` for transactional access
-- `ChunkHandle` — allocated chunk with `offset` and `limit`
+- `BlockEntryHandle` — single block entry; `.getCached(txn)` / `.setCached(txn)` for transactional access, and direct `.get(r)` / `.set(w, …)`, which take the region's `DirectRegionReader` (`region.reader()`, since 2026-10-19) and `DirectRegionWriter`
+- `ChunkHandle` — allocated chunk with `offset` and `limit`; direct getters take the reader too
 - `LineMarkTableHandle` — line-mark bitmap for Immix GC
 
 ---
@@ -3575,7 +3590,7 @@ These are zero-allocation wrappers around raw memory addresses:
 `ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. The persisted line-mark metadata descriptor's `unitSize` controls the line size, and its `fixedBytes` prefix precedes the per-line table; the built-in `MemRegions` descriptor defaults to a 256-byte line size and no prefix.
 
 - `resetAllLineMarks()` — clears all line marks at the start of a GC cycle. Line marks are explicitly transient GC state: mark/reset operations bypass `RegionTransaction` and issue no persistence boundary. A caller mounting after a crash must rebuild them; the allocator does not currently do that automatically.
-- Since 2026-10-19 the marks' stores go through the persistent-operation seam, as every other store the allocator makes does. `LineMarkHandle.setMark(w, v)` takes the region's `DirectRegionWriter` (`lineMarkWriter()`), like the other non-cached setters, and `resetAllLineMarks()` passes it; before, both stored through a forged `Ref<LineMark>`. A recorded trace therefore shows each mark as a 1-byte `STORE`, and marking and resetting add no `CLWB` or `SFENCE` (`persistent_ops:immix_line_marks_cross_the_seam`). `getMark()` still reads through the forged ref, since the seam records no loads.
+- Since 2026-10-19 the marks' stores go through the persistent-operation seam, as every other store the allocator makes does. `LineMarkHandle.setMark(w, v)` takes the region's `DirectRegionWriter` (`lineMarkWriter()`), like the other non-cached setters, and `resetAllLineMarks()` passes it; before, both stored through a forged `Ref<LineMark>`. A recorded trace therefore shows each mark as a 1-byte `STORE`, and marking and resetting add no `CLWB` or `SFENCE` (`persistent_ops:immix_line_marks_cross_the_seam`). Since the same day `getMark(r)` reads through the region's `DirectRegionReader`, like the other direct getters, rather than through a forged ref.
 
 ---
 
@@ -3618,7 +3633,7 @@ PWRegion.allocChunk(n)
 BlockEntryHandle.getUsedCached(txn)
   → RegionTransaction.readU8(addr)
       if cache.has(addr) → return cached value
-      else → Pointer.load<u8>(regionStart + offset)
+      else → wal.readU8(offset) → reader.loadU8(regionStart + offset)
 ```
 
 ### Crash recovery on remount

@@ -22,12 +22,39 @@ enum CheckpointCost {
 	EXPENSIVE
 }
 
+// Watches the loads code makes from a persistent region. Loads do not go
+// through PersistentOperations as stores do: a production load stays a plain
+// Pointer.load, and the region's readers (DirectRegionReader) call observe()
+// first, only when an observer is installed on the region's provider.
+//
+// The contract:
+//   - offset and length are region-relative, like a store's offset;
+//   - observe() is called BEFORE the bytes [offset, offset + length) are
+//     loaded, and before any field of a Ref forged over them is read, so the
+//     observer may rewrite those bytes in the region's mapping and the code
+//     will load what it wrote (a lazy crash search materialises its chosen
+//     image there);
+//   - one call may cover a whole layout or a byte loop's range, so the
+//     reader may load the covered bytes later, and more than once, without
+//     another call;
+//   - reads of bytes the running code itself stored are observed like any
+//     other: telling them apart is the observer's business, not the reader's.
+// The default observes nothing.
+class PersistentLoadObserver {
+	def observe(offset: u64, length: u64) { }
+}
+
 // Narrow seam for persistent scalar stores and PMEM ordering operations.
 // Offsets are always relative to the beginning of the owning BackendRegion.
 // Implementations must preserve naturally aligned little-endian 1/2/4/8-byte
 // stores. A BackendRegion owns one provider so stores, cache-line writebacks,
 // and fences can be observed in one total order without global tracing state.
+//
+// {loadObserver} is null in production. Installing one makes every reader of
+// this region (DirectRegionReader) report its loads to it first.
 class PersistentOperations {
+	var loadObserver: PersistentLoadObserver;
+
 	def storeU8(offset: u64, value: u8);
 	def storeU16(offset: u64, value: u16);
 	def storeU32(offset: u64, value: u32);

@@ -112,6 +112,7 @@ class PWBTreeImage(words: Array<u64>) {
 // {requestedCapacity} 0 asks for the most a node of the region's block size holds.
 class PWBTree(region: PWRegion, requestedCapacity: int) {
         private var writer: DirectRegionWriter;
+        private var reader: DirectRegionReader;
         private var ops: PersistentOperations;
         private var rootOffset: u64;            // region-relative offset of the root chunk
         private var cap: int;                   // keys per node
@@ -137,6 +138,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (region != null && region.backendRegion != null) {
                         ops = X86_64PersistentOps.ensureFor(region.backendRegion);
                         writer = DirectRegionWriter.new(ops, region.regionStart);
+                        reader = DirectRegionReader.new(ops, region.regionStart);
                 }
         }
 
@@ -250,8 +252,8 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 var guard = region.numBlocks + 1u64;
                 while (!entry.isNull() && guard > 0u64) {
                         guard--;
-                        def next = entry.getNext();
-                        if (entry.getUsed() && entry.getListNum() == ListKind.NONE.code) {
+                        def next = entry.getNext(reader);
+                        if (entry.getUsed(reader) && entry.getListNum(reader) == ListKind.NONE.code) {
                                 // The chain ends in the end-of-region entry,
                                 // which has no block behind it.
                                 def block = region.blockIndexOf(entry);
@@ -667,7 +669,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 def marked = Array<bool>.new(int.!(region.numBlocks));
                 marked[int.!(rootOffset / region.blockSize)] = true;
                 def rootEntry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + rootOffset));
-                if (rootEntry.isNull() || !rootEntry.getUsed()) return "the root chunk is not allocated";
+                if (rootEntry.isNull() || !rootEntry.getUsed(reader)) return "the root chunk is not allocated";
                 return walk(marked);
         }
 
@@ -694,7 +696,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (marked[block]) return "a node is reachable twice, or is the root chunk";
                 marked[block] = true;
                 def entry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + node));
-                if (entry.isNull() || !entry.getUsed() || entry.getListNum() != ListKind.NONE.code) {
+                if (entry.isNull() || !entry.getUsed(reader) || entry.getListNum(reader) != ListKind.NONE.code) {
                         return "a reachable node is not an allocated chunk";
                 }
                 def count = nodeKeys(node);
@@ -757,7 +759,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         }
 
         private def word(offset: u64, w: int) -> u64 {
-                return PWRegionUtils.pointerFromU64(nodeAddr(offset) + u64.!(w) * 8u64).load<u64>();
+                return reader.loadU64(nodeAddr(offset) + u64.!(w) * 8u64);
         }
 
         private def nodeTag(offset: u64) -> u64 { return word(offset, 0); }

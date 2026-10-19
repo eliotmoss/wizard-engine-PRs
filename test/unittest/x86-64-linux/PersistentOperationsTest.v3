@@ -813,7 +813,7 @@ def test_persistent_immix_line_marks_cross_the_seam(tc: PersistentOperationsTest
 	tc.t.assert_eq(1, recorder.events.length);
 	tc.assertStore(recorder.events[0], 1u64, firstMark + 3u64 * u64.!(LineMark.size),
 		1u8, u64.!(ImmixPWRegions.LINE_MARKED));
-	tc.t.assert_eq(ImmixPWRegions.LINE_MARKED, mark.getMark());
+	tc.t.assert_eq(ImmixPWRegions.LINE_MARKED, mark.getMark(region.reader()));
 
 	// A reset: one store per mark, in table order, each a STORE event, so
 	// none is a writeback or a fence.
@@ -827,7 +827,7 @@ def test_persistent_immix_line_marks_cross_the_seam(tc: PersistentOperationsTest
 	}
 	tc.assertSequences(events);
 	tc.assertStoreContract(events, TracePWRegions.SIZE);
-	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkResetValue, mark.getMark());
+	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkResetValue, mark.getMark(region.reader()));
 	region.deallocate();
 }
 

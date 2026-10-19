@@ -131,7 +131,7 @@ def test_alloc_oversized_rejected(tc: PWRegionTester) {
 def test_alloc_sets_used(tc: PWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(true, entry.getUsed());
+	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
 }
 
 // After allocChunk(1), the chunk header fields must reflect the initial
@@ -139,9 +139,9 @@ def test_alloc_sets_used(tc: PWRegionTester) {
 def test_alloc_chunk_header(tc: PWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	// offset = ChunkHeader.size (start of usable space past the header)
-	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
+	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset(tc.region.reader()));
 	// limit = 1 block * 4096 bytes/block
-	tc.t.assert_eq(4096u64, chunk.getLimit());
+	tc.t.assert_eq(4096u64, chunk.getLimit(tc.region.reader()));
 }
 
 
@@ -179,7 +179,7 @@ def test_free_foreign_rejected(tc: PWRegionTester) {
 	tc.t.assertz(true, !foreignChunk.isNull());
 	tc.t.assertz(false, tc.region.freeChunk(foreignChunk));
 	tc.t.assertz(false, tc.region.txn.isDirty());
-	tc.t.assertz(true, foreignRegion.chunkToBlockEntry(foreignChunk).getUsed());
+	tc.t.assertz(true, foreignRegion.chunkToBlockEntry(foreignChunk).getUsed(foreignRegion.reader()));
 }
 
 // After alloc+free, the block entry must show used == false.
@@ -187,7 +187,7 @@ def test_free_clears_used(tc: PWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.region.freeChunk(chunk);
 	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(false, entry.getUsed());
+	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
 }
 
 // After alloc+free, a subsequent alloc must succeed (the block was returned to
@@ -494,7 +494,7 @@ def test_immix_chunk_links_first_line_mark(tc: ImmixPWRegionTester) {
 
 	tc.t.assertz(false, chunk.isNull());
 	tc.t.assertz(false, expectedOffset == 0);
-	tc.t.assert_eq(expectedOffset, chunk.getLinemarks());
+	tc.t.assert_eq(expectedOffset, chunk.getLinemarks(tc.region.reader()));
 }
 
 // A GC-cycle reset clears every per-unit mark without overwriting the
@@ -513,7 +513,7 @@ def test_immix_reset_all_line_marks(tc: ImmixPWRegionTester) {
 		tc.t.assert_eq(0xa5u8, (prefix + i).load<u8>());
 	}
 	for (i < tc.region.numLineMarks) {
-		tc.t.assert_eq(ImmixPWRegions.LINE_FREE, tc.region.lineMarks[i].getMark());
+		tc.t.assert_eq(ImmixPWRegions.LINE_FREE, tc.region.lineMarks[i].getMark(tc.region.reader()));
 	}
 }
 
@@ -782,7 +782,7 @@ def test_alloc_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
 	def persistChangesCount = tc.backend.region.persistChangesCount;
 	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
 	tc.t.assertz(false, tc.region.freeChunk(committedChunk));
-	tc.t.assertz(true, tc.region.chunkToBlockEntry(committedChunk).getUsed());
+	tc.t.assertz(true, tc.region.chunkToBlockEntry(committedChunk).getUsed(tc.region.reader()));
 	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
 }
 
@@ -795,19 +795,19 @@ def test_free_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
 	def chunk = tc.region.allocChunk(1u32);
 	def entry = tc.region.chunkToBlockEntry(chunk);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
-	tc.t.assertz(true, entry.getUsed());
+	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
 	tc.backend.region.failNextPersistChanges = true;
 
 	tc.t.assertz(false, tc.region.freeChunk(chunk));
 	tc.t.assertz(true, tc.region.requiresRecovery());
 	tc.t.assertz(true, tc.region.txn.isDirty());
 	tc.t.assertz(false, entry.getUsedCached(tc.region.txn));
-	tc.t.assertz(true, entry.getUsed());
+	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
 
 	def persistChangesCount = tc.backend.region.persistChangesCount;
 	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
 	tc.t.assertz(false, tc.region.freeChunk(chunk));
-	tc.t.assertz(true, entry.getUsed());
+	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
 	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
 }
 
@@ -1491,7 +1491,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 		listed: Array<bool>) {
 
 		var previous = sentinel;
-		var current = sentinel.getListNext();
+		var current = sentinel.getListNext(candidate.reader());
 		var steps = 0;
 		while (!current.isNull()) {
 			if (steps > int.!(candidate.numBlocks)) {
@@ -1509,12 +1509,12 @@ class BlockDevicePWRegionTester(t: Tester) {
 				return;
 			}
 			listed[index] = true;
-			t.assert_eq(kind.code, current.getListNum());
-			t.assertz(false, current.getUsed());
-			t.assert_eq(previous.addr, current.getListPrev().addr);
+			t.assert_eq(kind.code, current.getListNum(candidate.reader()));
+			t.assertz(false, current.getUsed(candidate.reader()));
+			t.assert_eq(previous.addr, current.getListPrev(candidate.reader()).addr);
 
 			previous = current;
-			current = current.getListNext();
+			current = current.getListNext(candidate.reader());
 			steps++;
 		}
 	}
@@ -1549,15 +1549,15 @@ class BlockDevicePWRegionTester(t: Tester) {
 				return;
 			}
 			memorySeen[arrayIndex] = true;
-			t.assert_eq(previous.addr, current.getPrev().addr);
+			t.assert_eq(previous.addr, current.getPrev(candidate.reader()).addr);
 
-			def next = current.getNext();
+			def next = current.getNext(candidate.reader());
 			if (index == candidate.numBlocks) {
-				t.assertz(true, current.getUsed());
-				t.assert_eq(ListKind.NONE.code, current.getListNum());
+				t.assertz(true, current.getUsed(candidate.reader()));
+				t.assert_eq(ListKind.NONE.code, current.getListNum(candidate.reader()));
 				t.assertz(true, next.isNull());
-				t.assertz(true, current.getListPrev().isNull());
-				t.assertz(true, current.getListNext().isNull());
+				t.assertz(true, current.getListPrev(candidate.reader()).isNull());
+				t.assertz(true, current.getListNext(candidate.reader()).isNull());
 				reachedEnd = true;
 				break;
 			}
@@ -1571,21 +1571,21 @@ class BlockDevicePWRegionTester(t: Tester) {
 				t.fail("memory-order block indices are not increasing");
 				return;
 			}
-			t.assert_eq(current.addr, next.getPrev().addr);
+			t.assert_eq(current.addr, next.getPrev(candidate.reader()).addr);
 
-			if (current.getUsed()) {
-				def kind = current.getListNum();
+			if (current.getUsed(candidate.reader())) {
+				def kind = current.getListNum(candidate.reader());
 				t.assertz(true, kind == ListKind.NONE.code || kind == ListKind.METADATA.code);
-				t.assertz(true, current.getListPrev().isNull());
-				t.assertz(true, current.getListNext().isNull());
+				t.assertz(true, current.getListPrev(candidate.reader()).isNull());
+				t.assertz(true, current.getListNext(candidate.reader()).isNull());
 			} else {
 				def extentBlocks = nextIndex - index;
 				def expectedKind = if(
 					extentBlocks == 1u64,
 					ListKind.SMALL_FREE.code,
 					ListKind.LARGE_FREE.code);
-				t.assert_eq(expectedKind, current.getListNum());
-				if (!previous.isNull()) t.assertz(true, previous.getUsed());
+				t.assert_eq(expectedKind, current.getListNum(candidate.reader()));
+				if (!previous.isNull()) t.assertz(true, previous.getUsed(candidate.reader()));
 				freeByIndex[arrayIndex] = true;
 			}
 
@@ -1612,14 +1612,14 @@ class BlockDevicePWRegionTester(t: Tester) {
 			if (size == 0u32) continue;
 
 			def entry = candidate.blockTableHandle[u64.view(i)];
-			def next = entry.getNext();
-			t.assertz(true, entry.getUsed());
-			t.assert_eq(ListKind.NONE.code, entry.getListNum());
+			def next = entry.getNext(candidate.reader());
+			t.assertz(true, entry.getUsed(candidate.reader()));
+			t.assert_eq(ListKind.NONE.code, entry.getListNum(candidate.reader()));
 			t.assert_eq(u64.view(i) + u64.view(size), candidate.blockIndexOf(next));
 
 			def chunk = candidate.blockEntryToChunk(entry);
-			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getLimit());
-			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getChunkLimit());
+			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getLimit(candidate.reader()));
+			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getChunkLimit(candidate.reader()));
 		}
 
 		// The reverse check prevents an unexpected allocated extent from being
@@ -1633,9 +1633,9 @@ class BlockDevicePWRegionTester(t: Tester) {
 			}
 			def index = candidate.blockIndexOf(current);
 			if (index >= 2u64 && index < 7u64) {
-				t.assertz(current.getUsed(), allocationSizes[int.!(index)] != 0u32);
+				t.assertz(current.getUsed(candidate.reader()), allocationSizes[int.!(index)] != 0u32);
 			}
-			current = current.getNext();
+			current = current.getNext(candidate.reader());
 			steps++;
 		}
 	}
@@ -1655,7 +1655,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (region.backendRegion == null || region.txn == null) return 2;
 
 		def entry = region.blockTableHandle[2u64];
-		if (entry.getUsed()) return 3;
+		if (entry.getUsed(region.reader())) return 3;
 
 		var wal = DualTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
 		if (!wal.append(
@@ -1679,7 +1679,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (chunk.isNull()) return 3;
 		if (region.requiresRecovery()) return 4;
 		if (region.txn.isDirty()) return 5;
-		if (!region.blockTableHandle[2u64].getUsed()) return 6;
+		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 6;
 		if (!FileMmapRegion.?(region.backendRegion)) return 7;
 		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 8;
 		return 0;
@@ -1744,7 +1744,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
 
 		def allocatedRight = region.blockTableHandle[3u64];
-		if (!allocatedRight.getUsed()) return 4;
+		if (!allocatedRight.getUsed(region.reader())) return 4;
 		if (!region.freeChunk(region.blockEntryToChunk(allocatedRight))) return 5;
 		// Reaching this return means the expected SIGSTOP did not hold the child
 		// at the commit boundary.
@@ -1767,7 +1767,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 		def first = region.allocChunk(1u32);
 		if (first.isNull()) return 4;
-		if (!region.blockTableHandle[2u64].getUsed()) return 5;
+		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 5;
 		def second = region.allocChunk(1u32);
 		if (second.isNull()) return 6;
 		// Reaching this return means the expected second-boundary SIGSTOP did not
@@ -1816,8 +1816,8 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (first.isNull()) return 4;
 		def second = region.allocChunk(1u32);
 		if (second.isNull()) return 5;
-		if (!region.blockTableHandle[2u64].getUsed()) return 6;
-		if (!region.blockTableHandle[3u64].getUsed()) return 7;
+		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 6;
+		if (!region.blockTableHandle[3u64].getUsed(region.reader())) return 7;
 
 		SlotScrubBoundaryStopFileMmapRegion.!(region.backendRegion).closing = true;
 		region.deallocate();
@@ -1838,8 +1838,8 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (chunk.isNull()) return 3;
 		if (region.requiresRecovery()) return 4;
 		if (region.txn.isDirty()) return 5;
-		if (!region.blockTableHandle[2u64].getUsed()) return 6;
-		if (!region.largeSentinel.getListNext().isNull()) return 7;
+		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 6;
+		if (!region.largeSentinel.getListNext(region.reader()).isNull()) return 7;
 		if (!FileMmapRegion.?(region.backendRegion)) return 8;
 		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 9;
 		return 0;
@@ -1862,8 +1862,8 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (region.txn.isDirty()) return 8;
 
 		def coalesced = region.blockTableHandle[2u64];
-		if (coalesced.getUsed()) return 9;
-		if (coalesced.getListNum() != ListKind.LARGE_FREE.code) return 10;
+		if (coalesced.getUsed(region.reader())) return 9;
+		if (coalesced.getListNum(region.reader()) != ListKind.LARGE_FREE.code) return 10;
 		if (!FileMmapRegion.?(region.backendRegion)) return 11;
 		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 12;
 		return 0;
@@ -1877,27 +1877,27 @@ class BlockDevicePWRegionTester(t: Tester) {
 		def chunk = recovered.blockEntryToChunk(allocated);
 
 		// Memory-order chain: log block -> allocated block -> remainder -> metadata.
-		t.assertz(true, allocated.getUsed());
-		t.assert_eq(ListKind.NONE.code, allocated.getListNum());
-		t.assert_eq(logEntry.addr, allocated.getPrev().addr);
-		t.assert_eq(remainder.addr, allocated.getNext().addr);
-		t.assertz(true, allocated.getListPrev().isNull());
-		t.assertz(true, allocated.getListNext().isNull());
+		t.assertz(true, allocated.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.NONE.code, allocated.getListNum(recovered.reader()));
+		t.assert_eq(logEntry.addr, allocated.getPrev(recovered.reader()).addr);
+		t.assert_eq(remainder.addr, allocated.getNext(recovered.reader()).addr);
+		t.assertz(true, allocated.getListPrev(recovered.reader()).isNull());
+		t.assertz(true, allocated.getListNext(recovered.reader()).isNull());
 
-		t.assertz(false, remainder.getUsed());
-		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum());
-		t.assert_eq(allocated.addr, remainder.getPrev().addr);
-		t.assert_eq(metadata.addr, remainder.getNext().addr);
-		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev().addr);
-		t.assertz(true, remainder.getListNext().isNull());
-		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext().addr);
-		t.assert_eq(remainder.addr, metadata.getPrev().addr);
+		t.assertz(false, remainder.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum(recovered.reader()));
+		t.assert_eq(allocated.addr, remainder.getPrev(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, remainder.getNext(recovered.reader()).addr);
+		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev(recovered.reader()).addr);
+		t.assertz(true, remainder.getListNext(recovered.reader()).isNull());
+		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext(recovered.reader()).addr);
+		t.assert_eq(remainder.addr, metadata.getPrev(recovered.reader()).addr);
 
 		// The same transaction also initialized the allocated chunk header.
-		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
-		t.assert_eq(4096u64, chunk.getLimit());
-		t.assert_eq(4096u64, chunk.getChunkLimit());
-		t.assert_eq(0u64, chunk.getLinemarks());
+		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset(recovered.reader()));
+		t.assert_eq(4096u64, chunk.getLimit(recovered.reader()));
+		t.assert_eq(4096u64, chunk.getChunkLimit(recovered.reader()));
+		t.assert_eq(0u64, chunk.getLinemarks(recovered.reader()));
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
@@ -1911,31 +1911,31 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 		// Memory-order chain: log -> first allocation -> second allocation ->
 		// three-block free remainder -> metadata.
-		t.assertz(true, first.getUsed());
-		t.assert_eq(ListKind.NONE.code, first.getListNum());
-		t.assert_eq(logEntry.addr, first.getPrev().addr);
-		t.assert_eq(second.addr, first.getNext().addr);
-		t.assertz(true, second.getUsed());
-		t.assert_eq(ListKind.NONE.code, second.getListNum());
-		t.assert_eq(first.addr, second.getPrev().addr);
-		t.assert_eq(remainder.addr, second.getNext().addr);
+		t.assertz(true, first.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.NONE.code, first.getListNum(recovered.reader()));
+		t.assert_eq(logEntry.addr, first.getPrev(recovered.reader()).addr);
+		t.assert_eq(second.addr, first.getNext(recovered.reader()).addr);
+		t.assertz(true, second.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.NONE.code, second.getListNum(recovered.reader()));
+		t.assert_eq(first.addr, second.getPrev(recovered.reader()).addr);
+		t.assert_eq(remainder.addr, second.getNext(recovered.reader()).addr);
 
-		t.assertz(false, remainder.getUsed());
-		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum());
-		t.assert_eq(second.addr, remainder.getPrev().addr);
-		t.assert_eq(metadata.addr, remainder.getNext().addr);
-		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev().addr);
-		t.assertz(true, remainder.getListNext().isNull());
-		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext().addr);
+		t.assertz(false, remainder.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum(recovered.reader()));
+		t.assert_eq(second.addr, remainder.getPrev(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, remainder.getNext(recovered.reader()).addr);
+		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev(recovered.reader()).addr);
+		t.assertz(true, remainder.getListNext(recovered.reader()).isNull());
+		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext(recovered.reader()).addr);
 
 		def firstChunk = recovered.blockEntryToChunk(first);
 		def secondChunk = recovered.blockEntryToChunk(second);
-		t.assert_eq(u64.!(ChunkHeader.size), firstChunk.getOffset());
-		t.assert_eq(4096u64, firstChunk.getLimit());
-		t.assert_eq(4096u64, firstChunk.getChunkLimit());
-		t.assert_eq(u64.!(ChunkHeader.size), secondChunk.getOffset());
-		t.assert_eq(4096u64, secondChunk.getLimit());
-		t.assert_eq(4096u64, secondChunk.getChunkLimit());
+		t.assert_eq(u64.!(ChunkHeader.size), firstChunk.getOffset(recovered.reader()));
+		t.assert_eq(4096u64, firstChunk.getLimit(recovered.reader()));
+		t.assert_eq(4096u64, firstChunk.getChunkLimit(recovered.reader()));
+		t.assert_eq(u64.!(ChunkHeader.size), secondChunk.getOffset(recovered.reader()));
+		t.assert_eq(4096u64, secondChunk.getLimit(recovered.reader()));
+		t.assert_eq(4096u64, secondChunk.getChunkLimit(recovered.reader()));
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
@@ -1948,29 +1948,29 @@ class BlockDevicePWRegionTester(t: Tester) {
 		def chunk = recovered.blockEntryToChunk(allocated);
 
 		// Memory order skips the consumed extent's interior table entries.
-		t.assertz(true, allocated.getUsed());
-		t.assert_eq(ListKind.NONE.code, allocated.getListNum());
-		t.assert_eq(allocated.addr, logEntry.getNext().addr);
-		t.assert_eq(logEntry.addr, allocated.getPrev().addr);
-		t.assert_eq(metadata.addr, allocated.getNext().addr);
-		t.assertz(true, metadata.getUsed());
-		t.assert_eq(ListKind.METADATA.code, metadata.getListNum());
-		t.assert_eq(allocated.addr, metadata.getPrev().addr);
-		t.assert_eq(endMarker.addr, metadata.getNext().addr);
-		t.assertz(true, metadata.getListPrev().isNull());
-		t.assertz(true, metadata.getListNext().isNull());
-		t.assert_eq(metadata.addr, endMarker.getPrev().addr);
+		t.assertz(true, allocated.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.NONE.code, allocated.getListNum(recovered.reader()));
+		t.assert_eq(allocated.addr, logEntry.getNext(recovered.reader()).addr);
+		t.assert_eq(logEntry.addr, allocated.getPrev(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, allocated.getNext(recovered.reader()).addr);
+		t.assertz(true, metadata.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.METADATA.code, metadata.getListNum(recovered.reader()));
+		t.assert_eq(allocated.addr, metadata.getPrev(recovered.reader()).addr);
+		t.assert_eq(endMarker.addr, metadata.getNext(recovered.reader()).addr);
+		t.assertz(true, metadata.getListPrev(recovered.reader()).isNull());
+		t.assertz(true, metadata.getListNext(recovered.reader()).isNull());
+		t.assert_eq(metadata.addr, endMarker.getPrev(recovered.reader()).addr);
 
 		// Exact fit consumes the only free extent.
-		t.assertz(true, allocated.getListPrev().isNull());
-		t.assertz(true, allocated.getListNext().isNull());
-		t.assertz(true, recovered.smallSentinel.getListNext().isNull());
-		t.assertz(true, recovered.largeSentinel.getListNext().isNull());
+		t.assertz(true, allocated.getListPrev(recovered.reader()).isNull());
+		t.assertz(true, allocated.getListNext(recovered.reader()).isNull());
+		t.assertz(true, recovered.smallSentinel.getListNext(recovered.reader()).isNull());
+		t.assertz(true, recovered.largeSentinel.getListNext(recovered.reader()).isNull());
 
-		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset());
-		t.assert_eq(5u64 * 4096u64, chunk.getLimit());
-		t.assert_eq(5u64 * 4096u64, chunk.getChunkLimit());
-		t.assert_eq(0u64, chunk.getLinemarks());
+		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset(recovered.reader()));
+		t.assert_eq(5u64 * 4096u64, chunk.getLimit(recovered.reader()));
+		t.assert_eq(5u64 * 4096u64, chunk.getChunkLimit(recovered.reader()));
+		t.assert_eq(0u64, chunk.getLinemarks(recovered.reader()));
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
@@ -1985,29 +1985,29 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 		// Both neighbors were absorbed: the memory-order chain contains one
 		// five-block free extent between the log and metadata entries.
-		t.assert_eq(coalesced.addr, logEntry.getNext().addr);
-		t.assertz(false, coalesced.getUsed());
-		t.assert_eq(ListKind.LARGE_FREE.code, coalesced.getListNum());
-		t.assert_eq(logEntry.addr, coalesced.getPrev().addr);
-		t.assert_eq(metadata.addr, coalesced.getNext().addr);
-		t.assert_eq(coalesced.addr, metadata.getPrev().addr);
-		t.assert_eq(endMarker.addr, metadata.getNext().addr);
-		t.assert_eq(metadata.addr, endMarker.getPrev().addr);
+		t.assert_eq(coalesced.addr, logEntry.getNext(recovered.reader()).addr);
+		t.assertz(false, coalesced.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.LARGE_FREE.code, coalesced.getListNum(recovered.reader()));
+		t.assert_eq(logEntry.addr, coalesced.getPrev(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, coalesced.getNext(recovered.reader()).addr);
+		t.assert_eq(coalesced.addr, metadata.getPrev(recovered.reader()).addr);
+		t.assert_eq(endMarker.addr, metadata.getNext(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, endMarker.getPrev(recovered.reader()).addr);
 
 		// The coalesced entry is the only free-list member. The freed-right and
 		// old-remainder entries are interior to its extent and no longer listed.
-		t.assertz(true, recovered.smallSentinel.getListNext().isNull());
-		t.assert_eq(coalesced.addr, recovered.largeSentinel.getListNext().addr);
-		t.assert_eq(recovered.largeSentinel.addr, coalesced.getListPrev().addr);
-		t.assertz(true, coalesced.getListNext().isNull());
-		t.assertz(false, freedRight.getUsed());
-		t.assert_eq(ListKind.NONE.code, freedRight.getListNum());
-		t.assertz(true, freedRight.getListPrev().isNull());
-		t.assertz(true, freedRight.getListNext().isNull());
-		t.assertz(false, absorbedRemainder.getUsed());
-		t.assert_eq(ListKind.NONE.code, absorbedRemainder.getListNum());
-		t.assertz(true, absorbedRemainder.getListPrev().isNull());
-		t.assertz(true, absorbedRemainder.getListNext().isNull());
+		t.assertz(true, recovered.smallSentinel.getListNext(recovered.reader()).isNull());
+		t.assert_eq(coalesced.addr, recovered.largeSentinel.getListNext(recovered.reader()).addr);
+		t.assert_eq(recovered.largeSentinel.addr, coalesced.getListPrev(recovered.reader()).addr);
+		t.assertz(true, coalesced.getListNext(recovered.reader()).isNull());
+		t.assertz(false, freedRight.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.NONE.code, freedRight.getListNum(recovered.reader()));
+		t.assertz(true, freedRight.getListPrev(recovered.reader()).isNull());
+		t.assertz(true, freedRight.getListNext(recovered.reader()).isNull());
+		t.assertz(false, absorbedRemainder.getUsed(recovered.reader()));
+		t.assert_eq(ListKind.NONE.code, absorbedRemainder.getListNum(recovered.reader()));
+		t.assertz(true, absorbedRemainder.getListPrev(recovered.reader()).isNull());
+		t.assertz(true, absorbedRemainder.getListNext(recovered.reader()).isNull());
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
@@ -2102,7 +2102,7 @@ def test_bd_alloc_valid(tc: BlockDevicePWRegionTester) {
 def test_bd_alloc_sets_used(tc: BlockDevicePWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(true, entry.getUsed());
+	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
 	tc.cleanup();
 }
 
@@ -2111,7 +2111,7 @@ def test_bd_free_clears_used(tc: BlockDevicePWRegionTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.region.freeChunk(chunk);
 	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(false, entry.getUsed());
+	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
 	tc.cleanup();
 }
 
@@ -2315,7 +2315,7 @@ def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegio
 	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_FAILED, traced.operations[1]);
 	tc.t.assert_eq(1, traced.preparedOffsets.length);
 	def allocated = tc.region.blockTableHandle[2u64];
-	tc.t.assertz(false, allocated.getUsed());
+	tc.t.assertz(false, allocated.getUsed(tc.region.reader()));
 	tc.t.assertz(true, allocated.getUsedCached(tc.region.txn));
 
 	// The latch prevents both another allocator transaction and an explicit
@@ -2386,7 +2386,7 @@ def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: BlockDevicePWReg
 
 	tc.t.assertz(true, tc.region.requiresRecovery());
 	tc.t.assertz(false, tc.region.txn.isDirty());
-	tc.t.assertz(true, tc.region.blockTableHandle[2u64].getUsed());
+	tc.t.assertz(true, tc.region.blockTableHandle[2u64].getUsed(tc.region.reader()));
 	tc.t.assertz(true, traced.hasDirtyChanges);
 	tc.t.assert_eq(1, traced.dataSyncAttempts);
 	tc.t.assertz(true, traced.operations.length >= 2);
@@ -2750,7 +2750,7 @@ def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTe
 // A committed WAL should replay on remount and then be cleared.
 def test_bd_recover_committed_wal(tc: BlockDevicePWRegionTester) {
 	var entry = tc.region.blockTableHandle[2u64];
-	tc.t.assertz(false, entry.getUsed());
+	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
 
 	tc.writeCommittedWalUpdate(
 		tc.region,
@@ -2759,7 +2759,7 @@ def test_bd_recover_committed_wal(tc: BlockDevicePWRegionTester) {
 		1u8);
 
 	var region2 = tc.remount();
-	tc.t.assertz(true, region2.blockTableHandle[2u64].getUsed());
+	tc.t.assertz(true, region2.blockTableHandle[2u64].getUsed(region2.reader()));
 
 	tc.cleanup();
 }
@@ -2800,7 +2800,7 @@ def test_bd_abrupt_writer_recovers_committed_wal(tc: BlockDevicePWRegionTester) 
 	}
 
 	def recovered = tc.remount();
-	tc.t.assertz(true, recovered.blockTableHandle[2u64].getUsed());
+	tc.t.assertz(true, recovered.blockTableHandle[2u64].getUsed(recovered.reader()));
 
 	tc.cleanup();
 }
@@ -2996,8 +2996,8 @@ def test_bd_sigkill_coalescing_free_commit_boundary_recovers(tc: BlockDevicePWRe
 		return;
 	}
 	tc.t.assertz(true, tc.region.freeChunk(first));
-	if (tc.region.blockTableHandle[2u64].getUsed() ||
-		!tc.region.blockTableHandle[3u64].getUsed()) {
+	if (tc.region.blockTableHandle[2u64].getUsed(tc.region.reader()) ||
+		!tc.region.blockTableHandle[3u64].getUsed(tc.region.reader())) {
 		tc.t.fail("coalescing-free setup failed");
 		tc.cleanup();
 		return;
@@ -3317,7 +3317,7 @@ def test_bd_sigkill_coalescing_free_recovers_transaction(tc: BlockDevicePWRegion
 // A corrupt committed WAL must not replay, and recovery must durably clear it.
 def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
 	var entry = tc.region.blockTableHandle[2u64];
-	tc.t.assertz(false, entry.getUsed());
+	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
 
 	tc.writeCommittedWalUpdate(
 		tc.region,
@@ -3328,7 +3328,7 @@ def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
 	tc.corruptFirstRecordChecksum(tc.region);
 
 	var region2 = tc.remount();
-	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsed());
+	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsed(region2.reader()));
 
 	tc.cleanup();
 }
@@ -3356,7 +3356,7 @@ def test_bd_user_root_survives_remount(tc: BlockDevicePWRegionTester) {
 	def recovered = ChunkHandle(region2.regionStart + region2.getUserRoot());
 	def entry = region2.chunkToBlockEntry(recovered);
 	tc.t.assertz(false, entry.isNull());
-	tc.t.assertz(true, entry.getUsed());
+	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
 	tc.t.assert_eq(0xFEED_FACE_u64,
 		region2.txn.readU64(recovered.addr + u64.!(ChunkHeader.size)));
 

@@ -122,7 +122,7 @@ class PWBTreeTester(t: Tester) {
         def usedBlocks() -> u64 {
                 var used: u64 = 0;
                 for (i < region.numBlocks) {
-                        if (region.blockTableHandle[i].getUsed()) used++;
+                        if (region.blockTableHandle[i].getUsed(region.reader())) used++;
                 }
                 return used;
         }

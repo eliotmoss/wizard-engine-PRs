@@ -218,7 +218,8 @@ fields rather than parsing the rendering.
 The active `DualTxnWal` now routes fresh header creation, byte-wise record and
 slot zeroing, every record/header/entry/trailer/checksum store, after-image
 application, recovery replay, and durable-slot scrubbing through this provider.
-Loads remain direct and uninstrumented. Naturally aligned supported stores are
+Since 2026-10-19 its loads go through a reader over the same provider too (see
+[Loads](#loads-2026-10-19) below). Naturally aligned supported stores are
 checked before recording, so an invalid internal layout store fails immediately
 instead of entering a trace.
 
@@ -270,6 +271,85 @@ metadata and one free block are both refused up front.
 Tracing only `prepareChangedRange()` is not enough: it occurs after the stores,
 aggregates ranges, and cannot represent a partially constructed record that
 was written back by ordinary cache eviction before its explicit flush.
+
+### Loads (2026-10-19)
+
+Until 2026-10-19 loads were direct `Pointer.load`s and the seam saw none of
+them, so nothing could tell which bytes of a crash image recovery depends on.
+A search that branches only on what recovery reads (Jaaru's constraint
+refinement) needs exactly that, so loads now have a seam of their own. It is
+not on `PersistentOperations`' list of operations: a production load is still
+the same `Pointer.load`. What changed is who issues it.
+
+- **The observer.** `PersistentLoadObserver` (`src/engine/TxnBackend.v3`) has
+  one method, `observe(offset, length)`, and `PersistentOperations` carries a
+  nullable `loadObserver`, null in production. Offsets are region-relative, as
+  a store's are. The contract: `observe()` is called *before* the bytes
+  `[offset, offset + length)` are loaded, so the observer may rewrite them in
+  the region's mapping and the code loads what it wrote; one call may cover a
+  whole layout or a byte loop's range, which the code may then load directly
+  and more than once; and a load of bytes the running code stored itself is
+  observed like any other, since telling the two apart is the observer's
+  business.
+- **The reader.** `DirectRegionReader` (`X86_64TxnPWRegion.v3`) is
+  `DirectRegionWriter`'s counterpart: it holds the region's provider and its
+  start, takes absolute addresses as the writer does, and offers
+  `loadU8/U16/U32/U64/I16/I64(addr)` and `loadOffsetU64(offset)`, each of which
+  calls `observe()` when an observer is installed and then loads;
+  `observe(addr, length)`, for byte loops; and one `forge*` helper per layout
+  (`BlockEntry`, `ChunkHeader`, `LineMark`, `MetaDataDesc`, `DualWalHeader`,
+  `TxnRecordHeader`, `TxnCommitTrailer`, `LogEntry`), which observes the
+  layout's whole byte range and then forges the `Ref`. Every reader of a region
+  shares its provider, so an observer installed on the provider before a mount
+  sees the mount's first load.
+- **What goes through it.** The mount: `init()` reads the magic and `mount()`
+  the block size, block count, sentinels, block table and log-chunk offset,
+  one field at a time (until then both copied the whole 88-byte header into a
+  heap array); `getHeader()` observes all 88 bytes before its copy, and
+  `getMetaDataDesc()` and the Immix descriptor scan read `metaDataDescs` and
+  `numDescs` alone. The `BlockEntryHandle`, `ChunkHandle` and `LineMarkHandle`
+  getters take the reader, `getUsed(r)` as `setUsed(w, …)` takes the writer.
+  `DualTxnWal`: header and slot validation, replay, its four `Ref` helpers,
+  the transaction's cache misses (`readU8/I16/U64/I64`, so `RegionTransaction`'s
+  miss path), and the checksum loop, which observes the two ranges on either
+  side of the checksum field it skips. `PersistentAllocatorInvariants` walks
+  through `region.reader()`. The workloads: `PWSieve` observes a bitmap before
+  its byte loop, and `PWBTree` reads every node word through its reader.
+  Every `Ref` forged over region memory on the active path comes from a
+  reader's `forge*`.
+- **What stays raw, deliberately.** `PersistentImageMount.freeze()` and the
+  copies taken after an allocator check: they run after the code under test,
+  and properties read the frozen copy, not the mount.
+  `PWRegionUtils.calculateLogChecksum` and the rest of `SingleTxnWal` and
+  `MultiTxnWal`, which are not wired in. The backends' own I/O (the direct
+  backend reading its file at `create()`, the kernel writing pages back), which
+  is not a load the program's logic depends on. And test code that inspects a
+  region after the fact.
+
+**What the reader does not do yet.** Nothing prunes by loads: the explorer
+still enumerates images without consulting what recovery reads, and the lazy
+search that would is planned, not implemented. Observation is
+coarser than a load in three places, which can only make such a search branch
+more, never miss a dependence: `getHeader()` observes all 88 bytes, a forged
+layout all of its bytes, and a checksum loop all of its record but the
+checksum field.
+
+**Cost.** In production a load through the reader is a call, a read of the
+provider's `loadObserver` and a branch that is never taken. On sean-tan-PC
+(2026-10-19, file backend on tmpfs, so that `fdatasync` costs almost nothing
+and the CPU path dominates; CPU 2, `powersave`; 11 interleaved runs per
+build) the sieve step was unchanged (161.9 µs, −0.02 %); mounts and recoveries
+were 7.5–25 % faster (*inference:* `mount()` no longer copies the header into
+a heap array twice); and an allocation or free was 3.0–3.8 % (110–160 ns)
+slower, a B+Tree mutation 2.1–2.6 % (340–430 ns) and a lookup 3.7 % (7 ns),
+each outside the run-to-run spread. The B+Tree's cost is the reader call on
+each node word: with only `PWBTree`'s node reads raw again, every figure is at
+or below the old one. The allocator's is not the loads': a build with every
+load through the reader but without the checksum loop's two `observe()` calls
+measured from 0.2 % slower to 1.8 % faster than the old code, and one with
+those two calls moved into the checksum's callers 5.9–6.6 % slower. Two calls per commit cannot cost 130–290 ns themselves;
+*inference:* code placement moves an allocation here by more than the seam
+does. Magpie's DAX mount is not yet measured.
 
 ---
 
