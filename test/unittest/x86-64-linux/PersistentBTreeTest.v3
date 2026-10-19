@@ -25,14 +25,17 @@
 // tree's own writebacks, the CLWBs between the build and the WRITE mark, and the
 // explorer must then find an image the property rejects.
 //
-// How far each check reaches. A cut permits the product, over the lines the
-// trace writes, of each line's range of durable store prefixes; the log record
-// is written byte by byte, so on 2026-10-15 the insert's 4,602 cuts permitted
-// up to about 2^70 images each and all but 72 more than 16. The sweep over every
-// cut is therefore bounded, as persistent_sieve's is: BUDGET images per cut in
-// the explorer's order, which starts from the floor image (every line at what
-// the fences force) and varies the lowest lines first, and it says so. Two
-// checks are complete. At the final cut, every image is mounted. And from the
+// How far each check reaches. A cut admits the distinct images the product of
+// its lines' classes counts (PersistentExplorer.lineClasses); the log record is
+// written byte by byte, so a line of it can hold many distinct contents. On
+// 2026-10-20 the insert's busiest cut, 2,908 of 4,602, admitted
+// 1,194,997,579,776,000 distinct images, 4,422 of its cuts admitted more than
+// 16, and 39 admitted BUDGET or fewer. The sweep over every cut is therefore
+// bounded, as persistent_sieve's is: BUDGET distinct images per cut in the
+// explorer's order, the extremes first (every line at its floor, every line
+// at its last, then each line alone at its last with the rest at their floors)
+// and then class vectors drawn at random from a seed fixed by the trace and
+// the cut, and it says so. Two checks are complete. At the final cut, every image is mounted. And from the
 // WRITE mark to the end of the put, every new node's lines are at their floor
 // with nothing pending, at every cut: since an image's lines range from the
 // floor up, no image there lacks a byte of a new node. That is the tree's own

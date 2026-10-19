@@ -553,12 +553,15 @@ def test_alloc_format_publishes_the_magic_last(tc: PersistentAllocatorTester) {
 // cut permits at most two images, the magic's line with and without it and
 // every other line at its final bytes (format_publishes_the_magic_last), so
 // those cuts are checked exhaustively: two images at the magic's store and at
-// its writeback, one after its fence. Before it, a cut permits the product of
-// every line's range of durable store prefixes, so the sweep there is bounded,
-// FORMAT_BUDGET images per cut in the explorer's order, and says so; none of
-// those images carries the magic, so each checks the reformat. On 2026-10-19
-// the trace had 598 events over 16 lines, its 596 cuts before the magic's
-// store permitted up to about 2^61 images each, and the sweep checked 4,254.
+// its writeback, one after its fence. Before it, a cut admits the distinct
+// images the product of its lines' classes counts, so the sweep there is
+// bounded, FORMAT_BUDGET distinct images per cut in the explorer's order, and
+// says so; none of those images carries the magic, so each checks the
+// reformat. On 2026-10-20 the trace had 598 events over 16 lines, its 596 cuts
+// before the magic's store admitted up to 46,080 distinct images each (cut
+// 338) and 12,360,709 in all, and the sweep checked 4,739. (On 2026-10-19,
+// before the explorer counted distinct images, this said up to about 2^61
+// images each and 4,254 checked.)
 def test_alloc_crash_during_format_opens_consistent(tc: PersistentAllocatorTester) {
 	def trace = tc.recordFormat("pwregion_format");
 	if (trace == null) return;
@@ -586,11 +589,11 @@ def test_alloc_crash_during_format_opens_consistent(tc: PersistentAllocatorTeste
 // store to that fence nothing forces the rest of the header or the block
 // table, while the header's first line may reach the medium whole, magic and
 // all; so both checks above must fail, at the magic's cut. The sweep reaches
-// such an image because the explorer varies the lowest line first, the
-// header's first: its seven stores, the magic last, give eight prefixes, and
-// FORMAT_BUDGET, which bounds the prefixes tried per cut, is eight. In that
-// image every other line is at its floor, so mount() finds the magic beside a
-// zero block size and opens no table at all. On 2026-10-19 this rearrangement
+// such an image among the explorer's extremes: the header's first line alone
+// at its last, magic included, with every other line at its floor. On
+// 2026-10-20 it was the third image checked at that cut, after the all-floor
+// and all-last images. In that image mount() finds the magic beside a zero
+// block size and opens no table at all. On 2026-10-19 this rearrangement
 // had the digest of the trace format() recorded at afcf5525, and against that
 // code crash_during_format_opens_consistent failed at the same cut, 339 of 596.
 def test_alloc_early_magic_is_caught(tc: PersistentAllocatorTester) {

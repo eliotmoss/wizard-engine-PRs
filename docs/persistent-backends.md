@@ -2120,16 +2120,23 @@ consistent one.
   while it is checked, a collection can move a heap array, and `PWRegion`
   keeps the raw address.
 
-How far each check reaches. A cut permits the product, over the lines the trace
-writes, of each line's range of durable store prefixes. The log record is
-written a byte at a time, so the insert's cuts permit up to about 2^70 images
-each, and all but 72 of its 4,602 cuts permit more than 16:
+How far each check reaches. A cut admits the distinct images that the product
+of its lines' classes counts. The log record is written a byte at a time, so a
+line of it can hold many distinct contents. Counted on 2026-10-20, the insert's
+busiest cut (2,908 of its 4,602) admits 1,194,997,579,776,000 distinct images,
+and 4,422 of its cuts admit more than 16; the update's busiest (1,657 of 2,968)
+admits 26,066,309,068,800, and 2,795 of its cuts admit more than 16:
 
-- **Every cut, bounded.** The sweep takes 4 images a cut, in the explorer's
-  order. That order starts from the floor image, with every line at what the
-  fences force, and varies the lowest lines first. It accepted 18,167 images
-  for the insert and 11,730 for the update, and reports itself truncated.
-  `persistent_sieve:`'s sweeps are bounded the same way.
+- **Every cut, bounded.** The sweep checks up to 4 distinct images a cut, in
+  the explorer's order: the extremes first (every line at its floor, every line
+  at its last, then each line alone at its last with the rest at their floors),
+  then class vectors drawn at random from a seed fixed by the trace and the
+  cut. It checked 18,330 images for the insert and 11,818 for the update, and
+  reports itself truncated. `persistent_sieve:`'s sweeps are bounded the same
+  way. (Until 2026-10-20 this paragraph described the prefix odometer that
+  preceded distinct images, which started from the floor image and varied the
+  lowest lines first: up to about 2^70 images a cut, all but 72 of the insert's
+  cuts above 16, and 18,167 and 11,730 images checked.)
 - **The final cut, complete.** All 36 images the completed insert permits, and
   all 20 the update permits, hold the tree after the put.
 - **Durable before published, complete.** From the WRITE mark to the end of the
@@ -2150,8 +2157,10 @@ each, and all but 72 of its 4,602 cuts permit more than 16:
 
 What this does not show:
 - The rest of the property (the log, the allocator, the contents) is checked
-  only on the sample, except at the final cut and at the cuts that permit 4
-  images or fewer: 33 of the insert's 4,602 cuts and 27 of the update's 2,968.
+  only on the sample, except at the final cut and at the cuts that admit 4
+  distinct images or fewer: 39 of the insert's 4,602 cuts and 31 of the
+  update's 2,968 (counted 2026-10-20; the 33 and 27 given until then were
+  counted before the explorer counted distinct images).
 - It covers two puts at one geometry, not the benchmark's 4 KiB blocks and 252
   keys a node.
 - It takes the bytes before the put as durable, as `persistent_sieve:` does.
@@ -3567,12 +3576,17 @@ reformatting it if not; every image must open into an allocator that passes the
 invariant walk. From the magic's store on, every other line is at its floor
 (`format_publishes_the_magic_last`, from the trace, for every image at every
 cut), so the 3 cuts from there on are checked exhaustively, 5 images. The 596
-cuts before it permit up to about 2^61 images each and are bounded at 8 images
-a cut, 4,254 in all (`crash_during_format_opens_consistent`). The negative
-control, `early_magic_is_caught`, moves the magic back into the old order (a
-trace whose digest equals the one `afcf5525` records) and must fail both
-checks at the magic's cut, 339 of 596; against `afcf5525`'s own `format()` the
-sweep fails at that cut.
+cuts before it admit up to 46,080 distinct images each (at cut 338), 12,360,709
+in all, and only 55 of them admit 8 or fewer; they are bounded at 8 distinct
+images a cut, 4,739 checked in all (`crash_during_format_opens_consistent`,
+counted 2026-10-20; until then this said "up to about 2^61 images each" and
+"4,254 in all", figures from before the explorer counted distinct images). The
+negative control, `early_magic_is_caught`, moves the magic back into the old
+order (a trace whose digest equals the one `afcf5525` records) and must fail
+both checks at the magic's cut, 339 of 596; against `afcf5525`'s own
+`format()` the sweep fails at that cut. The sweep's failing image is the third
+it checks there, an extreme: the header's first line alone at its last, magic
+included, with every other line at its floor (2026-10-20).
 
 ### Handle types (unboxed)
 
