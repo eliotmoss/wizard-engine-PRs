@@ -532,7 +532,7 @@ test at another layer:
 | The trace contains every persistent store | The `persistent_ops:` store audit: complete byte coverage of `format()` with its padding holes asserted as holes, and allocator after-images strictly after the commit boundary. The Immix line marks, the one stated exception until 2026-10-19, now cross the seam too, as stores with no writeback or fence of their own (`persistent_ops:immix_line_marks_cross_the_seam`) |
 | The trace is inside the model's domain | `validate()` on every explored trace; `persistent_trace:` pins the seven defects it rejects, each at the right event |
 | The provider's `clwb`/`sfence` are `CLWB`/`SFENCE` | `persistent_ops:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
-| The search finds every admitted image | The reduced search equals the full branching search at every cut of three traces; an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
+| The search finds every admitted image | The reduced search equals the full branching search at every cut of four traces, byte for byte; its per-line content classes give exactly the distinct images of every prefix vector at every cut of the small traces and at sampled cuts of a recorded commit (`persistent_explore:line_classes_equal_distinct_images`, 2026-10-19); an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
 | Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, and Stage 2c's ordinary image. These are the only two places where real bytes are compared with the model |
 | One exploration covers more than one backend | Trace identity between the direct and PMEM backends at 2 KiB and 4 KiB blocks. The file backend has a stated model and no explorer |
 | "Recovery" means production recovery | Images are mounted through the production mount path (`runDualWal()`, `PersistentImageBackend`), never through a reimplementation |
@@ -553,7 +553,8 @@ does. These are permanent tests:
 - the trace validator rejects seven defects, each at the right event;
 - the model-conformance check rejects a flipped byte of the WAL header magic;
   and
-- the explorer catches the elided-writeback mutant 710 events into 1,401.
+- the explorer catches the elided-writeback mutant 708 events into 1,401 (710
+  until 2026-10-19, when an over-budget cut began checking its extremes first).
 
 These were one-off mutation runs:
 
@@ -572,19 +573,37 @@ be worth less, and the suite would say so.
 
 Chapter 6 should state coverage in these terms and no stronger:
 
-- **The lazy end, at every cut of the swept scenarios.** A budgeted sweep
-  starts from the fence-forced floor, which is the lazy image, and checks only
-  the next few images above it: 4 per cut for the sieve, 8 for the format
-  scenario (since 2026-10-19), 64 for the negative control.
-- **Every image, at selected cuts.** "Exhaustive" is true at the
-  commit-boundary cuts, the final cut of a sieve step, the batched apply's cuts,
-  the canonical two-crash image, the three-transaction history's final cut and
-  the second crash during its recovery
-  (`persistent_recovery:overwrite_guard_keeps_acknowledged_data` and
-  `crash_during_three_commit_recovery_recovers` assert both exhaustive), the
-  format scenario's cuts from the magic's store on, and the cheap allocator
-  cuts. Mid-record cuts
-  admit on the order of 10⁵ images and are budgeted.
+- **Budgets count distinct images (since 2026-10-19).** The reduced search
+  takes one of each cache line's distinct 64-byte contents per line, so each
+  image it checks is a different image. A cut with at most the budget's
+  number of distinct images is checked completely. A cut with more checks, up
+  to the budget: the lazy image; the eager image; each line alone at its last
+  content with the rest at their floors; each line one content below its last
+  with the rest at their last; then images drawn at random, without
+  replacement, with a seed derived from the trace and the cut and recorded in
+  the result (see [PMEM Crash Model](pmem-crash-model.md#enumerating-schedules)).
+  The budgets are 4 per cut for the sieve and the B+-tree, 3 to 8 for the
+  allocator scenarios, 8 for the format scenario, and 64 for the negative
+  control. Until 2026-10-19 they counted per-line prefix vectors in an odometer
+  that varied the lowest-addressed line first, and many vectors repeated an
+  image, so "64 for the negative control" was a step count: the ordinary step's
+  sweep checked 36,605 distinct images over its 1,457 cuts. It now checks
+  85,055, and the sieve step's sweep at 4 per cut checks 5,798 against 5,776.
+- **Every image, at every cut of the WAL scenarios, and at selected cuts
+  elsewhere.** Since 2026-10-19 the three WAL histories are swept over every
+  distinct image of every cut, and the sweeps assert `exhaustive()`: one commit
+  (215 cuts, 1,404 images, from 15,969,521 prefix vectors; the torn-record and
+  failed-recovery-persist sweeps), three commits (649 cuts, 601,294 images; the
+  overwrite guard's range sweep checks 597,079 of them), and the batched apply
+  (728 cuts, 393,342 images). Elsewhere "exhaustive" is true at the
+  commit-boundary cuts, the final cut of a sieve step, the canonical two-crash
+  image, the second crash during the three-transaction history's recovery, the
+  format scenario's cuts from the magic's store on, and the allocator cuts
+  within the budget. The allocator, format, sieve and B+-tree scenarios'
+  mid-record cuts are budgeted: at one cut the split allocation admits
+  145,212,480 distinct images, the format scenario before its magic 46,080, the
+  B+-tree split insert 1,194,997,579,776,000, and a sieve step at least 2⁶², the
+  count's saturation point.
 - **Long histories, at the two ends only.** The kill loops sample the eager
   image (layer 3a) and the lazy image rounded up to 4 KiB (the direct backend)
   at random cuts, and Stage 2c adds one real image per run. The interior of the
@@ -848,14 +867,18 @@ Witcher, Vinter and Mumak", rather than presenting it as a contribution.
    background eviction at every event, and the bounded two-crash profile.
    Neither Yat, Jaaru, Witcher nor Vinter reports such a check. *Cost:* Jaaru
    also prunes by what recovery reads, and the seam cannot, since it records no loads, so
-   mid-record cuts are budgeted rather than exhausted (see
-   [What the evidence covers](#what-the-evidence-covers-stated-exactly)).
+   the allocator, format, sieve and B+-tree scenarios' mid-record cuts are
+   budgeted rather than exhausted (see
+   [What the evidence covers](#what-the-evidence-covers-stated-exactly)). The
+   WAL scenarios are exhaustive since 2026-10-19 because the search keeps one
+   image per distinct line content, which leaves at most 14,256 images at any of
+   their cuts.
 
 Two points support these without being differentiators:
 
 - The negative control is Chapter 6 evidence, not a contribution: the
-  elided-writeback mutant passes on Magpie and the explorer rejects it 710
-  events into 1,401.
+  elided-writeback mutant passes on Magpie and the explorer rejects it 708
+  events into 1,401 (710 until 2026-10-19).
 - *Inference, to check before Chapter 5 states it:* between fences the floor is
   fixed and per-line prefixes only grow, so every image at a cut recurs at the
   last cut before the next `SFENCE`. "The lazy end at every cut" is then one
@@ -962,7 +985,9 @@ Seven, and they need real hours budgeted.
    {Magpie crash loop, layer-1b explorer, Stage 2c warm reset}. **Data in hand
    as of 2026-09-24:** the mutant reports `OK` on Magpie with a durable answer
    bit-identical to the ordinary run, and is rejected by the explorer at event
-   710 of 1401 with `free block is on the wrong list (block 4)`. Under the warm
+   710 of 1401 with `free block is on the wrong list (block 4)` (since
+   2026-10-19, when an over-budget cut began checking its extremes first, at
+   event 708 with `free block is on the wrong free list (block 3)`). Under the warm
    reset the mutant is `LOST` 3 of 3 (durable cursor back at the setup value,
    65,024, raw image byte-identical to setup's) while the ordinary build
    `SURVIVED` 3 of 3 (cursor 162,560, image byte-identical to a crash-free run).

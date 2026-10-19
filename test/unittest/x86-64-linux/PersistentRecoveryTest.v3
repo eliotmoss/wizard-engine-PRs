@@ -61,6 +61,14 @@ class PersistentRecoveryTester(t: Tester) {
 	var batchApplyEnd: int;			// cut after transaction 1's last writeback
 	var batchThirdStart: int;		// first event of transaction 3
 
+	// The most distinct images any one cut of the three-commit and batched-apply
+	// traces admits (cut 642 and cut 721, measured 2026-10-19). The sweeps over
+	// those traces take them as their budgets, which makes them exhaustive; a
+	// WAL change that lets some cut leave more images makes them report
+	// truncation rather than quietly check less.
+	def THREE_COMMIT_BUDGET = 14256;
+	def BATCHED_BUDGET = 10868;
+
 	// Record one real commit -- append, commit, no apply -- through the
 	// production WAL on a trace-recording PMEM region.
 	def recordCommit() -> bool {
@@ -263,25 +271,24 @@ def test_recovery_commit_boundary_survives_every_schedule(tc: PersistentRecovery
 // transaction may be absent or may replay, but a partially written record must
 // never recover as a value that was never committed.
 //
-// A real commit writes a record byte by byte across three cache lines, so the
-// mid-record cuts permit far more images than a unit test should mount. This
-// run is therefore deliberately bounded, and the bound is asserted rather than
-// hidden: the result reports itself as not exhaustive, so it is evidence over
-// the images it checked and nothing more. Milestone 8's separate tier is where
-// the unbounded sweep belongs.
+// Every distinct image of every cut is mounted, so the sweep is exhaustive. The
+// commit first zeroes its record slot one byte at a time over bytes that are
+// already zero, so the 215 cuts' 15,969,521 per-line prefix vectors give only
+// 1,404 distinct images: one at each of cuts 0 to 192 and at the commit point,
+// and 1,210 at the 21 cuts that catch the record partly written, at most 168 at
+// one cut. The default budget covers every cut.
 def test_recovery_torn_record_images_never_invent_state(tc: PersistentRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 24,
+	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 0,
 		tc.noInventedStateProperty());
 	if (!result.ok()) tc.t.fail(result.toArtifact());
-	tc.t.assertz(true, result.truncated);
-	tc.t.assertz(false, result.exhaustive());
-	// Every cut contributed at least one image, and the mid-record cuts
-	// contributed many more than one.
-	tc.t.assertz(true, result.imagesChecked > tc.trace.length());
+	tc.t.assertz(true, result.exhaustive());
+	tc.t.asserti(1404, result.imagesChecked);
+	tc.t.assert_eq(1404L, result.classProduct);
+	tc.t.assert_eq(15969521L, result.product);
 }
 
 // Recovery must be replayable: mounting the bytes recovery produced and
@@ -424,9 +431,10 @@ def test_recovery_failed_replay_persist_latches_and_reopens(tc: PersistentRecove
 	tc.t.assertz(false, clean.requiresRecovery);
 }
 
-// The same, over every image the commit can leave: whatever a failed recovery
-// persist leaves behind must never recover as a value that was never committed,
-// and a latch must always come with the failure that caused it.
+// The same, over every image the commit can leave, exhaustively: whatever a
+// failed recovery persist leaves behind must never recover as a value that was
+// never committed, and a latch must always come with the failure that caused
+// it.
 def test_recovery_failed_replay_persist_never_loses_a_record(tc: PersistentRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
@@ -436,9 +444,10 @@ def test_recovery_failed_replay_persist_never_loses_a_record(tc: PersistentRecov
 		tc.OFFSET, 8, tc.VALUE, false, 1)
 		.property("a failed recovery persist never loses or invents a record");
 
-	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 12, property);
+	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 0, property);
 	if (!result.ok()) tc.t.fail(result.toArtifact());
-	tc.t.assertz(true, result.truncated);
+	tc.t.assertz(true, result.exhaustive());
+	tc.t.asserti(1404, result.imagesChecked);
 
 	// At the commit boundary the transaction is acknowledged, so the stronger
 	// half of the contract holds there and that cut is exhaustive.
@@ -502,17 +511,15 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 	// the earlier cuts transaction 2 is not yet acknowledged and transaction 1
 	// may not be either.
 	def result = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.thirdCommitStart,
-		tc.trace.length(), 8,
+		tc.trace.length(), tc.THREE_COMMIT_BUDGET,
 		tc.historyProperty("reclaiming a slot never loses an acknowledged transaction",
 			true, true, false));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	// The mid-record cuts contribute more than one image each, so this is a
-	// sweep rather than a walk down the trace. The record is written byte by
-	// byte across several cache lines, so the bound is real and reported rather
-	// than hidden: this is evidence over the images it checked and nothing more.
+	// sweep rather than a walk down the trace, and it mounts every distinct
+	// image of every cut in the range.
 	tc.t.assertz(true, result.imagesChecked > tc.trace.length() - tc.thirdCommitStart + 1);
-	tc.t.assertz(true, result.truncated);
-	tc.t.assertz(false, result.exhaustive());
+	tc.t.assertz(true, result.exhaustive());
 
 	// The sweep would notice a transaction going missing: requiring the third
 	// one to survive at the cut where its commit has not yet begun fails. A
@@ -536,11 +543,11 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 	// The whole trace, with nothing required to survive: no cut may recover a
 	// value that was never committed, including the cuts that catch a slot
 	// half-overwritten.
-	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 4,
+	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, tc.THREE_COMMIT_BUDGET,
 		tc.historyProperty("a reclaimed slot never invents a transaction",
 			false, false, false));
 	if (!sweep.ok()) tc.t.fail(sweep.toArtifact());
-	tc.t.assertz(true, sweep.truncated);
+	tc.t.assertz(true, sweep.exhaustive());
 }
 
 // The two-crash profile over the reclaiming history: crash at the third commit
@@ -572,11 +579,10 @@ def test_recovery_crash_during_three_commit_recovery_recovers(tc: PersistentReco
 // commit point it is acknowledged, so every image of every cut through its
 // apply -- some of its four stores reached the region and some did not, a
 // shared line torn between them, some lines written back and others still
-// dirty -- must recover all four after-images. Those cuts are checked
-// exhaustively. Transaction 3 then destroys transaction 1's record, so its
-// cuts are where a line the apply failed to write back would be lost; they
-// and transaction 2's are swept with a bound, as the other multi-commit tests
-// do, because the records are written byte by byte.
+// dirty -- must recover all four after-images. Transaction 3 then destroys
+// transaction 1's record, so its cuts are where a line the apply failed to
+// write back would be lost. Every sweep here mounts every distinct image of
+// every cut it covers.
 def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTester) {
 	if (!tc.recordBatchedApply()) {
 		tc.t.fail("could not record a batched-apply WAL history");
@@ -594,17 +600,19 @@ def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTe
 	tc.t.assertz(true, apply.imagesChecked > 2 * (tc.batchApplyEnd - tc.batchAckStart + 1));
 
 	def second = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchApplyEnd,
-		tc.batchThirdStart, 8,
+		tc.batchThirdStart, 0,
 		tc.batchedProperty("the next commit keeps the batched transaction", true, false, false));
 	if (!second.ok()) tc.t.fail(second.toArtifact());
+	tc.t.assertz(true, second.exhaustive());
 
 	// From transaction 3's first event, transactions 1 and 2 are acknowledged
 	// and transaction 1's record is about to be destroyed: only the lines the
 	// batched apply wrote back can keep it.
 	def reclaim = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchThirdStart,
-		tc.trace.length(), 8,
+		tc.trace.length(), tc.BATCHED_BUDGET,
 		tc.batchedProperty("reclaiming the batched transaction's slot loses nothing", true, true, false));
 	if (!reclaim.ok()) tc.t.fail(reclaim.toArtifact());
+	tc.t.assertz(true, reclaim.exhaustive());
 
 	def atEnd = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
 		tc.batchedProperty("all three transactions survive the third commit", true, true, true));
@@ -612,9 +620,10 @@ def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTe
 	tc.t.assertz(true, atEnd.exhaustive());
 
 	// Nothing required, whole trace: no cut recovers a value never committed.
-	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 4,
+	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, tc.BATCHED_BUDGET,
 		tc.batchedProperty("a batched apply never invents state", false, false, false));
 	if (!sweep.ok()) tc.t.fail(sweep.toArtifact());
+	tc.t.assertz(true, sweep.exhaustive());
 
 	// The check can fail: transaction 2 is not yet committed at the first cut.
 	def unmet = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.batchAckStart, 0,

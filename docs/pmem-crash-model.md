@@ -435,8 +435,9 @@ image exists.
 
 `reducedCrashImages()` is the same answer without the intermediate schedule
 states: replay to the cut with no voluntary writeback, which leaves each line at
-its fence-forced floor, then enumerate the per-line prefixes at or above that
-floor. The reduction is sound and complete under the baseline profile because
+its fence-forced floor, then enumerate the images that the per-line prefixes at
+or above that floor give. The reduction is sound and complete under the baseline
+profile because
 
 - a durable prefix only ever grows;
 - a fence's obligation is fixed by the `CLWB`s preceding it, not by which
@@ -445,11 +446,66 @@ floor. The reduction is sound and complete under the baseline profile because
   itself, so no earlier voluntary writeback reaches an image that the boundary
   cannot.
 
-The reachable images at a cut are therefore exactly the product of the per-line
-prefix ranges above the floor. That is an argument, so
+The reachable images at a cut are therefore exactly the images of the product
+of the per-line prefix ranges above the floor. That is an argument, so
 `persistent_explore:reduction_agrees_with_full_search` checks it executably
-instead: at every cut of three traces, the two searches must produce the same
-image set.
+instead: at every cut of four traces, the two searches must produce the same
+image set, compared byte for byte. The fourth trace, added on 2026-10-19,
+rewrites bytes its lines already hold, so on it the two counts below differ.
+
+**One image per distinct content of each line (2026-10-19).** Many prefix
+vectors give the same image: a store that rewrites the bytes its line already
+holds adds a prefix but no content. A validated store never leaves its cache
+line, so a line's durable bytes depend on its own prefix length alone, and lines
+are disjoint; two prefix vectors give the same image exactly when they give
+every line the same 64 bytes. The reduced search therefore groups each line's
+prefixes by exact content (`PersistentLineClasses`, from `lineClasses()`; a hash
+is only the bucket key), represents each content by the least prefix that gives
+it, and takes one content per line, so every state it visits is a distinct image.
+Each exploration reports both sizes of its cut: `product`, the prefix vectors,
+and `classProduct`, the distinct images; both saturate at 2^62. In the one-commit
+WAL trace of `persistent_recovery:` the commit's first 192 stores zero its
+record slot one byte at a time over bytes that are already zero, so its 215 cuts
+admit 15,969,521 prefix vectors but 1,404 distinct images, and cut 192 alone
+has 274,625 vectors and one image. Until 2026-10-19 the search enumerated the
+prefix vectors themselves, least significant line first, and kept an image
+once by its 64-bit digest, so a budget counted vectors and not images: at
+budgets 12 and 24 that sweep checked 215 distinct images, one per cut.
+`persistent_explore:line_classes_equal_distinct_images` keeps that enumeration
+as a reference and requires the same images, byte for byte, each once, at every
+cut of the small traces and at sampled cuts of a recorded `DualTxnWal` commit.
+
+**Budgets, and what an over-budget cut checks (2026-10-19).** A budget counts
+distinct images. A cut whose distinct images number at most the budget is
+enumerated completely, the lazy image first and the lowest-addressed line's
+contents changing fastest, and the exploration is not truncated. A cut with more
+is truncated, and its budget goes to a stated selection, in this order:
+
+1. the lazy image (every line at its floor content) and the eager image (every
+   line at its last content);
+2. for each line with more than one content, in ascending address order, that
+   line alone at its last content with every other line at its floor;
+3. for each such line, that line one content below its last with every other
+   line at its last;
+4. class vectors drawn uniformly at random without replacement from a SplitMix64
+   stream, skipping any already taken. Below 2^62 vectors the draw is a sparse
+   Fisher–Yates shuffle of the vector indices; at 2^62 or more each line's
+   content is drawn independently, which is still uniform, and a repeat is
+   skipped.
+
+Repeats among the extremes are dropped, and the budget may stop the list at any
+point. The seed is `selectionSeed()`, a function of the trace's digest and the
+cut, so a run is reproducible; a truncated exploration records and renders it,
+and a counterexample's `selection:` line gives the failing image's place among
+the images checked and the seed. `selectCrashImages()` reruns a cut with a
+given seed. Where the distinct images fit the budget this is exhaustive; elsewhere it
+is the extremes plus a seeded sample, and evidence over the images it checked.
+The extremes come first because a single line at one end of its range with the
+rest at the other is a corner the prefix odometer reached only when the budget
+covered the whole range of every lower line: it varied the lowest line first,
+so a small budget left every higher line at its floor.
+`persistent_explore:over_budget_selection_takes_extremes_then_seeded_random`
+pins the order, the dedupe, and the replay from a seed.
 
 This is also where the model's shape becomes visible. A completed fence removes
 freedom: after the WAL's commit boundary the record is durable on every
@@ -468,7 +524,9 @@ and it names the window of the region worth printing. `PersistentCheckResult`
 keeps truncation beside the verdict: `exhaustive()` requires both that the
 property held on every image and that the search which produced them completed,
 because a budget-limited search that found nothing has not shown that nothing is
-there.
+there. Since 2026-10-19 it also sums `product` and `classProduct` over the cuts
+it reached, and its artifact ends with the line `checked X of Y distinct images
+(Z prefix states)`, followed by `, truncated` when a budget stopped some cut.
 
 Milestone 5's real recovery run is one such property. Nothing in this layer
 assumes it: the property is an arbitrary function of the durable bytes.
@@ -536,16 +594,20 @@ scenario began.
 
 ### What this run bounds
 
-A real commit constructs its record byte by byte across three cache lines, so a
-mid-record cut permits on the order of 10^5 images (the product of the per-line
-prefix ranges) — far more than a unit test should mount and recover. The
-committed-boundary cut is the cheap one: every line the record touched has been
-flushed and fenced, so it has exactly one image, and
+A real commit constructs its record across three cache lines, starting by
+zeroing its slot one byte at a time, so a mid-record cut permits up to 357,408
+per-line prefix vectors. Most of them repeat an image: the zeroing stores write
+zeroes over zeroes. The 215 cuts of the one-commit trace admit 1,404 distinct
+images in all: one at each of cuts 0 to 192 and at the commit point, and 1,210
+over the 21 cuts that catch the record partly written, at most 168 at one cut.
+The committed-boundary cut has exactly one image, since every line the record
+touched has been flushed and fenced, and
 `persistent_recovery:commit_boundary_survives_every_schedule` checks the
-must-survive half of the contract exhaustively there. The sweep over every cut
-runs under an explicit per-cut budget and asserts that it reports itself as
-**not** exhaustive, so it stands as evidence over the images it checked and
-nothing more. The unbounded sweep belongs in milestone 8's separate tier.
+must-survive half of the contract there. Since 2026-10-19 the sweep over every
+cut (`torn_record_images_never_invent_state`) mounts every one of the 1,404
+images and asserts that it is exhaustive; until then it ran under a budget of 24
+prefix vectors per cut, which reached 215 distinct images, one per cut, and
+asserted that it was not. On sean-tan-PC it takes 0.06–0.09 s.
 
 ### Histories, and the slot that gets reclaimed
 
@@ -569,7 +631,9 @@ cut of the whole history can satisfy. Over that range — including the cuts tha
 catch slot 1 zeroed, where transaction 1 exists nowhere in the log at all —
 production recovery must still produce both after-images.
 `persistent_recovery:overwrite_guard_keeps_acknowledged_data` runs that sweep
-under a reported budget, checks that the same property *fails* when the
+over every distinct image of every cut in the range, 597,079 of them (exhaustive
+since 2026-10-19; until then it was budgeted), checks that the same property
+*fails* when the
 unacknowledged third transaction is also required to survive — a property that
 holds because it asks nothing is not evidence — and checks the history's final
 cut exhaustively. That cut is one event past the third commit point, after the
@@ -578,7 +642,20 @@ one image; see above). It is cheap for the same reason: each line the new
 record touched was flushed and fenced, leaving only the third after-image's own
 line, applied write-behind and not yet persisted. Two images, and both must
 recover all three transactions. (Until 2026-10-19 this paragraph called the
-final cut "the third commit point".)
+final cut "the third commit point".) The test then sweeps the whole history,
+with nothing required to survive, over all 601,294 distinct images of its 649
+cuts. No cut of the history admits more than 14,256 (cut 642), which is the
+budget both sweeps take, so a WAL change that let a cut leave more would make
+them report truncation. On sean-tan-PC (2026-10-19) the range sweep took 15.4 s
+and the whole-history sweep 15.7 s, the test 31.0–31.3 s.
+
+The batched-apply history (`persistent_recovery:batched_apply_keeps_acknowledged_data`)
+is exhaustive in the same way since 2026-10-19: its 728 cuts admit 393,342
+distinct images, at most 10,868 at one cut (721). Its sweeps take 63 images over
+the batched apply's cuts, 16,841 over the second commit, 353,649 over the
+reclaiming third, and all 393,342 over the whole history with nothing required;
+on sean-tan-PC they took 5 ms, 0.48 s, 9.2 s and 10.1 s, the test 20.1–21.0 s.
+Before, the last three ran under budgets of 8, 8 and 4 prefix vectors per cut.
 
 The two-crash profile runs over the same history in
 `persistent_recovery:crash_during_three_commit_recovery_recovers`: crash at the
@@ -710,7 +787,8 @@ mount — WAL recovery plus whatever the allocator publishes — is one trace.
 
 For the canonical case — a commit-boundary crash — replay writes one after-image
 and publishes it with one boundary, so the second-crash state space is small
-enough to sweep exhaustively, unlike the mid-record cuts of a commit itself. The
+enough to sweep exhaustively, as, since 2026-10-19, are the mid-record cuts of
+the commit itself. The
 acknowledged after-image must survive every one of those images: recovery does
 not scrub the record it replayed, and replay is idempotent, so a remount reaches
 the same state. The allocator runs the same profile, with the invariant walk as
@@ -730,7 +808,10 @@ must then hold, over every image a cut permits:
 The second clause is the one with teeth. A recovery that reclaimed or scrubbed a
 record it had not durably replayed would return an honest-looking
 `PERSIST_FAILED` and still have destroyed the only durable copy of an
-acknowledged transaction.
+acknowledged transaction. `persistent_recovery:failed_replay_persist_never_loses_a_record`
+checks it over all 1,404 distinct images of the one-commit trace's 215 cuts and
+asserts the sweep exhaustive (since 2026-10-19; before, a budget of 12 prefix
+vectors per cut reached 215 of them); on sean-tan-PC it takes 0.06–0.07 s.
 
 The allocator has the same shape in `runPWRegionWithFailure()` /
 `PersistentAllocatorFailureProperty`, with one extra distinction. The invariant
@@ -1115,9 +1196,13 @@ the checks above.
 A recorded split allocation is roughly 700 events across 15 cache lines: the
 WAL record is written byte by byte, and the after-images touch the block table
 in several places. The commit boundary cut and the final cut are cheap, but the
-mid-record cuts permit far more images than a unit test should mount, so the
-per-cut sweep runs under an explicit budget and asserts that it reports itself
-as not exhaustive.
+mid-record cuts admit far more distinct images than a unit test should mount
+(145,212,480 at cut 703, and 2,263,112,768 over the 737 cuts), so the per-cut
+sweep runs under an explicit budget and asserts that it reports itself as not
+exhaustive. Since 2026-10-19 the budget counts distinct images and an
+over-budget cut takes its extremes first (see "Enumerating schedules"): at
+budget 8 the sweep checks 1,360 distinct images, where the prefix odometer at
+budget 8 reached 845.
 
 ---
 
@@ -1188,7 +1273,12 @@ second representation of the protocol.
    cut (see "Enumerating schedules" above). **Completed 2026-08-20:**
    counterexamples carry the durable image and a clamped byte window, and
    `checkImages()`/`checkAllCuts()` turn a property over images into a stored
-   counterexample with truncation reported beside the verdict.
+   counterexample with truncation reported beside the verdict. **2026-10-19:**
+   the reduced search takes one of each line's distinct contents per line, so a
+   budget counts distinct images; a cut within its budget is enumerated
+   completely, and one over it checks the extremes, then a seeded random sample
+   (see "Enumerating schedules" above); the one-commit, three-commit and
+   batched-apply WAL sweeps are exhaustive at every cut.
 5. **First slice completed 2026-08-20:** mount an enumerated image and run the
    production `DualTxnWal` recovery over it, with the acknowledgement contract
    (survival, no invented state, no latch, idempotence) as a checkable property

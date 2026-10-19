@@ -232,17 +232,22 @@ class PersistentBTreeTester(t: Tester) {
 		if (!result.ok()) return result;
 		var checked = result.imagesChecked;
 		var truncated = result.truncated;
+		var product = result.product, classes = result.classProduct;
 		result = PersistentExplorer.checkCutRange(trace, mounted, writeCut + 1, publishCut - 1, BUDGET,
 			property("between the WRITE and PUBLISH marks, every image holds the tree before or after", true, true));
 		if (!result.ok()) return result;
 		checked += result.imagesChecked;
 		truncated = truncated || result.truncated;
+		product = PersistentExplorer.addCounts(product, result.product);
+		classes = PersistentExplorer.addCounts(classes, result.classProduct);
 		result = PersistentExplorer.checkCutRange(trace, mounted, publishCut, trace.length(), BUDGET,
 			property("from the PUBLISH mark, every image holds the tree after the put", false, true));
 		if (!result.ok()) return result;
 		checked += result.imagesChecked;
 		truncated = truncated || result.truncated;
-		return PersistentCheckResult.new(result.exploration, null, checked, truncated);
+		product = PersistentExplorer.addCounts(product, result.product);
+		classes = PersistentExplorer.addCounts(classes, result.classProduct);
+		return PersistentCheckResult.new(result.exploration, null, checked, truncated, product, classes);
 	}
 
 	// The cache lines the last put's new nodes occupy, region-relative, as

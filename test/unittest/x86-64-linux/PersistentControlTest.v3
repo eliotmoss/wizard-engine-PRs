@@ -175,8 +175,11 @@ def test_pctl_elided_writeback_is_caught(tc: PersistentControlTester) {
 	// Pin the violation, not merely that one occurred. A control asserting only
 	// "something failed" would keep passing if the mutant started failing for an
 	// unrelated reason -- an unmodelable trace, a mount that never opened -- and
-	// would stop measuring what it is named for.
-	tc.t.assert_string("free block is on the wrong list (block 4)", cx.detail);
+	// would stop measuring what it is named for. Since 2026-10-19 a cut whose
+	// images outnumber the budget checks its extremes first; the first failing
+	// image is then at event 708, with this detail. In the old prefix order it
+	// was at 710, "free block is on the wrong list (block 4)".
+	tc.t.assert_string("free block is on the wrong free list (block 3)", cx.detail);
 	// The hole is inside the commit, not at either endpoint: a crash before the
 	// scenario starts or after it fully completes leaves a consistent region
 	// even without flushes, so an endpoint failure would indicate a broken

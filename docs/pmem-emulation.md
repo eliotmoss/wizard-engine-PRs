@@ -417,7 +417,9 @@ is still modelable (it validates against the baseline), carries zero `CLWB`
 events while its `STORE` and `SFENCE` counts match the ordinary recording
 exactly, and is rejected: a crash 710 events into a 1401-event scenario leaves a
 durable image whose *allocator* invariants already fail, with `free block is on
-the wrong list (block 4)`. The ordinary provider holds over every cut of the
+the wrong list (block 4)`. Since 2026-10-19, when an over-budget cut began
+checking its extreme images first, the first failing image is 708 events in,
+with `free block is on the wrong free list (block 3)`. The ordinary provider holds over every cut of the
 same scenario. So the model is sensitive to flush placement, and sensitive
 enough that the structural check alone catches it without the workload's
 cross-object invariants being reached.
@@ -628,8 +630,8 @@ cuts (milestone 3). `PersistentCrashMachine` replays it with asynchronous,
 non-snapshot writeback, fence obligations and background eviction, and
 materializes durable images (milestone 4). `PersistentExplorer` enumerates the
 images a cut admits, by full branching search or by the fence-forced floor plus
-per-line prefix product, which are checked against each other at every cut of
-three traces. Each image goes to production `DualTxnWal` recovery or a
+one of each line's distinct contents above it (a per-line prefix product until
+2026-10-19), which are checked against each other at every cut of four traces. Each image goes to production `DualTxnWal` recovery or a
 production `PWRegion` mount, which must satisfy the acknowledgement contract and
 the allocator's structural invariants (milestones 5–6). Crash during recovery
 and failed recovery boundaries run under the bounded two-crash profile

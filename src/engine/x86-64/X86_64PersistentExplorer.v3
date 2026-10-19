@@ -13,8 +13,8 @@
 //   - the full search branches on every permitted writeback at every event
 //     boundary, which is the model stated in the document and is exponential;
 //   - the reduced search replays the trace with no voluntary writeback at all
-//     and then enumerates the per-line prefixes reachable from the resulting
-//     state.
+//     and then enumerates the distinct contents each line can hold at or above
+//     the resulting state.
 //
 // The reduction is sound and complete under the baseline profile because a
 // durable prefix only grows, a fence's obligation is fixed by the CLWBs that
@@ -25,6 +25,20 @@
 // checks that claim executably at every cut of several traces rather than
 // leaving it as an argument.
 //
+// Many of those prefix vectors give the same image: a store that rewrites the
+// bytes a line already holds, such as zeroing a line that is zero, adds a
+// prefix but no content. A validated store never leaves its cache line, so a
+// line's durable bytes depend on its own prefix length alone, and lines are
+// disjoint. Two prefix vectors therefore give the same image exactly when they
+// give every line the same bytes. The reduced search groups each line's
+// prefixes by their exact 64-byte content (PersistentLineClasses; a hash is
+// only the bucket key) and enumerates one choice of content per line, so every
+// state it visits is a distinct image, and its budget counts distinct images.
+// An exploration reports both sizes of the cut: {product}, the number of
+// prefix vectors, and {classProduct}, the number of distinct images.
+// `persistent_explore:line_classes_equal_distinct_images` checks the grouping
+// against an enumeration of every prefix vector.
+//
 // A property over the images is checked here too: checkImages() runs one over
 // every image a cut can leave and turns the first failure into a stored
 // PersistentCounterexample carrying those durable bytes. Milestone 5's real
@@ -33,8 +47,15 @@
 // The distinct durable images a crash at one cut can produce, plus how much of
 // the state space was actually searched. {truncated} is never silent: a budget
 // that stopped the search is reported and rendered.
+//
+// {product} and {classProduct} describe the cut, not the search: the number of
+// per-line prefix vectors at or above the fence-forced floor, and the number of
+// distinct durable images those vectors give. Both saturate at
+// PersistentExplorer.COUNT_LIMIT. {seed} drove the reduced search's random
+// fill, and means something only when the exploration is {truncated}.
 class PersistentExploration(trace: PersistentTrace, crashAfter: int,
-	images: Array<PersistentDurableImage>, statesVisited: int, truncated: bool) {
+	images: Array<PersistentDurableImage>, statesVisited: int, truncated: bool,
+	product: long, classProduct: long, seed: u64) {
 
 	def imageCount() -> int {
 		return images.length;
@@ -51,16 +72,23 @@ class PersistentExploration(trace: PersistentTrace, crashAfter: int,
 		return false;
 	}
 
+	// Byte for byte, so a digest collision cannot make a missing image look
+	// present.
 	def containsImage(image: PersistentDurableImage) -> bool {
 		if (image == null) return false;
-		return containsDigest(image.digest());
+		for (i < images.length) if (images[i].sameBytes(image)) return true;
+		return false;
 	}
 
 	def render(buf: StringBuilder) -> StringBuilder {
 		buf.put2("--- pmem-exploration %s crash-after=%d", trace.name, crashAfter);
 		buf.put1(" of %d", trace.length()).ln();
-		buf.put2("states=%d images=%d truncated=", statesVisited, images.length);
-		buf.puts(if(truncated, "true", "false")).ln();
+		buf.put2("states=%d images=%d distinct=", statesVisited, images.length);
+		PersistentExplorer.putCount(buf, classProduct).puts(" prefix-states=");
+		PersistentExplorer.putCount(buf, product).puts(" truncated=");
+		buf.puts(if(truncated, "true", "false"));
+		if (truncated) buf.puts(" seed=0x").putx_64(seed);
+		buf.ln();
 		def d = digests();
 		for (i < d.length) buf.puts("image digest=0x").putx_64(d[i]).ln();
 		buf.put1("--- end pmem-exploration %s", trace.name).ln();
@@ -69,6 +97,196 @@ class PersistentExploration(trace: PersistentTrace, crashAfter: int,
 
 	def toArtifact() -> string {
 		return render(StringBuilder.new()).toString();
+	}
+}
+
+// The distinct contents one cache line can hold after a crash at one cut, over
+// its durable prefix lengths [{floor}, {last}]. Class 0 is the fence-forced
+// floor's content. Each later class is the first new content the line reaches
+// as its prefix grows, and is represented by the least prefix that gives it,
+// {prefixes[k]}, so a machine materializing a class only ever drains forward.
+// {contents[k]} is that class's bytes, the line's 64 bytes clamped to the
+// region; contents are pairwise different byte for byte.
+class PersistentLineClasses(line: u64, floor: int, last: int,
+	prefixes: Array<int>, contents: Array<Array<byte>>) {
+
+	def count() -> int {
+		return prefixes.length;
+	}
+
+	// The prefix lengths this line may hold, which the search no longer
+	// enumerates one by one.
+	def prefixStates() -> int {
+		return last - floor + 1;
+	}
+
+	// Put class {k}'s bytes into {image} at this line.
+	def writeInto(image: Array<byte>, k: int) {
+		Arrays.copyInto(contents[k], image, int.!(line));
+	}
+}
+
+
+// Where the reduced search's random fill gets its seed: by default from the
+// trace's digest and the cut, the digest computed once per sweep and only if
+// some cut needs it; or one fixed seed, to replay a selection.
+class PersistentSelectionSeeds(trace: PersistentTrace) {
+	private var digest = 0u64;
+	private var haveDigest = false;
+	private var fixedSeed = 0u64;
+	private var isFixed = false;
+
+	def fixed(seed: u64) -> this {
+		fixedSeed = seed;
+		isFixed = true;
+	}
+
+	def seedAt(cut: int) -> u64 {
+		if (isFixed) return fixedSeed;
+		if (!haveDigest) {
+			digest = trace.digest();
+			haveDigest = true;
+		}
+		return PersistentSplitMix.new(digest ^ (u64.!(cut) * 0x9E37_79B9_7F4A_7C15_u64)).next();
+	}
+}
+
+// SplitMix64: a small, fast generator whose stream is fixed by its seed.
+class PersistentSplitMix {
+	var state: u64;
+
+	new(state) { }
+
+	def next() -> u64 {
+		state += 0x9E37_79B9_7F4A_7C15_u64;
+		var z = state;
+		z = (z ^ (z >> 30)) * 0xBF58_476D_1CE4_E5B9_u64;
+		z = (z ^ (z >> 27)) * 0x94D0_49BB_1331_11EB_u64;
+		return z ^ (z >> 31);
+	}
+
+	// Uniform in [0, {n}), by rejecting the draws that would bias the modulus.
+	def below(n: u64) -> u64 {
+		def threshold = (0u64 - n) % n;
+		var r = next();
+		while (r < threshold) r = next();
+		return r % n;
+	}
+}
+
+// The distinct images a cut that admits more than its budget checks, chosen as
+// class vectors: entry i of a vector is line i's class. Every vector is taken
+// at most once, and images are built from the floor image and the classes'
+// bytes, so the selection can only contain images the model admits.
+class PersistentClassSelection(classes: Array<PersistentLineClasses>, floorBytes: Array<byte>,
+	limit: int) {
+
+	def images = Vector<PersistentDurableImage>.new();
+	private def chosen = HashMap<u64, Vector<Array<int>>>.new(PersistentExplorer.hashKey, u64.==);
+
+	def full() -> bool {
+		return images.length >= limit;
+	}
+
+	// The extremes, in this order, lines ascending: the lazy vector (every line
+	// at its floor content), the eager vector (every line at its last), each
+	// line alone at its last with the rest at their floors, and each line alone
+	// one class below its last with the rest at their last. Lines with one class
+	// have no extremes of their own. Repeats are dropped, and the budget may
+	// stop the list early.
+	def takeExtremes() {
+		def n = classes.length;
+		def lazy = Array<int>.new(n);
+		def eager = Array<int>.new(n);
+		for (i < n) eager[i] = classes[i].count() - 1;
+		offer(lazy);
+		offer(eager);
+		for (i < n) {
+			if (classes[i].count() < 2) continue;
+			def v = Array<int>.new(n);
+			v[i] = classes[i].count() - 1;
+			offer(v);
+		}
+		for (i < n) {
+			if (classes[i].count() < 2) continue;
+			def v = Arrays.dup(eager);
+			v[i] = classes[i].count() - 2;
+			offer(v);
+		}
+	}
+
+	// Fill the rest of the budget with class vectors drawn uniformly at random
+	// without replacement, skipping the ones already taken. Below COUNT_LIMIT
+	// the draw is a Fisher-Yates shuffle of the vector indices 0..{distinct}-1,
+	// kept sparse (only the positions a swap has moved are stored) and decoded
+	// mixed-radix, line 0 least significant. At COUNT_LIMIT the count no longer
+	// says how many vectors there are, so each line's class is drawn
+	// independently instead, which is still uniform over the vectors; a repeat,
+	// with at least 2^62 to choose from, is skipped.
+	def fillRandomly(rng: PersistentSplitMix, distinct: long) {
+		if (distinct < PersistentExplorer.COUNT_LIMIT) {
+			def moved = HashMap<long, long>.new(hashLong, long.==);
+			var pos = 0L;
+			while (!full() && pos < distinct) {
+				def j = pos + long.view(rng.below(u64.view(distinct - pos)));
+				def at = if(moved.has(j), moved[j], j);
+				moved[j] = if(moved.has(pos), moved[pos], pos);
+				pos++;
+				offer(decode(at));
+			}
+			return;
+		}
+		var attempts = 0;
+		def maxAttempts = 4 * limit + 64;
+		while (!full() && attempts < maxAttempts) {
+			attempts++;
+			def v = Array<int>.new(classes.length);
+			for (i < v.length) {
+				def n = classes[i].count();
+				if (n > 1) v[i] = int.view(rng.below(u64.!(n)));
+			}
+			offer(v);
+		}
+	}
+
+	// Take {choice} unless it was already taken or the budget is spent.
+	private def offer(choice: Array<int>) {
+		if (full()) return;
+		def key = hashChoice(choice);
+		var bucket = chosen[key];
+		if (bucket == null) {
+			bucket = Vector<Array<int>>.new();
+			chosen[key] = bucket;
+		}
+		for (i < bucket.length) if (Arrays.equal(bucket[i], choice)) return;
+		bucket.put(choice);
+		def bytes = Arrays.dup(floorBytes);
+		for (i < classes.length) if (choice[i] != 0) classes[i].writeInto(bytes, choice[i]);
+		images.put(PersistentDurableImage.new(bytes));
+	}
+
+	private def decode(index: long) -> Array<int> {
+		def v = Array<int>.new(classes.length);
+		var x = index;
+		for (i < v.length) {
+			def n = long.!(classes[i].count());
+			v[i] = int.!(x % n);
+			x = x / n;
+		}
+		return v;
+	}
+
+	private def hashChoice(choice: Array<int>) -> u64 {
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		for (c in choice) {
+			def r = (h << 7) | (h >> 57);
+			h = (r ^ u64.view(c)) * 0x1000_0000_01B3_u64;
+		}
+		return h;
+	}
+
+	private def hashLong(key: long) -> int {
+		return int.view(key ^ (key >> 32));
 	}
 }
 
@@ -85,8 +303,14 @@ class PersistentImageProperty(name: string, windowOffset: u64, windowLength: int
 // Outcome of checking a property over the images a cut (or every cut) permits.
 // {truncated} matters as much as {counterexample}: a search that ran out of
 // budget and found nothing has not shown that nothing is there.
+//
+// {product} and {classProduct} are the explorations' sizes summed over every
+// cut the check reached, the failing cut included, so a result states how much
+// of the space {imagesChecked} covers. Both saturate at
+// PersistentExplorer.COUNT_LIMIT.
 class PersistentCheckResult(exploration: PersistentExploration,
-	counterexample: PersistentCounterexample, imagesChecked: int, truncated: bool) {
+	counterexample: PersistentCounterexample, imagesChecked: int, truncated: bool,
+	product: long, classProduct: long) {
 
 	def ok() -> bool {
 		return counterexample == null;
@@ -99,8 +323,19 @@ class PersistentCheckResult(exploration: PersistentExploration,
 	}
 
 	def render(buf: StringBuilder) -> StringBuilder {
-		if (counterexample != null) return counterexample.render(buf);
-		return exploration.render(buf);
+		if (counterexample != null) counterexample.render(buf);
+		else exploration.render(buf);
+		return renderCoverage(buf);
+	}
+
+	// One line: how many distinct images were checked, out of how many the
+	// cuts admit, and how many prefix vectors those images stand for.
+	def renderCoverage(buf: StringBuilder) -> StringBuilder {
+		buf.put1("checked %d of ", imagesChecked);
+		PersistentExplorer.putCount(buf, classProduct).puts(" distinct images (");
+		PersistentExplorer.putCount(buf, product).puts(" prefix states)");
+		if (truncated) buf.puts(", truncated");
+		return buf.ln();
 	}
 
 	def toArtifact() -> string {
@@ -109,8 +344,13 @@ class PersistentCheckResult(exploration: PersistentExploration,
 }
 
 component PersistentExplorer {
-	// States a search may enqueue before it reports itself truncated.
+	// States a search may enqueue before it reports itself truncated. The
+	// reduced search's states are distinct images.
 	def DEFAULT_BUDGET = 8192;
+
+	// Where the counts of prefix vectors and distinct images stop growing
+	// rather than wrap: a sieve cut admits far more than 2^62 prefix vectors.
+	def COUNT_LIMIT = 1L << 62;
 
 	// Full search: branch on every permitted writeback at every event boundary,
 	// deduplicating states. This is the model as stated, and is the reference
@@ -121,9 +361,9 @@ component PersistentExplorer {
 		def m = PersistentCrashMachine.new(trace, initial);
 		def cut = clampCut(trace, crashAfter);
 		def frontier = Vector<PersistentMachineState>.new();
-		def seen = HashMap<u64, Vector<PersistentMachineState>>.new(hashState, u64.==);
+		def seen = HashMap<u64, Vector<PersistentMachineState>>.new(hashKey, u64.==);
 		def images = Vector<PersistentDurableImage>.new();
-		def imageDigests = Vector<u64>.new();
+		def imagesSeen = HashMap<u64, Vector<PersistentDurableImage>>.new(hashKey, u64.==);
 		var truncated = false;
 
 		enqueue(frontier, seen, m.snapshot());
@@ -132,7 +372,7 @@ component PersistentExplorer {
 			def state = frontier[head];
 			head++;
 			m.restore(state);
-			if (m.position() == cut) recordImage(images, imageDigests, m.crash());
+			if (m.position() == cut) recordImage(images, imagesSeen, m.crash());
 
 			// A dirty line may complete any prefix of its pending stores here,
 			// whether or not a CLWB asked for it: the torn-line and background
@@ -156,55 +396,143 @@ component PersistentExplorer {
 				break;
 			}
 		}
-		return PersistentExploration.new(trace, cut, images.extract(), frontier.length, truncated);
+		def classes = lineClasses(trace, initial, cut);
+		return PersistentExploration.new(trace, cut, images.extract(), frontier.length, truncated,
+			prefixProduct(classes), classProduct(classes), 0u64);
 	}
 
 	// Reduced search: replay to the cut with no voluntary writeback, which
-	// leaves each line at its fence-forced floor, then enumerate the per-line
-	// prefixes at or above that floor. Same image set, without the intermediate
-	// schedule states.
+	// leaves each line at its fence-forced floor, then take one content per
+	// line from the distinct contents its prefixes at or above that floor give.
+	// Same image set, without the intermediate schedule states, and without
+	// visiting one image twice.
+	//
+	// When the cut's distinct images number at most the budget, every one is
+	// enumerated, the lazy image first and the lowest-addressed line's contents
+	// changing fastest, and the exploration is complete. Otherwise it is
+	// truncated, and the budget is spent on a selection (PersistentClassSelection):
+	// the lazy image, the eager image, each line alone at its last content, each
+	// line alone one content below its last with the rest at theirs, and then
+	// class vectors drawn uniformly at random without replacement, seeded from
+	// the trace's digest and the cut (selectionSeed()), so a run is
+	// reproducible and the exploration records its seed.
 	def reducedCrashImages(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
 		budget: int) -> PersistentExploration {
+
+		return search(trace, initial, crashAfter, budget, PersistentSelectionSeeds.new(trace));
+	}
+
+	// The reduced search with the random fill's seed given rather than derived,
+	// to replay a recorded selection or to try others.
+	def selectCrashImages(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
+		budget: int, seed: u64) -> PersistentExploration {
+
+		return search(trace, initial, crashAfter, budget, PersistentSelectionSeeds.new(trace).fixed(seed));
+	}
+
+	// The seed the reduced search derives for {crashAfter}'s random fill.
+	def selectionSeed(trace: PersistentTrace, crashAfter: int) -> u64 {
+		return PersistentSelectionSeeds.new(trace).seedAt(clampCut(trace, crashAfter));
+	}
+
+	private def search(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
+		budget: int, seeds: PersistentSelectionSeeds) -> PersistentExploration {
 
 		def m = PersistentCrashMachine.new(trace, initial);
 		def cut = clampCut(trace, crashAfter);
 		m.runTo(cut);
-		def floor = m.snapshot();
-
-		def lines = m.lineCount();
-		def counts = Array<int>.new(lines);
-		def limits = Array<int>.new(lines);
-		for (i < lines) {
-			counts[i] = floor.durableCounts[i];
-			limits[i] = m.storesInLine(i);
+		def floorBytes = m.crash().bytes;
+		def classes = classesAt(m, floorBytes);
+		def product = prefixProduct(classes), distinct = classProduct(classes);
+		def limit = budgetOf(budget);
+		if (distinct <= long.!(limit)) {
+			def images = everyImage(classes, floorBytes);
+			return PersistentExploration.new(trace, cut, images, images.length, false,
+				product, distinct, 0u64);
 		}
+		def seed = seeds.seedAt(cut);
+		def selection = PersistentClassSelection.new(classes, floorBytes, limit);
+		selection.takeExtremes();
+		selection.fillRandomly(PersistentSplitMix.new(seed), distinct);
+		def images = selection.images.extract();
+		return PersistentExploration.new(trace, cut, images, images.length, true,
+			product, distinct, seed);
+	}
 
+	// Every class vector, by an odometer over the per-line classes, least
+	// significant line first, starting from the lazy image. {floorBytes} is
+	// rewritten one line at a time as the choices change.
+	private def everyImage(classes: Array<PersistentLineClasses>,
+		floorBytes: Array<byte>) -> Array<PersistentDurableImage> {
+
+		def work = floorBytes;
+		def lines = classes.length;
+		def choice = Array<int>.new(lines);
 		def images = Vector<PersistentDurableImage>.new();
-		def imageDigests = Vector<u64>.new();
-		var truncated = false;
 		var more = true;
-		var states = 0;
 		while (more) {
-			if (states >= budgetOf(budget)) {
-				truncated = true;
-				break;
-			}
-			states++;
-			m.restore(PersistentMachineState.new(cut, Arrays.dup(counts), floor.requiredCounts));
-			recordImage(images, imageDigests, m.crash());
-
-			// Odometer over the per-line prefix lengths, least significant line first.
+			images.put(PersistentDurableImage.new(Arrays.dup(work)));
 			more = false;
 			for (i < lines) {
-				if (counts[i] < limits[i]) {
-					counts[i]++;
+				def c = classes[i];
+				if (choice[i] + 1 < c.count()) {
+					choice[i]++;
+					c.writeInto(work, choice[i]);
 					more = true;
 					break;
 				}
-				counts[i] = floor.durableCounts[i];
+				if (choice[i] != 0) {
+					choice[i] = 0;
+					c.writeInto(work, 0);
+				}
 			}
 		}
-		return PersistentExploration.new(trace, cut, images.extract(), states, truncated);
+		return images.extract();
+	}
+
+	// The distinct contents of every line the trace writes, ascending by
+	// address, after a crash at {crashAfter}. Lines no prefix can change have
+	// one class.
+	def lineClasses(trace: PersistentTrace, initial: Array<byte>,
+		crashAfter: int) -> Array<PersistentLineClasses> {
+
+		def m = PersistentCrashMachine.new(trace, initial);
+		m.runTo(clampCut(trace, crashAfter));
+		return classesAt(m, m.crash().bytes);
+	}
+
+	// The number of prefix vectors {classes} stands for: the size of the old
+	// odometer's search.
+	def prefixProduct(classes: Array<PersistentLineClasses>) -> long {
+		var p = 1L;
+		for (c in classes) p = multiplyCount(p, c.prefixStates());
+		return p;
+	}
+
+	// The number of distinct images: one content per line, and lines are
+	// disjoint.
+	def classProduct(classes: Array<PersistentLineClasses>) -> long {
+		var p = 1L;
+		for (c in classes) p = multiplyCount(p, c.count());
+		return p;
+	}
+
+	// Sums and products of counts that saturate at COUNT_LIMIT.
+	def addCounts(a: long, b: long) -> long {
+		if (a >= COUNT_LIMIT - b) return COUNT_LIMIT;
+		return a + b;
+	}
+
+	def multiplyCount(a: long, n: int) -> long {
+		def b = long.!(n);
+		if (b == 0) return 0;
+		if (a > COUNT_LIMIT / b) return COUNT_LIMIT;
+		return a * b;
+	}
+
+	def putCount(buf: StringBuilder, n: long) -> StringBuilder {
+		if (n >= COUNT_LIMIT) return buf.puts(">=2^62");
+		return buf.putd_i64(n);
 	}
 
 
@@ -214,19 +542,42 @@ component PersistentExplorer {
 	def checkImages(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
 		budget: int, property: PersistentImageProperty) -> PersistentCheckResult {
 
-		def exploration = reducedCrashImages(trace, initial, crashAfter, budget);
+		return check(trace, initial, crashAfter, budget, property, PersistentSelectionSeeds.new(trace));
+	}
+
+	private def check(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
+		budget: int, property: PersistentImageProperty,
+		seeds: PersistentSelectionSeeds) -> PersistentCheckResult {
+
+		def exploration = search(trace, initial, crashAfter, budget, seeds);
 		for (i < exploration.images.length) {
 			def image = exploration.images[i];
 			def detail = property.check(image);
 			if (detail != null) {
 				def cx = PersistentCounterexample.new(trace.name, property.name, detail,
 					trace, exploration.crashAfter)
-					.withImage(image, property.windowOffset, property.windowLength);
-				return PersistentCheckResult.new(exploration, cx, i + 1, exploration.truncated);
+					.withImage(image, property.windowOffset, property.windowLength)
+					.withSelection(selectionNote(exploration, i, budgetOf(budget)));
+				return PersistentCheckResult.new(exploration, cx, i + 1, exploration.truncated,
+					exploration.product, exploration.classProduct);
 			}
 		}
 		return PersistentCheckResult.new(exploration, null, exploration.images.length,
-			exploration.truncated);
+			exploration.truncated, exploration.product, exploration.classProduct);
+	}
+
+	// Which of the cut's images failed, and how they were chosen, so that the
+	// failing image can be found again: the reduced search at the same cut and
+	// budget, or selectCrashImages() with the seed, gives the same images in
+	// the same order.
+	private def selectionNote(exploration: PersistentExploration, index: int, budget: int) -> string {
+		def buf = StringBuilder.new();
+		buf.put2("image %d of %d", index + 1, exploration.images.length);
+		if (!exploration.truncated) return buf.puts(", every distinct image of the cut").toString();
+		buf.puts(" chosen from ");
+		putCount(buf, exploration.classProduct);
+		buf.put1(" distinct images by budget %d: lazy, extremes, then seeded random, seed=0x", budget);
+		return buf.putx_64(exploration.seed).toString();
 	}
 
 	// The same check at every crash cut, earliest first, since the earliest
@@ -255,18 +606,22 @@ component PersistentExplorer {
 
 		var checked = 0;
 		var truncated = false;
+		var product = 0L, classes = 0L;
 		var last: PersistentExploration;
+		def seeds = PersistentSelectionSeeds.new(trace);
 		for (cut = first; cut <= end; cut++) {
-			def result = checkImages(trace, initial, cut, budget, property);
+			def result = check(trace, initial, cut, budget, property, seeds);
 			checked += result.imagesChecked;
 			if (result.truncated) truncated = true;
+			product = addCounts(product, result.product);
+			classes = addCounts(classes, result.classProduct);
 			last = result.exploration;
 			if (!result.ok()) {
 				return PersistentCheckResult.new(result.exploration, result.counterexample,
-					checked, truncated);
+					checked, truncated, product, classes);
 			}
 		}
-		return PersistentCheckResult.new(last, null, checked, truncated);
+		return PersistentCheckResult.new(last, null, checked, truncated, product, classes);
 	}
 
 	private def budgetOf(budget: int) -> int {
@@ -279,11 +634,93 @@ component PersistentExplorer {
 		return crashAfter;
 	}
 
-	private def recordImage(images: Vector<PersistentDurableImage>, digests: Vector<u64>,
-		image: PersistentDurableImage) {
-		def d = image.digest();
-		for (i < digests.length) if (digests[i] == d) return;
-		digests.put(d);
+	// Each line's classes, from a machine replayed to its cut with no voluntary
+	// writeback (so every line is at its floor) and {floorBytes}, that state's
+	// durable image. A line's bytes at prefix k are its floor bytes with its
+	// stores floor..k-1 applied in program order, which is what drainTo() does,
+	// so the classes are computed without replaying the trace per prefix.
+	private def classesAt(m: PersistentCrashMachine,
+		floorBytes: Array<byte>) -> Array<PersistentLineClasses> {
+
+		def out = Array<PersistentLineClasses>.new(m.lineCount());
+		def size = u64.!(floorBytes.length);
+		for (i < out.length) {
+			def line = m.lineAt(i);
+			var end = line + MmapRegionUtils.CACHE_LINE_SIZE;
+			if (end > size) end = size;
+			def start = int.!(line);
+			def cur = Arrays.range(floorBytes, start, int.!(end));
+			def floor = m.durableInLine(i), last = m.storesInLine(i);
+
+			def prefixes = Vector<int>.new();
+			def contents = Vector<Array<byte>>.new();
+			// Content hash to class indices: only the bucket key, since classes
+			// are told apart byte for byte.
+			def seen = HashMap<u64, Vector<int>>.new(hashKey, u64.==);
+			addClass(prefixes, contents, seen, floor, cur);
+			for (k = floor; k < last; k++) {
+				def e = m.storeInLine(i, k);
+				def width = u64.view(e.width);
+				if (e.offset < line || e.offset + width > end) {
+					// The machine files a store under the line its first byte is in;
+					// one that left the line would make lines depend on each other.
+					System.error("PersistentExplorerError",
+						"a store leaves its cache line; validate() the trace before exploring it");
+				}
+				var v = e.value;
+				for (b < int.view(e.width)) {
+					cur[int.!(e.offset - line) + b] = byte.view(u8.view(v));
+					v = v >> 8;
+				}
+				addClass(prefixes, contents, seen, k + 1, cur);
+			}
+			out[i] = PersistentLineClasses.new(line, floor, last, prefixes.extract(),
+				contents.extract());
+		}
+		return out;
+	}
+
+	// Add {bytes} as a class at {prefix} unless an earlier prefix already gave
+	// the same bytes. {bytes} is copied when kept, since the caller goes on
+	// mutating it.
+	private def addClass(prefixes: Vector<int>, contents: Vector<Array<byte>>,
+		seen: HashMap<u64, Vector<int>>, prefix: int, bytes: Array<byte>) {
+
+		def key = hashBytes(bytes);
+		var bucket = seen[key];
+		if (bucket == null) {
+			bucket = Vector<int>.new();
+			seen[key] = bucket;
+		}
+		for (j < bucket.length) if (Arrays.equal(contents[bucket[j]], bytes)) return;
+		bucket.put(contents.length);
+		prefixes.put(prefix);
+		contents.put(Arrays.dup(bytes));
+	}
+
+	private def hashBytes(bytes: Array<byte>) -> u64 {
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		for (b in bytes) {
+			def r = (h << 7) | (h >> 57);
+			h = (r ^ u64.view(b)) * 0x1000_0000_01B3_u64;
+		}
+		return h;
+	}
+
+	// Keep {image} unless an equal one was already found. The digest is only a
+	// bucket key; images are compared byte for byte, so a collision costs a
+	// comparison rather than a dropped image.
+	private def recordImage(images: Vector<PersistentDurableImage>,
+		seen: HashMap<u64, Vector<PersistentDurableImage>>, image: PersistentDurableImage) {
+
+		def key = image.digest();
+		var bucket = seen[key];
+		if (bucket == null) {
+			bucket = Vector<PersistentDurableImage>.new();
+			seen[key] = bucket;
+		}
+		for (i < bucket.length) if (bucket[i].sameBytes(image)) return;
+		bucket.put(image);
 		images.put(image);
 	}
 
@@ -305,5 +742,5 @@ component PersistentExplorer {
 		frontier.put(state);
 	}
 
-	private def hashState(key: u64) => i32.view(key ^ (key >> 32));
+	private def hashKey(key: u64) => i32.view(key ^ (key >> 32));
 }

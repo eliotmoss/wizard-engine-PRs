@@ -108,7 +108,8 @@ hardware that can lose a cache line.
 
 The mutant is expected to fail **differently from the explorer's
 counterexample**. The explorer found `free block is on the wrong list (block 4)`
-at one crash point. On hardware, most likely all three steps are lost at once
+at one crash point (since 2026-10-19, `free block is on the wrong free list
+(block 3)`, two events earlier). On hardware, most likely all three steps are lost at once
 (`every acknowledged step was lost`), because a 2 MiB region fits in the cache.
 That still fills the "mutant loses data" cell. **Observed in all three pairs**,
 with the mutant's surviving image byte-identical to the state setup left. Reproducing the explorer's exact

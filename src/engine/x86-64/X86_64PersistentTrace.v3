@@ -198,6 +198,7 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 	private var image: PersistentDurableImage;
 	private var windowOffset = 0u64;
 	private var windowLength = 0;
+	private var selection: string;
 
 	// Attach the durable bytes the crash left behind, plus the window of them
 	// worth printing (a record slot, an after-image). Without this the artifact
@@ -214,6 +215,18 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 		return image;
 	}
 
+	// Say how the search chose the failing image among those the cut admits
+	// -- its place in the order, and the seed of any random choice -- so the
+	// same search finds it again.
+	def withSelection(note: string) -> PersistentCounterexample {
+		selection = note;
+		return this;
+	}
+
+	def selectionNote() -> string {
+		return selection;
+	}
+
 	// The events that had executed when the crash was injected.
 	def cutTrace() -> PersistentTrace {
 		return trace.prefix(crashAfter);
@@ -224,6 +237,7 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 		buf.put1("property: %s", property).ln();
 		buf.put1("detail: %s", detail).ln();
 		buf.put2("crash-after-event: %d of %d", crashAfter, trace.length()).ln();
+		if (selection != null) buf.put1("selection: %s", selection).ln();
 		if (image != null) {
 			buf.put1("durable-image: bytes=%d digest=0x", image.size()).putx_64(image.digest()).ln();
 			if (windowLength > 0) {

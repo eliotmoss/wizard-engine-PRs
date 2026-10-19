@@ -1,8 +1,9 @@
 // Schedule-enumeration tests (second slice of milestone 4 in
 // docs/pmem-crash-model.md). These pin which durable images a crash at one cut
 // can produce, that equivalent schedules deduplicate to one state, that a
-// budget is reported rather than silently applied, and that the reduced search
-// agrees with the full one at every cut.
+// budget is reported rather than silently applied, that the reduced search
+// agrees with the full one at every cut, and that its line classes give exactly
+// the distinct images the per-line prefix vectors give.
 
 def PET = UnitTests.registerT("persistent_explore:", _, PersistentExplorerTester.new, _);
 def PETX = [
@@ -20,13 +21,69 @@ def PETX = [
 	PET("all_cuts_reports_earliest_failure", test_explore_all_cuts_reports_earliest_failure),
 	PET("truncated_search_is_not_evidence", test_explore_truncated_search_is_not_evidence),
 	PET("cut_range_checks_only_its_cuts", test_explore_cut_range_checks_only_its_cuts),
+	PET("line_classes_equal_distinct_images", test_explore_line_classes_equal_distinct_images),
+	PET("over_budget_selection_takes_extremes_then_seeded_random", test_explore_over_budget_selection_takes_extremes_then_seeded_random),
 	()
 ];
+
+// A set of durable images compared byte for byte. The bucket key is a hash of
+// the bytes of {lines}, the trace's touched lines: a function of the image, so
+// equal images share a bucket, and cheaper than digest() over the region,
+// since the images of one cut differ only there.
+class PersistentExplorerImageSet(lines: Array<u64>) {
+	def buckets = HashMap<u64, Vector<PersistentDurableImage>>.new(imageSetKey, u64.==);
+	var count = 0;
+
+	def length() -> int {
+		return count;
+	}
+
+	def contains(image: PersistentDurableImage) -> bool {
+		def bucket = buckets[key(image)];
+		if (bucket == null) return false;
+		for (i < bucket.length) if (bucket[i].sameBytes(image)) return true;
+		return false;
+	}
+
+	// True when {image} was not already present.
+	def add(image: PersistentDurableImage) -> bool {
+		def k = key(image);
+		var bucket = buckets[k];
+		if (bucket == null) {
+			bucket = Vector<PersistentDurableImage>.new();
+			buckets[k] = bucket;
+		}
+		for (i < bucket.length) if (bucket[i].sameBytes(image)) return false;
+		bucket.put(image);
+		count++;
+		return true;
+	}
+
+	private def key(image: PersistentDurableImage) -> u64 {
+		def bytes = image.bytes;
+		var h = 0x9E37_79B9_7F4A_7C15_u64;
+		for (line in lines) {
+			var end = int.!(line) + int.!(MmapRegionUtils.CACHE_LINE_SIZE);
+			if (end > bytes.length) end = bytes.length;
+			for (j = int.!(line); j < end; j++) {
+				def r = (h << 7) | (h >> 57);
+				h = (r ^ u64.view(bytes[j])) * 0x1000_0000_01B3_u64;
+			}
+		}
+		return h;
+	}
+}
+
+def imageSetKey(key: u64) -> int {
+	return i32.view(key ^ (key >> 32));
+}
 
 class PersistentExplorerTester(t: Tester) {
 	def A = 0x1111_2222_3333_4444_u64;
 	def B = 0x5555_6666_7777_8888_u64;
 	def C = 0x9999_AAAA_BBBB_CCCC_u64;
+	// A budget no test trace reaches, so a search under it is complete.
+	def EXHAUSTIVE = 1 << 30;
 
 	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistentTraceEvent {
 		return PersistentTraceEvent(seq, PersistentEventKind.STORE, offset, width, value);
@@ -58,10 +115,261 @@ class PersistentExplorerTester(t: Tester) {
 	}
 
 	// Same set of durable images, regardless of the order they were found in.
+	// Both searches keep each image once, byte for byte, so equal counts and
+	// containment make the sets equal.
 	def assertSameImages(expected: PersistentExploration, got: PersistentExploration) {
 		t.asserti(expected.imageCount(), got.imageCount());
-		def d = expected.digests();
-		for (i < d.length) t.assertz(true, got.containsDigest(d[i]));
+		for (i < expected.images.length) t.assertz(true, got.containsImage(expected.images[i]));
+	}
+
+	// The traces the reduction is checked on, ending with one whose stores
+	// often rewrite the bytes a line already holds.
+	def reductionTraces() -> Array<PersistentTrace> {
+		return [
+			trace("r_one_line", [
+				store(1u64, 0u64, 8u8, A),
+				store(2u64, 8u64, 8u8, B),
+				clwb(3u64, 0u64),
+				fence(4u64),
+				store(5u64, 16u64, 8u8, C)
+			]),
+			trace("r_two_lines", [
+				store(1u64, 0u64, 8u8, A),
+				store(2u64, 64u64, 8u8, B),
+				clwb(3u64, 64u64),
+				fence(4u64),
+				store(5u64, 72u64, 4u8, 0x2222_3333_u64),
+				clwb(6u64, 0u64),
+				fence(7u64)
+			]),
+			trace("r_overwrite", [
+				store(1u64, 32u64, 8u8, A),
+				store(2u64, 32u64, 8u8, B),
+				clwb(3u64, 0u64),
+				fence(4u64)
+			]),
+			repeatsTrace()
+		];
+	}
+
+	// Every small trace this file's tests explore, as they define them.
+	def smallTraces() -> Array<PersistentTrace> {
+		def others = [
+			trace("one_store", [store(1u64, 8u64, 8u8, A)]),
+			trace("fenced", [store(1u64, 8u64, 8u8, A), clwb(2u64, 0u64), fence(3u64)]),
+			trace("two_lines", [store(1u64, 0u64, 8u8, A), store(2u64, 128u64, 8u8, B)]),
+			trace("one_line_three_stores", [
+				store(1u64, 0u64, 8u8, A),
+				store(2u64, 8u64, 8u8, B),
+				store(3u64, 16u64, 8u8, C)
+			]),
+			trace("floor", [
+				store(1u64, 0u64, 8u8, A),
+				clwb(2u64, 0u64),
+				fence(3u64),
+				store(4u64, 8u64, 8u8, B)
+			]),
+			trace("mixed", [
+				store(1u64, 0u64, 8u8, A),
+				clwb(2u64, 0u64),
+				store(3u64, 128u64, 4u8, 0x1234_5678_u64),
+				fence(4u64),
+				store(5u64, 8u64, 2u8, 0xABCDu64)
+			]),
+			trace("budgeted", [
+				store(1u64, 0u64, 8u8, A),
+				store(2u64, 8u64, 8u8, B),
+				store(3u64, 64u64, 8u8, C),
+				store(4u64, 128u64, 8u8, A)
+			]),
+			trace("late_failure", [
+				store(1u64, 64u64, 8u8, B),
+				store(2u64, 0u64, 8u8, A),
+				clwb(3u64, 0u64),
+				fence(4u64)
+			]),
+			trace("ordered", [store(1u64, 0u64, 8u8, A), store(2u64, 8u64, 8u8, B)]),
+			trace("unflushed", [store(1u64, 0u64, 8u8, A)]),
+			trace("budgeted_check", [
+				store(1u64, 0u64, 8u8, A),
+				store(2u64, 8u64, 8u8, B),
+				store(3u64, 64u64, 8u8, C)
+			])
+		];
+		return Arrays.concat(others, reductionTraces());
+	}
+
+	// Stores that rewrite a line's bytes: a zero over zero, a value stored,
+	// cleared and stored again, a fenced value rewritten, and a line whose only
+	// store changes nothing. Most of its prefix vectors repeat an image.
+	def repeatsTrace() -> PersistentTrace {
+		return trace("repeats", [
+			store(1u64, 0u64, 8u8, 0u64),
+			store(2u64, 8u64, 8u8, A),
+			store(3u64, 8u64, 8u8, 0u64),
+			store(4u64, 8u64, 8u8, A),
+			store(5u64, 64u64, 8u8, B),
+			clwb(6u64, 64u64),
+			fence(7u64),
+			store(8u64, 64u64, 8u8, B),
+			store(9u64, 72u64, 4u8, 0x1234_5678_u64),
+			store(10u64, 128u64, 2u8, 0u64)
+		]);
+	}
+
+	// The reduced search as it stood until 2026-10-19, kept as the reference
+	// for the line classes: an odometer over every per-line prefix length from
+	// the fence-forced floor to the line's last store, least significant line
+	// first, each image read from the machine and kept once, byte for byte.
+	// The old search restore()d the machine at every vector; this one restores
+	// only when a line wraps back to its floor and otherwise completes the
+	// lowest line's next store with writebackAt(), the machine's own forward
+	// transition, which reaches the same state. Returns the distinct images and
+	// the number of prefix vectors.
+	def prefixOdometer(tr: PersistentTrace, initial: Array<byte>,
+		cut: int) -> (PersistentExplorerImageSet, int) {
+
+		def m = PersistentCrashMachine.new(tr, initial);
+		m.runTo(cut);
+		def floor = m.snapshot();
+		def lines = m.lineCount();
+		def counts = Arrays.dup(floor.durableCounts);
+		def limits = Array<int>.new(lines);
+		for (i < lines) limits[i] = m.storesInLine(i);
+		def distinct = PersistentExplorerImageSet.new(tr.touchedLines());
+		var states = 0;
+		var more = true;
+		while (more) {
+			states++;
+			distinct.add(m.crash());
+			more = false;
+			for (i < lines) {
+				if (counts[i] < limits[i]) {
+					counts[i]++;
+					more = true;
+					if (i == 0) m.writebackAt(0, counts[0]);
+					else m.restore(PersistentMachineState.new(floor.pos, Arrays.dup(counts), floor.requiredCounts));
+					break;
+				}
+				counts[i] = floor.durableCounts[i];
+			}
+		}
+		return (distinct, states);
+	}
+
+	// The line classes at {cut} against the old odometer: the same image set,
+	// byte for byte; a count equal to its number of distinct images; its number
+	// of prefix vectors as {product}; the lazy image first. Each line's classes
+	// are also rebuilt with the machine, that line drained to each of its
+	// prefixes and every other line at its floor: the distinct contents in
+	// order of first appearance, each at its least prefix. Returns the old
+	// odometer's prefix vectors and distinct images.
+	def assertClassesMatchOdometer(tr: PersistentTrace, initial: Array<byte>, cut: int) -> (int, int) {
+		def got = PersistentExplorer.reducedCrashImages(tr, initial, cut, EXHAUSTIVE);
+		def expected = prefixOdometer(tr, initial, cut);
+		def old = expected.0, states = expected.1;
+		t.assertz(false, got.truncated);
+		t.asserti(old.length(), got.imageCount());
+		t.asserti(got.imageCount(), got.statesVisited);
+		t.assert_eq(long.!(old.length()), got.classProduct);
+		t.assert_eq(long.!(states), got.product);
+		def mine = PersistentExplorerImageSet.new(tr.touchedLines());
+		for (i < got.images.length) {
+			t.assertz(true, old.contains(got.images[i]));
+			t.assertz(true, mine.add(got.images[i]));
+		}
+		def lazy = PersistentImages.lazyCrash(tr, initial, cut);
+		t.assertz(true, got.imageCount() > 0 && got.images[0].sameBytes(lazy));
+
+		def classes = PersistentExplorer.lineClasses(tr, initial, cut);
+		def m = PersistentCrashMachine.new(tr, initial);
+		m.runTo(cut);
+		def floor = m.snapshot();
+		t.asserti(m.lineCount(), classes.length);
+		for (i < classes.length) {
+			def c = classes[i];
+			t.assert_eq(m.lineAt(i), c.line);
+			t.asserti(floor.durableCounts[i], c.floor);
+			t.asserti(m.storesInLine(i), c.last);
+			def start = int.!(c.line);
+			var end = start + int.!(MmapRegionUtils.CACHE_LINE_SIZE);
+			if (end > lazy.size()) end = lazy.size();
+			def prefixes = Vector<int>.new();
+			def contents = Vector<Array<byte>>.new();
+			for (p = c.floor; p <= c.last; p++) {
+				def counts = Arrays.dup(floor.durableCounts);
+				counts[i] = p;
+				m.restore(PersistentMachineState.new(floor.pos, counts, floor.requiredCounts));
+				def bytes = Arrays.range(m.crash().bytes, start, end);
+				var seen = false;
+				for (k < contents.length) if (Arrays.equal(contents[k], bytes)) seen = true;
+				if (seen) continue;
+				prefixes.put(p);
+				contents.put(bytes);
+			}
+			t.asserti(prefixes.length, c.count());
+			if (!t.ok) break;
+			for (k < prefixes.length) {
+				t.asserti(prefixes[k], c.prefixes[k]);
+				t.assertz(true, Arrays.equal(contents[k], c.contents[k]));
+			}
+		}
+		return (states, old.length());
+	}
+
+	// Four lines, each holding three stores of different values and nothing
+	// fenced, so each line has four contents and the cut 4^4 = 256 images.
+	def fourLinesTrace() -> PersistentTrace {
+		def events = Vector<PersistentTraceEvent>.new();
+		var seq = 1u64;
+		for (k < 3) {
+			for (line < 4) {
+				def value = u64.!(1 + 16 * line + k);
+				events.put(store(seq, u64.!(64 * line + 8 * k), 8u8, value));
+				seq++;
+			}
+		}
+		return trace("four_lines", events.extract());
+	}
+
+	// The image whose line i holds the class {choice[i]} of {classes}, built by
+	// the machine: every line drained to that class's least prefix.
+	def imageOf(tr: PersistentTrace, cut: int, classes: Array<PersistentLineClasses>,
+		choice: Array<int>) -> PersistentDurableImage {
+
+		def m = PersistentCrashMachine.new(tr, null);
+		m.runTo(cut);
+		def floor = m.snapshot();
+		def counts = Array<int>.new(classes.length);
+		for (i < counts.length) counts[i] = classes[i].prefixes[choice[i]];
+		m.restore(PersistentMachineState.new(floor.pos, counts, floor.requiredCounts));
+		return m.crash();
+	}
+
+	def sameSequence(a: PersistentExploration, b: PersistentExploration) -> bool {
+		if (a.images.length != b.images.length) return false;
+		for (i < a.images.length) if (!a.images[i].sameBytes(b.images[i])) return false;
+		return true;
+	}
+
+	// Record one real commit -- append and commit, no apply -- through the
+	// production WAL, as persistent_recovery: does, and the bytes that were
+	// durable before it: the WAL header the constructor persisted.
+	def recordOneCommit() -> (PersistentTrace, Array<byte>) {
+		def region = makePmemRegion();
+		if (region == null) return (null, null);
+		def recorder = RecordingPersistentOperations.!(region.persistentOperations());
+		def base = u64.view(Pointer.atElement(region.range, 0));
+		def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+		def mounted = Array<byte>.new(region.range.length);
+		for (i < mounted.length) mounted[i] = region.range[i];
+		recorder.clear();
+		var ok = wal.append(200u64, 0x8877_6655_4433_2211_u64, 8u8);
+		ok = ok && wal.commit() == 1u64;
+		def tr = recorder.snapshot("dual_wal_commit");
+		region.destroy();
+		if (!ok || !tr.validate().ok()) return (null, null);
+		return (tr, mounted);
 	}
 
 	def countOf(text: string, needle: string) -> int {
@@ -81,6 +389,12 @@ class PersistentExplorerTester(t: Tester) {
 		if (image.read(8u64, 8) != 0u64 && image.read(0u64, 8) != A) {
 			return "second store durable without the first";
 		}
+		return null;
+	}
+
+	// Fails on any image whose line 192 holds the last value stored there.
+	def lastValueAbsent(image: PersistentDurableImage) -> string {
+		if (image.read(208u64, 8) == u64.!(1 + 16 * 3 + 2)) return "line 192 holds its last value";
 		return null;
 	}
 
@@ -219,31 +533,7 @@ def test_explore_brackets_lazy_and_eager(tc: PersistentExplorerTester) {
 // writeback and then enumerating per-line prefixes above the fence-forced floor
 // reaches exactly the images the full branching search reaches.
 def test_explore_reduction_agrees_with_full_search(tc: PersistentExplorerTester) {
-	def traces = [
-		tc.trace("r_one_line", [
-			tc.store(1u64, 0u64, 8u8, tc.A),
-			tc.store(2u64, 8u64, 8u8, tc.B),
-			tc.clwb(3u64, 0u64),
-			tc.fence(4u64),
-			tc.store(5u64, 16u64, 8u8, tc.C)
-		]),
-		tc.trace("r_two_lines", [
-			tc.store(1u64, 0u64, 8u8, tc.A),
-			tc.store(2u64, 64u64, 8u8, tc.B),
-			tc.clwb(3u64, 64u64),
-			tc.fence(4u64),
-			tc.store(5u64, 72u64, 4u8, 0x2222_3333_u64),
-			tc.clwb(6u64, 0u64),
-			tc.fence(7u64)
-		]),
-		tc.trace("r_overwrite", [
-			tc.store(1u64, 32u64, 8u8, tc.A),
-			tc.store(2u64, 32u64, 8u8, tc.B),
-			tc.clwb(3u64, 0u64),
-			tc.fence(4u64)
-		])
-	];
-
+	def traces = tc.reductionTraces();
 	for (i < traces.length) {
 		def tr = traces[i];
 		for (cut < tr.length() + 1) {
@@ -252,6 +542,8 @@ def test_explore_reduction_agrees_with_full_search(tc: PersistentExplorerTester)
 			def small = tc.reduced(tr, cut);
 			tc.t.assertz(false, small.truncated);
 			tc.assertSameImages(full, small);
+			// What the line classes count is what the full search finds.
+			tc.t.assert_eq(long.!(full.imageCount()), small.classProduct);
 		}
 	}
 }
@@ -474,4 +766,131 @@ def test_explore_cut_range_checks_only_its_cuts(tc: PersistentExplorerTester) {
 	def same = PersistentExplorer.checkCutRange(tr, null, 0, tr.length(), 0, property);
 	tc.t.asserti(all.counterexample.crashAfter, same.counterexample.crashAfter);
 	tc.t.asserti(all.imagesChecked, same.imagesChecked);
+}
+
+// The line classes, checked against the enumeration they replace. At every cut
+// of this file's traces, and at sampled cuts of a recorded one-commit DualTxnWal
+// trace, the reduced search's images are exactly the distinct images of the old
+// prefix odometer, each once; its count is that odometer's number of distinct
+// images and its {product} that odometer's number of prefix vectors.
+def test_explore_line_classes_equal_distinct_images(tc: PersistentExplorerTester) {
+	def traces = tc.smallTraces();
+	for (i < traces.length) {
+		def tr = traces[i];
+		for (cut < tr.length() + 1) tc.assertClassesMatchOdometer(tr, null, cut);
+	}
+
+	// The repeats trace at its last cut: five prefixes of line 0 give two
+	// contents, three of line 64 give two, and two of line 128 give one.
+	def repeats = tc.repeatsTrace();
+	def end = PersistentExplorer.reducedCrashImages(repeats, null, repeats.length(), 0);
+	tc.t.assert_eq(30L, end.product);
+	tc.t.assert_eq(4L, end.classProduct);
+	tc.t.asserti(4, end.imageCount());
+
+	// A recorded commit. Its first 192 stores zero the record slot one byte at a
+	// time over bytes that are already zero, so up to cut 192 every prefix
+	// vector gives the lazy image; the record's stores follow. The sampled cuts
+	// include the zeroing's 4,225 vectors at cut 128 and the record's first
+	// store at cut 193, where 278,850 vectors give two images. The later cuts
+	// before the commit point cost the reference more than a unit test should
+	// spend.
+	def recorded = tc.recordOneCommit();
+	def wal = recorded.0, mounted = recorded.1;
+	if (wal == null) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	tc.t.asserti(214, wal.length());
+	for (cut in [0, 16, 32, 48, 64, 80, 96, 112, 128, 193, wal.length()]) {
+		def r = tc.assertClassesMatchOdometer(wal, mounted, cut);
+		if (cut == 128) {
+			tc.t.asserti(4225, r.0);
+			tc.t.asserti(1, r.1);
+		}
+		if (cut == 193) {
+			tc.t.asserti(278850, r.0);
+			tc.t.asserti(2, r.1);
+		}
+	}
+}
+
+// A cut with more distinct images than the budget is truncated, and the budget
+// goes first to the extremes: the lazy image, the eager image, each line alone
+// at its last content, and each line alone one content below its last with the
+// rest at theirs; then to images drawn at random with a seed derived from the
+// trace and the cut. The selection holds only images the cut admits, each once,
+// and the same seed gives the same images in the same order.
+def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: PersistentExplorerTester) {
+	def tr = tc.fourLinesTrace();
+	def cut = tr.length();
+	def all = PersistentExplorer.reducedCrashImages(tr, null, cut, tc.EXHAUSTIVE);
+	tc.t.assertz(false, all.truncated);
+	tc.t.asserti(256, all.imageCount());
+	def classes = PersistentExplorer.lineClasses(tr, null, cut);
+	tc.t.asserti(4, classes.length);
+	for (c in classes) tc.t.asserti(4, c.count());
+
+	def got = PersistentExplorer.reducedCrashImages(tr, null, cut, 16);
+	tc.t.assertz(true, got.truncated);
+	tc.t.asserti(16, got.imageCount());
+	tc.t.assert_eq(256L, got.classProduct);
+	tc.t.assert_eq(PersistentExplorer.selectionSeed(tr, cut), got.seed);
+	def seen = PersistentExplorerImageSet.new(tr.touchedLines());
+	for (i < got.images.length) {
+		tc.t.assertz(true, all.containsImage(got.images[i]));
+		tc.t.assertz(true, seen.add(got.images[i]));
+	}
+
+	// The extremes, in order: lazy, eager, then each line alone at its last
+	// content, then each line one below its last with the rest at theirs.
+	tc.t.assertz(true, got.images[0].sameBytes(PersistentImages.lazyCrash(tr, null, cut)));
+	tc.t.assertz(true, got.images[1].sameBytes(PersistentImages.eagerCrash(tr, null, cut)));
+	for (i < 4) {
+		def alone = Array<int>.new(4);
+		alone[i] = 3;
+		tc.t.assertz(true, got.images[2 + i].sameBytes(tc.imageOf(tr, cut, classes, alone)));
+		def below = [3, 3, 3, 3];
+		below[i] = 2;
+		tc.t.assertz(true, got.images[6 + i].sameBytes(tc.imageOf(tr, cut, classes, below)));
+	}
+
+	// Reproducible: the derived seed replays through selectCrashImages(), a
+	// second run gives the same sequence, and another seed keeps the extremes
+	// but draws a different random tail.
+	def replay = PersistentExplorer.selectCrashImages(tr, null, cut, 16, got.seed);
+	tc.t.assertz(true, tc.sameSequence(got, replay));
+	tc.t.assertz(true, tc.sameSequence(got, PersistentExplorer.reducedCrashImages(tr, null, cut, 16)));
+	def other = PersistentExplorer.selectCrashImages(tr, null, cut, 16, got.seed + 1u64);
+	tc.t.asserti(16, other.imageCount());
+	for (i < 10) tc.t.assertz(true, other.images[i].sameBytes(got.images[i]));
+	var differ = false;
+	for (i = 10; i < 16; i++) if (!other.images[i].sameBytes(got.images[i])) differ = true;
+	tc.t.assertz(true, differ);
+
+	// A budget below the extremes' count stops them in order, and a budget of
+	// every image but one still draws distinct images to the end.
+	def three = PersistentExplorer.reducedCrashImages(tr, null, cut, 3);
+	tc.t.asserti(3, three.imageCount());
+	for (i < 3) tc.t.assertz(true, three.images[i].sameBytes(got.images[i]));
+	def most = PersistentExplorer.reducedCrashImages(tr, null, cut, 255);
+	tc.t.assertz(true, most.truncated);
+	tc.t.asserti(255, most.imageCount());
+	def mostSeen = PersistentExplorerImageSet.new(tr.touchedLines());
+	for (i < most.images.length) {
+		tc.t.assertz(true, all.containsImage(most.images[i]));
+		tc.t.assertz(true, mostSeen.add(most.images[i]));
+	}
+
+	// A sweep's counterexample names the failing image's place in the
+	// selection and the seed, so the same search finds it again.
+	def property = PersistentImageProperty.new("line 192 never holds its last value", 192u64, 8,
+		tc.lastValueAbsent);
+	def result = PersistentExplorer.checkImages(tr, null, cut, 4, property);
+	tc.t.assertz(false, result.ok());
+	// The eager image is the second one taken.
+	tc.t.asserti(2, result.imagesChecked);
+	def note = result.counterexample.selectionNote();
+	tc.t.assertz(true, Strings.startsWith(note, "image 2 of 4 chosen from 256 distinct images by budget 4"));
+	tc.t.asserti(1, tc.countOf(result.counterexample.toArtifact(), "selection: image 2 of 4"));
 }

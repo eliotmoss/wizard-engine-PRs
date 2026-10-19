@@ -281,6 +281,14 @@ class PersistentCrashMachine {
 		return drainTo(lineStates[index], count);
 	}
 
+	// The {k}th store executed into line {index}, in program order. A line's
+	// durable bytes at prefix length p are its bytes before the scenario with
+	// stores 0..p-1 applied, so an explorer can compute them from these without
+	// a restore() per prefix.
+	def storeInLine(index: int, k: int) -> PersistentTraceEvent {
+		return lineStates[index].stores[k];
+	}
+
 	// The machine's whole state: trace position plus the two per-line prefix
 	// lengths. The durable image is a function of these, so an exploration can
 	// enumerate states and materialize bytes only when it needs them.
