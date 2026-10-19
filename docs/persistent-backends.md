@@ -2138,7 +2138,9 @@ each, and all but 72 of its 4,602 cuts permit more than 16:
   every image without enumerating them.
 - **The negative control.** The insert's trace loses its 10 node writebacks, the
   `CLWB`s between the build and the WRITE mark. That leaves 97 of 107 `CLWB`s,
-  with the 8 `SFENCE`s unchanged. The mutant fails both complete checks:
+  with the 8 `SFENCE`s unchanged. The mutant fails the complete line check and
+  the bounded sweep (until 2026-10-19 this said "both complete checks", but the
+  sweep is the bounded one and the final-cut check is not run on the mutant):
   - the line check, at the WRITE mark itself;
   - the sweep, at event 4,207 of 4,591, inside the publish's commit, with "the
     tree could not reopen after recovery".

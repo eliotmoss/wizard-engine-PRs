@@ -55,10 +55,17 @@ See `docs/persistent-backends.md` for the surrounding storage stack.
   stroke.
 - **Same steady-state boundary count.** Phase B reaches one persistence
   boundary per commit — matching checkpointed `MultiTxnWal` while also dropping
-  its superblock `persistRange` — via a simple induction: a valid record N+1
-  on-region implies the boundary at its commit completed, so transaction N's
-  data is durable. At any moment at most one transaction's data is not yet
-  durable plus the record being committed — exactly two slots.
+  its superblock `persistRange` — via a simple induction on returned
+  boundaries: once N+1's commit boundary has returned, transaction N's data is
+  durable, because that boundary completes the writebacks of N's after-images;
+  and before N+1's commit reuses N−1's slot, the overwrite guard makes N−1's
+  data durable. A valid record N+1 on the region does not by itself show that
+  its boundary completed (the persistence-failure contract lets a complete
+  record reach the medium unacknowledged), but N's record is then still in its
+  slot, so recovery finds both. At any moment at most one transaction's data is
+  not yet durable plus the record being committed — exactly two slots. (Until
+  2026-10-19 this argued from "a valid record N+1 on-region implies the
+  boundary at its commit completed", which the failure contract contradicts.)
 - **The duplicate-location failure hazard becomes a structural non-issue.**
   Parity slot selection means a retried commit reuses the same slot and seq, so
   two copies of the same `txnSeq` cannot occupy different slots. The chosen
