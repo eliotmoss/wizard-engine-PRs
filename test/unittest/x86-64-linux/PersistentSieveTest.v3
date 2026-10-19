@@ -19,6 +19,14 @@
 // Scenarios are recorded over a PMEM-style region, never a volatile one: a
 // volatile region's persistence boundaries emit no CLWB or SFENCE, so the model
 // would be shown a run in which nothing was ever made durable.
+//
+// Images are mounted in an anonymous mapping (PersistentAnonMounts, the tree
+// explorer's PWBTreeAnonRegion), not in PersistentImageMounts.openArray()'s
+// heap array: the sieve allocates while it is checked, a collection can move a
+// heap array, and PWRegion keeps the raw address. Like the array, the
+// mapping's boundaries succeed without reaching the writeback hooks; only what
+// recovery and the sieve leave in the bytes is examined. Each image costs an
+// mmap and a munmap.
 
 def PST = UnitTests.registerT("persistent_sieve:", _, PersistentSieveTester.new, _);
 def PSTX = [
@@ -28,6 +36,7 @@ def PSTX = [
 	PST("step_images_satisfy_sieve",         test_psieve_step_images_satisfy_sieve),
 	PST("retiring_step_images_stay_consistent", test_psieve_retiring_step_images_stay_consistent),
 	PST("property_detects_a_damaged_image",  test_psieve_property_detects_a_damaged_image),
+	PST("mounted_image_survives_a_collection", test_psieve_mounted_image_survives_a_collection),
 	()
 ];
 
@@ -83,7 +92,7 @@ class PersistentSieveTester(t: Tester) {
 	}
 
 	def allocatorProperty(name: string) -> PersistentImageProperty {
-		return PersistentAllocatorProperty.new(BLOCKS, BLOCK_SIZE).property(name, 0u64, 0);
+		return PersistentSieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).allocatorProperty(name);
 	}
 
 	def sieveProperty(name: string) -> PersistentImageProperty {
@@ -108,9 +117,8 @@ class PersistentSieveTester(t: Tester) {
 class PersistentSieveProperty(numBlocks: u64, blockSize: u64, liveSegments: u64) {
 
 	def check(image: PersistentDurableImage) -> string {
-		def backend = PersistentImageBackend.new(image);
-		def region = PWRegion.new(backend, numBlocks, Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
-		if (region.backendRegion == null) return "durable image did not mount as an allocator";
+		def region = PersistentAnonMounts.openRegion(image, numBlocks, blockSize);
+		if (region == null) return "durable image did not mount as an allocator";
 
 		var violation = PersistentAllocatorInvariants.check(region);
 		if (violation == null) {
@@ -127,6 +135,20 @@ class PersistentSieveProperty(numBlocks: u64, blockSize: u64, liveSegments: u64)
 
 	def property(name: string) -> PersistentImageProperty {
 		return PersistentImageProperty.new(name, 0u64, 0, check);
+	}
+
+	// The allocator's structural invariants alone, as PersistentAllocatorProperty
+	// checks them, over the same mount as check().
+	def checkAllocator(image: PersistentDurableImage) -> string {
+		def region = PersistentAnonMounts.openRegion(image, numBlocks, blockSize);
+		if (region == null) return "durable image did not mount as an allocator";
+		def violation = PersistentAllocatorInvariants.check(region);
+		region.deallocate();
+		return violation;
+	}
+
+	def allocatorProperty(name: string) -> PersistentImageProperty {
+		return PersistentImageProperty.new(name, 0u64, 0, checkAllocator);
 	}
 }
 
@@ -287,4 +309,33 @@ def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
 	// also reports a null violation -- a corrupted bitmap accepted -- as
 	// "expected ..., got null".
 	tc.t.assert_string("segment bitmap disagrees with its descriptor", violation);
+}
+
+// A mounted image must not move under its region: a collection between
+// mounting an image and checking it leaves the bytes where PWRegion's raw
+// regionStart says they are, and the sieve still reattaches and checks clean.
+// In openArray()'s heap array the collector moves them, and this fails.
+def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
+	if (!tc.openRecordingSieve()) {
+		tc.t.fail("could not lay out a recording sieve");
+		return;
+	}
+	def trace = tc.recordStep("pwsieve_collected");
+	tc.cleanup();
+	if (trace == null) return;
+
+	def image = PersistentImages.eagerCrash(trace, tc.mounted, trace.length());
+	def region = PersistentAnonMounts.openRegion(image, tc.BLOCKS, tc.BLOCK_SIZE);
+	if (region == null) {
+		tc.t.fail("durable image did not mount as an allocator");
+		return;
+	}
+	def start = region.regionStart;
+	Target.forceGC();
+	tc.t.assert_eq(start, u64.view(Pointer.atElement(region.backendRegion.range, 0) - Pointer.NULL));
+	def sieve = PWSieve.new(region, tc.LIVE);
+	tc.t.assertz(true, sieve.open());
+	def violation = sieve.checkInvariants();
+	if (violation != null) tc.t.fail(violation);
+	region.deallocate();
 }
