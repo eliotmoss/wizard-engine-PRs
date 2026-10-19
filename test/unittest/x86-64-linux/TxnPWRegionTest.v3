@@ -2157,12 +2157,14 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 	tc.cleanup();
 }
 
-// Format issues three persistRange() fences, each a fence of its own: the two
-// ordered WAL initialization ranges, both in block 1's single page, and the
-// final publication of the complete eight-block mapping. Each must reach the
-// file as one fdatasync, asked to make exactly the pages its writebacks marked
-// durable -- the restriction of the PMEM model, not the page-aligned msync of
-// the range alone that the file backend issued until 2026-10-13.
+// Format issues four persistRange() fences, each a fence of its own: the two
+// ordered WAL initialization ranges, both in block 1's single page, the
+// complete eight-block mapping before the magic is stored, and then the
+// magic's line alone, in block 0's page (since 2026-10-19; until then the
+// magic rode the whole-mapping fence). Each must reach the file as one
+// fdatasync, asked to make exactly the pages its writebacks marked durable --
+// the restriction of the PMEM model, not the page-aligned msync of the range
+// alone that the file backend issued until 2026-10-13.
 def test_bd_file_format_syncs_marked_pages(tc: BlockDevicePWRegionTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
@@ -2181,15 +2183,15 @@ def test_bd_file_format_syncs_marked_pages(tc: BlockDevicePWRegionTester) {
 		return;
 	}
 
-	tc.t.assert_eq(3, traced.operations.length);
-	tc.t.assert_eq(3, traced.dataSyncAttempts);
+	tc.t.assert_eq(4, traced.operations.length);
+	tc.t.assert_eq(4, traced.dataSyncAttempts);
 	tc.t.assert_eq(0, traced.mappedSyncAttempts);
-	if (traced.operations.length != 3 || traced.syncMarkLo.length != 3) {
+	if (traced.operations.length != 4 || traced.syncMarkLo.length != 4) {
 		tc.cleanup();
 		return;
 	}
 
-	for (i < 3) {
+	for (i < 4) {
 		tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_COMPLETE, traced.operations[i]);
 	}
 	// Both ordered WAL initialization ranges occupy block 1's single page.
@@ -2198,10 +2200,14 @@ def test_bd_file_format_syncs_marked_pages(tc: BlockDevicePWRegionTester) {
 		tc.t.assert_eq(2u64, traced.syncMarkHi[i]);
 		tc.t.assert_eq(1u64, traced.syncMarkCount[i]);
 	}
-	// The final format publication covers the complete eight-block mapping.
+	// The format publication covers the complete eight-block mapping...
 	tc.t.assert_eq(0u64, traced.syncMarkLo[2]);
 	tc.t.assert_eq(8u64, traced.syncMarkHi[2]);
 	tc.t.assert_eq(8u64, traced.syncMarkCount[2]);
+	// ...and the magic follows it alone, in the header's page.
+	tc.t.assert_eq(0u64, traced.syncMarkLo[3]);
+	tc.t.assert_eq(1u64, traced.syncMarkHi[3]);
+	tc.t.assert_eq(1u64, traced.syncMarkCount[3]);
 	tc.t.assertz(true, traced.dirty.isEmpty());
 	tc.t.assertz(false, tc.region.requiresRecovery());
 	tc.assertAllocatorInvariants(tc.region);

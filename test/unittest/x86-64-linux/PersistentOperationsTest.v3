@@ -660,11 +660,17 @@ def test_persistent_pwregion_format_trace(tc: PersistentOperationsTester) {
 	}
 	tc.t.assertz(true, sawLogChunkStore);
 
-	// Publication: format() ends by flushing the whole region under one fence.
-	// The magic store is the last store, and nothing is written after the
-	// publication run begins.
+	// Publication, in two steps: format() flushes the whole region under one
+	// fence before the magic is stored, then stores the magic and writes its
+	// line back under a fence of its own. The magic store is the last store,
+	// and nothing is written between the whole-region run and it.
 	def lines = int.!(size / 64u64);
-	def fenceIndex = events.length - 1;
+	def last = events.length - 1;
+	tc.t.assertz(true, events[last].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, events[last - 1].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(0u64, events[last - 1].offset);  // the magic's line
+	tc.t.assert_eq(last - 2, magicField);
+	def fenceIndex = magicField - 1;
 	def runStart = fenceIndex - lines;
 	tc.t.assertz(true, events[fenceIndex].kind == PersistentEventKind.SFENCE);
 	for (i < lines) {
@@ -672,7 +678,7 @@ def test_persistent_pwregion_format_trace(tc: PersistentOperationsTester) {
 		tc.t.assertz(true, e.kind == PersistentEventKind.CLWB);
 		tc.t.assert_eq(u64.!(i) * 64u64, e.offset);
 	}
-	tc.t.assert_eq(runStart - 1, magicField);
+	tc.t.assertz(true, events[runStart - 1].kind == PersistentEventKind.STORE);
 	region.deallocate();
 }
 

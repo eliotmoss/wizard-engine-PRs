@@ -16,6 +16,9 @@ def PATX = [
 	PAT("failed_mount_persist_keeps_structure", test_alloc_failed_mount_persist_keeps_structure),
 	PAT("failed_mount_persist_sweep", test_alloc_failed_mount_persist_sweep),
 	PAT("two_transaction_images_stay_consistent", test_alloc_two_transaction_images_stay_consistent),
+	PAT("format_publishes_the_magic_last", test_alloc_format_publishes_the_magic_last),
+	PAT("crash_during_format_opens_consistent", test_alloc_crash_during_format_opens_consistent),
+	PAT("early_magic_is_caught", test_alloc_early_magic_is_caught),
 	()
 ];
 
@@ -23,6 +26,9 @@ class PersistentAllocatorTester(t: Tester) {
 	def BLOCKS = 8u64;
 	def BLOCK_SIZE = 2048u64;
 	def REGION_BYTES = 16384;
+	// Images per cut in the format sweeps (see test_alloc_early_magic_is_caught
+	// for why eight).
+	def FORMAT_BUDGET = 8;
 
 	var mounted: Array<byte>;	// durable bytes before the recorded scenario
 	var trace: PersistentTrace;
@@ -100,11 +106,151 @@ class PersistentAllocatorTester(t: Tester) {
 		return trace;
 	}
 
+	// Record format() itself as a scenario. The recorder is the region's
+	// provider before PWRegion's first store, so its events from the start are
+	// the whole format; the scenario starts from the zeroed bytes of a fresh
+	// mapping, so the explorer's initial image is null.
+	def recordFormat(name: string) -> PersistentTrace {
+		if (!openRecordingRegion()) {
+			t.fail("could not format a recording PWRegion");
+			return null;
+		}
+		def trace = recorder.snapshot(name);
+		cleanup();
+		if (!trace.validate().ok()) {
+			t.fail("recorded format trace is not modelable");
+			return null;
+		}
+		return trace;
+	}
+
+	def formatProperty(name: string) -> PersistentImageProperty {
+		return PersistentFormatProperty.new(BLOCKS, BLOCK_SIZE).property(name);
+	}
+
 	def cleanup() {
 		if (region != null) {
 			region.deallocate();
 			region = null;
 		}
+	}
+}
+
+// Crash images opened as allocators in an anonymous mapping, the way
+// PersistentBTreeProperty opens them (PWBTreeAnonRegion), not in
+// PersistentImageMounts.openArray()'s heap array, which Virgil's copying
+// collector can move while PWRegion keeps regionStart as a raw address. Like
+// the array, the mapping's boundaries succeed without reaching the writeback
+// and fence hooks; unlike it, each image costs an mmap and a munmap.
+component PersistentAnonMounts {
+	// Open {image} as production opens a region, without forceFormat. Null if
+	// the host refused the mapping or the image did not open; otherwise the
+	// caller deallocates the region, which unmaps the mapping.
+	def openRegion(image: PersistentDurableImage, numBlocks: u64, blockSize: u64) -> PWRegion {
+		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def container = PWBTreeAnonRegion.new(mapping);
+		for (i < image.size()) container.range[i] = image.bytes[i];
+		def region = PWRegion.new(PreparedRegionBackend.new(container), numBlocks,
+			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		if (region.backendRegion == null) {
+			container.destroy();
+			return null;
+		}
+		return region;
+	}
+}
+
+// What a crash during format() may leave, as a property of one image. Open it
+// as production does -- PWRegion.new() without forceFormat, so init() mounts an
+// image whose header carries the magic and reformats one whose header does
+// not -- and require the allocator's invariants of what was opened. An image
+// with the magic is mounted as it stands, so its table must already be whole;
+// one without must have been reformatted, and come out whole.
+class PersistentFormatProperty(numBlocks: u64, blockSize: u64) {
+
+	def check(image: PersistentDurableImage) -> string {
+		def marked = image.read(u64.view(PWRegionHeader.magic.offset), 8) == PWRegions.MAGIC;
+		def region = PersistentAnonMounts.openRegion(image, numBlocks, blockSize);
+		if (region == null) return "durable image did not open as an allocator";
+		var violation = PersistentAllocatorInvariants.check(region);
+		if (violation == null && region.getHeader().magic != PWRegions.MAGIC) {
+			violation = "open left the region without the magic";
+		}
+		region.deallocate();
+		if (violation == null) return null;
+		def what = if(marked, "an image carrying the magic was mounted",
+			"an image without the magic was reformatted");
+		return StringBuilder.new().put2("%s, and %s", what, violation).toString();
+	}
+
+	def property(name: string) -> PersistentImageProperty {
+		return PersistentImageProperty.new(name, u64.view(PWRegionHeader.magic.offset), 8, check);
+	}
+}
+
+// The recorded format() as a scenario: where its magic is, what is forced
+// once it is stored, and the same trace in the order format() had before.
+component PersistentFormatScenario {
+	// The index of the store that writes the magic, or -1 unless exactly one
+	// store touches the magic's bytes and it writes the whole magic.
+	def magicStore(trace: PersistentTrace) -> int {
+		def lo = u64.view(PWRegionHeader.magic.offset);
+		def hi = lo + 8u64;
+		var found = -1;
+		for (i < trace.events.length) {
+			def e = trace.events[i];
+			if (e.kind != PersistentEventKind.STORE) continue;
+			if (e.offset + u64.view(e.width) <= lo || e.offset >= hi) continue;
+			if (found >= 0) return -1;
+			if (e.offset != lo || e.width != 8u8 || e.value != PWRegions.MAGIC) return -1;
+			found = i;
+		}
+		return found;
+	}
+
+	// The first cut from {fromCut} on at which some image could hold the
+	// magic without every store format() made before it: a line other than
+	// the magic's has a store no fence has forced, or the magic's line has more
+	// than one. Or -1. Valid when the magic is the trace's last store, so that
+	// a single unforced store in its line is the magic itself. The machine
+	// replays with no voluntary writeback, which leaves every line at its
+	// floor, and an image's lines range from the floor up, so -1 says it of
+	// every image at every such cut without enumerating them.
+	def firstUnforcedCut(trace: PersistentTrace, fromCut: int) -> int {
+		def magic = u64.view(PWRegionHeader.magic.offset);
+		def magicLine = magic - magic % MmapRegionUtils.CACHE_LINE_SIZE;
+		def m = PersistentCrashMachine.new(trace, null);
+		m.runTo(fromCut);
+		while (true) {
+			for (i < m.lineCount()) {
+				def unforced = m.storesInLine(i) - m.durableInLine(i);
+				if (unforced > if(m.lineAt(i) == magicLine, 1, 0)) return m.position();
+			}
+			if (!m.step()) return -1;
+		}
+		return -1;
+	}
+
+	// {trace}, a format() recorded with the magic published on its own,
+	// rearranged into the order format() had until 2026-10-19: the magic
+	// stored last, before the whole-region writeback run, and made durable by
+	// that run's fence, with no writeback or fence of its own. Events are
+	// renumbered, so the result's digest can be compared with a trace the old
+	// code recorded.
+	def withEarlyMagic(trace: PersistentTrace, name: string) -> PersistentTrace {
+		def magic = magicStore(trace);
+		def lines = int.!(trace.regionBytes / MmapRegionUtils.CACHE_LINE_SIZE);
+		def runStart = magic - 1 - lines;
+		def out = Vector<PersistentTraceEvent>.new();
+		for (i < runStart) out.put(trace.events[i]);
+		out.put(trace.events[magic]);
+		for (i = runStart; i < magic; i++) out.put(trace.events[i]);
+		for (i < out.length) {
+			def e = out[i];
+			out[i] = PersistentTraceEvent(u64.!(i + 1), e.kind, e.offset, e.width, e.value);
+		}
+		return PersistentTrace.new(name, trace.regionBytes, out.extract());
 	}
 }
 
@@ -383,4 +529,110 @@ def test_alloc_two_transaction_images_stay_consistent(tc: PersistentAllocatorTes
 		tc.allocatorProperty("two transactions survive every crash schedule"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.imagesChecked > trace.length());
+}
+
+// format()'s ordering claim, for every image at every cut, without enumerating
+// them. Before the magic is stored no image can carry it: exactly one store
+// writes its bytes, and a fresh mapping holds zeroes there. From that store on,
+// every other store format() made is at its line's floor, so an image either
+// lacks the magic or holds everything the magic vouches for. The magic is the
+// last store, and only its own writeback and fence follow it.
+def test_alloc_format_publishes_the_magic_last(tc: PersistentAllocatorTester) {
+	def trace = tc.recordFormat("pwregion_format");
+	if (trace == null) return;
+	def magic = PersistentFormatScenario.magicStore(trace);
+	tc.t.assertz(true, magic > 0);
+	if (magic <= 0) return;
+	tc.t.asserti(trace.length() - 3, magic);
+	tc.t.assertz(true, trace.events[magic + 1].kind == PersistentEventKind.CLWB);
+	tc.t.assert_eq(0u64, trace.events[magic + 1].offset);  // the magic's line
+	tc.t.assertz(true, trace.events[magic + 2].kind == PersistentEventKind.SFENCE);
+	// The whole-region run's fence comes just before the magic.
+	tc.t.assertz(true, trace.events[magic - 1].kind == PersistentEventKind.SFENCE);
+	tc.t.asserti(-1, PersistentFormatScenario.firstUnforcedCut(trace, magic + 1));
+}
+
+// Every image a crash at any cut of format() can leave, opened as production
+// opens a region, must be a consistent allocator: mounted as it stands if it
+// carries the magic, reformatted if it does not. From the magic's store on, a
+// cut permits at most two images, the magic's line with and without it and
+// every other line at its final bytes (format_publishes_the_magic_last), so
+// those cuts are checked exhaustively: two images at the magic's store and at
+// its writeback, one after its fence. Before it, a cut permits the product of
+// every line's range of durable store prefixes, so the sweep there is bounded,
+// FORMAT_BUDGET images per cut in the explorer's order, and says so; none of
+// those images carries the magic, so each checks the reformat. On 2026-10-19
+// the trace had 598 events over 16 lines, its 596 cuts before the magic's
+// store permitted up to about 2^61 images each, and the sweep checked 4,254.
+def test_alloc_crash_during_format_opens_consistent(tc: PersistentAllocatorTester) {
+	def trace = tc.recordFormat("pwregion_format");
+	if (trace == null) return;
+	def magicCut = PersistentFormatScenario.magicStore(trace) + 1;
+	tc.t.assertz(true, magicCut > 0);
+	if (magicCut <= 0) return;
+
+	def before = PersistentExplorer.checkCutRange(trace, null, 0, magicCut - 1, tc.FORMAT_BUDGET,
+		tc.formatProperty("before the magic is stored, every image reformats into a consistent allocator"));
+	if (!before.ok()) tc.t.fail(before.toArtifact());
+	tc.t.assertz(true, before.imagesChecked > magicCut);
+	tc.t.assertz(true, before.truncated);
+	tc.t.assertz(false, before.exhaustive());
+
+	def after = PersistentExplorer.checkCutRange(trace, null, magicCut, trace.length(), tc.FORMAT_BUDGET,
+		tc.formatProperty("once the magic is stored, every image opens into a consistent allocator"));
+	if (!after.ok()) tc.t.fail(after.toArtifact());
+	tc.t.assertz(true, after.exhaustive());
+	tc.t.asserti(5, after.imagesChecked);
+}
+
+// The negative control: the same format() with the magic where it was until
+// 2026-10-19, stored before the whole-region writeback run and made durable by
+// that run's fence (PersistentFormatScenario.withEarlyMagic). From the magic's
+// store to that fence nothing forces the rest of the header or the block
+// table, while the header's first line may reach the medium whole, magic and
+// all; so both checks above must fail, at the magic's cut. The sweep reaches
+// such an image because the explorer varies the lowest line first, the
+// header's first: its seven stores, the magic last, give eight prefixes, and
+// FORMAT_BUDGET, which bounds the prefixes tried per cut, is eight. In that
+// image every other line is at its floor, so mount() finds the magic beside a
+// zero block size and opens no table at all. On 2026-10-19 this rearrangement
+// had the digest of the trace format() recorded at afcf5525, and against that
+// code crash_during_format_opens_consistent failed at the same cut, 339 of 596.
+def test_alloc_early_magic_is_caught(tc: PersistentAllocatorTester) {
+	def ordinary = tc.recordFormat("pwregion_format");
+	if (ordinary == null) return;
+	def magic = PersistentFormatScenario.magicStore(ordinary);
+	def lines = int.!(ordinary.regionBytes / MmapRegionUtils.CACHE_LINE_SIZE);
+	tc.t.asserti(ordinary.length() - 3, magic);
+	if (magic != ordinary.length() - 3) return;
+	for (i < lines) {
+		def e = ordinary.events[magic - 1 - lines + i];
+		tc.t.assertz(true, e.kind == PersistentEventKind.CLWB);
+		tc.t.assert_eq(u64.!(i) * MmapRegionUtils.CACHE_LINE_SIZE, e.offset);
+	}
+
+	def mutant = PersistentFormatScenario.withEarlyMagic(ordinary, "pwregion_format_early_magic");
+	// The magic moved, its writeback and fence gone, and nothing else changed.
+	tc.t.assertz(true, mutant.validate().ok());
+	tc.t.asserti(ordinary.count(PersistentEventKind.STORE), mutant.count(PersistentEventKind.STORE));
+	tc.t.asserti(ordinary.count(PersistentEventKind.CLWB) - 1, mutant.count(PersistentEventKind.CLWB));
+	tc.t.asserti(ordinary.count(PersistentEventKind.SFENCE) - 1, mutant.count(PersistentEventKind.SFENCE));
+	def early = PersistentFormatScenario.magicStore(mutant);
+	tc.t.asserti(mutant.length() - 2 - lines, early);
+	if (early != mutant.length() - 2 - lines) return;
+
+	// The complete check sees it at once.
+	tc.t.asserti(early + 1, PersistentFormatScenario.firstUnforcedCut(mutant, early + 1));
+
+	def result = PersistentExplorer.checkCutRange(mutant, null, early + 1, mutant.length(), tc.FORMAT_BUDGET,
+		tc.formatProperty("once the magic is stored, every image opens into a consistent allocator"));
+	tc.t.assertz(false, result.ok());
+	def cx = result.counterexample;
+	if (cx == null) {
+		tc.t.fail("the early magic produced no counterexample");
+		return;
+	}
+	tc.t.asserti(early + 1, cx.crashAfter);
+	tc.t.assert_string("an image carrying the magic was mounted, and memory-order chain does not reach the region marker",
+		cx.detail);
 }

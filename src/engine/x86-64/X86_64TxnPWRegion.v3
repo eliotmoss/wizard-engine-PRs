@@ -355,9 +355,9 @@ type CachedUpdate(value: u64, size: u8) #unboxed { }
 
 // Direct, non-transactional writes to the persistent image through the traced
 // PersistentOperations seam. Legal only where no WAL transaction protects the
-// bytes: format() builds the whole region before the WAL exists and publishes
-// it with a single persistRange(). Steady-state allocator mutations must use
-// RegionTransaction (the *Cached setters) instead.
+// bytes: format() builds the whole region before the WAL exists, persists it,
+// and only then stores and persists the magic that publishes it. Steady-state
+// allocator mutations must use RegionTransaction (the *Cached setters) instead.
 //
 // The method names deliberately mirror RegionTransaction's write* family so a
 // direct setter and its *Cached twin read as line-for-line counterparts, and
@@ -902,10 +902,16 @@ class PWRegion {
                 lastHandle.setPrev(writer, metaHandle);
                 sanitizeOffset(blockTableOffset + (userDataBlocks + 1) * u64.!(BlockEntry.size));
 
-                headerSetU64(PWRegionHeader.magic.offset, PWRegions.MAGIC);
-
-                // Persist the freshly formatted region image before exposing it.
+                // Publish in two steps. init() mounts any region whose header
+                // carries the magic, and a crash may make a line durable before
+                // lines stored ahead of it (docs/pmem-crash-model.md), so a magic
+                // made durable by the same persist as the block table could
+                // reach the medium before the table does. Everything else is
+                // made durable first; only then is the magic stored, and its
+                // line persisted under a fence of its own.
                 backendRegion.persistRange(0, u64.!(rng.length));
+                headerSetU64(PWRegionHeader.magic.offset, PWRegions.MAGIC);
+                backendRegion.persistRange(u64.view(PWRegionHeader.magic.offset), 8u64);
         }
 
         def getHeader() -> Ref<PWRegionHeader> {

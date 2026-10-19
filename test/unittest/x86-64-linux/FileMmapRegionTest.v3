@@ -450,7 +450,9 @@ def test_fm_elided_provider_syncs_nothing(tc: FileMmapTester) {
 // The old-against-new comparison is only fair if LEGACY really is the boundary
 // the file backend had until 2026-10-13: no writeback request reaches the
 // provider, format's persistRange() calls are msyncs of their own pages (two of
-// block 1's page, then the whole mapping), and a commit is one fdatasync.
+// block 1's page, the whole mapping, then the magic's page: format persists the
+// magic on its own since 2026-10-19, on every boundary), and a commit is one
+// fdatasync.
 def test_fm_legacy_boundary_is_the_old_one(tc: FileMmapTester) {
         RegionFileIO.unlink(tc.path);
         def backend = FilePersistenceTraceBackend.new(tc.path);
@@ -462,15 +464,17 @@ def test_fm_legacy_boundary_is_the_old_one(tc: FileMmapTester) {
                 return tc.cleanup();
         }
         tc.t.assert(!DirectIoOperations.?(traced.persistentOperations()), "the legacy region kept the marking provider");
-        tc.t.assert_eq(3, traced.mappedSyncAttempts);
+        tc.t.assert_eq(4, traced.mappedSyncAttempts);
         tc.t.assert_eq(0, traced.dataSyncAttempts);
-        if (traced.mappedSyncOffsets.length == 3) {
+        if (traced.mappedSyncOffsets.length == 4) {
                 tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[0]);
                 tc.t.assert_eq(4096u64, traced.mappedSyncSizes[0]);
                 tc.t.assert_eq(4096u64, traced.mappedSyncOffsets[1]);
                 tc.t.assert_eq(4096u64, traced.mappedSyncSizes[1]);
                 tc.t.assert_eq(0u64, traced.mappedSyncOffsets[2]);
                 tc.t.assert_eq(FM_BLOCKS * 4096u64, traced.mappedSyncSizes[2]);
+                tc.t.assert_eq(0u64, traced.mappedSyncOffsets[3]);
+                tc.t.assert_eq(4096u64, traced.mappedSyncSizes[3]);
         }
         traced.clearTrace();
         tc.t.assert(!tc.pw.allocChunk(1u32).isNull(), "allocation failed");
