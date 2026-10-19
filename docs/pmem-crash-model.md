@@ -343,7 +343,7 @@ the same `Pointer.load`. What changed is who issues it.
   or not loads were recorded, and nothing that consumes traces can see one.
   `clear()` empties both lists.
 
-The audit has four parts, in `PersistentOperationsTest.v3`:
+The audit has five parts, in `PersistentOperationsTest.v3`:
 
 - `persistent_ops:reader_matches_raw`: with no observer, every reader load
   equals the raw load, at every naturally aligned offset of a page for each
@@ -378,20 +378,27 @@ The audit has four parts, in `PersistentOperationsTest.v3`:
   2,968 cuts, 1,486 images, through `PWBTree.open()` and its invariants).
   On average 96 % of an allocator image and 92 % of a sieve image is neither
   observed nor stored, and so varied (at least 90 % and 78 %).
+- `persistent_ops:load_audit_btree_descents_fetch_the_path`: the B+Tree's
+  descents, which no reattach can exercise, since `open()` has walked, and so
+  observed, every node before `get()` or `put()` could run. On a tree of
+  height 3 with loads recorded from then on, a lookup observes exactly three
+  whole nodes, the root first, all different, and a `put()` of the same key
+  observes the same three, in the same order, before its first store.
 
 Neither half alone would do. The structural test names fields, so a load it
 does not name can escape; the inert test catches an escape only if the bytes
 behind it change what the run does on these scenarios, and only if nothing
-else in the run observed those bytes, at any point. Eight planted escapes
-were each caught: a raw `getUsed()`, an unobserved checksum loop and a raw
+else in the run observed those bytes, at any point. Nine planted escapes were
+each caught: a raw `getUsed()`, an unobserved checksum loop and a raw
 record-field load by the field audit and all three inert-bytes audits; a raw
 cache-miss read by the field audit and the sieve's and the B+Tree's (the
 allocator's walk never misses the transaction's cache); an unobserved sieve
 bitmap by the sieve's inert-bytes audit, the only one that runs that code;
-and a B+Tree walk whose fetch skips the observation, and a fetch that
-observes only a node's tag and key count, by the B+Tree's. Not caught: a
-lookup's or a put's descent that skips its fetch, because `open()` has
-observed every node before either descent runs.
+a B+Tree walk whose fetch skips the observation, and a fetch that observes
+only a node's tag and key count, by the B+Tree's; and a lookup's or a put's
+descent that skips its fetch by the descent test alone. The B+Tree's
+inert-bytes audit passes those two, because `open()` has observed every node
+before either descent runs; that is why the descent test exists.
 
 **What the reader does not do yet.** Nothing prunes by loads: the explorer
 still enumerates images without consulting what recovery reads, and the lazy
@@ -412,7 +419,8 @@ provider's `loadObserver` and a branch that is never taken, and a B+Tree node
 costs one such call when it is fetched. On sean-tan-PC (2026-10-19, file
 backend on tmpfs, so that `fdatasync` costs almost nothing and the CPU path
 dominates; `powersave`; 21 interleaved runs per build, pinned to CPU 2, a
-performance core, and then to CPU 20, an efficiency core):
+performance core, and then to CPU 20, an efficiency core; against pwregions at
+9f11eb6e, before the line-content explorer and the record-checksum control):
 
 - The sieve step was unchanged on CPU 2 (162.2 µs, −0.02 %) and 1.2 % slower
   on CPU 20, where the wall-clock time per step stayed within the spread.

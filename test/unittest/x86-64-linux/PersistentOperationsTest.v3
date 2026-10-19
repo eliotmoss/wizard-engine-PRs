@@ -23,6 +23,7 @@ def POTX = [
 	POT("load_audit_unobserved_bytes_inert", test_persistent_load_audit_unobserved_bytes_inert),
 	POT("load_audit_sieve_reattach_inert", test_persistent_load_audit_sieve_reattach_inert),
 	POT("load_audit_btree_reattach_inert", test_persistent_load_audit_btree_reattach_inert),
+	POT("load_audit_btree_descents_fetch_the_path", test_persistent_load_audit_btree_descents_fetch_the_path),
 	()
 ];
 
@@ -916,6 +917,19 @@ class PersistentLoadAuditRun(verdict: string, recovery: DualWalRecovery,
 }
 
 component PersistentLoadAudits {
+	// The offsets of the observations {loads} recorded that cover {nodeBytes}
+	// bytes, a B+Tree node's payload, in order; only those made before any
+	// store after the first {before} events, unless {before} is negative.
+	def nodeObserves(loads: RecordingLoadObserver, nodeBytes: u64, before: int) -> Array<u64> {
+		def v = Vector<u64>.new();
+		for (i < loads.loads.length) {
+			def e = loads.loads[i];
+			if (before >= 0 && e.afterEvents > before) break;
+			if (e.length == nodeBytes) v.put(e.offset);
+		}
+		return v.extract();
+	}
+
 	// Mount {image} as production mounts a region, through a recording PMEM
 	// container with loads recorded too, run {check} over the mounted
 	// region, and keep what the mount, the recovery and the check did.
@@ -1328,3 +1342,53 @@ def test_persistent_load_audit_btree_reattach_inert(tc: PersistentOperationsTest
 		bt.BLOCK_SIZE, 4, checks.btree);
 	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
 }
+
+// The descents of get() and put() fetch each node on the key's path through
+// the reader. The reattach audit cannot tell: open() has walked, and so
+// observed, every node before either could run. So, on a tree of height 3
+// with loads recorded from then on: a lookup observes exactly three whole
+// nodes, root first, each once and none twice; and a put of the same key
+// observes the same three, in the same order, before its first store.
+def test_persistent_load_audit_btree_descents_fetch_the_path(tc: PersistentOperationsTester) {
+	def bt = PersistentBTreeTester.new(tc.t);
+	if (!bt.openRecordingTree()) {
+		tc.t.fail("could not open the recording tree");
+		bt.cleanup();
+		return;
+	}
+	def n = bt.insertsToReach(3);
+	if (n < 0 || !bt.insertRange(0, n)) {
+		bt.cleanup();
+		return;
+	}
+	def tree = bt.tree;
+	tc.t.assert_eq(3u64, tree.height());
+	def header = u64.!(ChunkHeader.size);
+	def nodeBytes = (bt.BLOCK_SIZE - header) / 8u64 * 8u64;
+	def key = u64.!(n / 2);
+	def loads = bt.recorder.recordLoads();
+
+	def got = tree.get(key);
+	tc.t.assertz(true, got.0);
+	def path = PersistentLoadAudits.nodeObserves(loads, nodeBytes, -1);
+	if (path.length != 3) {
+		tc.t.fail1("a lookup observed %d whole nodes, not one per level", path.length);
+		bt.cleanup();
+		return;
+	}
+	tc.t.assert_eq(tree.rootNode() + header, path[0]);
+	tc.t.assertz(true, path[0] != path[1] && path[1] != path[2] && path[0] != path[2]);
+
+	loads.clear();
+	def start = bt.recorder.events.length;
+	tc.t.assertz(true, tree.put(key, got.1 + 1u64));
+	def before = PersistentLoadAudits.nodeObserves(loads, nodeBytes, start);
+	if (before.length != 3) {
+		tc.t.fail1("a put observed %d whole nodes before its first store, not one per level", before.length);
+		bt.cleanup();
+		return;
+	}
+	for (i < 3) tc.t.assert_eq(path[i], before[i]);
+	bt.cleanup();
+}
+
