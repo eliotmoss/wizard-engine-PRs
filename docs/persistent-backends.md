@@ -3177,8 +3177,10 @@ through a `DirectRegionReader` over the region's provider (the counterpart of
 `DirectRegionWriter`): typed `load*` methods, `observe()` for byte loops, and
 per-layout `forge*` helpers that observe a layout's bytes before forging its
 `Ref`. With no observer, a reader load is the same `Pointer.load` as before,
-behind a call and a never-taken branch. The contract, what goes through the
-reader and what stays raw, and the cost are in
+behind a call and a never-taken branch. A recording provider can keep loads too
+(`recordLoads()`), in a list of their own, so a trace stays
+`STORE`/`CLWB`/`SFENCE` only. The contract, what goes through the reader and
+what stays raw, the load audit and the cost are in
 [PMEM Crash Model](pmem-crash-model.md#loads-2026-10-19).
 
 `BackendProt` mirrors Linux `PROT_*` flags: `NONE(0) READ(1) WRITE(2) EXEC(4)`.
@@ -3662,7 +3664,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 |---|---:|---|
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
 | `DualTxnWalTest.v3` | 40 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
-| `PersistentOperationsTest.v3` | 5 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events |
+| `PersistentOperationsTest.v3` | 20 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events; the store audit over `PWRegion`; and, since 2026-10-19, the load seam: reader loads equal raw loads, an observer runs before the load it is shown and its rewrite is what the code loads, the load audit (`load_audit_covers_fields`: a mount, recovery and walk observe the header fields mount reads and not the others, the WAL header and both records whole, and every block entry the walk visits) and the inert-bytes audits over every cut of an allocator scenario and a sieve step and every fourth cut of a B+Tree update (bytes neither observed nor stored set to 0x00, 0xFF and a hash change no load, store or verdict) |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
 | `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |

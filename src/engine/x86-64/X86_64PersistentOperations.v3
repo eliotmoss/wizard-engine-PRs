@@ -2,7 +2,9 @@
 // Both mutate the same live byte image with ordinary Pointer.store operations;
 // the recorder additionally retains typed STORE/CLWB/SFENCE events in one
 // monotonically sequenced stream. Durability and crash scheduling deliberately
-// remain outside this milestone.
+// remain outside this milestone. Loads are observed rather than performed by
+// the provider (PersistentLoadObserver, DirectRegionReader); the recorder can
+// keep them too, in a list of their own (recordLoads()).
 
 enum PersistentEventKind {
 	STORE,
@@ -68,6 +70,7 @@ class X86_64PersistentOperations extends PersistentOperations {
 class RecordingPersistentOperations extends X86_64PersistentOperations {
 	def events = Vector<PersistentTraceEvent>.new();
 	private var nextSeq = 1u64;
+	private var loadRecorder: RecordingLoadObserver;
 
 	new(range: Range<byte>) super(range) { }
 
@@ -113,18 +116,114 @@ class RecordingPersistentOperations extends X86_64PersistentOperations {
 		return PersistentTrace.new(name, u64.!(range.length), events.copy());
 	}
 
+	// Clears the loads recorded by recordLoads() too, so the two lists keep
+	// describing the same stretch of execution.
 	def clear() {
 		events.clear();
 		nextSeq = 1u64;
+		if (loadRecorder != null) loadRecorder.clear();
 	}
 
 	def reset() {
 		clear();
 	}
 
+	// Record this region's loads as well as its stores: install a
+	// RecordingLoadObserver in front of whatever observer is installed (it is
+	// called first and may rewrite the bytes), and return it. Loads are kept
+	// in the observer's own list and never become PersistentTraceEvents, so
+	// {events}, and every trace snapshot() freezes from it, stays
+	// STORE/CLWB/SFENCE only: validate(), digest(), render(), the crash
+	// machine and the explorer never see a load. Each load records how many
+	// events preceded it, which places it in the same total order.
+	def recordLoads() -> RecordingLoadObserver {
+		if (loadRecorder == null) {
+			loadRecorder = RecordingLoadObserver.new(range, loadObserver, this);
+			loadObserver = loadRecorder;
+		}
+		return loadRecorder;
+	}
+
 	private def recordStore(offset: u64, width: u8, value: u64) {
 		events.put(PersistentTraceEvent(nextSeq++, PersistentEventKind.STORE,
 			offset, width, value));
+	}
+}
+
+// One observed load: the region-relative bytes [offset, offset + length) as
+// the code was about to load them, after the observer behind the recorder, if
+// any, had rewritten them. {afterEvents} is the number of STORE/CLWB/SFENCE events
+// the region's recorder held when the load was observed, so the load falls
+// between events[afterEvents - 1] and events[afterEvents]. {bytes} is null for
+// a load that does not lie inside the region.
+class PersistentLoadEvent(afterEvents: int, offset: u64, length: u64, bytes: Array<byte>) {
+	// The first min(length, 8) bytes, little-endian, as a typed load reads them.
+	def value() -> u64 {
+		if (bytes == null) return 0u64;
+		var v = 0u64;
+		def n = if(bytes.length < 8, bytes.length, 8);
+		for (i < n) v |= u64.view(bytes[i]) << u6.view(8 * i);
+		return v;
+	}
+
+	def same(that: PersistentLoadEvent) -> bool {
+		if (afterEvents != that.afterEvents || offset != that.offset || length != that.length) return false;
+		if (bytes == null || that.bytes == null) return bytes == that.bytes;
+		for (i < bytes.length) if (bytes[i] != that.bytes[i]) return false;
+		return true;
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put3("LOAD(after=%d, offset=%d, length=%d, value=0x", afterEvents, offset, length);
+		return buf.putx(value()).puts(")");
+	}
+}
+
+// A load observer that records every load, for audits. It calls {inner}
+// first, so it records what the code will actually load, and it can sit in
+// front of an observer that materialises bytes.
+class RecordingLoadObserver extends PersistentLoadObserver {
+	def range: Range<byte>;
+	def inner: PersistentLoadObserver;
+	def stores: RecordingPersistentOperations;	// may be null: no position
+	def loads = Vector<PersistentLoadEvent>.new();
+
+	new(range, inner, stores) { }
+
+	def observe(offset: u64, length: u64) {
+		if (inner != null) inner.observe(offset, length);
+		def at = if(stores == null, 0, stores.events.length);
+		def size = u64.!(range.length);
+		if (offset > size || length > size - offset) {
+			loads.put(PersistentLoadEvent.new(at, offset, length, null));
+			return;
+		}
+		def copy = Array<byte>.new(int.!(length));
+		def base = int.!(offset);
+		for (i < copy.length) copy[i] = range[base + i];
+		loads.put(PersistentLoadEvent.new(at, offset, length, copy));
+	}
+
+	// Loads that fell outside the region. A correct reader never makes one.
+	def outside() -> int {
+		var n = 0;
+		for (i < loads.length) if (loads[i].bytes == null) n++;
+		return n;
+	}
+
+	// Every byte some recorded load covered.
+	def coverage() -> Array<bool> {
+		def covered = Array<bool>.new(range.length);
+		for (i < loads.length) {
+			def e = loads[i];
+			if (e.bytes == null) continue;
+			for (b < e.bytes.length) covered[int.!(e.offset) + b] = true;
+		}
+		return covered;
+	}
+
+	def clear() {
+		loads.clear();
 	}
 }
 

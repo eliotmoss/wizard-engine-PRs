@@ -844,7 +844,9 @@ Witcher, Vinter and Mumak", rather than presenting it as a contribution.
    [What discharges the explorer's assumptions](#what-discharges-the-explorers-assumptions)).
    *Cost:* the kernel and the emitted instructions are invisible, and Vinter
    sees both; the trace is complete only by the store audit, which since
-   2026-10-19 includes the Immix line marks; and no loads are recorded. Read CrashMonkey before
+   2026-10-19 includes the Immix line marks; and loads, observed through the
+   region's reader since 2026-10-19, are complete only by the load audit
+   ([PMEM Crash Model](pmem-crash-model.md#loads-2026-10-19)). Read CrashMonkey before
    claiming anything "across media", since it is the block-level counterpart.
 2. **The oracle knows what was acknowledged.** At each cut the recovered state
    is checked against the acknowledgement contract, the allocator's structural
@@ -870,9 +872,11 @@ Witcher, Vinter and Mumak", rather than presenting it as a contribution.
    of three traces, under a stated model: asynchronous, non-snapshot `CLWB`,
    background eviction at every event, and the bounded two-crash profile.
    Neither Yat, Jaaru, Witcher nor Vinter reports such a check. *Cost:* Jaaru
-   also prunes by what recovery reads, and the seam cannot, since it records no loads, so
-   the allocator, format, sieve and B+-tree scenarios' mid-record cuts are
-   budgeted rather than exhausted (see
+   also prunes by what recovery reads. Since 2026-10-19 recovery's loads from a
+   region go through the seam, as far as the load audit shows, but nothing
+   prunes by them yet (the lazy search that would is planned, not
+   implemented), so the allocator, format, sieve and B+-tree scenarios'
+   mid-record cuts are budgeted rather than exhausted (see
    [What the evidence covers](#what-the-evidence-covers-stated-exactly)). The
    WAL scenarios are exhaustive since 2026-10-19 because the search keeps one
    image per distinct line content, which leaves at most 14,256 images at any of

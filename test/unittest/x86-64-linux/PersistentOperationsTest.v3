@@ -17,6 +17,12 @@ def POTX = [
 	POT("pwregion_alloc_applies_after_commit_boundary", test_persistent_pwregion_alloc_applies_after_commit_boundary),
 	POT("pwregion_txn_writes_each_line_back_once", test_persistent_pwregion_txn_writes_each_line_back_once),
 	POT("immix_line_marks_cross_the_seam", test_persistent_immix_line_marks_cross_the_seam),
+	POT("reader_matches_raw", test_persistent_reader_matches_raw),
+	POT("load_observer_runs_before_the_load", test_persistent_load_observer_runs_before_the_load),
+	POT("load_audit_covers_fields", test_persistent_load_audit_covers_fields),
+	POT("load_audit_unobserved_bytes_inert", test_persistent_load_audit_unobserved_bytes_inert),
+	POT("load_audit_sieve_reattach_inert", test_persistent_load_audit_sieve_reattach_inert),
+	POT("load_audit_btree_reattach_inert", test_persistent_load_audit_btree_reattach_inert),
 	()
 ];
 
@@ -857,4 +863,468 @@ def test_persistent_dual_wal_recovery_trace(tc: PersistentOperationsTester) {
 	tc.assertSequences(recorder.events);
 	tc.t.assert_eq(0xA5u8, region.range[200]);
 	region.destroy();
+}
+
+// ---------------------------------------------------------------------------
+// The load seam: DirectRegionReader and PersistentLoadObserver.
+// ---------------------------------------------------------------------------
+
+// What one mount of a crash image did: the verdict of the check run over it,
+// the recovery it performed, and every store, writeback, fence and load it
+// made, in their recorded order.
+class PersistentLoadAuditRun(verdict: string, recovery: DualWalRecovery,
+	stores: Array<PersistentTraceEvent>, loads: Array<PersistentLoadEvent>) {
+
+	// Bytes the run loaded or stored: the bytes that can affect it.
+	def touched(regionBytes: int) -> Array<bool> {
+		def mask = Array<bool>.new(regionBytes);
+		for (e in loads) {
+			if (e.bytes == null) continue;
+			for (b < e.bytes.length) mask[int.!(e.offset) + b] = true;
+		}
+		for (e in stores) {
+			if (e.kind != PersistentEventKind.STORE) continue;
+			for (b < int.view(e.width)) mask[int.!(e.offset) + b] = true;
+		}
+		return mask;
+	}
+
+	// The first way {that} differs from this run, or null.
+	def difference(that: PersistentLoadAuditRun) -> string {
+		if (recovery != that.recovery) return "recovery outcome differs";
+		if (verdict == null) {
+			if (that.verdict != null) return "verdict differs";
+		} else if (that.verdict == null || !Strings.equal(verdict, that.verdict)) {
+			return "verdict differs";
+		}
+		if (stores.length != that.stores.length) return "number of persistent operations differs";
+		for (i < stores.length) {
+			def x = stores[i], y = that.stores[i];
+			if (x.seq != y.seq || x.kind != y.kind || x.offset != y.offset
+				|| x.width != y.width || x.value != y.value) {
+				return Strings.format1("persistent operation %d differs", i);
+			}
+		}
+		if (loads.length != that.loads.length) return "number of loads differs";
+		for (i < loads.length) {
+			if (!loads[i].same(that.loads[i])) {
+				return loads[i].render(Strings.builderOf("load differs: ")).toString();
+			}
+		}
+		return null;
+	}
+}
+
+component PersistentLoadAudits {
+	// Mount {image} as production mounts a region, through a recording PMEM
+	// container with loads recorded too, run {check} over the mounted
+	// region, and keep what the mount, the recovery and the check did.
+	def run(image: PersistentDurableImage, numBlocks: u64, blockSize: u64,
+		check: PWRegion -> string) -> PersistentLoadAuditRun {
+
+		def mount = PersistentImageMounts.openMapped(image, true);
+		if (mount == null) return null;
+		def loads = mount.recorder.recordLoads();
+		def region = PWRegion.new(PreparedRegionBackend.new(mount.region), numBlocks,
+			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		if (region.backendRegion == null) {
+			return PersistentLoadAuditRun.new("did not mount", DualWalRecovery.CLEAN,
+				mount.recorder.events.copy(), loads.loads.copy());
+		}
+		def verdict = check(region);
+		def result = PersistentLoadAuditRun.new(verdict, region.lastRecovery,
+			mount.recorder.events.copy(), loads.loads.copy());
+		region.deallocate();
+		return result;
+	}
+
+	// {image} with every byte {keep} does not mark replaced by {fill}.
+	def refill(image: PersistentDurableImage, keep: Array<bool>, fill: int -> byte) -> PersistentDurableImage {
+		def bytes = Array<byte>.new(image.size());
+		for (i < bytes.length) bytes[i] = if(keep[i], image.bytes[i], fill(i));
+		return PersistentDurableImage.new(bytes);
+	}
+
+	def zeroes(i: int) -> byte { return 0x00u8; }
+	def ones(i: int) -> byte { return 0xFFu8; }
+	def hashed(i: int) -> byte {
+		return u8.view((u64.!(i) * 0x9E37_79B9_7F4A_7C15_u64 + 0x5Au64) >> 56);
+	}
+
+	// Mount {image}, then mount it three more times with every byte the first
+	// mount neither loaded nor stored set to 0x00, to 0xFF and to a hash of
+	// its offset. Returns the first difference, or null. A load that reached
+	// the region without being observed, and mattered, shows up here as a
+	// difference in the loads, the stores or the verdict.
+	def checkInert(image: PersistentDurableImage, numBlocks: u64, blockSize: u64,
+		check: PWRegion -> string, outcomes: Array<int>) -> string {
+
+		def first = run(image, numBlocks, blockSize, check);
+		if (first == null) return "could not map the image";
+		outcomes[first.recovery.tag]++;
+		def keep = first.touched(image.size());
+		def fills = [zeroes, ones, hashed];
+		def names = ["0x00", "0xFF", "a hash pattern"];
+		for (f < fills.length) {
+			def again = run(refill(image, keep, fills[f]), numBlocks, blockSize, check);
+			if (again == null) return "could not map the refilled image";
+			def diff = first.difference(again);
+			if (diff != null) {
+				return StringBuilder.new().put2("unobserved bytes set to %s change the run: %s",
+					names[f], diff).toString();
+			}
+		}
+		return null;
+	}
+
+	// checkInert() over the lazy and the eager image at every {stride}th cut
+	// of {trace}, and at its last cut. Fails {t} with the first difference.
+	def sweepInert(t: Tester, trace: PersistentTrace, initial: Array<byte>,
+		numBlocks: u64, blockSize: u64, stride: int, check: PWRegion -> string) -> Array<int> {
+
+		def outcomes = Array<int>.new(DualWalRecovery.PERSIST_FAILED.tag + 1);
+		var cut = 0;
+		while (true) {
+			def images = [PersistentImages.lazyCrash(trace, initial, cut),
+				PersistentImages.eagerCrash(trace, initial, cut)];
+			for (image in images) {
+				def diff = checkInert(image, numBlocks, blockSize, check, outcomes);
+				if (diff != null) {
+					t.fail(StringBuilder.new().put2("cut %d: %s", cut, diff).toString());
+					return outcomes;
+				}
+			}
+			if (cut == trace.length()) break;
+			cut += stride;
+			if (cut > trace.length()) cut = trace.length();
+		}
+		return outcomes;
+	}
+}
+
+// Checks run over a mounted image by the inert-bytes audits.
+class PersistentLoadAuditChecks(capacity: int, liveSegments: u64) {
+	def allocator(region: PWRegion) -> string {
+		return PersistentAllocatorInvariants.check(region);
+	}
+
+	def sieve(region: PWRegion) -> string {
+		def bad = PersistentAllocatorInvariants.check(region);
+		if (bad != null) return bad;
+		def sieve = PWSieve.new(region, liveSegments);
+		if (!sieve.open()) return "sieve could not reattach to its root after recovery";
+		return sieve.checkInvariants();
+	}
+
+	def btree(region: PWRegion) -> string {
+		def bad = PersistentAllocatorInvariants.check(region);
+		if (bad != null) return bad;
+		def tree = PWBTree.new(region, capacity);
+		if (!tree.open()) return "the tree could not reopen after recovery";
+		return tree.checkInvariants();
+	}
+}
+
+// With no observer installed, every reader load is the raw load it replaced:
+// each width at every naturally aligned offset of a page of varied bytes, the
+// region-relative form, and every field of each forged layout.
+def test_persistent_reader_matches_raw(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("reader mapping allocation failed");
+		return;
+	}
+	for (i < region.range.length) region.range[i] = u8.view(i * 37 + 11 + (i >> 8));
+	def ops = region.persistentOperations();
+	tc.t.assertz(true, ops.loadObserver == null);
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def r = DirectRegionReader.new(ops, base);
+	def raw = PWRegionUtils.pointerFromU64;
+	def size = u64.!(region.range.length);
+
+	for (off = 0u64; off < size; off++) {
+		def a = base + off;
+		tc.t.assert_eq(raw(a).load<u8>(), r.loadU8(a));
+		if (off % 2u64 == 0u64) {
+			tc.t.assert_eq(raw(a).load<u16>(), r.loadU16(a));
+			tc.t.assert_eq(raw(a).load<i16>(), r.loadI16(a));
+		}
+		if (off % 4u64 == 0u64) tc.t.assert_eq(raw(a).load<u32>(), r.loadU32(a));
+		if (off % 8u64 == 0u64) {
+			tc.t.assert_eq(raw(a).load<u64>(), r.loadU64(a));
+			tc.t.assert_eq(raw(a).load<i64>(), r.loadI64(a));
+			tc.t.assert_eq(raw(a).load<u64>(), r.loadOffsetU64(off));
+		}
+	}
+
+	def a = base + 512u64;
+	def e = r.forgeBlockEntry(a);
+	tc.t.assert_eq(raw(a).load<i16>(), e.listNum);
+	tc.t.assert_eq(raw(a + 8u64).load<i64>(), e.prev);
+	tc.t.assert_eq(raw(a + 16u64).load<i64>(), e.next);
+	tc.t.assert_eq(raw(a + 24u64).load<i64>(), e.listPrev);
+	tc.t.assert_eq(raw(a + 32u64).load<i64>(), e.listNext);
+	def c = r.forgeChunkHeader(a);
+	tc.t.assert_eq(raw(a).load<u64>(), c.offset);
+	tc.t.assert_eq(raw(a + 8u64).load<u64>(), c.limit);
+	tc.t.assert_eq(raw(a + 16u64).load<u64>(), c.chunk_limit);
+	tc.t.assert_eq(raw(a + 24u64).load<u64>(), c.linemarks);
+	tc.t.assert_eq(raw(a + 3u64).load<u8>(), r.forgeLineMark(a + 3u64).mark);
+	def d = r.forgeMetaDataDesc(a);
+	tc.t.assert_eq(raw(a).load<u64>(), d.kind);
+	tc.t.assert_eq(raw(a + 8u64).load<u32>(), d.fixedBytes);
+	tc.t.assert_eq(raw(a + 12u64).load<u32>(), d.unitSize);
+	tc.t.assert_eq(raw(a + 16u64).load<u32>(), d.bytesPerUnit);
+	tc.t.assert_eq(raw(a + 24u64).load<u64>(), d.offset);
+	def h = r.forgeDualWalHeader(a);
+	tc.t.assert_eq(raw(a).load<u64>(), h.magic);
+	tc.t.assert_eq(raw(a + 48u64).load<u64>(), h.checksum);
+	def rh = r.forgeRecordHeader(a);
+	tc.t.assert_eq(raw(a).load<u64>(), rh.magic);
+	tc.t.assert_eq(raw(a + u64.view(TxnRecordHeader.txnSeq.offset)).load<u64>(), rh.txnSeq);
+	def ct = r.forgeCommitTrailer(a);
+	tc.t.assert_eq(raw(a + u64.view(TxnCommitTrailer.checksum.offset)).load<u64>(), ct.checksum);
+	def le = r.forgeLogEntry(a);
+	tc.t.assert_eq(raw(a).load<u64>(), le.offset);
+	tc.t.assert_eq(raw(a + 8u64).load<u64>(), le.value);
+	tc.t.assert_eq(raw(a + 16u64).load<u8>(), le.width);
+
+	// The handles' getters are the reader's loads.
+	def entry = BlockEntryHandle(a);
+	tc.t.assert_eq(raw(a).load<i16>(), entry.getListNum(r));
+	tc.t.assertz(raw(a + 2u64).load<u8>() == 1u8, entry.getUsed(r));
+	tc.t.assert_eq(u64.view(i64.view(a) + raw(a + 16u64).load<i64>()), entry.getNext(r).addr);
+	def chunk = ChunkHandle(a);
+	tc.t.assert_eq(raw(a + 8u64).load<u64>(), chunk.getLimit(r));
+	tc.t.assert_eq(raw(a + 24u64).load<u64>(), chunk.getLinemarks(r));
+	tc.t.assert_eq(raw(a + 5u64).load<u8>(), LineMarkHandle(a + 5u64).getMark(r));
+
+	// Reading through the seam stores nothing.
+	tc.t.asserti(0, tc.recorderOf(region).events.length);
+	region.destroy();
+}
+
+// Rewrites each observed range with one byte value, so a test can tell
+// whether the load that follows saw the observer's bytes.
+class PersistentRewritingObserver(range: Range<byte>) extends PersistentLoadObserver {
+	var fill = 0u8;
+	var calls = 0;
+
+	def observe(offset: u64, length: u64) {
+		calls++;
+		for (i < int.!(length)) range[int.!(offset) + i] = fill;
+	}
+}
+
+// The observer contract: observe() runs before the load, over region-relative
+// offsets, and what it writes is what the code loads. A recorder installed in
+// front of it records the rewritten bytes, and neither adds a trace event.
+def test_persistent_load_observer_runs_before_the_load(tc: PersistentOperationsTester) {
+	def region = tc.makePmemRegion();
+	if (region == null) {
+		tc.t.fail("observer mapping allocation failed");
+		return;
+	}
+	def ops = region.persistentOperations();
+	def base = u64.view(Pointer.atElement(region.range, 0));
+	def r = DirectRegionReader.new(ops, base);
+	def rewrite = PersistentRewritingObserver.new(region.range);
+	ops.loadObserver = rewrite;
+
+	rewrite.fill = 0x5Au8;
+	tc.t.assert_eq(0x5A5A_5A5A_5A5A_5A5A_u64, r.loadU64(base + 64u64));
+	tc.t.assert_eq(0x5A5Au16, r.loadU16(base + 130u64));
+	rewrite.fill = 0x01u8;
+	def e = r.forgeBlockEntry(base + 256u64);
+	tc.t.assert_eq(0x0101_0101_0101_0101_i64, e.listNext);	// observed once, for the whole layout
+	tc.t.asserti(3, rewrite.calls);
+	r.observe(base + 1000u64, 0u64);			// an empty range is not reported
+	tc.t.asserti(3, rewrite.calls);
+
+	def recorder = tc.recorderOf(region);
+	def loads = recorder.recordLoads();
+	tc.t.assertz(true, ops.loadObserver == loads);
+	tc.t.assertz(true, loads.inner == rewrite);
+	rewrite.fill = 0xC3u8;
+	recorder.storeU8(8u64, 0x77u8);
+	tc.t.assert_eq(0xC3u8, r.loadU8(base + 9u64));
+	tc.t.assert_eq(0xC3C3u16, r.loadU16(base + 2048u64));
+	tc.t.asserti(2, loads.loads.length);
+	def first = loads.loads[0];
+	tc.t.asserti(1, first.afterEvents);	// after the one store
+	tc.t.assert_eq(9u64, first.offset);
+	tc.t.assert_eq(1u64, first.length);
+	tc.t.assert_eq(0xC3u64, first.value());
+	tc.t.assert_eq(2048u64, loads.loads[1].offset);
+	tc.t.assert_eq(0xC3C3u64, loads.loads[1].value());
+	tc.t.asserti(0, loads.outside());
+	// Loads never enter the trace.
+	tc.t.asserti(1, recorder.events.length);
+	tc.t.assertz(true, recorder.snapshot("loads").validate().ok());
+	recorder.clear();
+	tc.t.asserti(0, loads.loads.length);
+	region.destroy();
+}
+
+// The load audit's core regression, the counterpart of the store audit: a
+// mount, its recovery and the allocator's invariant walk load every byte they
+// depend on through the seam. Format, commit a short history, take the bytes
+// without close() (so both slots hold records to replay), mount them with a
+// recording observer, recover and walk. Asserted structurally: the header
+// fields mount reads, the WAL header and both records, every block entry the
+// walk visits and the free-list heads; and the header fields mount does not
+// read stay unobserved, so the audit cannot pass by observing everything.
+def test_persistent_load_audit_covers_fields(tc: PersistentOperationsTester) {
+	def backend = TracePWRegionBackend.new();
+	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
+		TracePWRegions.BLOCK_SIZE, true);
+	if (backend.region == null) {
+		tc.t.fail("load audit mapping allocation failed");
+		return;
+	}
+	def first = region.allocChunk(1u32);
+	def second = region.allocChunk(2u32);
+	tc.t.assertz(false, first.isNull() || second.isNull());
+	tc.t.assertz(true, region.freeChunk(first));
+	def bytes = Array<byte>.new(region.rng.length);
+	for (i < bytes.length) bytes[i] = region.rng[i];
+	region.deallocate();
+	def image = PersistentDurableImage.new(bytes);
+
+	def mount = PersistentImageMounts.openMapped(image, true);
+	if (mount == null) {
+		tc.t.fail("load audit mount allocation failed");
+		return;
+	}
+	def loads = mount.recorder.recordLoads();
+	def mounted = PWRegion.new(PreparedRegionBackend.new(mount.region), TracePWRegions.BLOCKS,
+		tc.noDescs(), TracePWRegions.BLOCK_SIZE, false);
+	tc.t.assertz(true, mounted.backendRegion != null);
+	tc.t.assertz(true, mounted.lastRecovery == DualWalRecovery.REPLAYED);
+	def violation = PersistentAllocatorInvariants.check(mounted);
+	if (violation != null) tc.t.fail(violation);
+	def afterWalk = loads.loads.length;
+	// A transaction read that misses its write-behind cache reads the region.
+	tc.t.assert_eq(0u64, mounted.getUserRoot());
+	if (loads.loads.length != afterWalk + 1) {
+		tc.t.fail("a transaction read that missed its cache was not observed");
+		mounted.deallocate();
+		return;
+	}
+	def rootLoad = loads.loads[afterWalk];
+	tc.t.assert_eq(u64.view(PWRegionHeader.userRoot.offset), rootLoad.offset);
+	tc.t.assert_eq(8u64, rootLoad.length);
+
+	// Mount reads the magic before anything else, and before any store.
+	def magic = loads.loads[0];
+	tc.t.asserti(0, magic.afterEvents);
+	tc.t.assert_eq(u64.view(PWRegionHeader.magic.offset), magic.offset);
+	tc.t.assert_eq(8u64, magic.length);
+	tc.t.assert_eq(PWRegions.MAGIC, magic.value());
+
+	// Every load lies in the region and is placed in the store order; the
+	// trace itself stays modelable.
+	tc.t.asserti(0, loads.outside());
+	var last = 0;
+	for (i < loads.loads.length) {
+		def at = loads.loads[i].afterEvents;
+		tc.t.assertz(true, at >= last && at <= mount.recorder.events.length);
+		last = at;
+	}
+	tc.t.assertz(true, mount.recorder.snapshot("mount").validate().ok());
+
+	def covered = loads.coverage();
+	// Header: blockTable, sentinels, numBlocks; magic, blockSize, logChunk.
+	tc.assertCovered(covered, 0u64, 24u64, true);
+	tc.assertCovered(covered, 56u64, 24u64, true);
+	// numBytes, numDescs, metaData and metaDataDescs are not read by a mount
+	// without descriptors; userRoot is, but only by getUserRoot() above.
+	tc.assertCovered(covered, 24u64, 32u64, false);
+	// The WAL header, whole: its fields, then its checksum over the rest.
+	def log = TracePWRegions.LOG_CHUNK_START;
+	tc.assertCovered(covered, log, u64.!(DualWalHeader.size), true);
+	// Both records, whole, and nothing of either slot beyond its record.
+	def slotBytes = ((TracePWRegions.BLOCK_SIZE - u64.!(DualWalHeader.size)) / 2u64) & ~63u64;
+	for (slot < 2) {
+		def start = log + u64.!(DualWalHeader.size) + u64.!(slot) * slotBytes;
+		def recordLen = u64.!(image.read(start + u64.view(TxnRecordHeader.recordLen.offset), 4));
+		tc.t.assertz(true, recordLen > 0u64 && recordLen < slotBytes);
+		tc.assertCovered(covered, start, recordLen, true);
+		tc.assertCovered(covered, start + recordLen, 64u64, false);
+	}
+	// Every entry in memory order, read from the recovered region, and the
+	// two free-list heads.
+	def walk = DirectRegionReader.new(X86_64PersistentOperations.new(mount.region.range), mounted.regionStart);
+	var entry = mounted.blockTableHandle[0u64];
+	var visited = 0;
+	while (!entry.isNull() && visited <= int.!(TracePWRegions.BLOCKS)) {
+		tc.assertBlockEntriesCovered(covered, entry.addr - mounted.regionStart, 1u64);
+		entry = entry.getNext(walk);
+		visited++;
+	}
+	tc.t.assertz(true, visited >= 4);
+	for (kind in [ListKind.SMALL_FREE, ListKind.LARGE_FREE]) {
+		def head = mounted.sentinels[u64.!(kind.code)].addr - mounted.regionStart;
+		tc.assertCovered(covered, head + u64.view(BlockEntry.listNext.offset), 8u64, true);
+	}
+	mounted.deallocate();
+}
+
+// The inert-bytes audit. A run that loads a byte without observing it can
+// depend on it unseen; so mount, recover and walk a crash image with loads
+// recorded, then again with every byte the run neither observed nor stored set
+// to 0x00, 0xFF and a hash pattern. The loads (offset, length and bytes), the
+// stores, the recovery outcome and the verdict must not change. Images: the
+// lazy and the eager one at every cut of a recorded two-allocation scenario,
+// so both a replaying and a clean recovery are covered.
+def test_persistent_load_audit_unobserved_bytes_inert(tc: PersistentOperationsTester) {
+	def at = PersistentAllocatorTester.new(tc.t);
+	if (!at.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	def trace = at.recordAllocations(2, "load_audit_two_allocations");
+	def mounted = at.mounted;
+	at.cleanup();
+	if (trace == null) return;
+	def checks = PersistentLoadAuditChecks.new(0, 0u64);
+	def outcomes = PersistentLoadAudits.sweepInert(tc.t, trace, mounted, at.BLOCKS,
+		at.BLOCK_SIZE, 1, checks.allocator);
+	tc.t.assertz(true, outcomes[DualWalRecovery.CLEAN.tag] > 0);
+	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
+}
+
+// The same audit over the sieve's reattach: recovery, the allocator walk,
+// PWSieve.open() (which may free leaked extents) and the sieve's invariants,
+// over the images of one recorded step.
+def test_persistent_load_audit_sieve_reattach_inert(tc: PersistentOperationsTester) {
+	def st = PersistentSieveTester.new(tc.t);
+	if (!st.openRecordingSieve()) {
+		tc.t.fail("could not lay out a recording sieve");
+		return;
+	}
+	def trace = st.recordStep("load_audit_sieve_step");
+	def mounted = st.mounted;
+	st.cleanup();
+	if (trace == null) return;
+	def checks = PersistentLoadAuditChecks.new(0, st.LIVE);
+	def outcomes = PersistentLoadAudits.sweepInert(tc.t, trace, mounted, st.BLOCKS,
+		st.BLOCK_SIZE, 1, checks.sieve);
+	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
+}
+
+// And over the B+Tree's reattach: recovery, the allocator walk, PWBTree.open()
+// (its invariants and leak sweep) and checkInvariants(), over the images of an
+// update at height 3, at every fourth cut (the trace has about 3,000 cuts and
+// each image is mounted four times).
+def test_persistent_load_audit_btree_reattach_inert(tc: PersistentOperationsTester) {
+	def bt = PersistentBTreeTester.new(tc.t);
+	def trace = bt.recordUpdate("load_audit_btree_update");
+	def mounted = bt.mounted;
+	bt.cleanup();
+	if (trace == null) return;
+	def checks = PersistentLoadAuditChecks.new(bt.CAPACITY, 0u64);
+	def outcomes = PersistentLoadAudits.sweepInert(tc.t, trace, mounted, bt.BLOCKS,
+		bt.BLOCK_SIZE, 4, checks.btree);
+	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
 }

@@ -325,6 +325,65 @@ the same `Pointer.load`. What changed is who issues it.
   backend reading its file at `create()`, the kernel writing pages back), which
   is not a load the program's logic depends on. And test code that inspects a
   region after the fact.
+- **Recording.** `RecordingPersistentOperations.recordLoads()` installs a
+  `RecordingLoadObserver` in front of any observer already installed, calling
+  it first, and returns it. Each load becomes a
+  `PersistentLoadEvent(afterEvents, offset, length, bytes)`: the bytes as the
+  code was about to load them, and the number of `STORE`/`CLWB`/`SFENCE`
+  events recorded before it, which places it in the same total order. Loads
+  are kept in that list and are never `PersistentTraceEvent`s. *Why a separate
+  list:* a trace is the crash machine's input, and a `LOAD` kind would have to
+  be handled, or skipped, by `validate()`, `digest()`, `render()`, the crash
+  machine's `step()` and the explorer, and would renumber and re-digest every
+  trace recorded with loads on. Kept apart, a trace is byte-identical whether
+  or not loads were recorded, and nothing that consumes traces can see one.
+  `clear()` empties both lists.
+
+The audit has four parts, in `PersistentOperationsTest.v3`:
+
+- `persistent_ops:reader_matches_raw`: with no observer, every reader load
+  equals the raw load, at every naturally aligned offset of a page for each
+  width, and so do fields of every forged layout and of the handles' getters.
+- `persistent_ops:load_observer_runs_before_the_load`: an observer that
+  rewrites what it is shown changes what a load, and a forged layout's field,
+  returns; a recorder in front of it records the rewritten bytes and the
+  position after the stores already made; no load enters the trace.
+- `persistent_ops:load_audit_covers_fields`, the counterpart of the store
+  audit: format a region, allocate twice and free once, and take its bytes
+  without `close()`, so both slots hold records to replay; mount that image
+  with loads recorded, recover and walk the invariants. The first load is the
+  magic, before any store. Structurally: the header fields mount reads are
+  observed and the four it does not (`numBytes`, `numDescs`, `metaData`,
+  `metaDataDescs`) are not, nor `userRoot` until `getUserRoot()` misses the
+  transaction's cache and reads it; the WAL header and both records are
+  observed whole, and the 64 bytes past either record are not; every block
+  entry in memory order is observed but for its padding, as are both free-list
+  heads. Every load lies in the region and in the store order, and the trace
+  still validates.
+- `persistent_ops:load_audit_unobserved_bytes_inert`, and the same for the
+  sieve's and the B+Tree's reattach (`load_audit_sieve_reattach_inert`,
+  `load_audit_btree_reattach_inert`): mount a crash image, recover and run the
+  check with loads recorded, then three times more with every byte the run
+  neither observed nor stored set to 0x00, to 0xFF and to a hash of its
+  offset. The loads (offset, length and bytes), the stores, writebacks and
+  fences, the recovery outcome and the verdict must not change. The images
+  are the lazy and the eager one at every cut of a two-allocation scenario
+  (1,471 cuts, 2,942 images, both `CLEAN` and `REPLAYED` recoveries) and of
+  one sieve step (1,457 cuts, 2,914 images, through `PWSieve.open()` and its
+  invariants), and at every fourth cut of a B+Tree update at height 3 (743 of
+  2,968 cuts, 1,486 images, through `PWBTree.open()` and its invariants).
+  On average 96 % of an allocator image and 92 % of a sieve image is neither
+  observed nor stored, and so varied (at least 90 % and 78 %).
+
+Neither half alone would do. The structural test names fields, so a load it
+does not name can escape; the inert test catches an escape only if the bytes
+behind it change what the run does on these scenarios. Six planted escapes
+were each caught: a raw `getUsed()`, an unobserved checksum loop and a raw
+record-field load by the field audit and all three inert-bytes audits; a raw
+cache-miss read by the field audit and the sieve's and the B+Tree's (the
+allocator's walk never misses the transaction's cache); and an unobserved
+sieve bitmap and a raw B+Tree node word by their own workload's inert-bytes
+audit, the only one that runs that code.
 
 **What the reader does not do yet.** Nothing prunes by loads: the explorer
 still enumerates images without consulting what recovery reads, and the lazy
