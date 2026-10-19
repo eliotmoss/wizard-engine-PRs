@@ -454,12 +454,20 @@ different numbering, and the text should never call them layers 1–4.
 
 ### One oracle, many image sources
 
-The properties form a ladder of their own, each strictly stronger than the one
-before: the WAL's acknowledgement contract, the allocator's structural
-invariants (`PersistentAllocatorInvariants.check()`), and the sieve's
-cross-object invariants (`PWSieve.checkInvariants()`). The strictness is shown,
-not assumed: `persistent_sieve:` corrupts two bytes of a durable bitmap, which
-the allocator walk accepts and the sieve property rejects.
+The properties are not a ladder. The WAL's acknowledgement contract checks
+that acknowledged after-images survive; the allocator's structural invariants
+(`PersistentAllocatorInvariants.check()`, the whole of
+`PersistentAllocatorProperty`) check structure and take no acknowledged value,
+so neither contains the other. Only the sieve's cross-object invariants contain
+another property: `PersistentSieveProperty` runs the allocator walk and then
+`PWSieve.checkInvariants()`. That containment is strict, and shown rather than
+assumed: `persistent_sieve:` corrupts two bytes of a durable bitmap, which the
+allocator walk accepts and the sieve property rejects. What the allocator
+finished is checked by count, not by the sweeps: the lazy image at the end of
+each allocation scenario must hold one more used extent per finished
+allocation (`PersistentAllocatorTest.v3`). (Corrected 2026-10-19: this
+paragraph called the three a ladder, each strictly stronger than the one
+before, which the code does not bear out.)
 
 The layers share the code of their oracles, not only the properties.
 `checkInvariants()` runs in `PWSieveTest`, in `PersistentSieveProperty`, after
@@ -566,11 +574,16 @@ Chapter 6 should state coverage in these terms and no stronger:
 
 - **The lazy end, at every cut of the swept scenarios.** A budgeted sweep
   starts from the fence-forced floor, which is the lazy image, and checks only
-  the next few images above it: 4 per cut for the sieve, 64 for the negative
-  control.
+  the next few images above it: 4 per cut for the sieve, 8 for the format
+  scenario (since 2026-10-19), 64 for the negative control.
 - **Every image, at selected cuts.** "Exhaustive" is true at the
   commit-boundary cuts, the final cut of a sieve step, the batched apply's cuts,
-  the canonical two-crash image and the cheap allocator cuts. Mid-record cuts
+  the canonical two-crash image, the three-transaction history's final cut and
+  the second crash during its recovery
+  (`persistent_recovery:overwrite_guard_keeps_acknowledged_data` and
+  `crash_during_three_commit_recovery_recovers` assert both exhaustive), the
+  format scenario's cuts from the magic's store on, and the cheap allocator
+  cuts. Mid-record cuts
   admit on the order of 10⁵ images and are budgeted.
 - **Long histories, at the two ends only.** The kill loops sample the eager
   image (layer 3a) and the lazy image rounded up to 4 KiB (the direct backend)

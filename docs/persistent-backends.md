@@ -782,7 +782,9 @@ which had been inferred:
 | C1E, C6 off | 1,026–1,027; 1,022–1,024 MHz | 36.4–36.6 % | 70.6–70.7; 0; 0 % | 2,179.2 / 2,175.5 µs | 2,250.2 / 2,247.3 µs | 13.5 µs | 1,340–1,357 ns |
 
 - **The core runs at about 1.0 GHz either way.** Disabling C1E and C6 moves its
-  busy clock by 2 % and each operation's median by under 1 %, and the
+  busy clock by 2 %, the insert and update medians by under 1 % and the lookup
+  medians by 0.8 % and 2.3 % (1,371 / 1,368 ns against 1,340 / 1,357 ns,
+  `clock-btree-file-{default,shallow}-r{1,2}.log`), and the
   computation per mutation stays at 13.5–13.6 µs (13.3–13.5 µs in the campaign
   of 2026-10-14) against 5.2–5.6 µs on PMEM. So the B+Tree's slower computation
   on `/home` fits a 1.0 GHz clock, but not the idle-state exit that slows the
@@ -3448,7 +3450,7 @@ Block N..M   Metadata   (block table, sentinels, descriptors)
 | `metaData` | u64 | offset to metadata area |
 | `metaDataDescs` | u64 | offset to descriptor table |
 | `magic` | u64 | `0x50_57_41_53_4D` ("PWASM") |
-| `blockSize` | u64 | bytes per block (wrapper default 512 KB) |
+| `blockSize` | u64 | bytes per block (wrapper default 512 KiB, `MemRegions.BlockSize = 512u64 * 1024u64`) |
 | `logChunk` | u64 | region-relative offset of the WAL log chunk (block 1 in the current layout) |
 | `userRoot` | u64 | region-relative offset of the caller's root object; `0` = none |
 

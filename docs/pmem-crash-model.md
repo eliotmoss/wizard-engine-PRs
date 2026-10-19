@@ -562,15 +562,20 @@ production recovery must still produce both after-images.
 `persistent_recovery:overwrite_guard_keeps_acknowledged_data` runs that sweep
 under a reported budget, checks that the same property *fails* when the
 unacknowledged third transaction is also required to survive — a property that
-holds because it asks nothing is not evidence — and checks the third commit
-point exhaustively. That cut is cheap for the same reason every commit point is:
-each line the new record touched was flushed and fenced, leaving only the third
-after-image's own line, applied write-behind and not yet persisted. Two images,
-and both must recover all three transactions.
+holds because it asks nothing is not evidence — and checks the history's final
+cut exhaustively. That cut is one event past the third commit point, after the
+third after-image is applied but not yet flushed (the commit point itself has
+one image; see above). It is cheap for the same reason: each line the new
+record touched was flushed and fenced, leaving only the third after-image's own
+line, applied write-behind and not yet persisted. Two images, and both must
+recover all three transactions. (Until 2026-10-19 this paragraph called the
+final cut "the third commit point".)
 
 The two-crash profile runs over the same history in
 `persistent_recovery:crash_during_three_commit_recovery_recovers`: crash at the
-third commit point, then crash again anywhere during the mount that recovers it.
+history's final cut (its lazy image), then crash again anywhere during the
+mount that recovers it. The test asserts that second-crash sweep exhaustive:
+replay writes two after-images and publishes them with one boundary.
 
 ---
 
