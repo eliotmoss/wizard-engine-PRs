@@ -15,11 +15,15 @@
 // Mounting an image is done through PersistentImageMounts, which offers the two
 // containers deliberately rather than by accident:
 //
-//   - openArray() is an ordinary byte-array region. Its persistence boundaries
-//     succeed without reaching the writeback/fence hooks, which is exactly right
-//     when only recovery's effect on bytes matters -- the simulator, not the
-//     backend, already decided which bytes survived. It costs no syscalls, which
-//     matters when a budgeted sweep mounts thousands of images.
+//   - openArray() is a plain region in an anonymous mapping (AnonMappedRegion).
+//     Its persistence boundaries succeed without reaching the writeback/fence
+//     hooks, which is exactly right when only recovery's effect on bytes
+//     matters -- the simulator, not the backend, already decided which bytes
+//     survived. Until 2026-10-19 it was a byte array on Virgil's heap (hence
+//     the name), which the collector can move under the mounted code (see
+//     AnonMappedRegion); a mapping costs an mmap and a munmap per image.
+//     openFailing() is the same container with boundaries that fail once, at
+//     a chosen call (InjectedFailureRegion).
 //   - openMapped() is a PmemMmapRegion, so its boundaries translate into
 //     cache-line writebacks and fences on the region's provider. With a
 //     recording provider installed, recovery's own stores, CLWBs and fences are
@@ -62,14 +66,52 @@ class PersistentImageMount(region: BackendRegion, recorder: RecordingPersistentO
 	}
 }
 
+// A region in an anonymous mapping whose persistence boundaries succeed
+// without reaching the writeback/fence hooks, as VolatileRegion's do. A byte
+// array on Virgil's heap would not do: the semispace collector moves it, and
+// PWRegion and DualTxnWal keep the region's start as a raw address and forge
+// every handle from it, so after a collection they read the old copy while
+// their stores, which go through the region's range, reach the moved one, and
+// the next collection reuses the old copy's memory. A mapping does not move.
+// The region holds the Mapping, so the mapping's finalizer cannot unmap it
+// while the region is in use; destroy() unmaps it.
+class AnonMappedRegion extends VolatileRegion {
+	var mapping: Mapping;
+
+	new(m: Mapping) super(CiRuntime.forgeRange<byte>(m.range.start, int.!(m.range.size()))) {
+		mapping = m;
+	}
+
+	def destroy() {
+		if (mapping != null) {
+			mapping.range.unmap();
+			mapping = null;
+		}
+	}
+}
+
 component PersistentImageMounts {
-	// Byte-array container: no syscalls, and persistence boundaries succeed
+	// Plain container (AnonMappedRegion): persistence boundaries succeed
 	// without reaching the writeback/fence hooks. Use this when only the effect
-	// of the mounted code on the bytes matters.
+	// of the mounted code on the bytes matters. Named for the heap byte array
+	// it used until 2026-10-19. Returns null if the host refused a mapping.
 	def openArray(image: PersistentDurableImage) -> PersistentImageMount {
-		def data = Array<byte>.new(image.size());
-		for (i < data.length) data[i] = image.bytes[i];
-		return PersistentImageMount.new(VolatileRegion.new(data[0 ..+ data.length]), null);
+		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = AnonMappedRegion.new(mapping);
+		for (i < image.size()) region.range[i] = image.bytes[i];
+		return PersistentImageMount.new(region, null);
+	}
+
+	// The plain container with persistence boundaries that fail once, at call
+	// {failAtBoundary} (InjectedFailureRegion). Returns null if the host
+	// refused a mapping.
+	def openFailing(image: PersistentDurableImage, failAtBoundary: int) -> PersistentImageMount {
+		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return null;
+		def region = InjectedFailureRegion.new(mapping, failAtBoundary);
+		for (i < image.size()) region.range[i] = image.bytes[i];
+		return PersistentImageMount.new(region, null);
 	}
 
 	// Mapped PMEM container, whose boundaries translate into writebacks and
@@ -90,16 +132,16 @@ component PersistentImageMounts {
 	}
 }
 
-// A byte-array container whose persistence boundaries fail once, at a chosen
-// call. The array mount cannot otherwise express a failed persist, and a failed
-// persist during recovery is precisely the case where an acknowledged
-// transaction could be lost if the WAL reclaimed a record it had not durably
-// replayed.
-class InjectedFailureRegion extends VolatileRegion {
+// The plain container (AnonMappedRegion) with persistence boundaries that fail
+// once, at a chosen call. The plain mount cannot otherwise express a failed
+// persist, and a failed persist during recovery is precisely the case where an
+// acknowledged transaction could be lost if the WAL reclaimed a record it had
+// not durably replayed. Until 2026-10-19 it was over a heap byte array.
+class InjectedFailureRegion extends AnonMappedRegion {
 	def failAtBoundary: int;	// 1 = the first boundary, 0 = never fail
 	var boundaries = 0;
 
-	new(range: Range<byte>, failAtBoundary) super(range) { }
+	new(mapping: Mapping, failAtBoundary) super(mapping) { }
 
 	def persistRange(offset: u64, size: u64) -> bool {
 		return boundary();
@@ -181,15 +223,16 @@ component PersistentRecoveries {
 
 	// The same recovery, with one persistence boundary failed. The WAL must
 	// latch rather than claim a durability it did not reach, and the bytes left
-	// behind must still be recoverable by a later mount.
+	// behind must still be recoverable by a later mount. Returns null only when
+	// the host could not provide a region.
 	def runDualWalWithFailure(image: PersistentDurableImage, logChunkOffset: u64,
 		logChunkSize: u64, failAtBoundary: int) -> PersistentRecoveryRun {
 
-		def data = Array<byte>.new(image.size());
-		for (i < data.length) data[i] = image.bytes[i];
-		def region = InjectedFailureRegion.new(data[0 ..+ data.length], failAtBoundary);
-		def mount = PersistentImageMount.new(region, null);
-		return recoverOn(mount, logChunkOffset, logChunkSize);
+		def mount = PersistentImageMounts.openFailing(image, failAtBoundary);
+		if (mount == null) return null;
+		def run = recoverOn(mount, logChunkOffset, logChunkSize);
+		mount.close();
+		return run;
 	}
 
 	// Mount {image} as an allocator through a recording container, so the whole
@@ -217,12 +260,14 @@ component PersistentRecoveries {
 	def runPWRegionWithFailure(image: PersistentDurableImage, numBlocks: u64,
 		blockSize: u64, failAtBoundary: int) -> PersistentRegionRun {
 
-		def data = Array<byte>.new(image.size());
-		for (i < data.length) data[i] = image.bytes[i];
-		def container = InjectedFailureRegion.new(data[0 ..+ data.length], failAtBoundary);
-		def region = PWRegion.new(PreparedRegionBackend.new(container), numBlocks,
+		def mount = PersistentImageMounts.openFailing(image, failAtBoundary);
+		if (mount == null) {
+			return PersistentRegionRun.new(false, false, "could not map a region for the durable image", null);
+		}
+		def region = PWRegion.new(PreparedRegionBackend.new(mount.region), numBlocks,
 			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
 		if (region.backendRegion == null) {
+			mount.close();
 			return PersistentRegionRun.new(false, false, "region did not mount", null);
 		}
 		def violation = PersistentAllocatorInvariants.checkStructure(region);
@@ -390,9 +435,13 @@ class PersistentImageBackend(image: PersistentDurableImage) extends TxnRegionBac
 
 	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
 		if (u64.!(image.size()) < size) return null;
-		// The array container: a sweep mounts thousands of images and only the
+		// The plain container: a sweep mounts thousands of images and only the
 		// bytes recovery leaves behind are examined. See PersistentImageMounts.
-		return PersistentImageMounts.openArray(image).region;
+		// Null if the host refused a mapping, which PWRegion reports as a
+		// region that did not mount.
+		def mount = PersistentImageMounts.openArray(image);
+		if (mount == null) return null;
+		return mount.region;
 	}
 
 	def isPersistent() -> bool {

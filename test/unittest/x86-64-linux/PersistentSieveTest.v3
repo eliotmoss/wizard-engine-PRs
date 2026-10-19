@@ -20,13 +20,12 @@
 // volatile region's persistence boundaries emit no CLWB or SFENCE, so the model
 // would be shown a run in which nothing was ever made durable.
 //
-// Images are mounted in an anonymous mapping (PersistentAnonMounts, the tree
-// explorer's PWBTreeAnonRegion), not in PersistentImageMounts.openArray()'s
-// heap array: the sieve allocates while it is checked, a collection can move a
-// heap array, and PWRegion keeps the raw address. Like the array, the
-// mapping's boundaries succeed without reaching the writeback hooks; only what
-// recovery and the sieve leave in the bytes is examined. Each image costs an
-// mmap and a munmap.
+// Images are mounted in an anonymous mapping (PersistentAnonMounts, which
+// opens PersistentImageBackend's AnonMappedRegion), not in a heap array: the
+// sieve allocates while it is checked, a collection can move a heap array, and
+// PWRegion keeps the raw address. The mapping's boundaries succeed without
+// reaching the writeback hooks; only what recovery and the sieve leave in the
+// bytes is examined. Each image costs an mmap and a munmap.
 
 def PST = UnitTests.registerT("persistent_sieve:", _, PersistentSieveTester.new, _);
 def PSTX = [
@@ -314,7 +313,8 @@ def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
 // A mounted image must not move under its region: a collection between
 // mounting an image and checking it leaves the bytes where PWRegion's raw
 // regionStart says they are, and the sieve still reattaches and checks clean.
-// In openArray()'s heap array the collector moves them, and this fails.
+// In a heap array, which openArray() used until 2026-10-19, the collector
+// moves them, and this fails.
 def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");

@@ -39,12 +39,12 @@
 // ordering claim, durable before published, shown for every image without
 // enumerating them; the sweep then checks the rest of the property on a sample.
 //
-// Images are mounted in an anonymous mapping (PWBTreeAnonRegion), not in
-// PersistentImageMounts.openArray()'s heap array: the tree allocates while it is
-// checked, a collection can move a heap array, and PWRegion keeps the raw
-// address. Like the array, the mapping's boundaries succeed without reaching the
-// writeback hooks; only what recovery and the sweep leave in the bytes is
-// examined.
+// Images are mounted in an anonymous mapping (PWBTreeAnonRegion), not in a
+// heap array, which PersistentImageMounts.openArray() used until 2026-10-19:
+// the tree allocates while it is checked, a collection can move a heap array,
+// and PWRegion keeps the raw address. Like openArray()'s, the mapping's
+// boundaries succeed without reaching the writeback hooks; only what recovery
+// and the sweep leave in the bytes is examined.
 
 def PBT = UnitTests.registerT("persistent_btree:", _, PersistentBTreeTester.new, _);
 def PBTX = [

@@ -19,6 +19,7 @@ def PRTX = [
 	PRT("overwrite_guard_keeps_acknowledged_data", test_recovery_overwrite_guard_keeps_acknowledged_data),
 	PRT("crash_during_three_commit_recovery_recovers", test_recovery_crash_during_three_commit_recovery_recovers),
 	PRT("batched_apply_keeps_acknowledged_data", test_recovery_batched_apply_keeps_acknowledged_data),
+	PRT("failing_mount_survives_a_collection", test_recovery_failing_mount_survives_a_collection),
 	()
 ];
 
@@ -619,4 +620,54 @@ def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTe
 	def unmet = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.batchAckStart, 0,
 		tc.batchedProperty("an uncommitted transaction is not required to survive", true, true, false));
 	tc.t.assertz(false, unmet.ok());
+}
+
+// The failure-injecting container (PersistentImageMounts.openFailing(), in
+// which runDualWalWithFailure() and runPWRegionWithFailure() mount every
+// image) must not move under its WAL. Mount the image a crash at the commit
+// boundary leaves and force a collection: the bytes must stay where the WAL's
+// raw base says. Recovery then replays at the first boundary, and a commit
+// made after the collection writes its whole record and fails at the second,
+// as injected. A failed boundary leaves the record indeterminate rather than
+// aborted, and a complete record replays, so a remount of the bytes left
+// behind must restore both after-images. Over the heap byte array
+// InjectedFailureRegion used until 2026-10-19, the collector moves the bytes,
+// and this fails. On 2026-10-19, over the heap array and without the address
+// check, the remount restored the first after-image but not the second: the
+// WAL computes a record's checksum by reading the record back through its raw
+// address, which after the collection reads the old copy.
+def test_recovery_failing_mount_survives_a_collection(tc: PersistentRecoveryTester) {
+	if (!tc.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def mount = PersistentImageMounts.openFailing(image, 2);
+	if (mount == null) {
+		tc.t.fail("could not map a region for the durable image");
+		return;
+	}
+	def base = mount.regionStart();
+	Target.forceGC();
+	tc.t.assert_eq(base, mount.regionStart());
+
+	def wal = DualTxnWal.new(base, base + tc.LOG_OFFSET, tc.LOG_SIZE, mount.region, false);
+	tc.t.assertz(true, wal.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, wal.append(tc.OFFSET_B, tc.VALUE_B, 8u8));
+	tc.t.assert_eq(0u64, wal.commit());
+	tc.t.assertz(true, wal.requiresRecovery());
+	tc.t.asserti(2, InjectedFailureRegion.!(mount.region).boundaries);
+	def left = mount.freeze();
+	mount.close();
+
+	def reopened = PersistentRecoveries.runDualWal(left, tc.LOG_OFFSET, tc.LOG_SIZE);
+	if (reopened == null) {
+		tc.t.fail("could not map a region for the bytes the failed commit left");
+		return;
+	}
+	tc.t.assertz(true, reopened.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(false, reopened.requiresRecovery);
+	tc.t.assert_eq(tc.VALUE, reopened.recovered.read(tc.OFFSET, 8));
+	tc.t.assert_eq(tc.VALUE_B, reopened.recovered.read(tc.OFFSET_B, 8));
+	tc.t.assert_eq(3u64, reopened.nextTxnSeq);
 }

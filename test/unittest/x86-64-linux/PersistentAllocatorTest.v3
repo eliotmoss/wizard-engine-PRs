@@ -19,6 +19,7 @@ def PATX = [
 	PAT("format_publishes_the_magic_last", test_alloc_format_publishes_the_magic_last),
 	PAT("crash_during_format_opens_consistent", test_alloc_crash_during_format_opens_consistent),
 	PAT("early_magic_is_caught", test_alloc_early_magic_is_caught),
+	PAT("mounted_image_survives_a_collection", test_alloc_mounted_image_survives_a_collection),
 	()
 ];
 
@@ -136,27 +137,21 @@ class PersistentAllocatorTester(t: Tester) {
 	}
 }
 
-// Crash images opened as allocators in an anonymous mapping, the way
-// PersistentBTreeProperty opens them (PWBTreeAnonRegion), not in
-// PersistentImageMounts.openArray()'s heap array, which Virgil's copying
-// collector can move while PWRegion keeps regionStart as a raw address. Like
-// the array, the mapping's boundaries succeed without reaching the writeback
-// and fence hooks; unlike it, each image costs an mmap and a munmap.
+// Crash images opened as allocators in an anonymous mapping, which Virgil's
+// copying collector cannot move while PWRegion keeps regionStart as a raw
+// address. Since 2026-10-19 this is PersistentImageBackend's own container
+// (PersistentImageMounts.openArray(), an AnonMappedRegion); until then that
+// was a heap array, and this opened the image in the tree explorer's
+// PWBTreeAnonRegion instead. The mapping's boundaries succeed without reaching
+// the writeback and fence hooks; each image costs an mmap and a munmap.
 component PersistentAnonMounts {
 	// Open {image} as production opens a region, without forceFormat. Null if
 	// the host refused the mapping or the image did not open; otherwise the
 	// caller deallocates the region, which unmaps the mapping.
 	def openRegion(image: PersistentDurableImage, numBlocks: u64, blockSize: u64) -> PWRegion {
-		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
-		if (mapping == null) return null;
-		def container = PWBTreeAnonRegion.new(mapping);
-		for (i < image.size()) container.range[i] = image.bytes[i];
-		def region = PWRegion.new(PreparedRegionBackend.new(container), numBlocks,
+		def region = PWRegion.new(PersistentImageBackend.new(image), numBlocks,
 			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
-		if (region.backendRegion == null) {
-			container.destroy();
-			return null;
-		}
+		if (region.backendRegion == null) return null;
 		return region;
 	}
 }
@@ -635,4 +630,53 @@ def test_alloc_early_magic_is_caught(tc: PersistentAllocatorTester) {
 	tc.t.asserti(early + 1, cx.crashAfter);
 	tc.t.assert_string("an image carrying the magic was mounted, and memory-order chain does not reach the region marker",
 		cx.detail);
+}
+
+// The container PersistentAllocatorProperty mounts every crash image in
+// (PersistentImageBackend) must not move under its region. Mount the image a
+// crash at a split allocation's commit boundary leaves, which recovery
+// replays, and force a collection: the bytes must stay where PWRegion's raw
+// regionStart says, and two allocations made after it, the second reading
+// what the first wrote, must be in the bytes the property copies out of
+// region.rng and hands on as the recovered image. In openArray()'s heap
+// array, which it used until 2026-10-19, the collector moves them, and this
+// fails. On 2026-10-19, over the heap array and without the address check,
+// both allocations returned the same block and the recovered image held two
+// used extents, not three, while the invariant walk through regionStart,
+// which reads the old copy, found nothing wrong.
+def test_alloc_mounted_image_survives_a_collection(tc: PersistentAllocatorTester) {
+	if (!tc.openRecordingRegion()) {
+		tc.t.fail("could not format a recording PWRegion");
+		return;
+	}
+	tc.snapshotMounted();
+	def before = tc.countUsed(PersistentDurableImage.new(Arrays.dup(tc.mounted)));
+	tc.recorder.clear();
+	tc.t.assertz(false, tc.region.allocChunk(2u32).isNull());
+	def trace = tc.recorder.snapshot("pwregion_split_alloc");
+	tc.cleanup();
+
+	def image = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
+	def region = PWRegion.new(PersistentImageBackend.new(image), tc.BLOCKS,
+		Array<Ref<MetaDataDesc>>.new(0), tc.BLOCK_SIZE, false);
+	if (region.backendRegion == null) {
+		tc.t.fail("durable image did not mount as an allocator");
+		return;
+	}
+	def start = region.regionStart;
+	Target.forceGC();
+	tc.t.assert_eq(start, u64.view(Pointer.atElement(region.backendRegion.range, 0) - Pointer.NULL));
+	def first = region.allocChunk(1u32);
+	def second = region.allocChunk(1u32);
+	tc.t.assertz(false, first.isNull());
+	tc.t.assertz(false, second.isNull());
+	tc.t.assertz(false, first.addr == second.addr);
+	tc.assertConsistent(PersistentAllocatorInvariants.check(region));
+	def after = Array<byte>.new(region.rng.length);
+	for (i < after.length) after[i] = region.rng[i];
+	region.deallocate();
+
+	def recovered = PersistentDurableImage.new(after);
+	tc.assertConsistent(PersistentAllocatorProperty.new(tc.BLOCKS, tc.BLOCK_SIZE).check(recovered));
+	tc.t.asserti(before + 3, tc.countUsed(recovered));
 }
