@@ -533,6 +533,7 @@ test at another layer:
 | The trace is inside the model's domain | `validate()` on every explored trace; `persistent_trace:` pins the seven defects it rejects, each at the right event |
 | The provider's `clwb`/`sfence` are `CLWB`/`SFENCE` | `persistent_ops:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
 | The search finds every admitted image | The reduced search equals the full branching search at every cut of four traces, byte for byte; its per-line content classes give exactly the distinct images of every prefix vector at every cut of the small traces and at sampled cuts of a recorded commit (`persistent_explore:line_classes_equal_distinct_images`, 2026-10-19); an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
+| A lazy leaf's verdict holds for every image it stands for (since 2026-10-20) | `persistent_lazy:`: every distinct image lies in exactly one leaf (small traces and the one-commit trace, every cut); each image's eager verdict equals its leaf's (the one-commit trace, and the overwrite guard's 597,079 images); each leaf's least and greatest image, run eagerly, make the lazy run's stores and loads byte for byte; a nondeterministic property is reported. Only for the scenarios these tests run |
 | Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, and Stage 2c's ordinary image. These are the only two places where real bytes are compared with the model |
 | One exploration covers more than one backend | Trace identity between the direct and PMEM backends at 2 KiB and 4 KiB blocks. The file backend has a stated model and no explorer |
 | "Recovery" means production recovery | Images are mounted through the production mount path (`runDualWal()`, `PersistentImageBackend`), never through a reimplementation |
@@ -558,7 +559,13 @@ does. These are permanent tests:
 - since 2026-10-19, it catches a recovery that skips the record checksum and so
   replays a torn record, on the sieve step at cut 385, at 12 images per cut.
   At the sieve tests' own 4 per cut it does not, and neither did the old
-  prefix odometer at up to 256 vectors per cut.
+  prefix odometer at up to 256 vectors per cut; and
+- since 2026-10-20, the lazy search catches the same mutant over a WAL
+  history whose third commit reuses the slot of a transaction whose
+  after-image the second rewrote, at cut 640, confirmed by the eager check
+  (over one commit into an empty slot the mutant is harmless, and both
+  searches pass), and a commit that leaves its record's last line out of the
+  commit-point fence, at the commit point.
 
 These were one-off mutation runs:
 
@@ -608,6 +615,15 @@ Chapter 6 should state coverage in these terms and no stronger:
   145,212,480 distinct images, the format scenario before its magic 46,080, the
   B+-tree split insert 1,194,997,579,776,000, and a sieve step at least 2⁶², the
   count's saturation point.
+- **The lazy search (since 2026-10-20), for the WAL properties only.** The
+  same WAL sweeps run lazily cover the same distinct images with one execution
+  per leaf: 377 for the one commit's 1,404, 5,958 for the three commits'
+  601,294 and 14,058 for the batched apply's 393,342; on sean-tan-PC the
+  three-commit and batched sweeps take 0.33 s and 0.72 s against 15.9 s and
+  10.5 s. A leaf's verdict stands for its images only as far as the load seam
+  is complete, which `persistent_lazy:` checks for the scenarios it runs. The
+  `persistent_recovery:` sweeps still run eagerly; nothing outside the WAL
+  properties is lazy yet.
 - **Long histories, at the two ends only.** The kill loops sample the eager
   image (layer 3a) and the lazy image rounded up to 4 KiB (the direct backend)
   at random cuts, and Stage 2c adds one real image per run. The interior of the
@@ -869,18 +885,27 @@ Witcher, Vinter and Mumak", rather than presenting it as a contribution.
    which Jaaru calls "an eager model checking approach"; Vinter's crash images
    have the same floor-plus-in-flight structure. What the thesis adds is that
    the reduced search is checked equal to full branching search at every cut
-   of three traces, under a stated model: asynchronous, non-snapshot `CLWB`,
+   of four traces, under a stated model: asynchronous, non-snapshot `CLWB`,
    background eviction at every event, and the bounded two-crash profile.
-   Neither Yat, Jaaru, Witcher nor Vinter reports such a check. *Cost:* Jaaru
-   also prunes by what recovery reads. Since 2026-10-19 recovery's loads from a
-   region go through the seam, as far as the load audit shows, but nothing
-   prunes by them yet (the lazy search that would is planned, not
-   implemented), so the allocator, format, sieve and B+-tree scenarios'
-   mid-record cuts are budgeted rather than exhausted (see
-   [What the evidence covers](#what-the-evidence-covers-stated-exactly)). The
-   WAL scenarios are exhaustive since 2026-10-19 because the search keeps one
-   image per distinct line content, which leaves at most 14,256 images at any of
-   their cuts.
+   Neither Yat, Jaaru, Witcher nor Vinter reports such a check. Jaaru also
+   prunes by what recovery reads, and since 2026-10-20 so does the lazy search
+   here, for the WAL properties: it branches only on the bytes recovery and the
+   property load, through the load seam, by re-execution rather than Jaaru's
+   fork, and checks its own soundness executably (the leaves partition the
+   images, each image's eager verdict is its leaf's, and each leaf's least and
+   greatest image make the same loads and stores; see
+   [PMEM Crash Model](pmem-crash-model.md#the-lazy-search-2026-10-20)). The
+   three WAL histories then take 377, 5,958 and 14,058 executions for their
+   1,404, 601,294 and 393,342 distinct images. *Cost:* only the WAL properties
+   are lazy so far, so the allocator, format, sieve and B+-tree scenarios'
+   mid-record cuts are still budgeted rather than exhausted (see
+   [What the evidence covers](#what-the-evidence-covers-stated-exactly)), and
+   at the sieve's cut 385 a preview of the lazy form prunes nothing; and its
+   soundness rests on every load of crash-image bytes crossing the seam first,
+   which the agreement tests show only for the scenarios they run. The WAL
+   scenarios were already exhaustive since 2026-10-19, because the search keeps
+   one image per distinct line content, which leaves at most 14,256 images at
+   any of their cuts.
 
 Two points support these without being differentiators:
 

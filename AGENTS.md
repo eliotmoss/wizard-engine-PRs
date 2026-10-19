@@ -137,6 +137,7 @@ Focused tests live in `test/unittest/x86-64-linux/`:
 - `DualTxnWalTest.v3` covers the active commit, recovery, guard, and failure paths.
 - `PersistentOperationsTest.v3`, `PersistentTraceTest.v3`, `PersistentImageTest.v3`, and `PersistentExplorerTest.v3` cover the persistence seam and crash explorer.
 - `PersistentRecoveryTest.v3` and `PersistentAllocatorTest.v3` run production recovery and allocator invariants over enumerated images.
+- `PersistentLazyExplorerTest.v3` checks the lazy search (`X86_64PersistentLazyExplorer.v3`): partition, verdict agreement, representatives and replay.
 - `MultiTxnWalTest.v3` covers the retained comparison implementation.
 
 ### On-Region Layout

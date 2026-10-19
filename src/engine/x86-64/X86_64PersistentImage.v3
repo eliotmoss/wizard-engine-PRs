@@ -24,11 +24,81 @@
 // Still out of scope: enumerating every permitted schedule, deduplicating the
 // resulting states, and feeding images into real recovery (milestones 4-5).
 
+// A durable image as a property reads it. A PersistentDurableImage holds every
+// byte. A lazy search's views (X86_64PersistentLazyExplorer.v3) hold some bytes
+// only as marks that stand for the crash image's byte at the same offset, and
+// decide such a byte when something reads it, which can branch the search.
+// read(), sameBytes() and firstDifference() mean the same on both kinds: the
+// bytes of the image the view stands for.
+class PersistentImageView {
+	def size() -> int;
+
+	// Little-endian scalar read, matching the byte order the recorded stores
+	// were encoded with. A lazy view decides every byte it reads.
+	def read(offset: u64, width: int) -> u64;
+
+	// Byte {i} when the view knows it without a decision, else -1.
+	def knownByte(i: int) -> int;
+
+	// Byte {i}, deciding it if the view does not yet know it.
+	def byteAt(i: int) -> byte;
+
+	// The lazy search whose crash image this view's undecided bytes stand
+	// for, or null for a view that knows every byte.
+	def origin() -> PersistentLazySearch {
+		return null;
+	}
+
+	def sameBytes(that: PersistentImageView) -> bool {
+		return PersistentImageViews.sameBytes(this, that);
+	}
+
+	// Index of the first differing byte, or -1 when the images are equal. This
+	// is what a counterexample needs to say *where* two schedules diverged.
+	def firstDifference(that: PersistentImageView) -> int {
+		return PersistentImageViews.firstDifference(this, that);
+	}
+}
+
+component PersistentImageViews {
+	def sameBytes(a: PersistentImageView, b: PersistentImageView) -> bool {
+		if (a == null || b == null || a.size() != b.size()) return false;
+		return firstDifference(a, b) < 0;
+	}
+
+	// Byte by byte. Two undecided bytes of one search's crash image at the same
+	// offset are the same byte, so they compare equal without a decision; an
+	// undecided byte compared with a known one is decided first.
+	def firstDifference(a: PersistentImageView, b: PersistentImageView) -> int {
+		if (a == null || b == null) return 0;
+		def n = if(a.size() < b.size(), a.size(), b.size());
+		def origin = a.origin();
+		def shared = origin != null && origin == b.origin();
+		for (i < n) {
+			var x = a.knownByte(i), y = b.knownByte(i);
+			if (x < 0 && y < 0 && shared) continue;
+			if (x < 0) x = int.view(a.byteAt(i));
+			if (y < 0) y = int.view(b.byteAt(i));
+			if (x != y) return i;
+		}
+		if (a.size() != b.size()) return n;
+		return -1;
+	}
+}
+
 // An immutable durable byte image: what a crash at some cut left behind.
-class PersistentDurableImage(bytes: Array<byte>) {
+class PersistentDurableImage(bytes: Array<byte>) extends PersistentImageView {
 
 	def size() -> int {
 		return bytes.length;
+	}
+
+	def knownByte(i: int) -> int {
+		return int.view(bytes[i]);
+	}
+
+	def byteAt(i: int) -> byte {
+		return bytes[i];
 	}
 
 	// Little-endian scalar read, matching the byte order the recorded stores
@@ -56,19 +126,22 @@ class PersistentDurableImage(bytes: Array<byte>) {
 		return h;
 	}
 
-	def sameBytes(that: PersistentDurableImage) -> bool {
-		if (that == null || that.bytes.length != bytes.length) return false;
-		for (i < bytes.length) if (bytes[i] != that.bytes[i]) return false;
+	// Against another durable image, a byte comparison; against a lazy view,
+	// the view decides the bytes it does not know.
+	def sameBytes(that: PersistentImageView) -> bool {
+		if (!PersistentDurableImage.?(that)) return PersistentImageViews.sameBytes(this, that);
+		def other = PersistentDurableImage.!(that);
+		if (other.bytes.length != bytes.length) return false;
+		for (i < bytes.length) if (bytes[i] != other.bytes[i]) return false;
 		return true;
 	}
 
-	// Index of the first differing byte, or -1 when the images are equal. This
-	// is what a counterexample needs to say *where* two schedules diverged.
-	def firstDifference(that: PersistentDurableImage) -> int {
-		if (that == null) return 0;
-		def n = if(bytes.length < that.bytes.length, bytes.length, that.bytes.length);
-		for (i < n) if (bytes[i] != that.bytes[i]) return i;
-		if (bytes.length != that.bytes.length) return n;
+	def firstDifference(that: PersistentImageView) -> int {
+		if (!PersistentDurableImage.?(that)) return PersistentImageViews.firstDifference(this, that);
+		def other = PersistentDurableImage.!(that);
+		def n = if(bytes.length < other.bytes.length, bytes.length, other.bytes.length);
+		for (i < n) if (bytes[i] != other.bytes[i]) return i;
+		if (bytes.length != other.bytes.length) return n;
 		return -1;
 	}
 

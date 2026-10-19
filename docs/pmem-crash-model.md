@@ -400,19 +400,21 @@ descent that skips its fetch by the descent test alone. The B+Tree's
 inert-bytes audit passes those two, because `open()` has observed every node
 before either descent runs; that is why the descent test exists.
 
-**What the reader does not do yet.** Nothing prunes by loads: the explorer
-still enumerates images without consulting what recovery reads, and the lazy
-search that would is planned, not implemented. Observation is
+**What the reader does and does not show.** Since 2026-10-20 the lazy search
+prunes by loads for the WAL properties ([The lazy search](#the-lazy-search-2026-10-20));
+the allocator, format, sieve and B+Tree properties are still checked image by
+image. Observation is
 coarser than a load in four places, which can only make such a search branch
 more, never miss a dependence: `getHeader()` observes all 88 bytes, a forged
 layout all of its bytes, a B+Tree fetch the node's whole payload whatever
 words are then read, and a checksum loop all of its record but the checksum
 field. The inert-bytes audits show that every byte loaded was observed at
 some point in the run, not that it was observed before it was loaded. That
-order is tested for the reader itself (`load_observer_runs_before_the_load`);
-elsewhere it rests on the code's shape: the reader's loads and `forge*`
-helpers observe first, a byte loop is observed before it starts, and a B+Tree
-fetch returns the node only after observing it.
+order is tested for the reader itself (`load_observer_runs_before_the_load`),
+and since 2026-10-20 for the scenarios `persistent_lazy:representatives_agree`
+runs (see the lazy search); elsewhere it rests on the code's shape: the
+reader's loads and `forge*` helpers observe first, a byte loop is observed
+before it starts, and a B+Tree fetch returns the node only after observing it.
 
 **Cost.** In production a load through the reader is a call, a read of the
 provider's `loadObserver` and a branch that is never taken, and a B+Tree node
@@ -860,6 +862,220 @@ The two-crash profile runs over the same history in
 history's final cut (its lazy image), then crash again anywhere during the
 mount that recovers it. The test asserts that second-crash sweep exhaustive:
 replay writes two after-images and publishes them with one boundary.
+
+---
+
+## The lazy search (2026-10-20)
+
+`src/engine/x86-64/X86_64PersistentLazyExplorer.v3` runs a property once for
+each set of crash images it cannot tell apart, and branches only on the bytes
+recovery and the property actually load. It is Jaaru's constraint refinement
+(Gorjiara et al., ASPLOS '21: BuildMayReadFrom, Fig. 9; DoRead, Fig. 10;
+Explore, Fig. 11) over the line classes of the reduced search, by re-execution
+rather than by fork.
+
+**The algorithm.** At a cut, each line the trace wrote can hold any of its
+distinct contents (`PersistentLineClasses`, see
+[Enumerating schedules](#enumerating-schedules)), independently of the other
+lines. `PersistentLazySearch` keeps, for each such line i, the set S_i of
+classes it may still hold, initially all of them, and one reused mapping that
+starts each execution holding the lazy image (class 0 everywhere). The crash
+image's mount gets a provider (`PersistentLazyOperations`) that performs and
+records its stores and marks every byte a store covers, and a
+`PersistentLoadObserver` installed before anything is constructed over it.
+When the code under test is about to load `[offset, offset + length)`, the
+observer splits the range by line and, for each line with |S_i| > 1, takes
+the bytes this execution has not stored and on which S_i's classes are not
+all equal. None, nothing happens. Otherwise S_i's classes fall into groups by
+their exact bytes there, numbered by their least class, and that is a
+decision point: the execution takes one group, S_i narrows to it, and the
+line's unstored bytes in the mapping are rewritten from the least class left,
+so the load reads bytes every class in the group agrees on. A load of the
+execution's own stores never branches. The search is depth-first over
+decision prefixes: an execution replays the prefix, takes group 0 at each new
+decision and records it, and the next execution takes the next untried group
+at the deepest decision that has one. Replaying checks that each decision
+falls on the same line with the same partition (`PersistentLazyDecision`); if
+not, the search stops and reports the property nondeterministic. An execution
+that ends is a leaf (`PersistentLazyLeaf`), and stands for every image whose
+line i holds a class in its final S_i, for every i: ∏|S_i| images.
+
+**Frozen copies.** The WAL properties freeze the mount after recovery and
+read the frozen copy, and the idempotence check mounts that copy and recovers
+it again. On a lazy mount `snapshot()` returns a `PersistentLazySnapshot`
+that keeps every byte recovery neither stored nor loaded, and the crash image
+has not decided, as a mark standing for the crash image's byte at the same
+offset. `PersistentImageView` is the interface both kinds of image share:
+`read()` decides the marked bytes it reads (which can branch), and
+`sameBytes()`/`firstDifference()` treat two marks at one offset, from one
+execution, as the same byte, so comparing two snapshots decides only bytes
+one of them knows. Mounting a snapshot, or the crash image a second time,
+gives a copy mount in a pooled mapping of its own, which fills a byte the
+view did not know from the crash image when it is first loaded. `freeze()`
+on a lazy mount decides every byte: correct, but it branches on all of them.
+
+**Lazy-safe properties.** A property runs lazily only as a
+`PersistentLazyProperty`, a function of an image view and a
+`PersistentImageMounter`: it mounts only through the mounter and reads frozen
+copies only through the view. A `PersistentImageProperty` cannot be passed by
+mistake. The same function, given a durable image and the eager mounter
+(`PersistentImageMounters.EAGER`, `openMapped()` per image, as `runDualWal()`
+always mounted), is the property's eager form, so the eager and lazy checks
+run one body of code. `PersistentWalHistoryProperty.checkOn()` and
+`PersistentWalRecoveryProperty`, idempotence included, are lazy-safe
+(`lazy()`); `runDualWalOn()` runs recovery over whatever the mounter gives,
+and `PersistentRecoveryRun.left` is the snapshot (`recovered` stays the
+durable image for an eager run). The failure-injection and two-crash
+properties, the allocator, format, sieve and B+Tree properties stay on the
+reduced search.
+
+**Entry points and results.** `PersistentLazyExplorer.checkImagesLazily()`,
+`checkCutRangeLazily()` and `checkAllCutsLazily()` mirror the eager ones; the
+budget counts leaves per cut, and a cut is truncated when the budget is spent
+with alternatives left. `PersistentLazyCheckResult` reports `leaves`,
+`represented` (the distinct images the leaves stand for, ∏|S_i| summed over
+leaves and saturating at 2^62), `classProduct` and `product`, rendered as
+"L leaves cover R of Y distinct images (Z prefix states)"; `exhaustive()` is
+`ok() && !truncated`. A failing leaf's counterexample is its least image
+(every line at the least class in S_i), built with the crash machine and
+attached with `withImage()`; its selection line gives the decisions and the
+classes still possible, and the image is re-checked with the property's eager
+form, which must give the same detail (`confirmed`, and "eager re-check: same
+detail" in the artifact).
+
+**Why a leaf's verdict holds for every image it stands for.** By induction
+over the execution: every image in the leaf's product makes the same loads
+with the same bytes, and so the same stores and the same verdict, provided
+every load of crash-image bytes is observed before it happens. Each loaded
+byte is stored by the execution itself (the same in every image), or one that
+every class in the line's current S_i agrees on, or one the decision just
+made them agree on, and S_i only narrows, so a byte once agreed on stays
+agreed on. The leaves partition the cut's images: the groups at a decision
+partition S_i, two leaves part at their first differing decision, and
+depth-first search takes every group. Three things this rests on are
+checked, in `persistent_lazy:` (`test/unittest/x86-64-linux/PersistentLazyExplorerTest.v3`),
+rather than assumed:
+
+- *The leaves partition the images.* `leaves_partition_classes`: at every cut
+  of the four reduction traces (with a property whose reads depend on what it
+  read, and one that mounts three times) and of the one-commit WAL trace, every
+  image Stage A enumerates lies in exactly one leaf and `represented ==
+  classProduct`. `reading_nothing_is_one_leaf` (one leaf per cut) and
+  `reading_everything_is_every_image` (`classProduct` leaves; 1,404 for the
+  one-commit sweep) calibrate the two ends.
+- *A leaf's verdict is each of its images' verdict.* `verdicts_agree`: each
+  image's eager verdict equals its leaf's, detail for detail, at every cut of
+  the small traces and of the one-commit trace under both halves of the
+  contract (requiring survival fails before the commit point, so both verdicts
+  occur); `three_commit_verdicts_agree` does the same for the 597,079 images
+  of the overwrite guard's range.
+- *No load escaped the seam or ran before its observation.*
+  `representatives_agree`: each leaf, run lazily with every mount recorded, and
+  run eagerly at its least and at its greatest image, must make the same
+  stores, writebacks, fences and loads (offset, length and bytes), in every
+  mount, and reach the same verdict: on the small traces, at every cut of the
+  one-commit trace, and over the overwrite guard's range.
+  `replay_detects_nondeterminism` checks the replay check with a property that
+  reads its two lines in alternating order.
+  `snapshots_compare_marks_without_deciding` checks that two snapshots of one
+  execution compare without a decision, and that a clean recovery's snapshot
+  equals the crash image without one.
+
+Five planted bugs, each applied alone and the four agreement tests run
+(`thesis-reviews/2026-10-20/stage-c/escapes`): an unobserved checksum loop is
+caught only by `representatives_agree`, over the three-commit range (77 loads
+against 75 at a leaf's least image; it passes the one-commit trace, and
+*we infer* that the record's field loads there decide its bytes before the loop
+runs); a raw load of the record's `txnSeq` by
+`verdicts_agree` and `representatives_agree`; a search that narrows S_i
+without rewriting the mapping, and a copy mount that never fills what its
+view lacked, by both as well (the second only through the property that
+mounts three times). A raw load of a replayed entry's value is caught by
+none, and is harmless: the checksum loop has already decided those bytes.
+*We infer* that the search needs a byte decided before it is loaded, not an
+observation at every load; with the checksum skipped that load would escape.
+`leaves_partition_classes` passes all five, as it should: the partition is a
+property of the decisions, whatever the loads.
+
+**What it costs and saves (2026-10-20).** On sean-tan-PC (i7-14700KF,
+`powersave`, unpinned), the WAL sweeps, each run three times by Stage A's
+exhaustive search and lazily; medians
+(`thesis-reviews/2026-10-20/stage-c/measure-wal.txt`):
+
+| Sweep | Cuts | Distinct images | Leaves | Most at a cut | Stage A | Lazy |
+|---|---|---|---|---|---|---|
+| One commit, nothing required | 215 | 1,404 | 377 | 13 | 43 ms | 27 ms |
+| Three commits, the overwrite guard's range | 217 | 597,079 | 5,202 | 77 | 15.85 s | 0.23 s |
+| Three commits, nothing required | 649 | 601,294 | 5,958 | 77 | 15.93 s | 0.33 s |
+| Batched apply, the apply | 8 | 63 | 8 | 1 | 1.8 ms | 0.7 ms |
+| Batched apply, the second commit | 217 | 16,841 | 379 | 13 | 0.45 s | 31 ms |
+| Batched apply, the reclaiming commit | 217 | 353,649 | 12,572 | 272 | 9.40 s | 0.66 s |
+| Batched apply, nothing required | 728 | 393,342 | 14,058 | 272 | 10.54 s | 0.72 s |
+
+Every lazy sweep is exhaustive and its leaves cover exactly the distinct
+images. Recovery's checksum loop, which reads a whole record, runs only once
+the record's header and trailer fields are well formed (`validateSlot()`), and
+*we infer* that replay storing each after-image before anything reads it is why
+the batched apply's own cuts are one leaf each. `persistent_lazy:wal_sweeps_are_exhaustive` runs
+the first, second, third, sixth and seventh rows in 2.1 s. The suite keeps the
+eager sweeps in `persistent_recovery:` as they were; switching them is a later
+stage.
+
+**The planted bugs.** `DualTxnWalMutants.skipRecordChecksum` is harmless over
+one commit into an empty slot, and both searches say so (373 leaves, and 1,404
+images): a record validates only once every field but the checksum is
+durable, and then it is the committed record. Over a reused slot it is not.
+In the rewrite history of `unchecked_record_checksum_is_caught`, transaction 2
+rewrites transaction 1's after-image and transaction 3 commits into
+transaction 1's slot; an image whose new header and trailer are durable while
+the entry line still holds transaction 1's entry is well formed but for its
+checksum, and replaying it after transaction 2 puts transaction 1's value back.
+With the checksum compared, 5,202 leaves cover the range's 597,079 images and
+the contract holds. With it skipped, the lazy search fails at cut 640 after
+4,797 leaves, in 0.24 s, with "acknowledged after-image absent after recovery
+... durable=0x8877665544332211", and the eager re-check gives the same detail;
+Stage A's sweep fails at the same cut after 525,837 images, in 13.2 s
+(`measure-mutants.txt`). `DualTxnWalMutants.recordLastLineUnflushed` (new,
+test-only) leaves the record's last line out of the commit-point fence; a
+commit recorded with it fails `unflushed_record_line_is_caught` at the commit
+point in the first leaf, the lazy image, with recovery `CLEAN`, confirmed
+eagerly.
+
+**A preview of the other properties (not converted).** Lazy-safe forms of the
+allocator and sieve properties take a few lines (mount through the mounter,
+check, deallocate), and were run outside the suite
+(`measure-preview.txt`, `measure-preview-reps.txt`). The split allocation's
+busiest cut (703, 145,212,480 distinct images) was truncated at 200,000
+leaves, which cover 139,361,949 of them; cut 685's 987,840 images took 8
+leaves. At 2,000 leaves per cut the whole sweep's 27,131 leaves cover
+2,190,532,385 of its 2,263,112,768 images. The sieve step's cut 385 does not
+prune at all: each of 200,000 leaves is one of its 4,147,200 images. Yet with
+the checksum skipped the lazy search reaches the image
+`persistent_sieve:unchecked_record_checksum_is_caught` finds there in its
+second leaf, confirmed eagerly. Its busiest cut (870, at least 2^62 images) is
+one leaf. `representatives_agree`'s check passes at allocator cuts 685, 700,
+720 and 736 and sieve cuts 870, 1,000 and 1,456. The format property reads its
+image before mounting it, the allocator property returns a raw copy of the
+region, and idempotence over an allocator uses `sameBytes()`; those, and the
+agreement tests over those scenarios, are what converting them needs.
+
+**Limits.**
+
+- Soundness rests on every load of crash-image bytes being decided first. The
+  load audits and `representatives_agree` show it for the scenarios they run,
+  and the latter only where an escaped byte differs between a leaf's least and
+  greatest image; `verdicts_agree` runs every image of the scenarios it covers.
+- Lazy-safety is a convention the type makes explicit, not a checked one: a
+  property that read a mount's bytes raw, or a frozen copy other than through
+  the view, would escape the same way.
+- Re-execution needs a deterministic property. The replay check catches a
+  divergence in the decisions; a nondeterministic verdict over the same reads
+  would show only in the agreement tests.
+- Coarse observation (a whole record for a checksum, a whole layout when
+  forged) costs leaves, never soundness.
+- The failure-injection, two-crash, allocator, format, sieve and B+Tree checks
+  remain on the reduced search, budgeted where they were. The numbers above
+  are from one desktop; Magpie was not used.
 
 ---
 
@@ -1413,8 +1629,11 @@ exponential. The implementation should combine:
 - hashing and deduplication of equivalent durable states;
 - partial-order reduction for independent cache lines;
 - bounded transaction and crash counts;
-- exhaustive runs for the canonical one/two/three-transaction scenarios; and
-- seeded pseudo-random schedules for longer mixed allocator histories.
+- exhaustive runs for the canonical one/two/three-transaction scenarios;
+- seeded pseudo-random schedules for longer mixed allocator histories; and
+- since 2026-10-20, for lazy-safe properties, one execution per set of images
+  that recovery's loads cannot tell apart
+  ([The lazy search](#the-lazy-search-2026-10-20)).
 
 Reductions must preserve every state relevant to record validation and the
 acknowledgement contract. In particular, record construction cannot simply be

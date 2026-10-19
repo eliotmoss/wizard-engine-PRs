@@ -59,8 +59,13 @@ component DualTxnWalConstants {
 // header, trailer and entries happen to be well formed.
 // persistent_sieve:unchecked_record_checksum_is_caught shows the crash-image
 // explorer rejecting that recovery.
+// With {recordLastLineUnflushed} set, a commit prepares its record minus the
+// record's last 64-byte line before the commit-point fence, an ordering bug: the
+// commit is acknowledged while the trailer's tail may still be volatile.
+// persistent_lazy:unflushed_record_line_is_caught records a commit with it set.
 component DualTxnWalMutants {
         var skipRecordChecksum = false;
+        var recordLastLineUnflushed = false;
 }
 
 // Outcome of DualTxnWal.recover(). Distinguishes nothing to replay, a
@@ -367,7 +372,9 @@ class DualTxnWal {
                 // result is unacknowledged, so this instance is latched until
                 // the durable image is reopened and recovered.
                 if (!prepareApplied()) return 0u64;
-                if (!backendRegion.prepareChangedRange(absStart - regionStart, recordLen64)) {
+                var preparedLen = recordLen64;
+                if (DualTxnWalMutants.recordLastLineUnflushed) preparedLen = recordLen64 - DualTxnWalConstants.ALIGNMENT;
+                if (!backendRegion.prepareChangedRange(absStart - regionStart, preparedLen)) {
                         recoveryRequired = true;
                         return 0u64;
                 }

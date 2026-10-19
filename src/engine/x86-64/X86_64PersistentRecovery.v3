@@ -33,9 +33,17 @@
 //     about the real seam.
 
 // What production recovery did with one durable image, and the bytes it left.
+// {left} is those bytes as the mount's snapshot() gave them: a durable image
+// when the mount held concrete bytes, and a lazy snapshot when it was one of a
+// lazy search's mounts (X86_64PersistentLazyExplorer.v3), whose bytes recovery
+// neither stored nor loaded may still stand for undecided crash-image bytes.
+// {recovered} is the same bytes as a durable image, and null for a lazy run.
 class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
 	nextTxnSeq: u64, lastCommittedSeq: u64, dataDurableSeq: u64,
-	recovered: PersistentDurableImage) {
+	left: PersistentImageView) {
+
+	def recovered: PersistentDurableImage = if(PersistentDurableImage.?(left),
+		PersistentDurableImage.!(left), null);
 
 	def render(buf: StringBuilder) -> StringBuilder {
 		buf.put1("recovery=%s", recovery.name);
@@ -61,12 +69,82 @@ class PersistentImageMount(region: BackendRegion, recorder: RecordingPersistentO
 		return PersistentDurableImage.new(after);
 	}
 
+	// The bytes as a property may read them afterwards. Here the frozen copy;
+	// a lazy search's mount returns a snapshot that keeps the bytes the code
+	// under test neither stored nor loaded as marks, so that freezing a mount
+	// decides nothing (PersistentLazyMount).
+	def snapshot() -> PersistentImageView {
+		return freeze();
+	}
+
 	def regionStart() -> u64 {
 		return u64.view(Pointer.atElement(region.range, 0));
 	}
 
 	def close() {
 		region.destroy();
+	}
+}
+
+// How a property mounts the images it is handed. A property written against a
+// mounter, rather than against PersistentImageMounts directly, runs unchanged
+// in an eager check, where every image is a PersistentDurableImage mounted in a
+// fresh mapping, and in the lazy search, whose mounter hands out mounts of the
+// crash image it is materialising (PersistentLazySearch). Returns null if the
+// host refused a mapping.
+class PersistentImageMounter {
+	def mount(image: PersistentImageView) -> PersistentImageMount;
+}
+
+// The eager mounter: a mapped PMEM container per image, as runDualWal() has
+// always mounted one. With {record} set every mount records its stores,
+// writebacks, fences and loads, kept in {logs} in mount order, so a run can be
+// compared with another run of the same code.
+class PersistentEagerMounter(record: bool) extends PersistentImageMounter {
+	def logs = Vector<PersistentMountLog>.new();
+
+	def mount(image: PersistentImageView) -> PersistentImageMount {
+		if (!PersistentDurableImage.?(image)) {
+			System.error("PersistentMountError", "an eager mount needs a durable image, not a lazy view");
+		}
+		def m = PersistentImageMounts.openMapped(PersistentDurableImage.!(image), record);
+		if (m != null && record) logs.put(PersistentMountLog.new(m.recorder, m.recorder.recordLoads()));
+		return m;
+	}
+}
+
+component PersistentImageMounters {
+	// What every eager property check mounts through.
+	def EAGER = PersistentEagerMounter.new(false);
+}
+
+// What one recorded mount did: its stores, writebacks and fences, and its
+// loads, in their recorded order.
+class PersistentMountLog(stores: RecordingPersistentOperations, loads: RecordingLoadObserver) {
+
+	// The first way {that} differs from this mount, or null.
+	def difference(that: PersistentMountLog) -> string {
+		def x = stores.events, y = that.stores.events;
+		if (x.length != y.length) {
+			return Strings.format2("%d persistent operations against %d", x.length, y.length);
+		}
+		for (i < x.length) {
+			def a = x[i], b = y[i];
+			if (a.seq != b.seq || a.kind != b.kind || a.offset != b.offset
+				|| a.width != b.width || a.value != b.value) {
+				return a.render(Strings.builderOf("persistent operation differs: ")).puts(" against ")
+					.puts(b.render(StringBuilder.new()).toString()).toString();
+			}
+		}
+		def p = loads.loads, q = that.loads.loads;
+		if (p.length != q.length) return Strings.format2("%d loads against %d", p.length, q.length);
+		for (i < p.length) {
+			if (!p[i].same(q[i])) {
+				return p[i].render(Strings.builderOf("load differs: ")).puts(" against ")
+					.puts(q[i].render(StringBuilder.new()).toString()).toString();
+			}
+		}
+		return null;
 	}
 }
 
@@ -194,7 +272,16 @@ component PersistentRecoveries {
 	def runDualWal(image: PersistentDurableImage, logChunkOffset: u64,
 		logChunkSize: u64) -> PersistentRecoveryRun {
 
-		def mount = PersistentImageMounts.openMapped(image, false);
+		return runDualWalOn(PersistentImageMounters.EAGER, image, logChunkOffset, logChunkSize);
+	}
+
+	// The same run over a mount {mounter} provides: the eager mounter's fresh
+	// mapping, or the lazy search's mapping of the crash image it is deciding.
+	// The run's {left} is the mount's snapshot().
+	def runDualWalOn(mounter: PersistentImageMounter, image: PersistentImageView,
+		logChunkOffset: u64, logChunkSize: u64) -> PersistentRecoveryRun {
+
+		def mount = mounter.mount(image);
 		if (mount == null) return null;
 		def run = recoverOn(mount, logChunkOffset, logChunkSize);
 		mount.close();
@@ -222,7 +309,7 @@ component PersistentRecoveries {
 		def wal = DualTxnWal.new(base, base + logChunkOffset, logChunkSize, mount.region, false);
 		def result = wal.recover();
 		return PersistentRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
-			wal.lastCommittedSeq, wal.dataDurableSeq, mount.freeze());
+			wal.lastCommittedSeq, wal.dataDurableSeq, mount.snapshot());
 	}
 
 	// The same recovery, with one persistence boundary failed. The WAL must
@@ -327,6 +414,11 @@ class PersistentWalRecoveryProperty(logChunkOffset: u64, logChunkSize: u64,
 	def property(name: string) -> PersistentImageProperty {
 		return PersistentImageProperty.new(name, offset, 16, check);
 	}
+
+	// The same check for the lazy search (PersistentLazyExplorer).
+	def lazy(name: string) -> PersistentLazyProperty {
+		return history.lazy(name, offset, 16);
+	}
 }
 
 // One after-image a recorded scenario wrote, and whether the transaction
@@ -350,7 +442,17 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 	afterImages: Array<PersistentWalAfterImage>) {
 
 	def check(image: PersistentDurableImage) -> string {
-		def run = PersistentRecoveries.runDualWal(image, logChunkOffset, logChunkSize);
+		return checkOn(image, PersistentImageMounters.EAGER);
+	}
+
+	// The contract itself, over whatever {mounter} mounts: the eager check
+	// above and the lazy search run this one body. It is lazy-safe because
+	// every byte it depends on is either loaded by recovery through the
+	// region's reader or read from a run's {left} with read(), which decides
+	// the bytes it reads, and the idempotence run mounts {left} through the
+	// same mounter.
+	def checkOn(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		def run = PersistentRecoveries.runDualWalOn(mounter, image, logChunkOffset, logChunkSize);
 		if (run == null) return "could not map a region for the durable image";
 		if (run.recovery == DualWalRecovery.PERSIST_FAILED) {
 			return detail("recovery reported PERSIST_FAILED", run, null);
@@ -361,7 +463,7 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 
 		for (i < afterImages.length) {
 			def a = afterImages[i];
-			def got = run.recovered.read(a.offset, a.width);
+			def got = run.left.read(a.offset, a.width);
 			if (a.mustSurvive) {
 				if (got != a.value) {
 					return detail("acknowledged after-image absent after recovery", run, a);
@@ -373,14 +475,14 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 
 		// Recovery is idempotent: replaying the image recovery just produced
 		// must not change any after-image or fail.
-		def again = PersistentRecoveries.runDualWal(run.recovered, logChunkOffset, logChunkSize);
+		def again = PersistentRecoveries.runDualWalOn(mounter, run.left, logChunkOffset, logChunkSize);
 		if (again == null) return "could not map a region for the recovered image";
 		if (again.recovery == DualWalRecovery.PERSIST_FAILED || again.requiresRecovery) {
 			return detail("second recovery over the recovered image failed", again, null);
 		}
 		for (i < afterImages.length) {
 			def a = afterImages[i];
-			if (again.recovered.read(a.offset, a.width) != run.recovered.read(a.offset, a.width)) {
+			if (again.left.read(a.offset, a.width) != run.left.read(a.offset, a.width)) {
 				return detail("recovery is not idempotent", again, a);
 			}
 		}
@@ -391,6 +493,11 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 		return PersistentImageProperty.new(name, windowOffset, windowLength, check);
 	}
 
+	// The same contract for the lazy search (PersistentLazyExplorer).
+	def lazy(name: string, windowOffset: u64, windowLength: int) -> PersistentLazyProperty {
+		return PersistentLazyProperty.new(name, windowOffset, windowLength, checkOn);
+	}
+
 	private def detail(text: string, run: PersistentRecoveryRun,
 		a: PersistentWalAfterImage) -> string {
 
@@ -398,7 +505,7 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 		run.render(buf);
 		if (a != null) {
 			buf.put1(" offset=%d", a.offset);
-			buf.puts(" durable=0x").putx_64(run.recovered.read(a.offset, a.width));
+			buf.puts(" durable=0x").putx_64(run.left.read(a.offset, a.width));
 		}
 		return buf.toString();
 	}

@@ -1,0 +1,793 @@
+// Lazy crash-image search tests (Stage C; docs/pmem-crash-model.md, "The lazy
+// search"). The search runs a property once per leaf, a set of images that
+// makes the same reads, and the soundness argument has three parts, each
+// checked here rather than assumed:
+//
+//   - the leaves partition the cut's distinct images (leaves_partition_classes,
+//     and the calibrations at both ends);
+//   - a leaf's verdict is every one of its images' eager verdict
+//     (verdicts_agree);
+//   - every load of crash-image bytes was observed before it happened, so each
+//     image in a leaf runs the same code on the same bytes
+//     (representatives_agree: the leaf's least and greatest images, run
+//     eagerly, make the same stores and loads, byte for byte).
+//
+// Then the replay check, the views' comparison of marks, the WAL sweeps run
+// lazily, and two planted bugs.
+
+def PLT = UnitTests.registerT("persistent_lazy:", _, PersistentLazyTester.new, _);
+def PLTX = [
+	PLT("leaves_partition_classes", test_lazy_leaves_partition_classes),
+	PLT("reading_nothing_is_one_leaf", test_lazy_reading_nothing_is_one_leaf),
+	PLT("reading_everything_is_every_image", test_lazy_reading_everything_is_every_image),
+	PLT("verdicts_agree", test_lazy_verdicts_agree),
+	PLT("three_commit_verdicts_agree", test_lazy_three_commit_verdicts_agree),
+	PLT("representatives_agree", test_lazy_representatives_agree),
+	PLT("replay_detects_nondeterminism", test_lazy_replay_detects_nondeterminism),
+	PLT("snapshots_compare_marks_without_deciding", test_lazy_snapshots_compare_marks_without_deciding),
+	PLT("wal_sweeps_are_exhaustive", test_lazy_wal_sweeps_are_exhaustive),
+	PLT("unchecked_record_checksum_is_caught", test_lazy_unchecked_record_checksum_is_caught),
+	PLT("unflushed_record_line_is_caught", test_lazy_unflushed_record_line_is_caught),
+	()
+];
+
+// The leaves of one cut's search, indexed by their decisions: a node is a
+// decision every leaf below it shares, its children are its groups, so an
+// image is found by following, at each node, the group its class at the
+// node's line falls in.
+class PersistentLazyLeafIndex {
+	def root = PersistentLazyNode.new();
+
+	// Add {leaf}; returns false if its decisions contradict a leaf already
+	// added (the same prefix, a different split).
+	def add(leaf: PersistentLazyLeaf) -> bool {
+		var node = root;
+		for (d in leaf.decisions) {
+			if (node.decision == null) {
+				if (node.leaf != null) return false;
+				node.decision = d;
+				node.children = Array<PersistentLazyNode>.new(d.groups);
+			} else if (!node.decision.sameSplit(d)) {
+				return false;
+			}
+			if (node.children[d.choice] == null) node.children[d.choice] = PersistentLazyNode.new();
+			node = node.children[d.choice];
+		}
+		if (node.decision != null || node.leaf != null) return false;
+		node.leaf = leaf;
+		return true;
+	}
+
+	// The leaf the image with line classes {choice} follows, or null.
+	def locate(choice: Array<int>) -> PersistentLazyLeaf {
+		var node = root;
+		while (node != null && node.decision != null) {
+			def g = node.decision.groupOf[choice[node.decision.line]];
+			if (g < 0) return null;
+			node = node.children[g];
+		}
+		return if(node == null, null, node.leaf);
+	}
+}
+
+class PersistentLazyNode {
+	var decision: PersistentLazyDecision;
+	var children: Array<PersistentLazyNode>;
+	var leaf: PersistentLazyLeaf;
+}
+
+class PersistentLazyTester(t: Tester) {
+	def explorer = PersistentExplorerTester.new(t);
+	def recovery = PersistentRecoveryTester.new(t);
+	def EXHAUSTIVE = 1 << 30;
+
+	// Set by flipCheck: which line it reads first alternates per call.
+	var flips = 0;
+	// Set by the snapshot test's property.
+	var snapshotFailure: string;
+	var snapshotChecks = 0;
+
+	// The rewrite history: transaction 2 rewrites transaction 1's after-image,
+	// and transaction 3 commits into transaction 1's slot.
+	var rewriteThirdStart = 0;
+
+	// Every leaf of a search, which must complete.
+	def leavesOf(s: PersistentLazySearch) -> Vector<PersistentLazyLeaf> {
+		def leaves = Vector<PersistentLazyLeaf>.new();
+		while (true) {
+			def leaf = s.next();
+			if (leaf == null) break;
+			leaves.put(leaf);
+		}
+		if (s.nondeterminism != null) t.fail(s.nondeterminism);
+		t.assertz(false, s.truncated);
+		return leaves;
+	}
+
+	// The class each line of {image} holds, -1 for a line whose bytes are no
+	// class of it, which fails the test.
+	def classVector(classes: Array<PersistentLineClasses>, image: PersistentDurableImage) -> Array<int> {
+		def v = Array<int>.new(classes.length);
+		for (i < classes.length) {
+			def c = classes[i];
+			def start = int.!(c.line);
+			v[i] = -1;
+			for (k < c.count()) {
+				def bytes = c.contents[k];
+				var same = true;
+				for (b < bytes.length) {
+					if (bytes[b] != image.bytes[start + b]) {
+						same = false;
+						break;
+					}
+				}
+				if (same) {
+					v[i] = k;
+					break;
+				}
+			}
+			if (v[i] < 0) t.fail1("line %d of an image holds none of its classes", c.line);
+		}
+		return v;
+	}
+
+	def sameDetail(a: string, b: string) -> bool {
+		if (a == null || b == null) return a == b;
+		return Strings.equal(a, b);
+	}
+
+	// One cut: run {property}'s lazy search to the end, then take every
+	// distinct image Stage A enumerates and require it in exactly one leaf,
+	// and the leaves to stand for exactly the cut's distinct images. Returns
+	// the number of leaves.
+	def assertPartition(tr: PersistentTrace, initial: Array<byte>, cut: int,
+		property: PersistentLazyProperty) -> int {
+
+		def s = PersistentLazyExplorer.search(tr, initial, cut, EXHAUSTIVE, property, false);
+		def leaves = leavesOf(s);
+		s.close();
+		t.assert_eq(s.classProduct, s.represented);
+		var sum = 0L;
+		for (i < leaves.length) sum += leaves[i].represented();
+		t.assert_eq(s.classProduct, sum);
+		def stageA = PersistentExplorer.reducedCrashImages(tr, initial, cut, EXHAUSTIVE);
+		t.assertz(false, stageA.truncated);
+		t.assert_eq(s.classProduct, long.!(stageA.imageCount()));
+		for (image in stageA.images) {
+			def v = classVector(s.classes, image);
+			var holders = 0;
+			for (i < leaves.length) if (leaves[i].contains(v)) holders++;
+			if (holders != 1) {
+				t.fail(Strings.format3("%s cut %d: an image lies in %d leaves", tr.name, cut, holders));
+				break;
+			}
+		}
+		return leaves.length;
+	}
+
+	// One cut: each of Stage A's images gets the verdict of the leaf it
+	// follows, detail for detail. Returns the number of leaves.
+	def assertVerdicts(tr: PersistentTrace, initial: Array<byte>, cut: int, budget: int,
+		property: PersistentLazyProperty) -> int {
+
+		def s = PersistentLazyExplorer.search(tr, initial, cut, EXHAUSTIVE, property, false);
+		def leaves = leavesOf(s);
+		s.close();
+		def index = PersistentLazyLeafIndex.new();
+		for (i < leaves.length) {
+			if (!index.add(leaves[i])) {
+				t.fail(Strings.format2("%s cut %d: two leaves split one prefix differently", tr.name, cut));
+				return leaves.length;
+			}
+		}
+		def stageA = PersistentExplorer.reducedCrashImages(tr, initial, cut, budget);
+		t.assertz(false, stageA.truncated);
+		for (image in stageA.images) {
+			def v = classVector(s.classes, image);
+			def leaf = index.locate(v);
+			if (leaf == null || !leaf.contains(v)) {
+				t.fail(Strings.format2("%s cut %d: an image follows no leaf that holds it", tr.name, cut));
+				return leaves.length;
+			}
+			def eager = property.checkEagerly(image);
+			if (!sameDetail(eager, leaf.detail)) {
+				t.fail(StringBuilder.new().put3("%s cut %d leaf %d: ", tr.name, cut, leaf.index)
+					.put2("eager verdict %s, lazy %s", if(eager == null, "holds", eager),
+						if(leaf.detail == null, "holds", leaf.detail)).toString());
+				return leaves.length;
+			}
+		}
+		return leaves.length;
+	}
+
+	// One cut: every leaf, run lazily with its mounts recorded, and then
+	// eagerly at its least and at its greatest image, must make the same
+	// stores, writebacks and fences and the same loads, byte for byte, in
+	// every mount, and reach the same verdict. Returns the number of leaves.
+	def assertRepresentatives(tr: PersistentTrace, initial: Array<byte>, cut: int,
+		property: PersistentLazyProperty) -> int {
+
+		def s = PersistentLazyExplorer.search(tr, initial, cut, EXHAUSTIVE, property, true);
+		def leaves = leavesOf(s);
+		for (i < leaves.length) {
+			def leaf = leaves[i];
+			def reps = [leaf.low(), leaf.high()];
+			def names = ["least", "greatest"];
+			for (r < reps.length) {
+				def image = s.imageOf(reps[r]);
+				def mounter = PersistentEagerMounter.new(true);
+				def eager = property.check(image, mounter);
+				def diff = difference(leaf, eager, mounter.logs);
+				if (diff != null) {
+					t.fail(StringBuilder.new().put3("%s cut %d leaf %d: ", tr.name, cut, leaf.index)
+						.put2("at its %s image: %s", names[r], diff).toString());
+					s.close();
+					return leaves.length;
+				}
+			}
+		}
+		s.close();
+		return leaves.length;
+	}
+
+	def difference(leaf: PersistentLazyLeaf, eager: string, logs: Vector<PersistentMountLog>) -> string {
+		if (!sameDetail(eager, leaf.detail)) return "the verdict differs";
+		if (leaf.logs.length != logs.length) {
+			return Strings.format2("%d mounts lazily, %d eagerly", leaf.logs.length, logs.length);
+		}
+		for (m < logs.length) {
+			def diff = leaf.logs[m].difference(logs[m]);
+			if (diff != null) return Strings.format2("mount %d: %s", m, diff);
+		}
+		return null;
+	}
+
+	// --- Properties ---
+
+	// Reads the first word of each line; where it is not zero, the word at +16
+	// as well, and where it is zero the byte at +8. Fails, naming the sum of
+	// what it read, unless that sum is zero, so that a leaf's detail depends
+	// on every byte its reads returned.
+	def wordsCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		def mount = mounter.mount(image);
+		if (mount == null) return "could not mount the image";
+		def base = mount.regionStart();
+		def r = DirectRegionReader.new(X86_64PersistentOps.ensureFor(mount.region), base);
+		def size = u64.!(mount.region.range.length);
+		var sum = 0u64;
+		for (line = 0u64; line < size; line += 64u64) {
+			def w = r.loadU64(base + line);
+			if (w != 0u64) sum += w + r.loadU64(base + line + 16u64);
+			else sum += u64.view(r.loadU8(base + line + 8u64));
+		}
+		mount.close();
+		if (sum == 0u64) return null;
+		return StringBuilder.new().puts("words sum to 0x").putx_64(sum).toString();
+	}
+
+	def words() -> PersistentLazyProperty {
+		return PersistentLazyProperty.new("words", 0u64, 64, wordsCheck);
+	}
+
+	// Three mounts, so the search's other mount paths run: the crash image,
+	// where it loads one word and stores another, then its snapshot, read
+	// word by word as wordsCheck reads, then the crash image again, a copy
+	// of it once the first mount has changed the mapping, where it loads the
+	// word at +8 of every line. The second and third mounts load bytes no
+	// earlier mount loaded, which the search fills from the crash image when
+	// they are loaded.
+	def twiceCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		def first = mounter.mount(image);
+		if (first == null) return "could not mount the image";
+		var base = first.regionStart();
+		var ops = X86_64PersistentOps.ensureFor(first.region);
+		var r = DirectRegionReader.new(ops, base);
+		var sum = r.loadU64(base);
+		ops.storeU64(64u64, sum ^ 0x5A5Au64);
+		def snapshot = first.snapshot();
+		first.close();
+		sum += snapshot.read(128u64, 8);
+		def next = wordsCheck(snapshot, mounter);
+		def third = mounter.mount(image);
+		if (third == null) return "could not mount the image again";
+		base = third.regionStart();
+		r = DirectRegionReader.new(X86_64PersistentOps.ensureFor(third.region), base);
+		def size = u64.!(third.region.range.length);
+		for (line = 0u64; line < size; line += 64u64) sum = sum * 31u64 + r.loadU64(base + line + 8u64);
+		third.close();
+		return StringBuilder.new().put1("%s; ", if(next == null, "zero", next))
+			.puts("twice sums to 0x").putx_64(sum).toString();
+	}
+
+	def twice() -> PersistentLazyProperty {
+		return PersistentLazyProperty.new("twice", 0u64, 64, twiceCheck);
+	}
+
+	def nothingCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		return null;
+	}
+
+	// Mounts the image and observes all of it.
+	def everythingCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		def mount = mounter.mount(image);
+		if (mount == null) return "could not mount the image";
+		def base = mount.regionStart();
+		def r = DirectRegionReader.new(X86_64PersistentOps.ensureFor(mount.region), base);
+		r.observe(base, u64.!(mount.region.range.length));
+		mount.close();
+		return null;
+	}
+
+	// Deliberately nondeterministic: reads line 0 then line 64 on odd calls,
+	// line 64 then line 0 on even ones.
+	def flipCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		flips++;
+		def mount = mounter.mount(image);
+		if (mount == null) return "could not mount the image";
+		def base = mount.regionStart();
+		def r = DirectRegionReader.new(X86_64PersistentOps.ensureFor(mount.region), base);
+		if (flips % 2 == 1) {
+			r.loadU64(base);
+			r.loadU64(base + 64u64);
+		} else {
+			r.loadU64(base + 64u64);
+			r.loadU64(base);
+		}
+		mount.close();
+		return null;
+	}
+
+	// flipCheck's reads, always in the odd calls' order.
+	def steadyCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		def mount = mounter.mount(image);
+		if (mount == null) return "could not mount the image";
+		def base = mount.regionStart();
+		def r = DirectRegionReader.new(X86_64PersistentOps.ensureFor(mount.region), base);
+		r.loadU64(base);
+		r.loadU64(base + 64u64);
+		mount.close();
+		return null;
+	}
+
+	def survives() -> PersistentLazyProperty {
+		return PersistentWalRecoveryProperty.new(recovery.LOG_OFFSET, recovery.LOG_SIZE,
+			recovery.OFFSET, 8, recovery.VALUE, true).lazy("acknowledged transaction survives recovery");
+	}
+
+	def noInventedState() -> PersistentLazyProperty {
+		return PersistentWalRecoveryProperty.new(recovery.LOG_OFFSET, recovery.LOG_SIZE,
+			recovery.OFFSET, 8, recovery.VALUE, false).lazy("recovery never invents an uncommitted value");
+	}
+
+	def history(name: string, ackA: bool, ackB: bool, ackC: bool) -> PersistentLazyProperty {
+		return PersistentWalHistoryProperty.new(recovery.LOG_OFFSET, recovery.LOG_SIZE, [
+			PersistentWalAfterImage.new(recovery.OFFSET, 8, recovery.VALUE, ackA),
+			PersistentWalAfterImage.new(recovery.OFFSET_B, 8, recovery.VALUE_B, ackB),
+			PersistentWalAfterImage.new(recovery.OFFSET_C, 8, recovery.VALUE_C, ackC)
+		]).lazy(name, recovery.slotOffsets[1], 64);
+	}
+
+	def batched(name: string, ackA: bool, ackB: bool, ackC: bool) -> PersistentLazyProperty {
+		def offsets = recovery.BATCH_OFFSETS;
+		def n = offsets.length;
+		def images = Array<PersistentWalAfterImage>.new(n + 2);
+		for (i < n) images[i] = PersistentWalAfterImage.new(offsets[i], 8, recovery.batchValue(offsets[i]), ackA);
+		images[n] = PersistentWalAfterImage.new(recovery.BATCH_B_OFFSET, 8,
+			recovery.batchValue(recovery.BATCH_B_OFFSET), ackB);
+		images[n + 1] = PersistentWalAfterImage.new(recovery.BATCH_C_OFFSET, 8,
+			recovery.batchValue(recovery.BATCH_C_OFFSET), ackC);
+		return PersistentWalHistoryProperty.new(recovery.LOG_OFFSET, recovery.LOG_SIZE, images)
+			.lazy(name, recovery.slotOffsets[1], 64);
+	}
+
+	// The rewrite history's contract from its third commit on: transaction 2's
+	// after-image, which overwrote transaction 1's, must survive, and
+	// transaction 3's may be absent but never anything else.
+	def rewriteProperty() -> PersistentLazyProperty {
+		return PersistentWalHistoryProperty.new(recovery.LOG_OFFSET, recovery.LOG_SIZE, [
+			PersistentWalAfterImage.new(recovery.OFFSET, 8, recovery.VALUE_B, true),
+			PersistentWalAfterImage.new(recovery.OFFSET_C, 8, recovery.VALUE_C, false)
+		]).lazy("a reused slot's stale entries never replay over newer data", recovery.slotOffsets[1], 192);
+	}
+
+	// Three transactions through the production WAL, applied write-behind as
+	// in persistent_recovery:three_commits_reclaim_the_oldest_slot, except that
+	// the second rewrites the first one's after-image. The third commits into
+	// the first one's slot, whose entry line still holds the first
+	// transaction's entry while the new record is being written: a torn record
+	// whose header and trailer are new and whose entry is stale is well formed
+	// in every field but the checksum.
+	def recordRewrite() -> bool {
+		def mapping = Mmap.reserve(recovery.REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
+		if (mapping == null) return false;
+		def region = PmemMmapRegion.new(mapping, -1);
+		def recorder = RecordingPersistentOperations.new(region.range);
+		region.setPersistentOperations(recorder);
+		def base = u64.view(Pointer.atElement(region.range, 0));
+		def wal = DualTxnWal.new(base, base + recovery.LOG_OFFSET, recovery.LOG_SIZE, region, true);
+		for (i < 2) recovery.slotOffsets[i] = wal.slotAddr(i) - base;
+		recovery.mounted = Array<byte>.new(region.range.length);
+		for (i < recovery.mounted.length) recovery.mounted[i] = region.range[i];
+		recorder.clear();
+		var ok = commitOne(wal, recovery.OFFSET, recovery.VALUE, 1u64);
+		ok = ok && commitOne(wal, recovery.OFFSET, recovery.VALUE_B, 2u64);
+		rewriteThirdStart = recorder.events.length;
+		ok = ok && commitOne(wal, recovery.OFFSET_C, recovery.VALUE_C, 3u64);
+		recovery.trace = recorder.snapshot("dual_wal_rewrite");
+		ok = ok && recovery.trace.validate().ok();
+		region.destroy();
+		return ok;
+	}
+
+	private def commitOne(wal: DualTxnWal, offset: u64, value: u64, expectSeq: u64) -> bool {
+		if (!wal.append(offset, value, 8u8)) return false;
+		if (wal.commit() != expectSeq) return false;
+		return wal.applyUpdate(offset, value, 8u8);
+	}
+
+	// Mount the crash image, recover, freeze; mount the snapshot, recover
+	// again, freeze; then compare. Comparing two snapshots of one execution
+	// must decide nothing, since both keep the bytes neither recovery read as
+	// the same marks; comparing a snapshot with the crash image decides
+	// nothing either when recovery stored nothing, since the snapshot is then
+	// the crash image's marks and the bytes recovery loaded.
+	def snapshotCheck(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
+		def s = image.origin();
+		def first = PersistentRecoveries.runDualWalOn(mounter, image, recovery.LOG_OFFSET, recovery.LOG_SIZE);
+		def second = PersistentRecoveries.runDualWalOn(mounter, first.left, recovery.LOG_OFFSET, recovery.LOG_SIZE);
+		def before = s.decisionsTaken();
+		def same = first.left.sameBytes(second.left);
+		def diff = first.left.firstDifference(image);
+		def after = s.decisionsTaken();
+		snapshotChecks++;
+		if (!same && snapshotFailure == null) snapshotFailure = "recovery over its own snapshot changed it";
+		if (first.recovery == DualWalRecovery.CLEAN) {
+			if (diff >= 0 && snapshotFailure == null) snapshotFailure = "a clean recovery's snapshot differs from the crash image";
+			if (after != before && snapshotFailure == null) snapshotFailure = "comparing with a clean recovery's snapshot decided bytes";
+		} else if (diff != int.!(recovery.OFFSET) && snapshotFailure == null) {
+			snapshotFailure = Strings.format1("a replay's snapshot first differs at %d, not at its after-image", diff);
+		}
+		if (first.left.knownByte(int.!(recovery.OFFSET)) < 0 && snapshotFailure == null) {
+			snapshotFailure = "the after-image's byte is a mark";
+		}
+		return null;
+	}
+}
+
+// Every distinct image of every cut lies in exactly one leaf, and the leaves
+// stand for exactly the cut's distinct images: on the four traces the reduced
+// search is checked on, read by a property whose reads depend on what it read,
+// and on a recorded DualTxnWal commit read by production recovery.
+def test_lazy_leaves_partition_classes(tc: PersistentLazyTester) {
+	for (tr in tc.explorer.reductionTraces()) {
+		for (cut = 0; cut <= tr.length(); cut++) {
+			tc.assertPartition(tr, null, cut, tc.words());
+			tc.assertPartition(tr, null, cut, tc.twice());
+			if (!tc.t.ok) return;
+		}
+	}
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	var leaves = 0;
+	for (cut = 0; cut <= tr.length(); cut++) {
+		leaves += tc.assertPartition(tr, tc.recovery.mounted, cut, tc.noInventedState());
+		if (!tc.t.ok) return;
+	}
+	// Recovery reads all of a record only when its header is well formed, so
+	// it tells fewer images apart than there are.
+	tc.t.assertz(true, leaves < 1404);
+}
+
+// A property that reads nothing cannot tell images apart: one leaf per cut,
+// standing for all of the cut's images.
+def test_lazy_reading_nothing_is_one_leaf(tc: PersistentLazyTester) {
+	def nothing = PersistentLazyProperty.new("reads nothing", 0u64, 0, tc.nothingCheck);
+	def traces = Vector<(PersistentTrace, Array<byte>)>.new();
+	for (tr in tc.explorer.reductionTraces()) traces.put((tr, null));
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	traces.put((tc.recovery.trace, tc.recovery.mounted));
+	for (i < traces.length) {
+		def tr = traces[i].0, initial = traces[i].1;
+		for (cut = 0; cut <= tr.length(); cut++) {
+			def r = PersistentLazyExplorer.checkImagesLazily(tr, initial, cut, 0, nothing);
+			tc.t.assertz(true, r.exhaustive());
+			tc.t.assert_eq(1L, r.leaves);
+			tc.t.assert_eq(r.classProduct, r.represented);
+		}
+	}
+}
+
+// A property that observes every byte tells every image apart: as many leaves
+// as distinct images, which is Stage A's enumeration.
+def test_lazy_reading_everything_is_every_image(tc: PersistentLazyTester) {
+	def everything = PersistentLazyProperty.new("reads everything", 0u64, 0, tc.everythingCheck);
+	def traces = Vector<(PersistentTrace, Array<byte>)>.new();
+	for (tr in tc.explorer.reductionTraces()) traces.put((tr, null));
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	traces.put((tc.recovery.trace, tc.recovery.mounted));
+	for (i < traces.length) {
+		def tr = traces[i].0, initial = traces[i].1;
+		def r = PersistentLazyExplorer.checkAllCutsLazily(tr, initial, 0, everything);
+		tc.t.assertz(true, r.exhaustive());
+		tc.t.assert_eq(r.classProduct, r.leaves);
+		tc.t.assert_eq(r.classProduct, r.represented);
+	}
+	// The whole one-commit sweep: 1,404 executions, one per distinct image.
+	def r = PersistentLazyExplorer.checkAllCutsLazily(tc.recovery.trace, tc.recovery.mounted, 0, everything);
+	tc.t.assert_eq(1404L, r.leaves);
+}
+
+// Each image's eager verdict is its leaf's lazy verdict, detail for detail:
+// on the small traces with the reading property, and at every cut of the
+// one-commit trace with both halves of the acknowledgement contract. Requiring
+// survival fails before the commit point and holds at it, so both verdicts
+// occur.
+def test_lazy_verdicts_agree(tc: PersistentLazyTester) {
+	for (tr in tc.explorer.reductionTraces()) {
+		for (cut = 0; cut <= tr.length(); cut++) {
+			tc.assertVerdicts(tr, null, cut, tc.EXHAUSTIVE, tc.words());
+			tc.assertVerdicts(tr, null, cut, tc.EXHAUSTIVE, tc.twice());
+			if (!tc.t.ok) return;
+		}
+	}
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	for (cut = 0; cut <= tr.length(); cut++) {
+		tc.assertVerdicts(tr, tc.recovery.mounted, cut, tc.EXHAUSTIVE, tc.noInventedState());
+		tc.assertVerdicts(tr, tc.recovery.mounted, cut, tc.EXHAUSTIVE, tc.survives());
+		if (!tc.t.ok) return;
+	}
+}
+
+// The same agreement over the three-commit history, from the third commit's
+// first event, with the overwrite guard's property: 597,079 images, each
+// mounted eagerly and its verdict compared with its leaf's.
+def test_lazy_three_commit_verdicts_agree(tc: PersistentLazyTester) {
+	if (!tc.recovery.recordThreeCommits()) {
+		tc.t.fail("could not record three production WAL commits");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	def property = tc.history("reclaiming a slot never loses an acknowledged transaction", true, true, false);
+	for (cut = tc.recovery.thirdCommitStart; cut <= tr.length(); cut++) {
+		tc.assertVerdicts(tr, tc.recovery.mounted, cut, tc.recovery.THREE_COMMIT_BUDGET, property);
+		if (!tc.t.ok) return;
+	}
+}
+
+// Every leaf's least and greatest image, run eagerly with every mount
+// recorded, make the same stores, writebacks, fences and loads as the lazy
+// execution, byte for byte, and reach its verdict. This is the executable
+// check that no load of crash-image bytes escaped the seam or ran before its
+// observation, for the code these scenarios run: such a load would read the
+// least class lazily and the greatest at the high image.
+def test_lazy_representatives_agree(tc: PersistentLazyTester) {
+	for (tr in tc.explorer.reductionTraces()) {
+		for (cut = 0; cut <= tr.length(); cut++) {
+			tc.assertRepresentatives(tr, null, cut, tc.words());
+			tc.assertRepresentatives(tr, null, cut, tc.twice());
+			if (!tc.t.ok) return;
+		}
+	}
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	for (cut = 0; cut <= tr.length(); cut++) {
+		tc.assertRepresentatives(tr, tc.recovery.mounted, cut, tc.noInventedState());
+		tc.assertRepresentatives(tr, tc.recovery.mounted, cut, tc.survives());
+		if (!tc.t.ok) return;
+	}
+	if (!tc.recovery.recordThreeCommits()) {
+		tc.t.fail("could not record three production WAL commits");
+		return;
+	}
+	def three = tc.recovery.trace;
+	def property = tc.history("reclaiming a slot never loses an acknowledged transaction", true, true, false);
+	for (cut = tc.recovery.thirdCommitStart; cut <= three.length(); cut++) {
+		tc.assertRepresentatives(three, tc.recovery.mounted, cut, property);
+		if (!tc.t.ok) return;
+	}
+}
+
+// A property whose reads change from one execution to the next voids the
+// search: replaying the first leaf's prefix meets a different decision, and
+// the search says so instead of reporting leaves that do not partition.
+def test_lazy_replay_detects_nondeterminism(tc: PersistentLazyTester) {
+	def tr = tc.explorer.fourLinesTrace();
+	tc.flips = 0;
+	def flip = PersistentLazyProperty.new("reads in a different order each time", 0u64, 0, tc.flipCheck);
+	def r = PersistentLazyExplorer.checkImagesLazily(tr, null, tr.length(), 0, flip);
+	tc.t.assertz(false, r.ok());
+	tc.t.assertz(false, r.exhaustive());
+	tc.t.assertz(true, r.nondeterminism != null);
+	tc.t.assert_eq(1L, r.leaves);
+	def artifact = r.toArtifact();
+	tc.t.asserti(1, tc.recovery.countOf(artifact, "nondeterministic: decision 0 split line 64 into 2 groups on replay, but line 0 into 2 groups"));
+	// The same reads in a fixed order are fine.
+	def fixed = PersistentLazyProperty.new("reads in one order", 0u64, 0, tc.steadyCheck);
+	def ok = PersistentLazyExplorer.checkImagesLazily(tr, null, tr.length(), 0, fixed);
+	tc.t.assertz(true, ok.exhaustive());
+	tc.t.assert_eq(4L, ok.leaves);
+	tc.t.assert_eq(ok.classProduct, ok.represented);
+}
+
+// The lazy snapshots' comparison: two snapshots of one execution compare
+// without deciding anything, a clean recovery's snapshot equals the crash
+// image without deciding anything, and a replay's first differs from it at the
+// after-image it stored. Every leaf at every cut of the one-commit trace.
+def test_lazy_snapshots_compare_marks_without_deciding(tc: PersistentLazyTester) {
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	def property = PersistentLazyProperty.new("snapshots compare", 0u64, 0, tc.snapshotCheck);
+	tc.snapshotFailure = null;
+	tc.snapshotChecks = 0;
+	def r = PersistentLazyExplorer.checkAllCutsLazily(tr, tc.recovery.mounted, 0, property);
+	if (tc.snapshotFailure != null) tc.t.fail(tc.snapshotFailure);
+	tc.t.assertz(true, r.exhaustive());
+	tc.t.assert_eq(r.leaves, long.!(tc.snapshotChecks));
+	tc.t.assert_eq(1404L, r.represented);
+}
+
+// The WAL sweeps of persistent_recovery:, run lazily: each covers every
+// distinct image of every cut with fewer executions than images.
+def test_lazy_wal_sweeps_are_exhaustive(tc: PersistentLazyTester) {
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def one = PersistentLazyExplorer.checkAllCutsLazily(tc.recovery.trace, tc.recovery.mounted, 0,
+		tc.noInventedState());
+	if (!one.ok()) tc.t.fail(one.toArtifact());
+	tc.t.assertz(true, one.exhaustive());
+	tc.t.assert_eq(1404L, one.represented);
+	tc.t.assert_eq(1404L, one.classProduct);
+	tc.t.assert_eq(15969521L, one.product);
+	tc.t.assertz(true, one.leaves < one.represented);
+
+	if (!tc.recovery.recordThreeCommits()) {
+		tc.t.fail("could not record three production WAL commits");
+		return;
+	}
+	def budget = tc.recovery.THREE_COMMIT_BUDGET;
+	def guard = PersistentLazyExplorer.checkCutRangeLazily(tc.recovery.trace, tc.recovery.mounted,
+		tc.recovery.thirdCommitStart, tc.recovery.trace.length(), budget,
+		tc.history("reclaiming a slot never loses an acknowledged transaction", true, true, false));
+	if (!guard.ok()) tc.t.fail(guard.toArtifact());
+	tc.t.assertz(true, guard.exhaustive());
+	tc.t.assert_eq(597079L, guard.represented);
+	def three = PersistentLazyExplorer.checkAllCutsLazily(tc.recovery.trace, tc.recovery.mounted, budget,
+		tc.history("a reclaimed slot never invents a transaction", false, false, false));
+	if (!three.ok()) tc.t.fail(three.toArtifact());
+	tc.t.assertz(true, three.exhaustive());
+	tc.t.assert_eq(601294L, three.represented);
+	tc.t.assertz(true, three.leaves < three.represented);
+
+	if (!tc.recovery.recordBatchedApply()) {
+		tc.t.fail("could not record a batched-apply WAL history");
+		return;
+	}
+	def reclaim = PersistentLazyExplorer.checkCutRangeLazily(tc.recovery.trace, tc.recovery.mounted,
+		tc.recovery.batchThirdStart, tc.recovery.trace.length(), tc.recovery.BATCHED_BUDGET,
+		tc.batched("reclaiming the batched transaction's slot loses nothing", true, true, false));
+	if (!reclaim.ok()) tc.t.fail(reclaim.toArtifact());
+	tc.t.assertz(true, reclaim.exhaustive());
+	tc.t.assert_eq(353649L, reclaim.represented);
+	def batched = PersistentLazyExplorer.checkAllCutsLazily(tc.recovery.trace, tc.recovery.mounted,
+		tc.recovery.BATCHED_BUDGET, tc.batched("a batched apply never invents state", false, false, false));
+	if (!batched.ok()) tc.t.fail(batched.toArtifact());
+	tc.t.assertz(true, batched.exhaustive());
+	tc.t.assert_eq(393342L, batched.represented);
+	tc.t.assertz(true, batched.leaves < batched.represented);
+}
+
+// Recovery that skips the record checksum (DualTxnWalMutants.skipRecordChecksum).
+// Over one commit into an empty slot it is harmless, and both searches say so:
+// a record validates only once every field but the checksum is durable, and
+// then it is the record that was committed. Over a slot that is reused it is
+// not: the third commit of the rewrite history writes into the first one's
+// slot, and an image whose new header and trailer are durable while its entry
+// line still holds the first transaction's entry is well formed but for its
+// checksum. Replayed after the second transaction, that stale entry puts the
+// first value back over the second, acknowledged one. The lazy search finds
+// that image, and the eager check over it gives the same detail.
+def test_lazy_unchecked_record_checksum_is_caught(tc: PersistentLazyTester) {
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	DualTxnWalMutants.skipRecordChecksum = true;
+	def lazyOne = PersistentLazyExplorer.checkAllCutsLazily(tc.recovery.trace, tc.recovery.mounted, 0,
+		tc.noInventedState());
+	def eagerOne = PersistentExplorer.checkAllCuts(tc.recovery.trace, tc.recovery.mounted, 0,
+		tc.noInventedState().eager());
+	DualTxnWalMutants.skipRecordChecksum = false;
+	tc.t.assertz(true, lazyOne.exhaustive());
+	tc.t.assertz(true, eagerOne.exhaustive());
+
+	if (!tc.recordRewrite()) {
+		tc.t.fail("could not record the rewrite history");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	def property = tc.rewriteProperty();
+	// Correct recovery keeps the contract over every image of every cut.
+	def control = PersistentLazyExplorer.checkCutRangeLazily(tr, tc.recovery.mounted,
+		tc.rewriteThirdStart, tr.length(), tc.EXHAUSTIVE, property);
+	if (!control.ok()) tc.t.fail(control.toArtifact());
+	tc.t.assertz(true, control.exhaustive());
+
+	DualTxnWalMutants.skipRecordChecksum = true;
+	def lazy = PersistentLazyExplorer.checkCutRangeLazily(tr, tc.recovery.mounted,
+		tc.rewriteThirdStart, tr.length(), tc.EXHAUSTIVE, property);
+	DualTxnWalMutants.skipRecordChecksum = false;
+	tc.t.assertz(false, lazy.ok());
+	tc.t.assertz(true, lazy.nondeterminism == null);
+	tc.t.assertz(true, lazy.confirmed);
+	def cx = lazy.counterexample;
+	if (cx == null) return;
+	tc.t.asserti(1, tc.recovery.countOf(cx.detail, "acknowledged after-image absent after recovery"));
+	tc.t.asserti(1, tc.recovery.countOf(cx.selectionNote(), "eager re-check: same detail"));
+	// Stage A's search over the same cut fails too, and under the mutant the
+	// counterexample's image recovers the stale value; with the checksum
+	// compared it recovers the acknowledged one.
+	DualTxnWalMutants.skipRecordChecksum = true;
+	def eager = PersistentExplorer.checkImages(tr, tc.recovery.mounted, cx.crashAfter, tc.EXHAUSTIVE,
+		property.eager());
+	def run = PersistentRecoveries.runDualWal(cx.durableImage(), tc.recovery.LOG_OFFSET, tc.recovery.LOG_SIZE);
+	DualTxnWalMutants.skipRecordChecksum = false;
+	tc.t.assertz(false, eager.ok());
+	tc.t.assert_eq(tc.recovery.VALUE, run.recovered.read(tc.recovery.OFFSET, 8));
+	def fixed = PersistentRecoveries.runDualWal(cx.durableImage(), tc.recovery.LOG_OFFSET, tc.recovery.LOG_SIZE);
+	tc.t.assert_eq(tc.recovery.VALUE_B, fixed.recovered.read(tc.recovery.OFFSET, 8));
+}
+
+// An ordering bug: a commit that leaves its record's last line out of the
+// commit-point fence (DualTxnWalMutants.recordLastLineUnflushed, set only while
+// recording). The commit is acknowledged, yet the lazy image at the commit point
+// lacks the trailer's tail, so recovery finds no record and the acknowledged
+// after-image is gone. With the flag clear the same check passes.
+def test_lazy_unflushed_record_line_is_caught(tc: PersistentLazyTester) {
+	DualTxnWalMutants.recordLastLineUnflushed = true;
+	def recorded = tc.recovery.recordCommit();
+	DualTxnWalMutants.recordLastLineUnflushed = false;
+	if (!recorded) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def tr = tc.recovery.trace;
+	def r = PersistentLazyExplorer.checkImagesLazily(tr, tc.recovery.mounted, tr.length(), 0, tc.survives());
+	tc.t.assertz(false, r.ok());
+	tc.t.assertz(true, r.confirmed);
+	def cx = r.counterexample;
+	if (cx == null) return;
+	tc.t.asserti(1, tc.recovery.countOf(cx.detail, "acknowledged after-image absent after recovery: recovery=CLEAN"));
+	tc.t.asserti(tr.length(), cx.crashAfter);
+	// The eager check over the same cut agrees.
+	def eager = PersistentExplorer.checkImages(tr, tc.recovery.mounted, tr.length(), 0, tc.survives().eager());
+	tc.t.assertz(false, eager.ok());
+
+	if (!tc.recovery.recordCommit()) {
+		tc.t.fail("could not record a production WAL commit");
+		return;
+	}
+	def ok = PersistentLazyExplorer.checkImagesLazily(tc.recovery.trace, tc.recovery.mounted,
+		tc.recovery.trace.length(), 0, tc.survives());
+	tc.t.assertz(true, ok.exhaustive());
+}
