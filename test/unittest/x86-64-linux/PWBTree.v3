@@ -282,13 +282,13 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (h < 1 || h > PWBTreeConst.MAX_HEIGHT) return false;
 
                 // Descend, remembering the path and the child slot at each level.
-                var node = rootGet(TreeRoot.rootNode.offset);
+                var node = fetch(rootGet(TreeRoot.rootNode.offset));
                 for (d < h) {
                         pathNodes[d] = node;
                         if (d < h - 1) {
                                 def j = childSlot(node, key);
                                 pathSlots[d] = j;
-                                node = innerChild(node, j);
+                                node = fetch(innerChild(node, j));
                         }
                 }
                 def leaf = pathNodes[h - 1];
@@ -535,8 +535,8 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         def get(key: u64) -> (bool, u64) {
                 if (rootOffset == 0) return (false, 0);
                 def h = int.!(rootGet(TreeRoot.height.offset));
-                var node = rootGet(TreeRoot.rootNode.offset);
-                for (d = 0; d < h - 1; d++) node = innerChild(node, childSlot(node, key));
+                var node = fetch(rootGet(TreeRoot.rootNode.offset));
+                for (d = 0; d < h - 1; d++) node = fetch(innerChild(node, childSlot(node, key)));
                 def c = int.!(nodeKeys(node));
                 def pos = leafLowerBound(node, c, key);
                 var result = (false, 0u64);
@@ -589,7 +589,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (node == 0 || node >= regionBytes || node % region.blockSize != 0) {
                         return "a node offset is outside the region or not block aligned";
                 }
-                def tag = nodeTag(node);
+                def tag = nodeTag(fetch(node));
                 if ((tag & PWBTreeConst.MAGIC_MASK) != PWBTreeConst.NODE_MAGIC) return "node magic wrong";
                 if ((tag & PWBTreeConst.LEVEL_MASK) != u64.!(level)) {
                         return "a node's level does not match its depth: the leaves are not all at the tree's height";
@@ -645,7 +645,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         // The words node {offset} holds from its tag on: 2 + 2 * count for a
         // leaf, 3 + 2 * count for an internal node.
         def nodeWords(offset: u64) -> int {
-                def c = int.!(nodeKeys(offset));
+                def c = int.!(nodeKeys(fetch(offset)));
                 return if((nodeTag(offset) & PWBTreeConst.LEVEL_MASK) == 0, 2 + 2 * c, 3 + 2 * c);
         }
 
@@ -758,8 +758,21 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 return region.regionStart + offset + u64.!(ChunkHeader.size);
         }
 
+        // Each place that reaches a node (the descents of put() and get(),
+        // nodeError(), which both walks call before anything else is read
+        // from a node, and nodeWords()) fetches it: observes the node's whole
+        // payload through the reader, once, as the forge helpers observe a
+        // layout. Its words are then loaded raw, any number of times, as
+        // PersistentLoadObserver allows. The whole payload, because the word
+        // count is itself read from the node; on a node nodeError() accepts,
+        // every word read lies within it.
+        private def fetch(offset: u64) -> u64 {
+                reader.observe(nodeAddr(offset), u64.!(maxWords) * 8u64);
+                return offset;
+        }
+
         private def word(offset: u64, w: int) -> u64 {
-                return reader.loadU64(nodeAddr(offset) + u64.!(w) * 8u64);
+                return PWRegionUtils.pointerFromU64(nodeAddr(offset) + u64.!(w) * 8u64).load<u64>();
         }
 
         private def nodeTag(offset: u64) -> u64 { return word(offset, 0); }

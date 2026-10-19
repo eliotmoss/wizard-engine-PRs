@@ -314,7 +314,11 @@ the same `Pointer.load`. What changed is who issues it.
   miss path), and the checksum loop, which observes the two ranges on either
   side of the checksum field it skips. `PersistentAllocatorInvariants` walks
   through `region.reader()`. The workloads: `PWSieve` observes a bitmap before
-  its byte loop, and `PWBTree` reads every node word through its reader.
+  its byte loop, and `PWBTree` fetches each node it reaches (in the descents
+  of `put()` and `get()`, in `nodeError()`, which both walks call before
+  anything else is read from a node, and in `nodeWords()`): it observes the
+  node's whole payload once, as a `forge*` helper observes a layout, and then
+  loads its words directly.
   Every `Ref` forged over region memory on the active path comes from a
   reader's `forge*`.
 - **What stays raw, deliberately.** `PersistentImageMount.freeze()` and the
@@ -377,38 +381,65 @@ The audit has four parts, in `PersistentOperationsTest.v3`:
 
 Neither half alone would do. The structural test names fields, so a load it
 does not name can escape; the inert test catches an escape only if the bytes
-behind it change what the run does on these scenarios. Six planted escapes
+behind it change what the run does on these scenarios, and only if nothing
+else in the run observed those bytes, at any point. Eight planted escapes
 were each caught: a raw `getUsed()`, an unobserved checksum loop and a raw
 record-field load by the field audit and all three inert-bytes audits; a raw
 cache-miss read by the field audit and the sieve's and the B+Tree's (the
-allocator's walk never misses the transaction's cache); and an unobserved
-sieve bitmap and a raw B+Tree node word by their own workload's inert-bytes
-audit, the only one that runs that code.
+allocator's walk never misses the transaction's cache); an unobserved sieve
+bitmap by the sieve's inert-bytes audit, the only one that runs that code;
+and a B+Tree walk whose fetch skips the observation, and a fetch that
+observes only a node's tag and key count, by the B+Tree's. Not caught: a
+lookup's or a put's descent that skips its fetch, because `open()` has
+observed every node before either descent runs.
 
 **What the reader does not do yet.** Nothing prunes by loads: the explorer
 still enumerates images without consulting what recovery reads, and the lazy
 search that would is planned, not implemented. Observation is
-coarser than a load in three places, which can only make such a search branch
+coarser than a load in four places, which can only make such a search branch
 more, never miss a dependence: `getHeader()` observes all 88 bytes, a forged
-layout all of its bytes, and a checksum loop all of its record but the
-checksum field.
+layout all of its bytes, a B+Tree fetch the node's whole payload whatever
+words are then read, and a checksum loop all of its record but the checksum
+field. The inert-bytes audits show that every byte loaded was observed at
+some point in the run, not that it was observed before it was loaded. That
+order is tested for the reader itself (`load_observer_runs_before_the_load`);
+elsewhere it rests on the code's shape: the reader's loads and `forge*`
+helpers observe first, a byte loop is observed before it starts, and a B+Tree
+fetch returns the node only after observing it.
 
 **Cost.** In production a load through the reader is a call, a read of the
-provider's `loadObserver` and a branch that is never taken. On sean-tan-PC
-(2026-10-19, file backend on tmpfs, so that `fdatasync` costs almost nothing
-and the CPU path dominates; CPU 2, `powersave`; 11 interleaved runs per
-build) the sieve step was unchanged (161.9 µs, −0.02 %); mounts and recoveries
-were 7.5–25 % faster (*inference:* `mount()` no longer copies the header into
-a heap array twice); and an allocation or free was 3.0–3.8 % (110–160 ns)
-slower, a B+Tree mutation 2.1–2.6 % (340–430 ns) and a lookup 3.7 % (7 ns),
-each outside the run-to-run spread. The B+Tree's cost is the reader call on
-each node word: with only `PWBTree`'s node reads raw again, every figure is at
-or below the old one. The allocator's is not the loads': a build with every
-load through the reader but without the checksum loop's two `observe()` calls
-measured from 0.2 % slower to 1.8 % faster than the old code, and one with
-those two calls moved into the checksum's callers 5.9–6.6 % slower. Two calls per commit cannot cost 130–290 ns themselves;
-*inference:* code placement moves an allocation here by more than the seam
-does. Magpie's DAX mount is not yet measured.
+provider's `loadObserver` and a branch that is never taken, and a B+Tree node
+costs one such call when it is fetched. On sean-tan-PC (2026-10-19, file
+backend on tmpfs, so that `fdatasync` costs almost nothing and the CPU path
+dominates; `powersave`; 21 interleaved runs per build, pinned to CPU 2, a
+performance core, and then to CPU 20, an efficiency core):
+
+- The sieve step was unchanged on CPU 2 (162.2 µs, −0.02 %) and 1.2 % slower
+  on CPU 20, where the wall-clock time per step stayed within the spread.
+- Mounts and recoveries were 2–11 % faster on both cores, the recoveries on
+  CPU 2 within the spread (*inference:* `mount()` no longer copies the header
+  into a heap array twice).
+- A B+Tree mutation was 0.6–0.7 % faster on CPU 2 and 2.3–2.5 % slower on
+  CPU 20; a lookup stayed within the spread on both. A reader call on each node
+  word had cost a lookup 3.7 % and a mutation 2.1–2.6 % on CPU 2, which is why
+  a node is observed once, when it is fetched.
+- An allocation or free was 2.9–3.5 % (100–155 ns) slower on CPU 2. On CPU 20 a
+  one-block allocation or free was 8.2–8.5 % *faster*, and the larger ones were
+  within the spread.
+
+*Inference:* code placement, not the seam, sets the allocator's difference.
+Adding one statement that never runs to the top of `PWRegion.deallocate()`,
+which moves all the code placed after it, made the old code's one-block
+allocation 5.7 % faster on CPU 2; adding two made it 1.9 % slower. With the
+same additions, the branch was 4.7 % and 0.5 % slower than the old code.
+Builds of the branch that drop the checksum loop's two `observe()` calls, or
+that replace `DualTxnWal`'s reader calls with an inline check of the observer,
+measured within 2 % of the old code on both cores. Two calls per commit cannot
+cost 100–155 ns. Virgil's `#inline` hint on the reader's methods changes
+nothing: the build with it is byte-identical, since `build.sh` does not turn on
+v3c's early inliner (`-O3` or `-inline`). The variants and their runs are kept outside the
+repository (`thesis-reviews/2026-10-19/stage-b/variants2`). Magpie's DAX mount
+is not yet measured.
 
 ---
 
