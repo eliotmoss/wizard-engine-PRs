@@ -504,7 +504,7 @@ def test_immix_reset_all_line_marks(tc: ImmixPWRegionTester) {
 	def prefix = PWRegionUtils.pointerFromU64(tc.region.regionStart + lineDesc.offset);
 	for (i < int.!(lineDesc.fixedBytes)) (prefix + i).store<u8>(0xa5u8);
 	for (i < tc.region.numLineMarks) {
-		tc.region.lineMarks[i].setMark(ImmixPWRegions.LINE_MARKED);
+		tc.region.lineMarks[i].setMark(tc.region.lineMarkWriter(), ImmixPWRegions.LINE_MARKED);
 	}
 
 	tc.region.resetAllLineMarks();
@@ -518,14 +518,15 @@ def test_immix_reset_all_line_marks(tc: ImmixPWRegionTester) {
 }
 
 // Line marks are transient tracing state, not allocator consistency metadata.
-// Mark/reset therefore stays outside RegionTransaction and all persistence APIs.
+// Mark/reset therefore stays outside RegionTransaction and every persistence
+// boundary: its stores cross the seam, but it prepares and persists nothing.
 def test_immix_line_marks_bypass_wal(tc: ImmixPWRegionTester) {
 	def tracked = tc.backend.region;
 	def prepareCount = tracked.prepareChangedRangeCount;
 	def persistRangeCount = tracked.persistRangeCount;
 	def persistChangesCount = tracked.persistChangesCount;
 
-	tc.region.lineMarks[3u64].setMark(ImmixPWRegions.LINE_MARKED);
+	tc.region.lineMarks[3u64].setMark(tc.region.lineMarkWriter(), ImmixPWRegions.LINE_MARKED);
 	tc.region.resetAllLineMarks();
 
 	tc.t.assertz(false, tc.region.txn.isDirty());

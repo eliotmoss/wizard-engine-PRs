@@ -16,7 +16,7 @@ def POTX = [
 	POT("pwregion_format_descriptor_trace", test_persistent_pwregion_format_descriptor_trace),
 	POT("pwregion_alloc_applies_after_commit_boundary", test_persistent_pwregion_alloc_applies_after_commit_boundary),
 	POT("pwregion_txn_writes_each_line_back_once", test_persistent_pwregion_txn_writes_each_line_back_once),
-	POT("immix_line_marks_emit_no_events", test_persistent_immix_line_marks_emit_no_events),
+	POT("immix_line_marks_cross_the_seam", test_persistent_immix_line_marks_cross_the_seam),
 	()
 ];
 
@@ -786,11 +786,12 @@ def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentO
 	region.deallocate();
 }
 
-// Immix line marks are deliberately transient: they bypass the WAL and the
-// persistence boundaries, so they must not appear in a persistence trace at
-// all. After the store audit they are the only remaining direct stores in the
-// allocator, so this documents that end state as intentional.
-def test_persistent_immix_line_marks_emit_no_events(tc: PersistentOperationsTester) {
+// Immix line marks are deliberately transient: they bypass the WAL, and no
+// writeback or fence is issued for them. Their stores still cross the seam like
+// every other store the allocator makes, so a trace records each one as a 1-byte
+// store at the mark's region-relative offset, and nothing else. The offsets
+// are derived from the on-region descriptor, not from the handle's own code.
+def test_persistent_immix_line_marks_cross_the_seam(tc: PersistentOperationsTester) {
 	def backend = TracePWRegionBackend.new();
 	def region = ImmixPWRegion.new(backend, TracePWRegions.BLOCKS, tc.lineDescs(),
 		TracePWRegions.BLOCK_SIZE, true);
@@ -799,11 +800,34 @@ def test_persistent_immix_line_marks_emit_no_events(tc: PersistentOperationsTest
 		return;
 	}
 	tc.t.assertz(true, region.backendRegion != null);
+	def desc = region.getMetaDataDesc(0u64);
+	def firstMark = desc.offset + u64.!(desc.fixedBytes);
+	def marks = TracePWRegions.SIZE / u64.!(ImmixPWRegions.DefaultImmixLineSize);
+	tc.t.assert_eq(marks, region.numLineMarks);
 	def recorder = backend.recorder();
 	recorder.clear();
 
+	// One mark set: one store, and the mark reads back through the forged ref.
+	def mark = region.lineMarks[3u64];
+	mark.setMark(region.lineMarkWriter(), ImmixPWRegions.LINE_MARKED);
+	tc.t.assert_eq(1, recorder.events.length);
+	tc.assertStore(recorder.events[0], 1u64, firstMark + 3u64 * u64.!(LineMark.size),
+		1u8, u64.!(ImmixPWRegions.LINE_MARKED));
+	tc.t.assert_eq(ImmixPWRegions.LINE_MARKED, mark.getMark());
+
+	// A reset: one store per mark, in table order, each a STORE event, so
+	// none is a writeback or a fence.
+	recorder.clear();
 	region.resetAllLineMarks();
-	tc.t.assert_eq(0, recorder.events.length);
+	def events = recorder.events;
+	tc.t.assert_eq(int.!(marks), events.length);
+	for (i < events.length) {
+		tc.assertStore(events[i], u64.!(i + 1), firstMark + u64.!(i) * u64.!(LineMark.size),
+			1u8, u64.!(ImmixPWRegions.ImmixLineMarkResetValue));
+	}
+	tc.assertSequences(events);
+	tc.assertStoreContract(events, TracePWRegions.SIZE);
+	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkResetValue, mark.getMark());
 	region.deallocate();
 }
 

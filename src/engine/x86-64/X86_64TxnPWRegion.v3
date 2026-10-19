@@ -338,8 +338,8 @@ type LineMarkHandle(addr: u64) #unboxed {
                 return getRef().mark;
         }
 
-        def setMark(v: u8) {
-                getRef().mark = v;
+        def setMark(w: DirectRegionWriter, v: u8) {
+                w.writeU8(addr + u64.view(LineMark.mark.offset), v);
         }
 }
 
@@ -356,8 +356,10 @@ type CachedUpdate(value: u64, size: u8) #unboxed { }
 // Direct, non-transactional writes to the persistent image through the traced
 // PersistentOperations seam. Legal only where no WAL transaction protects the
 // bytes: format() builds the whole region before the WAL exists, persists it,
-// and only then stores and persists the magic that publishes it. Steady-state
-// allocator mutations must use RegionTransaction (the *Cached setters) instead.
+// and only then stores and persists the magic that publishes it; ImmixPWRegion's
+// line marks are transient GC state, for which no writeback or fence is issued.
+// Steady-state allocator mutations must use RegionTransaction (the *Cached
+// setters) instead.
 //
 // The method names deliberately mirror RegionTransaction's write* family so a
 // direct setter and its *Cached twin read as line-for-line counterparts, and
@@ -371,7 +373,7 @@ class DirectRegionWriter {
 
         new(ops, regionStart) { }
 
-        // Write BlockEntry.used (u1/bool stored as u8)
+        // Write BlockEntry.used (u1/bool stored as u8), LineMark.mark
         def writeU8(addr: u64, val: u8) {
                 ops.storeU8(addr - regionStart, val);
         }
@@ -1217,11 +1219,20 @@ class ImmixPWRegion extends PWRegion {
                 chunk.setLinemarksCached(txn, lineMarks[lineIndex].addr - regionStart);
         }
 
+        // The region's non-transactional writer, exposed for line marks only:
+        // setMark() takes it explicitly, like the other direct setters, so a
+        // store that bypasses the WAL stays visible at the call site.
+        def lineMarkWriter() -> DirectRegionWriter {
+                return writer;
+        }
+
         def resetAllLineMarks() {
                 // Line marks are transient GC state. They deliberately bypass the
                 // allocator transaction/WAL and must be rebuilt after a crash.
+                // Their stores cross the persistence seam like every other
+                // allocator store, but no writeback or fence is issued for them.
                 for (index < numLineMarks) {
-                        lineMarks[index].getRef().mark = ImmixPWRegions.ImmixLineMarkResetValue;
+                        lineMarks[index].setMark(writer, ImmixPWRegions.ImmixLineMarkResetValue);
                 }
         }
 }
