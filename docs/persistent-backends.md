@@ -58,6 +58,26 @@ completes every outstanding CLWB. Two consequences:
 - Because the dirty marking lives in the provider, the elided-writeback mutant
   works unchanged: its no-op `clwb()` leaves nothing to write back.
 
+**Audit (2026-10-19).** A text search of the allocator and the log,
+`X86_64TxnPWRegion.v3` and `X86_64DualTxnWal.v3`, at `afcf5525` and again at
+`fc7466a3` (after the change to `format()` below), with comments set aside.
+Neither file has a type test (`.?`) or a cast to a backend or region class, or
+names a backend or region class other than the abstract `BackendRegion` and
+`TxnRegionBackend`. Of the medium words searched for (pmem, dax, mmap, msync,
+fdatasync, direct, and also fsync, clwb, sfence, file and volatile), only
+"direct" occurs, in the name of `DirectRegionWriter`, the allocator's
+non-transactional writer. `backendRegion` is used only through
+`prepareChangedRange`, `persistChanges`, `persistRange`, `range` and `destroy`,
+besides null checks and being handed to `X86_64PersistentOps.ensureFor()` and
+`DualTxnWal`; the region itself comes from `TxnRegionBackend.create()`. The
+backend is chosen outside both files: by `X86_64Backends`
+(`X86_64TxnBackend.v3`) and `Backends` (`TxnBackend.v3`), through the wrappers
+in `X86_64PWRegion.v3`, or by a caller that passes its own `TxnRegionBackend`.
+The change to `format()` adds one `backendRegion` call, a second
+`persistRange()`, for the magic. This is a search of the two files' text, not a
+proof: it does not follow the calls into the providers and regions, where the
+backends differ by design.
+
 **Safeguards.** Setting `O_DIRECT` proves little, so `create()` checks behaviour:
 a misaligned one-byte `pwrite` must fail with `EINVAL`. That refuses tmpfs (which
 accepts `O_DIRECT` and buffers anyway from kernel 6.6), ext4 with `data=journal`,
@@ -3493,12 +3513,14 @@ PWRegion.__new(backend, numBlocks, metaDataDescs, blockSize, forceFormat)
   else                       → mount(blockSize)
 
 format(blockSize)
-  write PWRegionHeader (incl. logChunk offset)
+  write PWRegionHeader (incl. logChunk offset), all but the magic
   create SMALL_FREE and LARGE_FREE sentinels
   allocate block table in metadata area
   link all user blocks in memory order
   insert all user blocks onto LARGE_FREE list
-  backendRegion.persistRange(0, full_size)   -- single durable write to initialise
+  backendRegion.persistRange(0, full_size)   -- everything but the magic
+  store the magic
+  backendRegion.persistRange(magic, 8)       -- then the magic's line alone
 
 mount(blockSize)
   verify blockSize and numBlocks match header
@@ -3507,6 +3529,28 @@ mount(blockSize)
   init DualTxnWal + RegionTransaction
   txn.recover()                              -- replay committed WAL if present
 ```
+
+**The magic is published last (2026-10-19).** `mount()` trusts any header that
+carries the magic, so the magic must not become durable before what it vouches
+for. Until 2026-10-19 `format()` stored the magic last and made the whole
+region durable with one `persistRange()`; under the crash model a line can
+become durable before lines stored ahead of it, so a crash inside that persist
+could leave the magic durable beside a block table that was not, and a later
+open would mount it. `format()` now persists everything else first, then
+stores the magic and persists its line under a fence of its own: one more fence
+per format, four in all with the log's two. `persistent_alloc:` records
+`format()` (598 events over 16 lines, at 8 blocks of 2 KiB) and opens every
+crash image as production does, mounting it if it carries the magic and
+reformatting it if not; every image must open into an allocator that passes the
+invariant walk. From the magic's store on, every other line is at its floor
+(`format_publishes_the_magic_last`, from the trace, for every image at every
+cut), so the 3 cuts from there on are checked exhaustively, 5 images. The 596
+cuts before it permit up to about 2^61 images each and are bounded at 8 images
+a cut, 4,254 in all (`crash_during_format_opens_consistent`). The negative
+control, `early_magic_is_caught`, moves the magic back into the old order (a
+trace whose digest equals the one `afcf5525` records) and must fail both
+checks at the magic's cut, 339 of 596; against `afcf5525`'s own `format()` the
+sweep fails at that cut.
 
 ### Handle types (unboxed)
 
@@ -3604,7 +3648,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
 | `PWBTreeTest.v3` | 22 | the persistent B+Tree workload (2026-10-14), over regions in anonymous mappings rather than the volatile backend, whose heap array Virgil's copying collector moves under PWRegion's raw addresses (a collection during a test aborted the full binary on 2026-10-14; `pwsieve:` and the `pwregion:` groups still use that backend): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, a full region failing cleanly, three forced collections between mutations, and a corrupted or cyclic image refused rather than walked: a node that is its own child, one at the wrong level and impossible heights by `open()` and `forEach()`; a published root offset whose sum with the block size wraps past zero by `open()`; and a node reached twice by `open()` and by `compare()`, whose keys from `forEach()` must strictly increase, even when the repeated leaf is the size of the one it displaced; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
 | `PWOpsTest.v3` | 6 | the basic-operation benchmark's expectations on the production PMEM boundary path: exact `CLWB`/`SFENCE` counts per allocation and free against the record, the steady state alternating them returns to, no event for an empty commit, no boundary for a clean mount, and one line per replayed entry under one fence for a recovery |
-| `PersistentSieveTest.v3` | 6 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check |
+| `PersistentSieveTest.v3` | 7 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step, and a damaged-bitmap self-check; since 2026-10-19 its images are mounted in an anonymous mapping, not a heap array the collector can move, and a forced collection under a mounted image leaves it in place |
 | `FileMmapRegionTest.v3` | 6 | the file backend as a restriction of the PMEM model (2026-10-13): trace identity with the PMEM backend, every page written back before a fence covered by that fence's syncs, the file after every sync admitted by the model exactly (eager and marked-only images), an `O_DIRECT` re-read of every synced range, no sync under the elided-writeback mutant, and the legacy boundary unchanged; at 2 KiB and 4 KiB blocks, with the `fdatasync` and `msync` fences |
 
 The trace recorder deliberately has no durable image, background eviction,
@@ -3650,7 +3694,8 @@ preparation after it. The same seam injects one real `EBADF` result through
 blocks same-mount retry/flush, and replays the complete page-cache record after
 remount. The same seam records which pages each `fdatasync` was asked to make
 durable: fresh format issues two WAL initialization fences, each marking the
-log's one page, before the whole-region publication, while clean close
+log's one page, before the whole-region publication, and since 2026-10-19 a
+fourth, after it, marking the header's page alone for the magic, while clean close
 completes the final-data `fdatasync` before an injected failing slot-scrub
 `fdatasync` marking the log page alone. The latter latches its old WAL instance
 and remount preserves the allocated structure. These tests do not yet

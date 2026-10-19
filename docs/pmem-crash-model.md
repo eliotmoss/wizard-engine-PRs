@@ -225,8 +225,10 @@ instead of entering a trace.
 The seam now covers the whole active path. `PWRegion.format()` writes the region
 header, sentinels, block table, and metadata descriptors through a
 `DirectRegionWriter` — a non-transactional writer over the same provider —
-before its whole-region `persistRange`, and the non-cached `BlockEntryHandle`
-and `ChunkHandle` setters take that writer as an explicit parameter. The
+before its whole-region `persistRange` (since 2026-10-19 all but the magic,
+which it stores after that persist and persists under a fence of its own), and
+the non-cached `BlockEntryHandle` and `ChunkHandle` setters take that writer as
+an explicit parameter. The
 provider is resolved once in the `PWRegion` constructor via
 `X86_64PersistentOps.ensureFor()`, which installs the production provider on
 regions that lack one (notably `VolatileRegion`) so that one object serves the
@@ -616,13 +618,32 @@ outcomes and invariants for many of these scenarios.
 
 ### Which container an image is mounted in
 
-`PersistentImageMounts` offers two, and the choice is a modelling decision
-rather than an implementation detail:
+`PersistentImageMounts` offers two, and the tests a third; the choice is a
+modelling decision rather than an implementation detail:
 
 | Mount | Container | Boundaries | Use |
 |---|---|---|---|
-| `openArray()` | byte array | succeed without reaching the writeback/fence hooks | only recovery's effect on the bytes matters; costs no syscalls, which is what makes a sweep over thousands of images affordable |
+| `openArray()` | byte array on Virgil's heap, which the collector moves (below) | succeed without reaching the writeback/fence hooks | only recovery's effect on the bytes matters; costs no syscalls, which is what makes a sweep over thousands of images affordable |
+| `PersistentAnonMounts.openRegion()` (tests, 2026-10-19) | anonymous mapping (`PWBTreeAnonRegion` behind `PreparedRegionBackend`), which does not move | succeed without reaching the writeback/fence hooks | as `openArray()`, where the mounted code allocates; costs an `mmap` and a `munmap` per image |
 | `openMapped(record)` | `PmemMmapRegion` | translate into cache-line writebacks and fences on the region's provider | the mounted run must itself be modelled; with `record` set, its stores, `CLWB`s and fences are captured as a trace |
+
+**The array moves (2026-10-19).** `openArray()`'s byte array is an ordinary
+heap object, and Virgil's semispace collector moves it, while `PWRegion` and
+`DualTxnWal` keep the region's start as a raw address. A collection during a
+mount leaves them reading and writing the old copy. The same hazard, in the
+volatile backend's array, aborted a full test run in `pwbtree:` on 2026-10-14
+(`docs/ROADMAP.md`, `PWBTreeTest.v3`). The tree's explorer mounted its images
+in an anonymous mapping from the start, and
+since 2026-10-19 so do the sieve's (`persistent_sieve:`, and
+`persistent_control:` through the same property) and the format scenario
+(`persistent_alloc:crash_during_format_opens_consistent`). The mapping's
+boundaries are the array's, so what a check concludes is unchanged; it costs
+an `mmap` and a `munmap` per image, which took the six `persistent_sieve:`
+tests it had before (19,394 images) from 3.08 s to 3.23 s, medians of nine
+interleaved runs on sean-tan-PC. `persistent_sieve:mounted_image_survives_a_collection`
+forces a collection under a mounted image, and fails on the array. Still on
+heap arrays: `PersistentImageBackend`, so `PersistentAllocatorProperty` and the
+other `persistent_alloc:` sweeps, and `InjectedFailureRegion`, below.
 
 The array mount is sound for a recovery whose *result* is being checked: the
 simulator, not the backend, already decided which bytes survived the crash, and
