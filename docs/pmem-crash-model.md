@@ -699,13 +699,14 @@ block alone at its last content and the cut's six other changeable lines at
 their floor. Its mount reports `used block is linked into a free list (block
 2)`. With the checksum compared, that image recovers into a consistent sieve,
 and the sweep passes over cuts 0 to 385. The catch depends on the budget. On
-2026-10-19 the same sweep passed at 2, 3 and 4 images per cut, and 4 is the
-sieve tests' own budget; it failed at cut 660 at 6 and 8, at cut 385 at 10 and
+2026-10-19 the same sweep passed at 2, 3 and 4 images per cut, and 4 was the
+sieve tests' own budget until 2026-10-20; it failed at cut 660 at 6 and 8, at cut 385 at 10 and
 12, and at cut 289 at 16 and 64. The prefix odometer, run on 2026-10-20 on the
 pre-change explorer with the same flag, passed at 4, 12, 64 and 256 vectors per cut,
 checking 5,776, 14,927, 36,605 and 126,076 distinct images. The selection
 therefore reaches an image the odometer did not, but at the budget the sieve
-tests use it does not catch this mutant either.
+tests then used it did not catch this mutant either (for the budget since, see
+the next paragraph).
 
 **What each budget catches, and what it costs (2026-10-20).** Apart from the
 checksum skip's 12, the budgets were set in their tests with no recorded
@@ -756,6 +757,14 @@ is that image's place in the selection's fixed order (the control's fifteenth
 at cut 708, the early magic's third at cut 339), and a change to the order
 moves it. These are six planted bugs, one or two per scenario, and a budget
 that catches them is not shown to catch any other bug.
+
+Since 2026-10-20 the sieve's ordinary sweeps run at 16 images per cut, the
+smallest of the budgets measured at which a step's sweep catches both of the
+sieve's planted bugs; at 4 it caught neither. The ordinary step's sweep checks
+22,659 images, the retiring step's 30,740. The record-checksum test keeps its
+12, which pins the catch at cut 385; at 16 the suite's seed fails at cut 289.
+The other budgets already sit at or above their scenarios' smallest catching
+budget and are unchanged.
 
 This is also where the model's shape becomes visible. A completed fence removes
 freedom: after the WAL's commit boundary the record is durable on every

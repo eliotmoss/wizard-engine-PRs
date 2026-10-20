@@ -48,9 +48,15 @@ class PersistentSieveTester(t: Tester) {
 	def BLOCKS = 8u64;
 	def BLOCK_SIZE = 2048u64;
 	def LIVE = 2u64;
-	// Small: every cut of a ~200-event trace is swept, so the per-cut image
-	// count has to stay affordable. Truncation is reported, never assumed away.
-	def BUDGET = 4;
+	// Every cut of a step is swept (1,457 for an ordinary step), so the per-cut
+	// image count has to stay affordable. 16 is the smallest measured budget at
+	// which a step's sweep catches both planted sieve bugs, the elided-writeback
+	// control (from 15) and the skipped record checksum (from 6); at 4, the
+	// budget until 2026-10-20, it caught neither. The ordinary step's sweep takes
+	// 1.23 s at 16 against 0.50 s at 4
+	// (results/20261020T010508Z-sean-tan-PC-budget-sensitivity). Truncation is
+	// reported, never assumed away.
+	def BUDGET = 16;
 
 	var mounted: Array<byte>;       // durable bytes before the recorded scenario
 	var region: PWRegion;
@@ -351,11 +357,12 @@ def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
 // changeable lines, at offset 3456 in the WAL's log block, holds its last
 // content and every other line its floor, the ninth image the selection takes.
 // The prefix odometer missed the mutant at 4, 12, 64 and 256 vectors per cut
-// (measured 2026-10-20 on the explorer before the line classes). The selection reaches the image only once
-// the budget covers enough of a cut's extremes, which BUDGET's 4 does not:
-// measured on 2026-10-19, this sweep passes at budgets 2 to 4, fails at cut
-// 660 at 6 and 8, and at cut 385 at 10 and 12. Hence 12, two above the
-// smallest budget that catches it at cut 385.
+// (measured 2026-10-20 on the explorer before the line classes). The selection
+// reaches the image only once the budget covers enough of a cut's extremes,
+// which 4, BUDGET until 2026-10-20, does not: measured on 2026-10-19, this
+// sweep passes at budgets 2 to 4, fails at cut 660 at 6 and 8, and at cut 385
+// at 10 and 12. Hence 12, two above the smallest budget that catches it at cut
+// 385. At BUDGET's 16 the suite's seed catches it earlier, at cut 289.
 def test_psieve_unchecked_record_checksum_is_caught(tc: PersistentSieveTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");

@@ -558,8 +558,9 @@ does. These are permanent tests:
   and
 - since 2026-10-19, it catches a recovery that skips the record checksum and so
   replays a torn record, on the sieve step at cut 385, at 12 images per cut.
-  At the sieve tests' own 4 per cut it does not, and neither did the old
-  prefix odometer at up to 256 vectors per cut; and
+  At 4 per cut, the sieve tests' budget until 2026-10-20, it does not, and
+  neither did the old prefix odometer at up to 256 vectors per cut; at their
+  16 since then, a sweep with the flag set fails at cut 289; and
 - since 2026-10-20, the lazy search catches the same mutant over a WAL
   history whose third commit reuses the slot of a transaction whose
   after-image the second rewrote, at cut 640, confirmed by the eager check
@@ -593,13 +594,19 @@ Chapter 6 should state coverage in these terms and no stronger:
   with the rest at their last; then images drawn at random, without
   replacement, with a seed derived from the trace and the cut and recorded in
   the result (see [PMEM Crash Model](pmem-crash-model.md#enumerating-schedules)).
-  The budgets are 4 per cut for the sieve and the B+-tree, 3 to 8 for the
-  allocator scenarios, 8 for the format scenario, and 64 for the negative
-  control. Until 2026-10-19 they counted per-line prefix vectors in an odometer
+  The budgets are 16 per cut for the sieve (4 until 2026-10-20), 4 for the
+  B+-tree, 3 to 8 for the allocator scenarios, 8 for the format scenario, and
+  64 for the negative control. Where a scenario has planted bugs, its budget
+  is at least the smallest that catches them all: 15 for the sieve, 1 for the
+  B+-tree, 2 for the split allocation and 3 for the format; the other
+  allocator scenarios have none (see [PMEM Crash
+  Model](pmem-crash-model.md#enumerating-schedules), "What each budget
+  catches, and what it costs"). Until 2026-10-19 they counted per-line prefix vectors in an odometer
   that varied the lowest-addressed line first, and many vectors repeated an
   image, so "64 for the negative control" was a step count: the ordinary step's
   sweep checked 36,605 distinct images over its 1,457 cuts. It now checks
-  85,055, and the sieve step's sweep at 4 per cut checks 5,798 against 5,776.
+  85,055, and the sieve step's sweep at 4 per cut checks 5,798 against 5,776; at 16
+  per cut, since 2026-10-20, it checks 22,659.
 - **Every image, at every cut of the WAL scenarios, and at selected cuts
   elsewhere.** Since 2026-10-19 the three WAL histories are swept over every
   distinct image of every cut, and the sweeps assert `exhaustive()`: one commit
