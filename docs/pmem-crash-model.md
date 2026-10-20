@@ -1550,11 +1550,21 @@ reports `stable_writes` 0. btrfs waits whatever the device says.
 *Does each 64-byte line then still hold a prefix of its stores?* Only if B2
 holds. With one writer, x86's store order makes a line's contents at any
 instant a prefix of the stores to it, so a device that reads each line at one
-instant receives a prefix. x86 servers service a device read with one coherent
-request per 64-byte line (Intel's DDIO documentation: "Even if the I/O agent
-requests a partial cache-line read, a full cache-line is read from coherent
-memory"), which suggests B2 holds in practice for DMA straight from the page
-cache. No document promises it. The PCI Express Base Specification puts it
+instant receives a prefix. Intel documents that on its 4th and 5th Generation
+Xeon Scalable processors a device's partial read of a line fetches the whole
+line from coherent memory (Taylor and Tkachuk, "Introduction to Intel Data
+Direct I/O Technology (Intel DDIO) Analysis with Performance Monitoring",
+Intel, 2024, §3.1.1, Table 1: "Even if the I/O agent requests a partial
+cache-line read, a full cache-line is read from coherent memory"). A
+full-line coherent read returns the line as it stood at one instant, which
+suggests B2 holds in practice for DMA straight from the page cache on those
+processors. Neither host here has one: Magpie's is a Cascade Lake Xeon Gold
+6252N and sean-tan-PC's a Raptor Lake Core i7-14700KF. The article says only
+that "many of the concepts apply to previous Intel® Xeon® class processor
+generations" (§1), without saying which. Until 2026-10-20 this paragraph
+said "x86 servers service a device read with one coherent request per 64-byte
+line", which is broader than the source. No document promises B2. The PCI
+Express Base Specification puts it
 outside its scope (§2.4.2, "Update Ordering and Granularity Observed by a Read
 Transaction"): under concurrent CPU updates "the Requester may observe an
 updated value in location B and an old value in location A, regardless of the
