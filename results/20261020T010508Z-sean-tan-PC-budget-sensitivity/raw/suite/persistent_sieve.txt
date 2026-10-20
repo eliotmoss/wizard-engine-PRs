@@ -1,0 +1,17 @@
+##>8 unit tests
+##+persistent_sieve:recorded_step_is_modelable
+##-ok
+##+persistent_sieve:final_cut_is_exhaustive
+##-ok
+##+persistent_sieve:step_images_satisfy_allocator
+##-ok
+##+persistent_sieve:step_images_satisfy_sieve
+##-ok
+##+persistent_sieve:retiring_step_images_stay_consistent
+##-ok
+##+persistent_sieve:property_detects_a_damaged_image
+##-ok
+##+persistent_sieve:mounted_image_survives_a_collection
+##-ok
+##+persistent_sieve:unchecked_record_checksum_is_caught
+##-ok

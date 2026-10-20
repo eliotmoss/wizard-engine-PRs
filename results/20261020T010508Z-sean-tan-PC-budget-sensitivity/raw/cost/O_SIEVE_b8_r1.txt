@@ -1,0 +1,7 @@
+CPU 4
+##>1 unit tests
+##+budget_study:O_SIEVE_b8_s0
+TRACE case=O_SIEVE name=pwsieve_step_sieve events=1456 digest=0x0F83F5C39293C142
+ROW case=O_SIEVE kind=ordinary budget=8 salt=0 caught=0 cut=-1 events=1456 failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=- imagesChecked=11546 cuts=1457 truncatedCuts=1431 randomCuts=247 randomImages=838 maxExtremes=8 sweepUs=747239 totalUs=747441
+COVER case=O_SIEVE budget=8 salt=0 checked 11546 of >=2^62 distinct images (>=2^62 prefix states), truncated
+##-ok

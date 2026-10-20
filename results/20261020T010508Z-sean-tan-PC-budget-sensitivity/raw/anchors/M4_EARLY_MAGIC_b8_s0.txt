@@ -1,0 +1,10 @@
+CPU 6
+##>1 unit tests
+##+budget_study:M4_EARLY_MAGIC_b8_s0
+blockSize mismatch: requested 2048, stored 0
+TRACE case=M4_EARLY_MAGIC name=pwregion_format_early_magic events=596 digest=0x9BDA404D9511606F
+ROW case=M4_EARLY_MAGIC kind=mutant budget=8 salt=0 caught=1 cut=339 events=596 failIndex=3 failImages=8 failDistinct=53760 failExtremes=8 failFrom=extreme imagesChecked=3 cuts=1 truncatedCuts=1 randomCuts=0 randomImages=0 maxExtremes=8 sweepUs=298 totalUs=362
+DETAIL case=M4_EARLY_MAGIC budget=8 salt=0 an image carrying the magic was mounted, and memory-order chain does not reach the region marker
+NOTE case=M4_EARLY_MAGIC budget=8 salt=0 image 3 of 8 chosen from 53760 distinct images by budget 8: lazy, extremes, then seeded random, seed=0x31F066A86F566CDC
+COVER case=M4_EARLY_MAGIC budget=8 salt=0 checked 3 of 53760 distinct images (26790027264000 prefix states), truncated
+##-ok

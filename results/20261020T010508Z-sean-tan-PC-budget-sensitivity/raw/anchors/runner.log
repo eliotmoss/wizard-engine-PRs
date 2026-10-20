@@ -1,0 +1,32 @@
+BEGIN 2026-10-20T12:05:08 tasks=15 todo=15 cpus=0,2,4,6,8,10,12,14 bin=/home/sean-tan/.cache/budget-study-run/bin/unittest-frozen-v2
+START M1_CONTROL_ELIDED_b64_s0 cpu=0 12:05:08
+START O_CONTROL_ORDINARY_b64_s0 cpu=2 12:05:08
+START M2_CHECKSUM_SKIP_b2_s0 cpu=4 12:05:08
+START M2_CHECKSUM_SKIP_b3_s0 cpu=6 12:05:08
+START M2_CHECKSUM_SKIP_b4_s0 cpu=8 12:05:08
+START M2_CHECKSUM_SKIP_b6_s0 cpu=10 12:05:08
+START M2_CHECKSUM_SKIP_b8_s0 cpu=12 12:05:08
+START M2_CHECKSUM_SKIP_b10_s0 cpu=14 12:05:08
+END M2_CHECKSUM_SKIP_b10_s0 cpu=14 status=0 wall=0.214s user=0.171s sys=0.043s maxrss_kb=109728 12:05:09
+START M2_CHECKSUM_SKIP_b12_s0 cpu=14 12:05:09
+END M2_CHECKSUM_SKIP_b6_s0 cpu=10 status=0 wall=0.278s user=0.228s sys=0.050s maxrss_kb=151392 12:05:09
+START M2_CHECKSUM_SKIP_b16_s0 cpu=10 12:05:09
+END M2_CHECKSUM_SKIP_b8_s0 cpu=12 status=0 wall=0.333s user=0.281s sys=0.051s maxrss_kb=174240 12:05:09
+START M2_CHECKSUM_SKIP_b64_s0 cpu=12 12:05:09
+END M2_CHECKSUM_SKIP_b2_s0 cpu=4 status=0 wall=0.392s user=0.313s sys=0.079s maxrss_kb=278624 12:05:09
+START M3_BTREE_ELIDED_b4_s0 cpu=4 12:05:09
+END M2_CHECKSUM_SKIP_b3_s0 cpu=6 status=0 wall=0.454s user=0.383s sys=0.071s maxrss_kb=304384 12:05:09
+START M4_EARLY_MAGIC_b8_s0 cpu=6 12:05:09
+END M4_EARLY_MAGIC_b8_s0 cpu=6 status=0 wall=0.002s user=0.001s sys=0.001s maxrss_kb=11684 12:05:09
+START O_SIEVE_b4_s0 cpu=6 12:05:09
+END M2_CHECKSUM_SKIP_b12_s0 cpu=14 status=0 wall=0.244s user=0.195s sys=0.049s maxrss_kb=122720 12:05:09
+START O_BTREE_INSERT_b64_s0 cpu=14 12:05:09
+END M2_CHECKSUM_SKIP_b16_s0 cpu=10 status=0 wall=0.220s user=0.186s sys=0.035s maxrss_kb=108160 12:05:09
+END M2_CHECKSUM_SKIP_b4_s0 cpu=8 status=0 wall=0.520s user=0.431s sys=0.089s maxrss_kb=330144 12:05:09
+END O_SIEVE_b4_s0 cpu=6 status=0 wall=0.515s user=0.430s sys=0.084s maxrss_kb=330144 12:05:09
+END M2_CHECKSUM_SKIP_b64_s0 cpu=12 status=0 wall=0.646s user=0.536s sys=0.111s maxrss_kb=294080 12:05:09
+END M1_CONTROL_ELIDED_b64_s0 cpu=0 status=0 wall=1.878s user=1.592s sys=0.286s maxrss_kb=718848 12:05:10
+END O_CONTROL_ORDINARY_b64_s0 cpu=2 status=0 wall=3.772s user=3.363s sys=0.409s maxrss_kb=718912 12:05:12
+END M3_BTREE_ELIDED_b4_s0 cpu=4 status=0 wall=4.433s user=4.091s sys=0.342s maxrss_kb=718848 12:05:13
+END O_BTREE_INSERT_b64_s0 cpu=14 status=0 wall=49.607s user=46.680s sys=2.922s maxrss_kb=718848 12:05:59
+ALLDONE 2026-10-20T12:05:59

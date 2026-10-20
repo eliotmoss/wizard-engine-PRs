@@ -1,0 +1,7 @@
+CPU 4
+##>1 unit tests
+##+budget_study:O_SPLIT_ALLOC_b1_s0
+TRACE case=O_SPLIT_ALLOC name=pwregion_split_alloc events=736 digest=0x0199E3D137B955F1
+ROW case=O_SPLIT_ALLOC kind=ordinary budget=1 salt=0 caught=0 cut=-1 events=736 failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=- imagesChecked=737 cuts=737 truncatedCuts=94 randomCuts=0 randomImages=0 maxExtremes=1 sweepUs=133213 totalUs=133302
+COVER case=O_SPLIT_ALLOC budget=1 salt=0 checked 737 of 2263112768 distinct images (>=2^62 prefix states), truncated
+##-ok

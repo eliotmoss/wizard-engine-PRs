@@ -1,0 +1,7 @@
+CPU 6
+##>1 unit tests
+##+budget_study:M2_CHECKSUM_SKIP_b3_s0
+TRACE case=M2_CHECKSUM_SKIP name=pwsieve_step_sieve events=1456 digest=0x0F83F5C39293C142
+ROW case=M2_CHECKSUM_SKIP kind=mutant budget=3 salt=0 caught=0 cut=-1 events=1456 failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=- imagesChecked=4355 cuts=1457 truncatedCuts=1443 randomCuts=0 randomImages=0 maxExtremes=3 sweepUs=441737 totalUs=442007
+COVER case=M2_CHECKSUM_SKIP budget=3 salt=0 checked 4355 of >=2^62 distinct images (>=2^62 prefix states), truncated
+##-ok

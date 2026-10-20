@@ -1,0 +1,7 @@
+CPU 4
+##>1 unit tests
+##+budget_study:O_FORMAT_BEFORE_b8_s0
+TRACE case=O_FORMAT_BEFORE name=pwregion_format events=598 digest=0xC8CD32DB2463F211
+ROW case=O_FORMAT_BEFORE kind=ordinary budget=8 salt=0 caught=0 cut=-1 events=598 failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=- imagesChecked=4739 cuts=596 truncatedCuts=541 randomCuts=57 randomImages=171 maxExtremes=8 sweepUs=237152 totalUs=237191
+COVER case=O_FORMAT_BEFORE budget=8 salt=0 checked 4739 of 12360709 distinct images (>=2^62 prefix states), truncated
+##-ok

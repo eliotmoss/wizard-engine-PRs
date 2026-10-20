@@ -1,0 +1,9 @@
+CPU 4
+##>1 unit tests
+##+budget_study:M3_BTREE_ELIDED_b4_s0
+TRACE case=M3_BTREE_ELIDED name=pwbtree_split_insert_elided events=4591 digest=0xBBF6B180ED6944B5
+ROW case=M3_BTREE_ELIDED kind=mutant budget=4 salt=0 caught=1 cut=4207 events=4591 failIndex=1 failImages=4 failDistinct=30000 failExtremes=4 failFrom=extreme imagesChecked=16768 cuts=4208 truncatedCuts=4179 randomCuts=61 randomImages=61 maxExtremes=4 sweepUs=4408459 totalUs=4410714
+DETAIL case=M3_BTREE_ELIDED budget=4 salt=0 the tree could not reopen after recovery
+NOTE case=M3_BTREE_ELIDED budget=4 salt=0 image 1 of 4 chosen from 30000 distinct images by budget 4: lazy, extremes, then seeded random, seed=0x3DB3FFB90EE376ED
+COVER case=M3_BTREE_ELIDED budget=4 salt=0 checked 16768 of 78304239428928713 distinct images (>=2^62 prefix states), truncated
+##-ok

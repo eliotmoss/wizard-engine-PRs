@@ -1,0 +1,9 @@
+CPU 14
+##>1 unit tests
+##+budget_study:M2_CHECKSUM_SKIP_b10_s0
+TRACE case=M2_CHECKSUM_SKIP name=pwsieve_step_sieve events=1456 digest=0x0F83F5C39293C142
+ROW case=M2_CHECKSUM_SKIP kind=mutant budget=10 salt=0 caught=1 cut=385 events=1456 failIndex=9 failImages=10 failDistinct=4147200 failExtremes=10 failFrom=extreme imagesChecked=3814 cuts=386 truncatedCuts=369 randomCuts=176 randomImages=721 maxExtremes=10 sweepUs=209231 totalUs=209534
+DETAIL case=M2_CHECKSUM_SKIP budget=10 salt=0 used block is linked into a free list (block 2)
+NOTE case=M2_CHECKSUM_SKIP budget=10 salt=0 image 9 of 10 chosen from 4147200 distinct images by budget 10: lazy, extremes, then seeded random, seed=0x390AF6184C9AE0FC
+COVER case=M2_CHECKSUM_SKIP budget=10 salt=0 checked 3814 of 108592180 distinct images (2677370617155 prefix states), truncated
+##-ok

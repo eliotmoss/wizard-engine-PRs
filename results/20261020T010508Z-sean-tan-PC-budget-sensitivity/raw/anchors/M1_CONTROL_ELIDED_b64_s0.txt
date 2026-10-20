@@ -1,0 +1,9 @@
+CPU 0
+##>1 unit tests
+##+budget_study:M1_CONTROL_ELIDED_b64_s0
+TRACE case=M1_CONTROL_ELIDED name=pwsieve_step_elided events=1401 digest=0x9E850033115738C8
+ROW case=M1_CONTROL_ELIDED kind=mutant budget=64 salt=0 caught=1 cut=708 events=1401 failIndex=15 failImages=64 failDistinct=15913497600000 failExtremes=26 failFrom=extreme imagesChecked=41683 cuts=709 truncatedCuts=612 randomCuts=611 randomImages=29756 maxExtremes=26 sweepUs=1853389 totalUs=1853669
+DETAIL case=M1_CONTROL_ELIDED budget=64 salt=0 free block is on the wrong free list (block 3)
+NOTE case=M1_CONTROL_ELIDED budget=64 salt=0 image 15 of 64 chosen from 15913497600000 distinct images by budget 64: lazy, extremes, then seeded random, seed=0x6CDD4D6B2FFDF54D
+COVER case=M1_CONTROL_ELIDED budget=64 salt=0 checked 41683 of 82215086819380 distinct images (>=2^62 prefix states), truncated
+##-ok

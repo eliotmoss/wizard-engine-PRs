@@ -1,0 +1,5 @@
+persistent_control:* exit=0 ok=4 fail=0
+persistent_sieve:* exit=0 ok=8 fail=0
+persistent_btree:* exit=0 ok=7 fail=0
+persistent_alloc:* exit=0 ok=13 fail=0
+persistent_explore:* exit=0 ok=16 fail=0

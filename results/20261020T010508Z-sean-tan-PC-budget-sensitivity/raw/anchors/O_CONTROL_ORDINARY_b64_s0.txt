@@ -1,0 +1,7 @@
+CPU 2
+##>1 unit tests
+##+budget_study:O_CONTROL_ORDINARY_b64_s0
+TRACE case=O_CONTROL_ORDINARY name=pwsieve_step_ordinary events=1456 digest=0x0F83F5C39293C142
+ROW case=O_CONTROL_ORDINARY kind=ordinary budget=64 salt=0 caught=0 cut=-1 events=1456 failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=- imagesChecked=85055 cuts=1457 truncatedCuts=1265 randomCuts=1185 randomImages=54856 maxExtremes=64 sweepUs=3747553 totalUs=3747798
+COVER case=O_CONTROL_ORDINARY budget=64 salt=0 checked 85055 of >=2^62 distinct images (>=2^62 prefix states), truncated
+##-ok

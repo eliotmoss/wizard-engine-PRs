@@ -1,0 +1,9 @@
+CPU 12
+##>1 unit tests
+##+budget_study:M2_CHECKSUM_SKIP_b8_s0
+TRACE case=M2_CHECKSUM_SKIP name=pwsieve_step_sieve events=1456 digest=0x0F83F5C39293C142
+ROW case=M2_CHECKSUM_SKIP kind=mutant budget=8 salt=0 caught=1 cut=660 events=1456 failIndex=5 failImages=8 failDistinct=150232320000 failExtremes=8 failFrom=extreme imagesChecked=5257 cuts=661 truncatedCuts=653 randomCuts=121 randomImages=414 maxExtremes=8 sweepUs=325444 totalUs=325737
+DETAIL case=M2_CHECKSUM_SKIP budget=8 salt=0 memory-order forward link is not mirrored (block 3)
+NOTE case=M2_CHECKSUM_SKIP budget=8 salt=0 image 5 of 8 chosen from 150232320000 distinct images by budget 8: lazy, extremes, then seeded random, seed=0xEF7BBB7FA062E6B0
+COVER case=M2_CHECKSUM_SKIP budget=8 salt=0 checked 5257 of 3838885475380 distinct images (>=2^62 prefix states), truncated
+##-ok

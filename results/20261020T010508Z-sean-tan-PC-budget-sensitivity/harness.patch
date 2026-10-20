@@ -1,0 +1,584 @@
+diff --git a/src/engine/x86-64/X86_64DualTxnWal.v3 b/src/engine/x86-64/X86_64DualTxnWal.v3
+index a03d60a4..44b375c6 100644
+--- a/src/engine/x86-64/X86_64DualTxnWal.v3
++++ b/src/engine/x86-64/X86_64DualTxnWal.v3
+@@ -68,6 +68,20 @@ component DualTxnWalMutants {
+         var recordLastLineUnflushed = false;
+ }
+ 
++// SCRATCH (budget study, 2026-10-20). Not for any shared branch. Two mutants
++// ported by hand from the 2026-10-19 selection study (its APPLY_BEFORE_COMMIT
++// and UNLOGGED_LINK_STORE), off by default, set only by the study's harness
++// while it records:
++//   applyBeforeCommit: RegionTransaction.commit() stores and prepares the
++//     after-images before wal.commit(), not after it;
++//   unloggedLinkStore: RegionTransaction.writeI64() (BlockEntry prev, next,
++//     listPrev, listNext) stores the 8-byte link in place, with no redo entry,
++//     no extent and no writeback of its own.
++component BudgetStudyMutants {
++        var applyBeforeCommit = false;
++        var unloggedLinkStore = false;
++}
++
+ // Outcome of DualTxnWal.recover(). Distinguishes nothing to replay, a
+ // successful replay, an unusable log, and a replay whose data persist failed.
+ enum DualWalRecovery {
+@@ -639,6 +653,12 @@ class DualTxnWal {
+                 return true;
+         }
+ 
++        // SCRATCH (budget study): BudgetStudyMutants.unloggedLinkStore's in-place
++        // store, with no redo entry, no extent and no writeback.
++        def storeUnlogged(offset: u64, value: u64, width: u8) {
++                writeAfterImage(offset, value, width);
++        }
++
+         private def writeAfterImage(offset: u64, value: u64, width: u8) {
+                 match (width) {
+                         1 => persistentOperations.storeU8(offset, u8.view(value));
+diff --git a/src/engine/x86-64/X86_64PersistentExplorer.v3 b/src/engine/x86-64/X86_64PersistentExplorer.v3
+index 1507e0f2..5ce69f2e 100644
+--- a/src/engine/x86-64/X86_64PersistentExplorer.v3
++++ b/src/engine/x86-64/X86_64PersistentExplorer.v3
+@@ -147,7 +147,57 @@ class PersistentSelectionSeeds(trace: PersistentTrace) {
+ 			digest = trace.digest();
+ 			haveDigest = true;
+ 		}
+-		return PersistentSplitMix.new(digest ^ (u64.!(cut) * 0x9E37_79B9_7F4A_7C15_u64)).next();
++		// SCRATCH (budget study): the salt is XORed into the derivation; salt 0
++		// leaves it exactly as the suite has it.
++		return PersistentSplitMix.new(digest ^ (u64.!(cut) * 0x9E37_79B9_7F4A_7C15_u64)
++			^ (BudgetStudySelection.salt * 0xD1B5_4A32_D192_ED03_u64)).next();
++	}
++}
++
++// SCRATCH (budget study, 2026-10-20). Not for any shared branch. A salt for the
++// per-cut seeds, and counters a sweep's harness reads to tell whether any image
++// it checked came from the seeded random stage rather than the fixed extremes.
++component BudgetStudySelection {
++	var salt = 0u64;
++	// Per sweep, reset by the harness.
++	var cuts = 0;                // cuts checked
++	var truncatedCuts = 0;       // cuts whose distinct images outnumbered the budget
++	var randomCuts = 0;          // cuts where at least one checked image was a random draw
++	var randomImages = 0L;       // checked images that were random draws
++	var maxExtremes = 0;         // the most extremes any over-budget cut had
++	// Set by search() for the cut in hand: how many of its images are extremes
++	// (all of them when the cut is enumerated completely).
++	var lastExtremes = 0;
++	// At the failing cut, if any: its extremes, and the failing image's index (1-based).
++	var failExtremes = -1;
++	var failIndex = -1;
++
++	def reset() {
++		cuts = 0;
++		truncatedCuts = 0;
++		randomCuts = 0;
++		randomImages = 0L;
++		maxExtremes = 0;
++		lastExtremes = 0;
++		failExtremes = -1;
++		failIndex = -1;
++	}
++
++	def noteCut(truncated: bool, checked: int, failed: bool) {
++		cuts++;
++		if (truncated) {
++			truncatedCuts++;
++			if (lastExtremes > maxExtremes) maxExtremes = lastExtremes;
++		}
++		def random = checked - lastExtremes;
++		if (random > 0) {
++			randomCuts++;
++			randomImages += long.!(random);
++		}
++		if (failed) {
++			failExtremes = lastExtremes;
++			failIndex = checked;
++		}
+ 	}
+ }
+ 
+@@ -447,12 +497,14 @@ component PersistentExplorer {
+ 		def limit = budgetOf(budget);
+ 		if (distinct <= long.!(limit)) {
+ 			def images = everyImage(classes, floorBytes);
++			BudgetStudySelection.lastExtremes = images.length;  // SCRATCH (budget study)
+ 			return PersistentExploration.new(trace, cut, images, images.length, false,
+ 				product, distinct, 0u64);
+ 		}
+ 		def seed = seeds.seedAt(cut);
+ 		def selection = PersistentClassSelection.new(classes, floorBytes, limit);
+ 		selection.takeExtremes();
++		BudgetStudySelection.lastExtremes = selection.images.length;  // SCRATCH (budget study)
+ 		selection.fillRandomly(PersistentSplitMix.new(seed), distinct);
+ 		def images = selection.images.extract();
+ 		return PersistentExploration.new(trace, cut, images, images.length, true,
+@@ -554,6 +606,7 @@ component PersistentExplorer {
+ 			def image = exploration.images[i];
+ 			def detail = property.check(image);
+ 			if (detail != null) {
++				BudgetStudySelection.noteCut(exploration.truncated, i + 1, true);  // SCRATCH (budget study)
+ 				def cx = PersistentCounterexample.new(trace.name, property.name, detail,
+ 					trace, exploration.crashAfter)
+ 					.withImage(image, property.windowOffset, property.windowLength)
+@@ -562,6 +615,7 @@ component PersistentExplorer {
+ 					exploration.product, exploration.classProduct);
+ 			}
+ 		}
++		BudgetStudySelection.noteCut(exploration.truncated, exploration.images.length, false);  // SCRATCH (budget study)
+ 		return PersistentCheckResult.new(exploration, null, exploration.images.length,
+ 			exploration.truncated, exploration.product, exploration.classProduct);
+ 	}
+diff --git a/src/engine/x86-64/X86_64TxnPWRegion.v3 b/src/engine/x86-64/X86_64TxnPWRegion.v3
+index 7fd12007..0a58ec1e 100644
+--- a/src/engine/x86-64/X86_64TxnPWRegion.v3
++++ b/src/engine/x86-64/X86_64TxnPWRegion.v3
+@@ -562,6 +562,12 @@ class RegionTransaction {
+                 if (requiresRecovery()) return false;
+                 if (!isDirty()) return true;
+                 appendToWal();
++                if (BudgetStudyMutants.applyBeforeCommit) {  // SCRATCH (budget study)
++                        if (!applyToRegion()) return false;
++                        if (wal.commit() == 0u64) return false;
++                        clear();
++                        return true;
++                }
+                 def txnSeq = wal.commit();
+                 if (txnSeq == 0u64) return false;
+                 if (!applyToRegion()) return false;
+@@ -624,6 +630,10 @@ class RegionTransaction {
+ 
+         // Write BlockEntry.prev, next, listPrev, listNext
+         def writeI64(addr: u64, val: i64) {
++                if (BudgetStudyMutants.unloggedLinkStore) {  // SCRATCH (budget study)
++                        wal.storeUnlogged(addr - regionStart, u64.view(val), 8u8);
++                        return;
++                }
+                 writeHelper(addr, 8, u64.view(val));
+         }
+ 
+diff --git a/test/unittest/x86-64-linux/BudgetStudyTest.v3 b/test/unittest/x86-64-linux/BudgetStudyTest.v3
+new file mode 100644
+index 00000000..2007ac84
+--- /dev/null
++++ b/test/unittest/x86-64-linux/BudgetStudyTest.v3
+@@ -0,0 +1,418 @@
++// SCRATCH (budget study, 2026-10-20). Not for any shared branch.
++//
++// How the explorer's per-cut budget changes what its sweeps catch, and what
++// they cost. Each case records its scenario the way its suite test records it
++// (by calling the same tester methods), optionally under a planted bug, and
++// sweeps it as the test does: the same cut ranges, in the same order, with the
++// same properties, stopping at the first failing cut. Only the budget and the
++// salt XORed into the per-cut seeds (BudgetStudySelection.salt; 0 is the
++// suite's own seeds) vary. One test per case, budget and salt:
++//   budget_study:<case>_b<budget>_s<salt>
++// Output lines:
++//   TRACE case=.. name=.. events=.. digest=..
++//   ROW case=.. kind=.. budget=.. salt=.. caught=0|1 cut=.. events=..
++//       failIndex=.. failImages=.. failDistinct=.. failExtremes=.. failFrom=..
++//       imagesChecked=.. cuts=.. truncatedCuts=.. randomCuts=.. randomImages=..
++//       maxExtremes=.. sweepUs=.. totalUs=..
++//   DETAIL case=.. budget=.. salt=.. <counterexample detail>
++//   NOTE case=.. budget=.. salt=.. <counterexample selection note>
++//   COVER case=.. budget=.. salt=.. <the result's coverage line>
++
++def BST = UnitTests.registerT("budget_study:", _, BudgetStudyTester.new, _);
++
++class BudgetStudyTester(t: Tester) { }
++
++enum BudgetCase {
++	// Planted bugs.
++	M1_CONTROL_ELIDED,	// persistent_control:elided_writeback_is_caught (suite budget 64)
++	M2_CHECKSUM_SKIP,	// persistent_sieve:unchecked_record_checksum_is_caught (12)
++	M3_BTREE_ELIDED,	// persistent_btree:elided_node_writeback_is_caught (4)
++	M4_EARLY_MAGIC,		// persistent_alloc:early_magic_is_caught (8)
++	M5_APPLY_BEFORE_COMMIT,	// ported mutant on persistent_alloc:split_alloc_images_stay_consistent (8)
++	M6_UNLOGGED_LINK_STORE,	// ported mutant on the same scenario (8)
++	// The same sweeps, and the suite's other budgeted sweeps, on ordinary code.
++	O_SIEVE,		// persistent_sieve:step_images_satisfy_sieve (4); M2's ordinary twin
++	O_CONTROL_ORDINARY,	// persistent_control:ordinary_writeback_holds (64); M1's ordinary twin
++	O_SIEVE_ALLOC,		// persistent_sieve:step_images_satisfy_allocator (4)
++	O_SIEVE_RETIRING,	// persistent_sieve:retiring_step_images_stay_consistent (4)
++	O_BTREE_INSERT,		// persistent_btree:split_insert_images_satisfy_tree (4); M3's ordinary twin
++	O_BTREE_UPDATE,		// persistent_btree:update_images_satisfy_tree (4)
++	O_FORMAT_BEFORE,	// persistent_alloc:crash_during_format_opens_consistent, cuts before the magic (8)
++	O_FORMAT_AFTER,		// the same test, cuts from the magic on (8); M4's ordinary twin
++	O_SPLIT_ALLOC,		// persistent_alloc:split_alloc_images_stay_consistent (8); M5's and M6's twin
++	O_COALESCING_FREE,	// persistent_alloc:coalescing_free_images_stay_consistent (8)
++	O_TWO_ALLOCS,		// persistent_alloc:two_transaction_images_stay_consistent (6)
++	O_ALLOC_RECOVERY_CRASH,	// persistent_alloc:crash_during_allocator_recovery_stays_consistent (8)
++	O_FAILED_MOUNT_SWEEP	// persistent_alloc:failed_mount_persist_sweep (3)
++}
++
++def BUDGET_STUDY_BUDGETS = [1, 2, 3, 4, 6, 8, 10, 12, 13, 14, 15, 16, 32, 64];
++def BUDGET_STUDY_SALTS = 10;
++
++def BSTX = registerBudgetStudy();
++
++def registerBudgetStudy() -> int {
++	for (c in BudgetCase) {
++		for (b in BUDGET_STUDY_BUDGETS) {
++			for (s < BUDGET_STUDY_SALTS) {
++				def name = StringBuilder.new().puts(c.name).put2("_b%d_s%d", b, s).toString();
++				BST(name, runBudgetCase(_, c, b, s));
++			}
++		}
++	}
++	return 0;
++}
++
++// A recorded scenario and the sweep its test runs over it, at a given budget.
++class BudgetScenario(trace: PersistentTrace, sweep: int -> PersistentCheckResult) { }
++
++component BudgetStudyClock {
++	def nanos() -> long {
++		def ts = Array<long>.new(2);
++		Linux.syscall(LinuxConst.SYS_clock_gettime, (4, Pointer.atElement(ts, 0)));  // CLOCK_MONOTONIC_RAW
++		return ts[0] * 1000000000L + ts[1];
++	}
++}
++
++def isMutantCase(c: BudgetCase) -> bool {
++	return c.tag <= BudgetCase.M6_UNLOGGED_LINK_STORE.tag;
++}
++
++def runBudgetCase(tc: BudgetStudyTester, c: BudgetCase, budget: int, salt: int) {
++	def t = tc.t;
++	def t0 = BudgetStudyClock.nanos();
++	def s = buildBudgetScenario(t, c);
++	if (s == null) {
++		if (t.ok) t.fail("scenario could not be recorded");
++		return;
++	}
++	BudgetStudySelection.reset();
++	BudgetStudySelection.salt = u64.!(salt);
++	def t1 = BudgetStudyClock.nanos();
++	def result = s.sweep(budget);
++	def t2 = BudgetStudyClock.nanos();
++	BudgetStudySelection.salt = 0u64;
++
++	def buf = StringBuilder.new();
++	buf.put3("TRACE case=%s name=%s events=%d digest=0x", c.name, s.trace.name, s.trace.length());
++	buf.putx_64(s.trace.digest()).ln();
++	def cx = result.counterexample;
++	buf.put3("ROW case=%s kind=%s budget=%d", c.name, if(isMutantCase(c), "mutant", "ordinary"), budget);
++	buf.put2(" salt=%d caught=%d", salt, if(cx != null, 1, 0));
++	buf.put2(" cut=%d events=%d", if(cx != null, cx.crashAfter, -1), s.trace.length());
++	if (cx != null) {
++		def S = BudgetStudySelection.failExtremes, i = BudgetStudySelection.failIndex;
++		def ex = result.exploration;
++		buf.put2(" failIndex=%d failImages=%d failDistinct=", i, ex.images.length);
++		PersistentExplorer.putCount(buf, ex.classProduct);
++		buf.put2(" failExtremes=%d failFrom=%s", S,
++			if(!ex.truncated, "complete", if(i <= S, "extreme", "random")));
++	} else {
++		buf.puts(" failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=-");
++	}
++	buf.puts(" imagesChecked=").putd(result.imagesChecked);
++	buf.put3(" cuts=%d truncatedCuts=%d randomCuts=%d", BudgetStudySelection.cuts,
++		BudgetStudySelection.truncatedCuts, BudgetStudySelection.randomCuts);
++	buf.puts(" randomImages=").putd_i64(BudgetStudySelection.randomImages);
++	buf.put1(" maxExtremes=%d", BudgetStudySelection.maxExtremes);
++	buf.puts(" sweepUs=").putd_i64((t2 - t1) / 1000L);
++	buf.puts(" totalUs=").putd_i64((t2 - t0) / 1000L).ln();
++	if (cx != null) {
++		buf.put3("DETAIL case=%s budget=%d salt=%d ", c.name, budget, salt).puts(cx.detail).ln();
++		buf.put3("NOTE case=%s budget=%d salt=%d ", c.name, budget, salt).puts(cx.selectionNote()).ln();
++	}
++	buf.put3("COVER case=%s budget=%d salt=%d ", c.name, budget, salt);
++	result.renderCoverage(buf);
++	System.puts(buf.toString());
++}
++
++def budgetSweepAll(trace: PersistentTrace, initial: Array<byte>, property: PersistentImageProperty,
++	budget: int) -> PersistentCheckResult {
++	return PersistentExplorer.checkAllCuts(trace, initial, budget, property);
++}
++
++def budgetSweepRange(trace: PersistentTrace, initial: Array<byte>, from: int, to: int,
++	property: PersistentImageProperty, budget: int) -> PersistentCheckResult {
++	return PersistentExplorer.checkCutRange(trace, initial, from, to, budget, property);
++}
++
++// persistent_sieve:unchecked_record_checksum_is_caught's sweep: the flag is
++// set only while the sweep runs, so recording is ordinary.
++def budgetSweepChecksumSkip(trace: PersistentTrace, initial: Array<byte>,
++	property: PersistentImageProperty, budget: int) -> PersistentCheckResult {
++	DualTxnWalMutants.skipRecordChecksum = true;
++	def result = PersistentExplorer.checkAllCuts(trace, initial, budget, property);
++	DualTxnWalMutants.skipRecordChecksum = false;
++	return result;
++}
++
++// PersistentBTreeTester.checkEveryCut() with the budget as a parameter: every
++// cut, each under the property its marks allow, the marks moved by {shift}.
++def budgetSweepBTree(tc: PersistentBTreeTester, trace: PersistentTrace, shift: int,
++	budget: int) -> PersistentCheckResult {
++	def writeCut = tc.markAt(PWBTreePhase.WRITE, 0) - shift;
++	def publishCut = tc.markAt(PWBTreePhase.PUBLISH, 0) - shift;
++	var result = PersistentExplorer.checkCutRange(trace, tc.mounted, 0, writeCut, budget,
++		tc.property("up to the WRITE mark, every image holds the tree before the put", true, false));
++	if (!result.ok()) return result;
++	var checked = result.imagesChecked;
++	var truncated = result.truncated;
++	var product = result.product, classes = result.classProduct;
++	result = PersistentExplorer.checkCutRange(trace, tc.mounted, writeCut + 1, publishCut - 1, budget,
++		tc.property("between the WRITE and PUBLISH marks, every image holds the tree before or after", true, true));
++	if (!result.ok()) return PersistentCheckResult.new(result.exploration, result.counterexample,
++		checked + result.imagesChecked, truncated || result.truncated,
++		PersistentExplorer.addCounts(product, result.product),
++		PersistentExplorer.addCounts(classes, result.classProduct));
++	checked += result.imagesChecked;
++	truncated = truncated || result.truncated;
++	product = PersistentExplorer.addCounts(product, result.product);
++	classes = PersistentExplorer.addCounts(classes, result.classProduct);
++	result = PersistentExplorer.checkCutRange(trace, tc.mounted, publishCut, trace.length(), budget,
++		tc.property("from the PUBLISH mark, every image holds the tree after the put", false, true));
++	checked += result.imagesChecked;
++	truncated = truncated || result.truncated;
++	product = PersistentExplorer.addCounts(product, result.product);
++	classes = PersistentExplorer.addCounts(classes, result.classProduct);
++	return PersistentCheckResult.new(result.exploration, result.counterexample, checked, truncated,
++		product, classes);
++}
++
++// A copy of PersistentBTreeTest's withoutWritebacks(), which is not visible
++// from this file: {trace} without the CLWBs among its events [{from}, {to}),
++// and how many were dropped.
++def budgetWithoutWritebacks(trace: PersistentTrace, from: int, to: int, name: string) -> (PersistentTrace, int) {
++	def out = Vector<PersistentTraceEvent>.new();
++	var removed = 0;
++	for (i < trace.events.length) {
++		def e = trace.events[i];
++		if (i >= from && i < to && e.kind == PersistentEventKind.CLWB) {
++			removed++;
++			continue;
++		}
++		out.put(e);
++	}
++	return (PersistentTrace.new(name, trace.regionBytes, out.copy()), removed);
++}
++
++def budgetFail(t: Tester, msg: string) -> BudgetScenario {
++	t.fail(msg);
++	return null;
++}
++
++// A split allocation, recorded as persistent_alloc:split_alloc_images_stay_consistent
++// records it, with {mutant} set only around the allocation.
++def recordSplitAlloc(tc: PersistentAllocatorTester, mutant: int) -> PersistentTrace {
++	if (!tc.openRecordingRegion()) return null;
++	tc.snapshotMounted();
++	tc.recorder.clear();
++	if (mutant == 1) BudgetStudyMutants.applyBeforeCommit = true;
++	if (mutant == 2) BudgetStudyMutants.unloggedLinkStore = true;
++	def chunk = tc.region.allocChunk(2u32);
++	BudgetStudyMutants.applyBeforeCommit = false;
++	BudgetStudyMutants.unloggedLinkStore = false;
++	if (chunk.isNull()) {
++		tc.t.fail("allocation failed while recording the scenario");
++		return null;
++	}
++	def trace = tc.recorder.snapshot("pwregion_split_alloc");
++	tc.cleanup();
++	if (!trace.validate().ok()) {
++		tc.t.fail("recorded allocator trace is not modelable");
++		return null;
++	}
++	return trace;
++}
++
++def buildBudgetScenario(t: Tester, c: BudgetCase) -> BudgetScenario {
++	match (c) {
++		M1_CONTROL_ELIDED => {
++			def tc = PersistentControlTester.new(t);
++			def trace = tc.recordOneStep(true, "pwsieve_step_elided");
++			if (trace == null) return null;
++			if (!trace.validate().ok()) return budgetFail(t, "mutant trace not modelable");
++			if (trace.count(PersistentEventKind.CLWB) != 0) return budgetFail(t, "mutant recorded a writeback");
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.sieveProperty("sieve invariants survive every crash schedule of a step"), _));
++		}
++		M2_CHECKSUM_SKIP => {
++			def tc = PersistentSieveTester.new(t);
++			if (!tc.openRecordingSieve()) return budgetFail(t, "could not lay out a recording sieve");
++			def trace = tc.recordStep("pwsieve_step_sieve");
++			tc.cleanup();
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepChecksumSkip(trace, tc.mounted,
++				tc.sieveProperty("sieve invariants survive every crash schedule of a step"), _));
++		}
++		M3_BTREE_ELIDED => {
++			def tc = PersistentBTreeTester.new(t);
++			def ordinary = tc.recordSplitInsert("pwbtree_split_insert");
++			if (ordinary == null) return null;
++			def nodeLines = tc.tree.lastNodeLines();
++			tc.cleanup();
++			def buildCut = tc.markAt(PWBTreePhase.COMPUTE, 1);
++			def writeCut = tc.markAt(PWBTreePhase.WRITE, 0);
++			def cut = budgetWithoutWritebacks(ordinary, buildCut, writeCut, "pwbtree_split_insert_elided");
++			def mutant = cut.0, removed = cut.1;
++			if (!mutant.validate().ok()) return budgetFail(t, "mutant trace not modelable");
++			if (removed != nodeLines) return budgetFail(t, "removed writebacks are not the node lines");
++			return BudgetScenario.new(mutant, budgetSweepBTree(tc, mutant, removed, _));
++		}
++		M4_EARLY_MAGIC => {
++			def tc = PersistentAllocatorTester.new(t);
++			def ordinary = tc.recordFormat("pwregion_format");
++			if (ordinary == null) return null;
++			def lines = int.!(ordinary.regionBytes / MmapRegionUtils.CACHE_LINE_SIZE);
++			def mutant = PersistentFormatScenario.withEarlyMagic(ordinary, "pwregion_format_early_magic");
++			if (!mutant.validate().ok()) return budgetFail(t, "mutant trace not modelable");
++			def early = PersistentFormatScenario.magicStore(mutant);
++			if (early != mutant.length() - 2 - lines) return budgetFail(t, "early magic not where expected");
++			return BudgetScenario.new(mutant, budgetSweepRange(mutant, null, early + 1, mutant.length(),
++				tc.formatProperty("once the magic is stored, every image opens into a consistent allocator"), _));
++		}
++		M5_APPLY_BEFORE_COMMIT => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = recordSplitAlloc(tc, 1);
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.allocatorProperty("allocator structure survives every crash schedule"), _));
++		}
++		M6_UNLOGGED_LINK_STORE => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = recordSplitAlloc(tc, 2);
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.allocatorProperty("allocator structure survives every crash schedule"), _));
++		}
++		O_SIEVE => {
++			def tc = PersistentSieveTester.new(t);
++			if (!tc.openRecordingSieve()) return budgetFail(t, "could not lay out a recording sieve");
++			def trace = tc.recordStep("pwsieve_step_sieve");
++			tc.cleanup();
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.sieveProperty("sieve invariants survive every crash schedule of a step"), _));
++		}
++		O_CONTROL_ORDINARY => {
++			def tc = PersistentControlTester.new(t);
++			def trace = tc.recordOneStep(false, "pwsieve_step_ordinary");
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.sieveProperty("sieve invariants survive every crash schedule of a step"), _));
++		}
++		O_SIEVE_ALLOC => {
++			def tc = PersistentSieveTester.new(t);
++			if (!tc.openRecordingSieve()) return budgetFail(t, "could not lay out a recording sieve");
++			def trace = tc.recordStep("pwsieve_step_alloc");
++			tc.cleanup();
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.allocatorProperty("allocator survives every crash schedule of a sieve step"), _));
++		}
++		O_SIEVE_RETIRING => {
++			def tc = PersistentSieveTester.new(t);
++			if (!tc.openRecordingSieve()) return budgetFail(t, "could not lay out a recording sieve");
++			for (k < 2) {
++				if (!tc.sieve.step()) {
++					tc.cleanup();
++					return budgetFail(t, "could not fill the retention window");
++				}
++			}
++			def trace = tc.recordStep("pwsieve_retiring_step");
++			tc.cleanup();
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.sieveProperty("a retiring step leaves a recoverable sieve"), _));
++		}
++		O_BTREE_INSERT => {
++			def tc = PersistentBTreeTester.new(t);
++			def trace = tc.recordSplitInsert("pwbtree_split_insert");
++			if (trace == null) return null;
++			tc.cleanup();
++			return BudgetScenario.new(trace, budgetSweepBTree(tc, trace, 0, _));
++		}
++		O_BTREE_UPDATE => {
++			def tc = PersistentBTreeTester.new(t);
++			def trace = tc.recordUpdate("pwbtree_update");
++			if (trace == null) return null;
++			tc.cleanup();
++			return BudgetScenario.new(trace, budgetSweepBTree(tc, trace, 0, _));
++		}
++		O_FORMAT_BEFORE => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = tc.recordFormat("pwregion_format");
++			if (trace == null) return null;
++			def magicCut = PersistentFormatScenario.magicStore(trace) + 1;
++			if (magicCut <= 0) return budgetFail(t, "no magic store");
++			return BudgetScenario.new(trace, budgetSweepRange(trace, null, 0, magicCut - 1,
++				tc.formatProperty("before the magic is stored, every image reformats into a consistent allocator"), _));
++		}
++		O_FORMAT_AFTER => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = tc.recordFormat("pwregion_format");
++			if (trace == null) return null;
++			def magicCut = PersistentFormatScenario.magicStore(trace) + 1;
++			if (magicCut <= 0) return budgetFail(t, "no magic store");
++			return BudgetScenario.new(trace, budgetSweepRange(trace, null, magicCut, trace.length(),
++				tc.formatProperty("once the magic is stored, every image opens into a consistent allocator"), _));
++		}
++		O_SPLIT_ALLOC => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = recordSplitAlloc(tc, 0);
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.allocatorProperty("allocator structure survives every crash schedule"), _));
++		}
++		O_COALESCING_FREE => {
++			def tc = PersistentAllocatorTester.new(t);
++			if (!tc.openRecordingRegion()) return budgetFail(t, "could not format a recording PWRegion");
++			def first = tc.region.allocChunk(1u32);
++			def second = tc.region.allocChunk(2u32);
++			if (first.isNull() || second.isNull() || !tc.region.freeChunk(first)) {
++				tc.cleanup();
++				return budgetFail(t, "could not set up the coalescing free");
++			}
++			tc.snapshotMounted();
++			tc.recorder.clear();
++			if (!tc.region.freeChunk(second)) {
++				tc.cleanup();
++				return budgetFail(t, "free failed while recording");
++			}
++			def trace = tc.recorder.snapshot("pwregion_coalescing_free");
++			tc.cleanup();
++			if (!trace.validate().ok()) return budgetFail(t, "trace not modelable");
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.allocatorProperty("free coalescing survives every crash schedule"), _));
++		}
++		O_TWO_ALLOCS => {
++			def tc = PersistentAllocatorTester.new(t);
++			if (!tc.openRecordingRegion()) return budgetFail(t, "could not format a recording PWRegion");
++			tc.snapshotMounted();
++			def trace = tc.recordAllocations(2, "pwregion_two_allocations");
++			tc.cleanup();
++			if (trace == null) return null;
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted,
++				tc.allocatorProperty("two transactions survive every crash schedule"), _));
++		}
++		O_ALLOC_RECOVERY_CRASH => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = recordSplitAlloc(tc, 0);
++			if (trace == null) return null;
++			def crashed = PersistentImages.lazyCrash(trace, tc.mounted, trace.length());
++			def recording = PersistentRecoveries.recordPWRegionRecovery(crashed, tc.BLOCKS, tc.BLOCK_SIZE,
++				"pwregion_mount_recovery");
++			if (recording == null) return budgetFail(t, "could not mount the crash image as an allocator");
++			if (!recording.trace.validate().ok()) return budgetFail(t, "recovery trace not modelable");
++			return BudgetScenario.new(recording.trace, budgetSweepAll(recording.trace, crashed.bytes,
++				tc.allocatorProperty("allocator survives a crash during its own recovery"), _));
++		}
++		O_FAILED_MOUNT_SWEEP => {
++			def tc = PersistentAllocatorTester.new(t);
++			def trace = recordSplitAlloc(tc, 0);
++			if (trace == null) return null;
++			def property = PersistentAllocatorFailureProperty.new(tc.BLOCKS, tc.BLOCK_SIZE, 1)
++				.property("a failed mount persist leaves a recoverable allocator");
++			return BudgetScenario.new(trace, budgetSweepAll(trace, tc.mounted, property, _));
++		}
++	}
++}

@@ -707,6 +707,56 @@ checking 5,776, 14,927, 36,605 and 126,076 distinct images. The selection
 therefore reaches an image the odometer did not, but at the budget the sieve
 tests use it does not catch this mutant either.
 
+**What each budget catches, and what it costs (2026-10-20).** Apart from the
+checksum skip's 12, the budgets were set in their tests with no recorded
+reason. On 2026-10-20 a scratch harness, not on this branch
+(`results/20261020T010508Z-sean-tan-PC-budget-sensitivity`), reran every
+planted bug's sweep at 1, 2, 4, 8, 12, 16, 32 and 64 distinct images per
+cut, and at 3, 6, 10, 13, 14 and 15. Each sweep ran as its test runs it,
+stopping at the first failing cut. While a cut's budget covers no more than its
+extremes the selection is fixed; wherever a sweep checked a random draw, it was
+rerun under nine more seeds, a salt XORed into the per-cut seed derivation (salt
+0 is the suite's seed). Two mutants from the 2026-10-19 selection study were
+ported as test-only flags onto the split allocation, the only planted bugs on
+an allocator scenario: `RegionTransaction` storing and preparing its
+after-images before `wal.commit()`, and its 8-byte link fields stored in place,
+unlogged. Both still fail on this code. The smallest budget that catches each
+bug, under all ten seeds where seeds apply:
+
+- the elided-writeback control, 15. It passes at 1 to 14 (no seed of ten
+  catches it at 4 to 14). From 15 on it is caught at cut 708 by the fifteenth
+  image the selection takes there, an extreme, so the seed does not matter;
+- the record-checksum skip, 6, as above (no seed of ten catches it at 4). From
+  14 on the seed decides the cut: the suite's seed fails at 289, as above, but
+  at 16 eight of the ten seeds fail at 385 and the other two earlier, and at 64
+  the cuts range from 258 to 385;
+- the B+-tree's removed node writebacks, 1: the lazy image alone fails at event
+  4,207. At 32 and 64 the sweep fails earlier, at 4,199, with `the tree's value
+  for a key differs from the reference`;
+- the early magic, 3: the third image at the magic's cut;
+- after-images applied before the commit, 2, at cut 4; and
+- the unlogged link store, 1, at cut 437 (from 2, at cut 3).
+
+So the sieve step needs 15 to catch both of its planted bugs, the B+-tree split
+insert 1, the split allocation 2 and the format 3. The suite runs the sieve's
+two controls at 64 and 12 and its ordinary sweeps at 4, the B+-tree at 4, the
+split allocation at 8 and the format at 8. Thirteen sweeps of unmutated code
+from twelve suite tests, each planted bug's twin and the suite's other budgeted
+sweeps, passed at every budget and under every seed tried: 1,334 runs, none
+failing. The ordinary sweeps were timed on one P-core of sean-tan-PC under
+the powersave governor, three runs each. At budgets 1, 4, 16 and 64 the
+medians were 0.31, 0.50, 1.23 and 3.70 s for the sieve step (1,457, 5,798,
+22,659 and 85,055 images) and 2.49, 4.77, 13.90 and 49.47 s for the B+-tree
+split insert (4,602, 18,330, 72,584 and 283,420 images). The split allocation
+took 0.13, 0.15, 0.20 and 0.40 s, and the format before its magic 0.07, 0.14,
+0.39 and 1.32 s. Time grows close to linearly with the images checked, and at
+15 the sieve step took 1.17 s (21,329 images). At each bug's smallest budget
+the failing image is an extreme, the same under every seed, so each threshold
+is that image's place in the selection's fixed order (the control's fifteenth
+at cut 708, the early magic's third at cut 339), and a change to the order
+moves it. These are six planted bugs, one or two per scenario, and a budget
+that catches them is not shown to catch any other bug.
+
 This is also where the model's shape becomes visible. A completed fence removes
 freedom: after the WAL's commit boundary the record is durable on every
 schedule, so that cut has exactly one image, while the cut one event later — the

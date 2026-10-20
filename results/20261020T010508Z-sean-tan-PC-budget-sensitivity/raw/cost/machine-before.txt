@@ -1,0 +1,25 @@
+date: 2026-10-20T12:17:37+1100
+uname: Linux pc-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+uptime: 12:17:37 up 1 day, 11:39,  3 users,  load average: 0.73, 8.22, 6.87
+cpu4 scaling_driver: intel_pstate
+cpu4 scaling_governor: powersave
+cpu4 energy_performance_preference: balance_performance
+cpu4 scaling_min_freq: 800000
+cpu4 scaling_max_freq: 5500000
+governors (all cpus): 28 powersave
+no_turbo: 0
+thread_siblings_list cpu4: 4-5
+top processes by cpu:
+    PID PSR %CPU     ELAPSED COMMAND
+ 565177  26 25.0       00:00 python3
+ 548221  12  3.9       51:09 node-MainThread
+ 551777   8  1.6       43:28 claude
+   2599   2  1.0  1-11:38:59 cli-proxy-api
+ 560495   8  1.0       10:46 claude
+ 448116   8  0.6    11:07:36 opencode
+   2466  22  0.3  1-11:38:59 tailscaled
+ 548570  22  0.3       51:07 cloudflared
+   1193  20  0.1  1-11:39:02 irq/187-iwlwifi:default_queue
+   2258   4  0.0  1-11:39:00 NetworkManager
+ 563659  16  0.0       04:10 kworker/u112:3-events_unbound
+

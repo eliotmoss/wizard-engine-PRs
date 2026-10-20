@@ -1,0 +1,104 @@
+##>13 unit tests
+##+persistent_alloc:mounted_region_satisfies_invariants
+##-ok
+##+persistent_alloc:walker_detects_a_broken_chain
+##-ok
+##+persistent_alloc:commit_boundary_recovers_allocation
+##-ok
+##+persistent_alloc:split_alloc_images_stay_consistent
+##-ok
+##+persistent_alloc:coalescing_free_images_stay_consistent
+##-ok
+##+persistent_alloc:crash_during_allocator_recovery_stays_consistent
+##-ok
+##+persistent_alloc:failed_mount_persist_keeps_structure
+WAL recovery replay could not be persisted; records retained for the next mount
+##-ok
+##+persistent_alloc:failed_mount_persist_sweep
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+WAL recovery replay could not be persisted; records retained for the next mount
+##-ok
+##+persistent_alloc:two_transaction_images_stay_consistent
+##-ok
+##+persistent_alloc:format_publishes_the_magic_last
+##-ok
+##+persistent_alloc:crash_during_format_opens_consistent
+##-ok
+##+persistent_alloc:early_magic_is_caught
+blockSize mismatch: requested 2048, stored 0
+##-ok
+##+persistent_alloc:mounted_image_survives_a_collection
+##-ok

@@ -1,0 +1,9 @@
+##>4 unit tests
+##+persistent_control:mutant_trace_is_still_modelable
+##-ok
+##+persistent_control:mutant_records_no_writeback
+##-ok
+##+persistent_control:ordinary_writeback_holds
+##-ok
+##+persistent_control:elided_writeback_is_caught
+##-ok

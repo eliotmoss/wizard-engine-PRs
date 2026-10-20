@@ -1,0 +1,63 @@
+# Machine and provenance, budget-sensitivity study (2026-10-20)
+
+## host
+hostname: pc-ubuntu (results host tag sean-tan-PC, as in the other results/ dirs from this desktop)
+kernel: Linux 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+microcode: 0x133
+CPU(s):                                  28
+Model name:                              Intel(R) Core(TM) i7-14700KF
+Thread(s) per core:                      2
+Core(s) per socket:                      20
+L2 cache:                                28 MiB (11 instances)
+L3 cache:                                33 MiB (1 instance)
+hybrid: P-cores are CPUs 0-15 (8 cores, siblings (0,1) (2,3) ... (14,15)); E-cores are CPUs 16-27 (lscpu -e)
+memory: 29 GiB
+
+## frequency control (read, not changed; changing it needs root)
+scaling_driver: intel_pstate
+governor: 28 powersave
+cpu4 energy_performance_preference: balance_performance
+intel_pstate/no_turbo: 0
+
+## software
+engine base: wizard-engine-PRs pwregions 129555ed (scratch worktree ~/.cache/budget-study-wt, branch budget-study, uncommitted)
+patch: harness.patch (git apply to 129555ed); verified 2026-10-20 in a fresh clone: applies, builds, and the rebuilt bin/unittest.x86-64-linux is byte-identical to unittest-frozen-v2
+virgil: Aeneas III-11.1975; ~/research/virgil-titzer at eb52db978 Support Pointer.{load,store}<u64> on 32-bit platforms (#775)
+binaries (raw/binaries.sha256):
+  ad0c375214e7d2c2afcdf3744a8dacb66c01de998b63108177c41a9c14a90bc4  bin/unittest-frozen-v1
+  42783700d4e86bd3583388b02ddeccc52c21b2c2552ef667b2f1c67a6e182e0a  bin/unittest-frozen-v2
+  v2 = every reported run; v1 = the first salt-0 pass (raw/superseded-v1), identical but for budgets 13-15 not being registered
+
+## catch matrix (raw/matrix): 20 slots, CPUs 0,2,4,...,14 (one thread per P-core) and 16-27 (E-cores), 1715 runs, all exit status 0
+uptime before (first line: the salt-0 pass; second: the salts 1-9 pass):
+   12:06:02 up 1 day, 11:27,  3 users,  load average: 1.52, 1.87, 0.95
+   12:07:12 up 1 day, 11:28,  3 users,  load average: 8.96, 4.47, 1.94
+uptime after (same order):
+   12:07:00 up 1 day, 11:28,  3 users,  load average: 10.59, 4.63, 1.96
+   12:14:14 up 1 day, 11:35,  3 users,  load average: 20.00, 16.26, 8.56
+
+## timing (raw/cost, raw/cost-extra): one process at a time, taskset -c 4 (P-core 2; sibling CPU 5 left idle), after the matrix had finished and the 1-minute load had fallen below 1
+### cost
+  before date: 2026-10-20T12:17:37+1100
+  before uname: Linux pc-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+  before uptime: 12:17:37 up 1 day, 11:39,  3 users,  load average: 0.73, 8.22, 6.87
+  after  date: 2026-10-20T12:24:19+1100
+  after  uname: Linux pc-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+  after  uptime: 12:24:19 up 1 day, 11:45,  3 users,  load average: 1.00, 2.88, 4.80
+  busy over the window: cpuall busy=3.77%
+  busy over the window: cpu4 busy=99.98%
+  busy over the window: cpu5 busy=0.01%
+  timing window 12:17:37 to 12:24:19 (401.9 s)
+### cost-extra
+  before date: 2026-10-20T12:25:17+1100
+  before uname: Linux pc-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+  before uptime: 12:25:17 up 1 day, 11:46,  3 users,  load average: 0.44, 2.38, 4.51
+  after  date: 2026-10-20T12:25:30+1100
+  after  uname: Linux pc-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+  after  uptime: 12:25:30 up 1 day, 11:47,  3 users,  load average: 0.52, 2.33, 4.47
+  busy over the window: cpuall busy=3.62%
+  busy over the window: cpu4 busy=99.92%
+  busy over the window: cpu5 busy=0.00%
+  timing window 12:25:18 to 12:25:30 (12.0 s)
+
+The 5- and 15-minute load averages at the start of the main timing window (8.22, 6.87) are the decay of the catch matrix, which had ended about three minutes earlier; /proc/stat over the window itself shows CPU 4 busy 99.98 %, CPU 5 0.01 %, all 28 CPUs 3.77 % (that is, about 0.2 % outside CPU 4).

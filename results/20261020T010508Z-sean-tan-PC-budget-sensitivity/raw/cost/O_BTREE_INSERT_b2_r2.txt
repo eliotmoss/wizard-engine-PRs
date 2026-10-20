@@ -1,0 +1,7 @@
+CPU 4
+##>1 unit tests
+##+budget_study:O_BTREE_INSERT_b2_s0
+TRACE case=O_BTREE_INSERT name=pwbtree_split_insert events=4601 digest=0x38E55D66837BE5FA
+ROW case=O_BTREE_INSERT kind=ordinary budget=2 salt=0 caught=0 cut=-1 events=4601 failIndex=-1 failImages=-1 failDistinct=-1 failExtremes=-1 failFrom=- imagesChecked=9186 cuts=4602 truncatedCuts=4575 randomCuts=0 randomImages=0 maxExtremes=2 sweepUs=3264944 totalUs=3266962
+COVER case=O_BTREE_INSERT budget=2 salt=0 checked 9186 of 77822268919471128 distinct images (>=2^62 prefix states), truncated
+##-ok
