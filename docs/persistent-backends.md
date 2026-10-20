@@ -3337,7 +3337,9 @@ recover() -> DualWalRecovery
 
 `CORRUPT` reports an invalid dual-WAL header. Recovery leaves valid records in place; replaying an already-durable after-image again is harmless.
 
-`close()` is the clean-unmount boundary: it persists the last applied transaction and scrubs only slots whose data is known durable. Unrecovered records and records protected by a failed final persist remain available for the next mount.
+`close()` is the clean-unmount boundary: it persists the last applied transaction, then scrubs only slots whose data is known durable, oldest sequence first, each under its own `persistRange()`. Unrecovered records and records protected by a failed final persist remain available for the next mount.
+
+The order matters for correctness. Even sequences use slot 0, so sequence N+1 can sit in slot 0 with N in slot 1. Scrubbing by slot index would then erase N+1 first, and a crash before N's scrub would let recovery replay N's after-images over N+1's durable data, losing an acknowledged update. Scrubbing oldest first means an interrupted close leaves the newer record (`dual_wal:close_indeterminate_first_scrub_preserves_latest_value`, `pwregion_bd:sigkill_close_first_slot_scrub_preserves_latest_state`). The crash explorer does not cover close (`docs/THESIS.md`: "Not explored by the model"). Until 2026-10-20 this section did not give the order; `close()` has scrubbed oldest first since 2026-08-11 (ROADMAP, "Two-slot redo WAL, phase B").
 
 ### Persistence-failure contract
 
@@ -3454,16 +3456,23 @@ readU8(addr)
 
 **File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `PWRegion`)
 
-`PWRegion` implements a first-fit block allocator over the persistent region. All metadata mutations go through `RegionTransaction` so they are WAL-protected.
+`PWRegion` implements a first-fit block allocator over the persistent region; it hands out extents, runs of one or more contiguous blocks. Once the region is formatted, every allocator metadata mutation (block-table entries, sentinels, chunk headers, the durable root) goes through `RegionTransaction`, so it is WAL-protected. Two kinds of store do not: `format()` writes its structures directly through the region's `DirectRegionWriter` (see *Format vs. mount*), and the transient Immix line marks are stored through a `DirectRegionWriter` with no writeback or fence (see *Immix GC extension*). Until 2026-10-20 this paragraph said that all metadata mutations go through `RegionTransaction`, which `format()` never did.
 
 ### Region layout
 
 ```
-Block 0      PWRegionHeader
+Block 0      PWRegionHeader (88 B), then the free-list sentinels:
+             BlockLists.MAX_LISTS = 8 entries x 40 B at offsets 88-407,
+             of which SMALL_FREE (0) and LARGE_FREE (1) are used
 Block 1      WAL log chunk
-Block 2..N   User data  (allocated / free)
-Block N..M   Metadata   (block table, sentinels, descriptors)
+Block 2..    User data: extents, allocated or free
+Last blocks  Metadata, carved down from the region's end: the block table
+             (numBlocks + 1 entries) at the end, the descriptor table below
+             it, and each descriptor's metadata (e.g. Immix line marks)
+             below that
 ```
+
+`format()` sets the sentinels at `PWRegionHeader.size` and records that offset in the header's `sentinels` field; `validGeometry()` reserves all eight. The metadata blocks are the fewest whole blocks that hold the metadata area, and form one `METADATA` extent. Until 2026-10-20 this diagram put the sentinels in the metadata area; they have followed the header since 2025-07-06 (`4d43a8cd`).
 
 ### `PWRegionHeader` (88 bytes, stored at offset 0)
 
@@ -3506,32 +3515,54 @@ marked used and nothing reaches it. This is a space leak, not an inconsistency
 cost of the current per-operation commit granularity.
 
 **Format change.** The header grew 80 → 88 bytes. Sentinels sit immediately
-after the header (`formatSentinels()` uses `PWRegionHeader.size`), so they moved
-with it and a region formatted by an older build cannot be mounted by this one:
-`magic`, `numBlocks` and `blockSize` still validate at their unchanged offsets,
-but the sentinel array would be read 8 bytes early. Regions must be reformatted.
-This follows the precedent of the 72 → 80 growth that added `logChunk`.
+after the header (`formatSentinels()` uses `PWRegionHeader.size`), so a region
+formatted by an older build has them at offset 80, where this build's
+`userRoot` lies. `mount()` reads the `sentinels`, `blockTable` and `logChunk`
+offsets from the stored header, and `magic`, `numBlocks` and `blockSize` still
+validate at their unchanged offsets, so such a region still mounts. Its
+`userRoot`, though, is the first 8 bytes of the `SMALL_FREE` sentinel
+(`listNum`, `used` and padding): `getUserRoot()` returns the zero that format
+left there, and `setUserRoot()` stores into the sentinel. The header has no
+version field, so nothing refuses an older region. Older regions are therefore
+unsupported and must be reformatted. When the 72 → 80 growth added `logChunk`,
+`mount()` gained a fallback instead: a stored `logChunk` of 0 means block 1
+(`pwregion_bd:legacy_log_chunk_fallback`). Until 2026-10-20 this paragraph said
+an older region could not be mounted because the sentinel array would be read
+8 bytes early; `mount()` has read the stored `sentinels` offset since
+2026-03-13 (`bf2cf90a`). The mount of an 80-byte region is read from the code,
+not tested.
 
 ### `BlockEntry` (40 bytes)
 
-Each block has one entry in the block table:
+The block table holds `numBlocks + 1` entries, one per block plus an
+end-of-region marker, but only the entry of an extent's first block is live.
+An extent runs to the next live entry in address order, so its length is not
+stored. An interior entry belongs to no chain or list; a split gives the
+remainder's first entry a live role.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `listNum` | i16 | free-list index (see `ListKind`) |
 | `used` | u1 | 1 = allocated |
-| `prev` | i64 | previous block in address order |
-| `next` | i64 | next block in address order |
-| `listPrev` | i64 | previous on same free list |
-| `listNext` | i64 | next on same free list |
+| `prev` | i64 | first entry of the previous extent in address order |
+| `next` | i64 | first entry of the next extent in address order |
+| `listPrev` | i64 | previous extent on the same free list, or the list's sentinel |
+| `listNext` | i64 | next extent on the same free list |
 
 `ListKind` values: `METADATA(-1)`, `NONE(-2)`, `USED(-3)`, `SMALL_FREE(0)`, `LARGE_FREE(1)`.
+An allocated extent carries `NONE`, which `removeFromList()` sets; `USED` is
+defined but never stored. The header block and the log block are `METADATA`
+extents of one block each, the metadata blocks one `METADATA` extent, and the
+end marker carries `NONE` with `used` set. Until 2026-10-20 this section said
+each block had an entry of its own in the chains; the allocator has used
+extents since 2025-07-24 (`faed4563`).
 
 ### Allocation strategy
 
 - Single-block requests try `SMALL_FREE` first, then fall back to `LARGE_FREE`.
 - Multi-block requests search `LARGE_FREE` for a first fit.
-- If the found block is larger than needed, it is split; the remainder is re-inserted into the appropriate list.
+- If the found extent is larger than needed, it is split: the front is allocated, and the remainder, whose first entry becomes live, is re-inserted into the appropriate list.
+- A free coalesces the extent with a free neighbour on either side in address order before inserting it into a list.
 - Every allocation or free calls `performCommit()` to commit the updated block table entries atomically via the WAL.
 
 ### Format vs. mount
@@ -3541,12 +3572,16 @@ PWRegion.__new(backend, numBlocks, metaDataDescs, blockSize, forceFormat)
   if forceFormat or no magic → format(blockSize)
   else                       → mount(blockSize)
 
-format(blockSize)
-  write PWRegionHeader (incl. logChunk offset), all but the magic
-  create SMALL_FREE and LARGE_FREE sentinels
-  allocate block table in metadata area
-  link all user blocks in memory order
-  insert all user blocks onto LARGE_FREE list
+format(blockSize)                -- every store through the DirectRegionWriter, not the log
+  header: numBlocks, numBytes, blockSize, userRoot = 0
+  formatSentinels(): header.sentinels = 88; clear all 8 entries
+  block table (numBlocks + 1 entries) carved from the region's end; cleared
+  descriptor table, then each descriptor's metadata, carved below it
+  if numBlocks < metadataBlocks + 3: return     -- too small; magic never stored
+  entries: block 0 (header) → block 1 (log), both METADATA
+  header.logChunk = block 1; fresh DualTxnWal header   -- the log persists its own
+  block 2 heads one free extent of every user block, alone on LARGE_FREE
+    → first metadata block (one METADATA extent) → end marker (NONE, used)
   backendRegion.persistRange(0, full_size)   -- everything but the magic
   store the magic
   backendRegion.persistRange(magic, 8)       -- then the magic's line alone
@@ -3555,11 +3590,16 @@ mount(blockSize)
   -- header fields are read one at a time through the region's
   -- DirectRegionReader (magic in init(), then these), since 2026-10-19
   verify blockSize and numBlocks match header
-  restore block table handle
+  locate sentinels via header.sentinels
+  restore block table handle via header.blockTable
   locate log chunk via header.logChunk       -- fall back to block 1 if unset (0)
   init DualTxnWal + RegionTransaction
   txn.recover()                              -- replay committed WAL if present
 ```
+
+Until 2026-10-20 the `format()` sketch above said it linked every user block in
+memory order and inserted each onto `LARGE_FREE`, and left out the descriptors,
+the size guard and the log's initialisation; the code makes one free extent.
 
 **The magic is published last (2026-10-19).** `mount()` trusts any header that
 carries the magic, so the magic must not become durable before what it vouches
