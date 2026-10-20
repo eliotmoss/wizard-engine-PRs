@@ -1,6 +1,6 @@
 # Persistent Backends: Design and Implementation
 
-This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system enables Wizard's garbage collector to use durable storage (PMEM/DAX, file-backed mmap, or explicit direct I/O to a file or raw block device) with crash-consistent allocation via a write-ahead log (WAL). See [PMEM Emulation](pmem-emulation.md) for the supported emulated-PMEM development environment and validation limits, and [PMEM Crash Model](pmem-crash-model.md) for the proposed store/`CLWB`/`SFENCE` trace explorer.
+This document covers the design of the persistent/transactional memory backend system on the `pwregions` branch. The system is meant to give the garbage collector of a persistent WASM heap durable storage (PMEM/DAX, file-backed mmap, or explicit direct I/O to a file or raw block device) with crash-consistent allocation via a write-ahead log (WAL). No collector uses it yet: the allocator has no connection to WASM execution ([Design Critique](CRITIQUE.md), item 8). See [PMEM Emulation](pmem-emulation.md) for the supported emulated-PMEM development environment and validation limits, and [PMEM Crash Model](pmem-crash-model.md) for the proposed store/`CLWB`/`SFENCE` trace explorer.
 
 ---
 
