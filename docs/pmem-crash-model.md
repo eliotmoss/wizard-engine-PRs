@@ -1654,8 +1654,10 @@ more; all need root:
    machines, the device's cache, so the ordinary build must give `SURVIVED`
    and the elided-writeback mutant, whose fences now sync nothing, `LOST`:
       the discrimination the kill loop cannot make (commands in
-   [Persistent Backends](persistent-backends.md#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
-   Not yet run (2026-10-21).
+      [Persistent Backends](persistent-backends.md#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
+   Run on sean-tan-PC on 2026-10-21, once per build: ordinary `SURVIVED` and
+   mutant `LOST`, every acknowledged step lost
+   ([details](persistent-backends.md#a-kernel-reset-separates-the-file-backends-builds)).
 2. **Block-level images.** dm-log-writes logs every write and flush beneath
    the filesystem; `replay-log` (xfstests) rebuilds the device at every entry,
    and each image, once its filesystem is mounted on a copy, can be compared
@@ -1677,7 +1679,8 @@ ordinary provider `OK` over 20 kills (20 acknowledged-step checks, 0 lost); with
 the elided-writeback mutant, whose fences sync nothing, also `OK`. The mutant
 never waits for the device, so at the default delay it fills the sieve's table
 after 4 kills (4 checks, 0 lost); with the kill delay capped at 2,000 µs it
-takes all 20 (6 checks, 0 lost). As on DAX, the evidence for the file backend is the model plus
+takes all 20 (6 checks, 0 lost). A kernel reset on block storage does discriminate (follow-up 1 above,
+2026-10-21). Beyond it, as on DAX, the evidence for the file backend is the model plus
 the checks above.
 
 ### Scale

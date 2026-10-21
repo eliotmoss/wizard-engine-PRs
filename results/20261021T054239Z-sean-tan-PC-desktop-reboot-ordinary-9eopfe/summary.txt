@@ -1,0 +1,16 @@
+---- ordinary kernel-reset verification
+pwreboot exit 0 (0 SURVIVED; 1 LOST; 3 INVALID; other codes are errors)
+raw image: 2097152 bytes, 7205 nonzero
+recovery: REPLAYED
+durable cursor 162560, primes 14891, leaked extents reclaimed 0
+setup cursor 65024, acknowledged cursor 162560, acknowledged primes 14891
+verdict SURVIVED
+reason all acknowledged steps are durable and every invariant holds
+---- limits
+State and region share the ext4 root on /dev/nvme1n1p3; /tmp is volatile tmpfs.
+There is no other writable disk filesystem available for a separate state filesystem.
+pwreboot StateFile.line fsyncs every line (test/pwreboot.main.v3:182-190).
+The final ack and summary share one fsync immediately before reset (lines 458-473).
+Inference: under data=ordered an fsync forces out only data blocks newly allocated in its transaction, so a state fsync could mask a mutant loss only if ext4 fell back to nodelalloc (low free space); heavy concurrent dirtying could mask one through background writeback instead.
+No sync is inserted after pwreboot starts arm. Preparation/arm metadata are synced beforehand.
+A warm reset keeps the device powered: this tests kernel/filesystem cache loss, not device-cache power-loss durability.

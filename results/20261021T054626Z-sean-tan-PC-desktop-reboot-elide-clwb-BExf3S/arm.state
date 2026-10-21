@@ -1,0 +1,8 @@
+provider elide-clwb
+start_cursor 65024
+ack 1 cursor 97536 count 9378
+ack 2 cursor 130048 count 12163
+ack 3 cursor 162560 count 14891
+acked_steps 3
+acked_cursor 162560
+acked_count 14891

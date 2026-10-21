@@ -1,0 +1,12 @@
+owner sean-tan
+provider elide-clwb
+region_dir /home/sean-tan/pwfile-reboot/20261021T054626Z-sean-tan-PC-desktop-reboot-elide-clwb-BExf3S-15qegZ
+commit b369a1debd39d149996e973bae39aeb8a6eb305a
+binary_sha256 c6708f70c81764f982924ca6f727bee75e7ea7349bc22596f359ebf04053770c
+binary_make_q up-to-date (exit 0 after incremental make)
+host pc-ubuntu
+kernel Linux 7.0.0-38-generic x86_64 GNU/Linux
+54386f386941434a238e3c84cfc0e282e1963d0e8ab04e1ea5335cfae4f318aa  /home/sean-tan/research/wizard-engine-PRs/scripts/desktop-reboot-check.sh
+geometry 512 x 4096; setup 2 steps; arm 3 steps; reset fd 3
+?? results/20261021T054239Z-sean-tan-PC-desktop-reboot-ordinary-9eopfe/
+?? results/20261021T054626Z-sean-tan-PC-desktop-reboot-elide-clwb-BExf3S/

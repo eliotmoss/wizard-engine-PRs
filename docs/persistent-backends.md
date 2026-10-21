@@ -431,7 +431,11 @@ sean-tan-PC's NVMe after the change, `pwsieve` with the ordinary provider gave
 `OK` over 20 kills (20 acknowledged-step checks, 0 lost), and so did the
 elided-writeback mutant, whose fences now sync nothing: 4 kills at the default
 delay before the table filled (4 checks, 0 lost), and 20 with the kill delay
-capped at 2,000 µs (6 checks, 0 lost). The evidence for this backend is the
+capped at 2,000 µs (6 checks, 0 lost). A kernel reset, which discards the
+page cache, does separate them: on 2026-10-21, one run each, the ordinary
+build's verdict was `SURVIVED` and the mutant's `LOST`, with every
+acknowledged step gone
+([below](#a-kernel-reset-separates-the-file-backends-builds)). The rest of the evidence for this backend is the
 model and the checks in `FileMmapRegionTest.v3`.
 
 ### On Magpie
@@ -556,7 +560,8 @@ followed every boundary's writes
    command to save the post-reboot counters in the run directory. This checks
    kernel/filesystem cache loss while the device stays powered, **not device-cache power-loss
    durability**; both providers surviving would not establish discrimination.
-   No reset has been run with these wrappers yet (2026-10-21). `scripts/stage2c.sh` treats
+      Run 2026-10-21, once per provider: ordinary `SURVIVED`, `elide-clwb` `LOST`
+   ([below](#a-kernel-reset-separates-the-file-backends-builds)). `scripts/stage2c.sh` treats
    the file backend as a dry run without a reboot, so it cannot be used as it
    stands.
 
@@ -889,16 +894,18 @@ which had been inferred:
 
 ## sean-tan-PC's root checks (2026-10-21)
 
-Sean ran two of the desktop's three
+Sean ran the desktop's three
 [follow-ups that need root](#follow-ups-that-need-root) with sudo on
-2026-10-21, at `dd0c1cc5` on kernel 7.0.0-38, each binary built by the owner
-first and current under `make -q`: the flush trace
-(`scripts/desktop-root-checks.sh`,
-`results/20261021T040954Z-sean-tan-PC-desktop-root-checks`) and the stable-writes
-A/B (`scripts/desktop-stable-writes.sh`,
-`results/20261021T041120Z-sean-tan-PC-desktop-stable-writes`). The kernel crash
-(`scripts/desktop-reboot-check.sh`) has not been run. Every figure below is from
-those two directories.
+2026-10-21, on kernel 7.0.0-38, each binary built by the owner first and
+current under `make -q`: the flush trace (`scripts/desktop-root-checks.sh`,
+`results/20261021T040954Z-sean-tan-PC-desktop-root-checks`) and the
+stable-writes A/B (`scripts/desktop-stable-writes.sh`,
+`results/20261021T041120Z-sean-tan-PC-desktop-stable-writes`), both at
+`dd0c1cc5`, and the kernel reset (`scripts/desktop-reboot-check.sh`, over SSH,
+at `b369a1de`: `results/20261021T054239Z-sean-tan-PC-desktop-reboot-ordinary-9eopfe`
+and `results/20261021T054626Z-sean-tan-PC-desktop-reboot-elide-clwb-BExf3S`).
+`b369a1de` changed only docs and results after `dd0c1cc5`. Every figure below
+is from those directories.
 
 ### `fdatasync` sends the NVMe a cache flush: observed
 
@@ -987,11 +994,54 @@ phases' 1,863,736 against 1,913,426 ns, +2.7 % (`summary.txt`).
 - **Nothing on either host changed.** Neither host's devices request stable
   writes, so B2 still holds by construction on neither.
 
+### A kernel reset separates the file backend's builds
+
+Follow-up 1, run once per provider. `prepare` ran `pwreboot setup` on a fresh
+2 MiB region (512 × 4096) in a mapped file under `~/pwfile-reboot` on the root
+ext4, two sieve steps, then `sync -f`. `arm` ran three more steps, each
+acknowledged by an fsynced state line in `results/`, and wrote `b` to an
+inherited `/proc/sysrq-trigger` descriptor straight after the last
+acknowledgement's fsync, so the machine reset without syncing. `verify` ran
+after the reboot, once, on a copy-preserved image (`region-before-verify.img`):
+
+| Provider | Setup cursor | Acknowledged cursor; primes | Recovery | Durable cursor; primes | Verdict |
+|---|---|---|---|---|---|
+| ordinary | 65,024 | 162,560; 14,891 | `REPLAYED` | 162,560; 14,891 | `SURVIVED`: "all acknowledged steps are durable and every invariant holds" |
+| `elide-clwb` | 65,024 | 162,560; 14,891 | `CLEAN` | 65,024; 6,495 | `LOST`: "every acknowledged step was lost" |
+
+- **The discrimination the kill loop cannot make.** A killed process leaves the
+  page cache, so on this backend the ordinary build and the mutant both pass
+  the kill loop ([above](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
+  A reset discards it: the ordinary build's fences carried all three
+  acknowledged steps to the drive, and the mutant, whose fences sync nothing,
+  kept only what setup's `sync -f` had made durable.
+- **Recovery shows whether the records arrived.** `recover()` replays
+  whenever a slot holds a valid record, and records stay in their slots until
+  a clean close ([Recovery and close](#recovery-and-close)), so the ordinary
+  build's `REPLAYED` says its arm records reached the drive, not that any
+  after-image was missing; replaying a durable one is harmless. The mutant's
+  `CLEAN` says no valid record did. The raw images hold 7,205 and 5,420
+  nonzero bytes. This repeats, through a real reset and the page cache, the
+  cursors and recovery outcomes of the direct backend's `pwreboot` pair
+  ([above](#crash-behaviour-process-death-is-the-crash)), which ran without a
+  reboot; the sieve is deterministic.
+- **The drive stayed powered.** `nvme smart-log` read 557 power cycles and 7
+  unsafe shutdowns before the first arm and again before the second, after the
+  first reset. The counters after the second reset were not recorded (verify's
+  printed `sudo nvme smart-log` command was not run). Each run's boot ID
+  changed (`verify-boot.txt` against `arm-before.txt`), and dirty memory before
+  arming was 2,056 and 4,700 kB.
+- **Limits.** One run per provider, each one cut, straight after the last
+  acknowledgement; the reset keeps the drive powered, so this checks the loss
+  of the page cache, not of the drive's cache or power. The state file shares
+  the root filesystem with the region, so a state fsync could have masked a
+  mutant loss only through the conditions in `notes.txt`; the mutant lost
+  every step, so none did here.
+
 ### What the checks leave open
 
-- The kernel crash on block storage, the one follow-up that discriminates the
-  file backend's fences (`desktop-reboot-check.sh`; it resets this machine
-  twice).
+- Repeats of the kernel reset, and cuts other than straight after an
+  acknowledgement.
 - Whether the drive keeps a flushed write through a power failure: B3 and B4's
   device half.
 - What stable writes cost when background writeback overlaps a program's

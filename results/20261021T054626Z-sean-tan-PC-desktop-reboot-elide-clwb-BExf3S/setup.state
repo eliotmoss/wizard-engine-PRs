@@ -1,0 +1,7 @@
+region /home/sean-tan/pwfile-reboot/20261021T054626Z-sean-tan-PC-desktop-reboot-elide-clwb-BExf3S-15qegZ/wizard-pwreboot-u1000-p5804-0.region
+backend file
+blocks 512
+block_size 4096
+setup_steps 2
+setup_cursor 65024
+setup_count 6495

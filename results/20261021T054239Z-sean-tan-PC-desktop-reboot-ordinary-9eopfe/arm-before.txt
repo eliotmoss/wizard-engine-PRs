@@ -1,0 +1,46 @@
+recorded 2026-10-21T05:43:25+00:00
+boot_id 86ac7575-83c3-4f46-b2c7-f952198baf73
+ 16:43:25 up 2 days, 16:04,  7 users,  load average: 0.03, 0.20, 0.27
+proc_uptime 230696.13 6307191.33
+---- effective ext4 options
+rw
+bsddf
+nogrpid
+block_validity
+dioread_nolock
+nodiscard
+delalloc
+nowarn_on_error
+journal_checksum
+barrier
+auto_da_alloc
+user_xattr
+acl
+noquota
+resuid=0
+resgid=0
+errors=continue
+commit=5
+min_batch_time=0
+max_batch_time=15000
+i_version
+stripe=0
+data=ordered
+inode_readahead_blks=32
+init_itable=10
+max_dir_size_kb=0
+prefetch_block_bitmaps
+---- Dirty/Writeback (kB)
+Dirty:              2056 kB
+Writeback:             0 kB
+WritebackTmp:          0 kB
+---- vm.dirty_*
+dirty_background_bytes 0
+dirty_background_ratio 10
+dirty_bytes 0
+dirty_expire_centisecs 3000
+dirty_ratio 20
+dirty_writeback_centisecs 500
+---- df /
+Filesystem     1K-blocks     Used Available Use% Mounted on
+/dev/nvme1n1p3 410640872 79131688 310576320  21% /
