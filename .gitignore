@@ -14,3 +14,6 @@ src/engine/cbd/slow/CBDValidator.v3
 src/engine/cbd/slow/CBDTypes.v3
 
 src/engine/cbd/fast/CBDFastInt.v3
+
+# Local desktop reset run selectors; result directories remain tracked as before.
+/results/desktop-reboot*.latest

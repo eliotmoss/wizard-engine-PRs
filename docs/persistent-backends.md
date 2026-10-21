@@ -484,32 +484,79 @@ the kill loop's result on a second host.
 
 ### Follow-ups that need root
 
+Desktop flush tracing (no reset; two six-minute benchmark timeouts plus
+matched idle windows). Build as yourself first, since under `sudo` the PATH has
+no `v3c`: `make bin/pwbench.x86-64-linux`, then
+`sudo env PWROOT_USER=sean-tan scripts/desktop-root-checks.sh`.
+This records the root ext4 mount/superblock and NVMe queue facts, then traces
+`block:block_rq_issue` on `nvme1n1` during file and direct pwbench runs with
+Magpie's parameters (2 MiB, 8 entries, 2,000 measured commits after 200 warm-up);
+it only checks with `make -q` that pwbench is current (and says to run `make`
+as yourself if not),
+and checks the file run's `boundary fdatasync` line. Each run has an idle trace
+window of the same requested duration (actual durations are recorded), to put
+root journal commits (`commit=5`), desktop IO and `/boot/efi` traffic in context;
+before each idle window it syncs the benchmark directory and waits 10 s outside
+the trace, so the window does not catch the benchmark's own last commit.
+Counts include all commands, with a `pwbench`/`jbd2`/`kworker`/other breakdown;
+workers can issue benchmark IO. Ratios use pwbench's reported **measured persist
+boundaries**, each a `fdatasync`, rather than an assumed count of commits. The
+whole-process numerator also includes setup, warm-up and close, so those ratios
+and a variable idle baseline cannot establish one flush/FUA per syscall. The
+trace shows requests sent, not that the device makes them durable. INT, TERM
+and HUP stop and wait for the benchmark before removing the private trace
+instance; cleanup failures are reported. Not yet run (2026-10-21).
+
 1. **A kernel crash on block storage, with discrimination.** `pwreboot` already
    runs the file backend, and `arm` with an inherited `/proc/sysrq-trigger`
    descriptor resets the machine straight after the `fsync` of its last
-   acknowledgement. A warm reset discards the page cache, so the ordinary build
-   should give `SURVIVED` and the mutant `LOST`. On sean-tan-PC (this resets
-   the machine; keep the region's directory off any filesystem the reset could
-   damage, and if possible the state files on a different filesystem from the
-   region, so that their `fsync` cannot write the region back):
+   acknowledgement. A warm reset discards the page cache; the intended
+   discriminator is ordinary `SURVIVED` against mutant `LOST`, not an assumed
+   result. On sean-tan-PC (`pc-ubuntu`), save all work first: **arm immediately
+   resets the machine without syncing or unmounting**, putting the shared root
+   filesystem at risk. **Check that GRUB's default entry is Ubuntu before
+   arming.** Run each command from this checkout:
 
-   ```
-   make bin/pwreboot.x86-64-linux
-   D=$HOME/pwfile-reboot && mkdir -p "$D"
-   bin/pwreboot.x86-64-linux setup "$D" "$D/setup.state" file 512 4096 2
-   sync -f "$D"
-   R=$(awk '$1 == "region" { print $2 }' "$D/setup.state")
-   sudo sh -c "exec 3>/proc/sysrq-trigger && exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- $PWD/bin/pwreboot.x86-64-linux arm $R $D/arm.state file elide-clwb 512 4096 3 3"
-   # after the machine is back:
-   bin/pwreboot.x86-64-linux verify "$R" file 512 4096 \
-       "$(awk '$1 == "setup_cursor" { print $2 }' "$D/setup.state")" \
-       "$(awk '$1 == "acked_cursor" { print $2 }' "$D/arm.state")" \
-       "$(awk '$1 == "acked_count" { print $2 }' "$D/arm.state")"
+   ```bash
+   scripts/desktop-reboot-check.sh prepare ordinary
+   sudo env PWROOT_USER=sean-tan scripts/desktop-reboot-check.sh arm ordinary --yes-reset-this-machine
+   # After the machine is back (the arm command also prints an exact run-specific command):
+   scripts/desktop-reboot-check.sh verify ordinary
+   # Then a separate run with a fresh region and the negative-control provider:
+   scripts/desktop-reboot-check.sh prepare elide-clwb
+   sudo env PWROOT_USER=sean-tan scripts/desktop-reboot-check.sh arm elide-clwb --yes-reset-this-machine
+   # After the second reset:
+   scripts/desktop-reboot-check.sh verify elide-clwb
    ```
 
-   Then the same with `ordinary` in place of `elide-clwb`, and a fresh `D`.
-   `scripts/stage2c.sh` treats the file backend as a dry run without a reboot,
-   so it cannot be used as it stands.
+   `prepare` and `verify` run without root. Preparation always runs incremental
+   `make bin/pwreboot.x86-64-linux`, requires `make -q` to confirm it is current,
+   and records that result and the binary hash in the manifest. It uses a fresh
+   directory under the owner's home on the ext4 root, runs
+   `setup ... file 512 4096 2`, then `sync -f`; arm uses three more steps
+   and inherited descriptor 3. State files and boot IDs live under `results/`
+   on that same ext4 root, never `/tmp` (tmpfs). A different state filesystem
+   would be preferable, so that its `fsync` cannot write the region back, but
+   this desktop has no other writable disk filesystem available. `pwreboot`
+   fsyncs every state line, and combines the last acknowledgement and summary
+   in one fsync immediately before resetting. **Inference:** under `data=ordered` an fsync
+   forces out only data blocks newly allocated in its transaction, so a state
+   fsync could mask the mutant's losses only if ext4 fell back to nodelalloc
+   (low free space); heavy concurrent dirtying could mask them through
+   background writeback instead.
+   The wrapper records that limitation and rejects verification until the boot
+   ID changes. Before arming it records the effective ext4 options, Dirty and
+   Writeback memory, `vm.dirty_*`, `df /`, and, as root,
+   `nvme smart-log /dev/nvme1` (power cycles and unsafe shutdowns); if nvme-cli
+   is absent it
+   checks for sysfs equivalents and reports when none are exposed. Arm outputs
+   are opened as the ordinary owner. Non-root `verify` prints an exact sudo
+   command to save the post-reboot counters in the run directory. This checks
+   kernel/filesystem cache loss while the device stays powered, **not device-cache power-loss
+   durability**; both providers surviving would not establish discrimination.
+   No reset or root check has been run with these wrappers yet. `scripts/stage2c.sh` treats
+   the file backend as a dry run without a reboot, so it cannot be used as it
+   stands.
 
 2. **Block-level images (dm-log-writes).** The `log-writes` device-mapper target
    logs every write and flush beneath the filesystem, and xfstests'
@@ -553,10 +600,38 @@ the kill loop's result on a second host.
    checker on the region file, and unmounts. `--check 1` checks after every
    entry instead of every flush.
 
-3. **Stable writes.** `echo 1 | sudo tee /sys/block/nvme1n1/queue/stable_writes`
-   before the filesystem is mounted makes B2 hold by construction; the setting
-   is read only at mount, so for the root filesystem it needs a reboot path that
-   sets it first (a udev rule). Then rerun the A/B above to price it.
+3. **Stable writes.** `sudo env PWROOT_USER=sean-tan scripts/desktop-stable-writes.sh`
+   (no reset) prices the mapped-file sieve's `file-block` configuration with
+   `stable_writes=1` against `0` on two fresh ext4-over-loop filesystems, **not
+   on the NVMe directly**; it measures cost, not crash durability. The root
+   ext4 mount is the only available ext4 and stable writes are read at mount,
+   so the script leaves its queue unchanged: it fully writes two private
+   2 GiB images in `/var/tmp`, attaches loops with direct IO, verifies each
+   loop's backing path before formatting, and sets each loop's queue before
+   `mkfs.ext4` and mounting under `/mnt`. Formatting disables discard and lazy
+   inode-table/journal initialization. After one discarded warm-up campaign on
+   each mount, four measured pairs run in balanced ABBA order twice (1, 0, 0, 1,
+   1, 0, 0, 1), as the owner. Each campaign uses five rounds, 256 x 4096, eight
+   warm-up steps, and CPU 2 by default. This is intended to finish within 30
+   minutes, with a 24-minute deadline covering warm-up and measured campaigns.
+   Build it as yourself first (`make bin/pwsievebench.x86-64-linux`); the
+   script only checks with `make -q` that it is current, then hashes it;
+   campaigns must preserve that hash and remain current. Results include
+   queue/mount facts, per-campaign `/proc/vmstat` snapshots and deltas (including
+   `nr_dirtied` and `nr_written`), and `/proc/sys/vm/dirty_*`. Any exposed named
+   stable-page/writeback-wait counters are included; absent counters are
+   reported. **Read a null result with those counters and dirty settings:**
+   stable pages add a wait only when a store hits a page under writeback.
+   `fdatasync` waits for writeback, so this single-threaded 1 MiB sieve relies
+   on background writeback (normally `dirty_expire_centisecs=3000`) to overlap
+   stores. Near-zero cost may mean no stable-page waits occurred. The vmstat
+   counters are system-wide, so unrelated activity also contributes.
+   INT, TERM and HUP stop and wait for the campaign before cleanup attempts to
+   unmount, detach and remove private resources. Busy or failed resources are
+   retained and recorded in `cleanup.txt`; interrupted loop attachments are
+   rediscovered by backing image. This requires writable loop
+   `queue/stable_writes` support and refuses if setting it fails. No root path
+   or loop-device behavior has been exercised with this wrapper yet.
 4. **The A/B under `performance`**, to compare with the 86 % directly:
    `echo performance | sudo tee /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor`,
    then the campaigns above, then set it back to `powersave`. Done for the
