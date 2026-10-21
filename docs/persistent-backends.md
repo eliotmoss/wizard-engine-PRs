@@ -1026,9 +1026,10 @@ after the reboot, once, on a copy-preserved image (`region-before-verify.img`):
   ([above](#crash-behaviour-process-death-is-the-crash)), which ran without a
   reboot; the sieve is deterministic.
 - **The drive stayed powered.** `nvme smart-log` read 557 power cycles and 7
-  unsafe shutdowns before the first arm and again before the second, after the
-  first reset. The counters after the second reset were not recorded (verify's
-  printed `sudo nvme smart-log` command was not run). Each run's boot ID
+  unsafe shutdowns before the first arm, again before the second (after the
+  first reset), and after the second reset (`verify-smart-after.txt` of the
+  `elide-clwb` run, read before any further boot). The ordinary run has no
+  after-reading of its own; the second run's before-reading serves. Each run's boot ID
   changed (`verify-boot.txt` against `arm-before.txt`), and dirty memory before
   arming was 2,056 and 4,700 kB.
 - **Limits.** One run per provider, each one cut, straight after the last
