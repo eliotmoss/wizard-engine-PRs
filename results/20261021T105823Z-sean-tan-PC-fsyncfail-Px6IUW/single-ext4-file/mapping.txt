@@ -1,0 +1,9 @@
+log_offset 4096
+log_bytes 4096
+log_sector 266248
+log_sectors 8
+extent_flags -
+fail_sector 266248
+fail_sectors 8
+other_slot_sector -
+prepared_slots -

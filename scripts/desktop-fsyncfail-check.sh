@@ -1006,7 +1006,11 @@ run_case() { # scenario, fs, backend
         cmp -s "$CD/log-device-before.bin" "$CD/log-device-ready.bin" || die "the log chunk on the device changed between fault-prepare and READY"
     fi
     [[ "$NONCE_HEX" =~ ^[0-9a-f]{16}$ ]] || die "bad nonce_le_hex"
-    DMESG0=$(dmesg --time-format iso | wc -l)
+    # The run window by time, not by line count: the ring buffer drops its
+    # oldest lines as new ones arrive (UFW logs every few seconds here), so a
+    # count taken now no longer marks the same line later. Timestamps in
+    # dmesg's ISO format compare as strings (results/20261021T105823Z-...-Px6IUW).
+    DMESG_T0=$(date '+%Y-%m-%dT%H:%M:%S,%6N')
 
     # Arm, and check the armed table without writing to it.
     swap_table "$(armed_table "$SIZE" "$LOOP_MM")" "armed: sectors $FS0+$FN -> error"
@@ -1074,7 +1078,7 @@ run_case() { # scenario, fs, backend
         FSSTATE=$FSSTATE/no-remount
         say "---- remount failed: no verify" | as_user tee -a "$CD/fs.txt" > /dev/null
     fi
-    dmesg --time-format iso | tail -n +$((DMESG0 + 1)) | as_user tee "$CD/dmesg.txt" > /dev/null
+    dmesg --time-format iso | awk -v t0="$DMESG_T0" 'substr($1, 1, 26) >= t0' | as_user tee "$CD/dmesg.txt" > /dev/null
     fs_facts "after verify" | as_user tee -a "$CD/fs.txt" > /dev/null
 
     summary_row "$c" | as_user tee -a "$OUT/summary.txt"

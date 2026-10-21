@@ -1115,19 +1115,85 @@ the control.
   the device's start, where XFS placed the chunk. The script's own reads use
   `O_DIRECT`. They read the block device's cache, not the file's, so the
   result does not depend on them.
-- **Limits.** ext4 twice and XFS once; one transient write error, since the
-  device works again before the reopen, as in the paper's one failed write;
-  4 KiB blocks; a one-word transaction. A lasting error would also fail
-  recovery's own boundary, which latches again. For the direct backend, a
-  completed write followed by a failed device flush remains untested.
+- **Limits.** ext4 twice and XFS once (three times and twice with the repeat
+  below); one transient write error, since the device works again before the
+  reopen, as in the paper's one failed write; 4 KiB blocks; a one-word
+  transaction after a clean close. The longer histories below add two
+  acknowledged transactions before the failure, 8 KiB blocks and two-word
+  transactions. A lasting error would also fail recovery's
+  own boundary, which latches again. For the direct backend, a completed write
+  followed by a failed device flush remains untested.
+
+#### Two longer histories: an acknowledged write lost, an unacknowledged one torn
+
+Sean ran `run` again on 2026-10-21 at `bd23bd4f`, on kernel 7.0.0-38:
+`results/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW`, three scenarios on
+ext4 and XFS with both backends, twelve cases. `single` repeated the table
+above, ext4's third run and XFS's second. The two new scenarios start from two
+acknowledged transactions whose records fill both slots: `fault-prepare`
+commits N-2 = 1 (word M = A) and N-1 = 2 (M = B), makes their data durable
+with `flush()`, which scrubs no slot, and exits without a clean close. The
+error target then covers only the 4 KiB page holding slot N mod 2. The
+per-case `dmesg.txt` files are incomplete: the script found its window by
+counting ring-buffer lines, which shift once the buffer wraps.
+`kernel-journal.txt`, read from the journal afterwards, has every message, and
+the script now selects the window by timestamp.
+
+| Scenario | Blocks | History | File backend, ext4 and XFS | Direct backend, ext4 and XFS |
+|---|---|---|---|---|
+| `stale-slot` | 8 KiB: the slots on different pages | commit N (M = C) fails; same-boot reopen; one more commit, "next" (M2 = D), acknowledged; umount and mount | `LOST`: "M holds N-2's value A: the acknowledged N-1's write is undone" | `CONSISTENT` |
+| `tear` | 4 KiB: both slots on one page | commit N (M = C, Z = E) fails; same-boot reopen; umount and mount | `TORN`: "N (unacknowledged) is partly present: its Z = E is durable and its M = C is undone" | `CONSISTENT` |
+
+- **Every fault hit its page.** The journal has ext4's `I/O error 10 writing
+  to inode 14 starting block 33283` (stale-slot, slot 1's page) and `… block
+  33281` (tear), and XFS's `writeback error on inode 132, offset 12288, sector
+  120` and `… offset 4096, sector 112`. Every file system stayed `rw`, ext4's
+  `errors_count` stayed 0 and every XFS mount ended clean. The allocator's and
+  the sieve's invariants held in all twelve cases.
+- **Stale slot: how an acknowledged write is lost.** The log comparisons give
+  the record sequences in slots 0 and 1. After the failed commit the page
+  cache held (2, 3) and the device (2, 1). The same-boot reopen replayed record
+  3 from the cache, so "next" became sequence 4 and went to slot 0: cache
+  (4, 3), device (4, 1). Nothing wrote slot 1's page again, so after next's
+  boundary the device still held the stale record N-2 there. After the remount
+  recovery replayed 1 and then 4, which put N-2's value back over the
+  acknowledged N-1's write. On the direct backend the reopen read (2, 1) from
+  the device, "next" became 3 and overwrote the stale slot, and nothing was
+  lost.
+- **Tear: how an unacknowledged transaction splits.** The failed page held both
+  slots, so the device kept (2, 1). The same-boot replay of N made both of N's
+  words durable through recovery's boundary. After the remount recovery
+  replayed 1 and 2, which restored M to N-1's value but left Z, which neither
+  touches, at N's: N is partly present, which the contract allows neither as
+  absent nor as replayed. No crash was needed, unlike the inference above
+  about a crash during the replay's write-back.
+- **Which configurations are exposed.** At 4 KiB blocks both slots share a
+  page, the tear case. From 8 KiB up they sit on different pages (`slotBytes`,
+  [Active on-region layout](#active-on-region-layout)), the stale-slot case,
+  which includes the platform wrappers' default 512 KiB block
+  ([`PWRegionHeader`](#pwregionheader-88-bytes-stored-at-offset-0)). Both need
+  a failed write on the file backend over ext4 or XFS and a reopen in the same
+  boot; a crash alone does not produce them.
+- *Inference:* replay's idempotence does not help, since what recovery replays
+  is chosen from slots whose device copy no longer matches the cache; and no
+  structural check after one crash flags either outcome, since the invariants
+  hold.
+- **Not fixed** ([Open Issues](ROADMAP.md#open-issues), #7). Options, none
+  built: recovery reads the log through `O_DIRECT` and refuses to mount when it
+  differs from the mapping, as the direct backend in effect does (Rebello et
+  al., §5 #8); a failed boundary on this backend requires the page cache gone,
+  as after a reboot, before the reopen; or recovery stores each record it
+  validates back into its slot before replaying, so that the page is written
+  again (§5 #7), at one more boundary per recovery.
 
 ### What the checks leave open
 
 - Repeats of the kernel reset, and cuts other than straight after an
   acknowledgement.
-- Repeats of the failed write, a transaction whose after-images span several
-  pages, a lasting error, and other block sizes; for the direct backend, a
-  failed flush after a completed write.
+- Repeats of the failed-write runs (`single` three times on ext4 and twice on
+  XFS, the two longer histories once each), a lasting error, transactions whose
+  after-images span more pages, and, for the direct backend, a failed flush
+  after a completed write.
 - Whether the drive keeps a flushed write through a power failure: B3 and B4's
   device half.
 - What stable writes cost when background writeback overlaps a program's
@@ -3699,8 +3765,13 @@ failures:
   the page cache and replayed it, recovery's boundary made the after-image
   durable, and the record never reached the device, so a later `CLEAN` came
   with the transaction's data present (observed 2026-10-21,
-  [sean-tan-PC's root checks](#a-failed-write-below-ext4-and-xfs-the-same-boot-reopen-replays-a-record-the-disk-lacks)). The direct backend
-  reads the device on reopen and was not affected.
+  [sean-tan-PC's root checks](#a-failed-write-below-ext4-and-xfs-the-same-boot-reopen-replays-a-record-the-disk-lacks)). Over longer
+  histories it is worse: with the slots on different pages (8 KiB blocks and
+  up) a later recovery replayed a stale record over an acknowledged
+  transaction's write, and with both on one page (4 KiB) the failed
+  transaction was left partly present
+  ([two longer histories](#two-longer-histories-an-acknowledged-write-lost-an-unacknowledged-one-torn)). The direct backend reads the
+  device on reopen and was not affected.
 
 Redo entries are `(offset, width, after-image)` stores. Replaying the same
 valid record, including one whose original caller received `0`, is therefore

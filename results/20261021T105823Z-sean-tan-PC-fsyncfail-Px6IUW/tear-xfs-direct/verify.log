@@ -1,0 +1,21 @@
+scenario tear
+next_acked 0
+found_header_valid 1
+found_slot0_seq 2
+found_slot1_seq 1
+recovery REPLAYED
+latched 0
+m 17651275806765317824
+x 0
+m_is B
+x_is 0
+leaks_reclaimed 0
+sieve_invariants ok
+allocator_invariants ok
+cursor 65024
+count 6495
+acks CONSISTENT
+acks_reason N-1 is present; N (unacknowledged) is wholly absent
+verdict CONSISTENT
+reason N-1 is present; N (unacknowledged) is wholly absent
+verify_exit 0

@@ -1,0 +1,33 @@
+scenario tear
+pre_header_valid 1
+pre_slot0_seq 2
+pre_slot1_seq 1
+mount_recovery REPLAYED
+leaks_reclaimed 0
+word_m_offset 12264
+word_x_offset 12280
+x_word Z
+m_before 2566481641669095473
+x_before 0
+txn_seq 3
+test_slot 1
+slot_bytes 1984
+slot0_offset 4160
+slot1_offset 6144
+value_c 17501252878314448682
+value_c_le_hex 2a273768c4f0e0f2
+value_x 8264404395133929362
+value_x_le_hex 928722bc0210b172
+READY
+commit_ok 0
+latched 1
+ATTEMPTED
+reopen_seen_header_valid 1
+reopen_seen_slot0_seq 2
+reopen_seen_slot1_seq 3
+reopen_recovery REPLAYED
+reopen_latched 0
+reopen_m 17501252878314448682
+reopen_x 8264404395133929362
+DONE
+driver_exit 0

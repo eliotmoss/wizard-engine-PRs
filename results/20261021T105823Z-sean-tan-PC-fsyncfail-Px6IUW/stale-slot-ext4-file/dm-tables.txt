@@ -1,0 +1,8 @@
+---- created: all linear
+0 2097152 linear 7:24 0
+---- armed: sectors 266264+8 -> error
+0 266264 linear 7:24 0
+266264 8 error
+266272 1830880 linear 7:24 266272
+---- restored: all linear
+0 2097152 linear 7:24 0

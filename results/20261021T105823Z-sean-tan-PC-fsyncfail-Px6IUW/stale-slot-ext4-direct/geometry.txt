@@ -1,0 +1,11 @@
+scenario stale-slot
+block_size 8192
+log_offset 8192
+log_bytes 8192
+slot_bytes 4032
+slot0_offset 8256
+slot1_offset 12288
+test_slot 1
+fail_offset 12288
+fail_bytes 4096
+other_slot_page 8192

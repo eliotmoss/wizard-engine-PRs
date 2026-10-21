@@ -1,0 +1,8 @@
+---- mounted
+/dev/mapper/pwfsf-Px6IUW-single-xfs-direct /home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/single-xfs-direct.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+---- after the reopen
+/dev/mapper/pwfsf-Px6IUW-single-xfs-direct /home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/single-xfs-direct.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+---- remounted (cache dropped)
+/dev/mapper/pwfsf-Px6IUW-single-xfs-direct /home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/single-xfs-direct.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+---- after verify
+/dev/mapper/pwfsf-Px6IUW-single-xfs-direct /home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/single-xfs-direct.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota

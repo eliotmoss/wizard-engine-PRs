@@ -1,0 +1,41 @@
+scenario stale-slot
+pre_header_valid 1
+pre_slot0_seq 2
+pre_slot1_seq 1
+mount_recovery REPLAYED
+leaks_reclaimed 0
+word_m_offset 24536
+word_x_offset 24552
+x_word M2
+m_before 16017793811225428507
+x_before 0
+txn_seq 3
+test_slot 1
+slot_bytes 4032
+slot0_offset 8256
+slot1_offset 12288
+value_c 3842250949521625769
+value_c_le_hex a9d224a8e16a5235
+value_x 14228137217296397337
+value_x_le_hex 1974774c6a7f74c5
+READY
+commit_ok 0
+latched 1
+ATTEMPTED
+reopen_seen_header_valid 1
+reopen_seen_slot0_seq 2
+reopen_seen_slot1_seq 3
+reopen_recovery REPLAYED
+reopen_latched 0
+reopen_m 3842250949521625769
+reopen_x 0
+REOPENED
+next_seq_expected 4
+next_ok 1
+next_latched 0
+next_seen_header_valid 1
+next_seen_slot0_seq 4
+next_seen_slot1_seq 3
+next_seq 4
+DONE
+driver_exit 0

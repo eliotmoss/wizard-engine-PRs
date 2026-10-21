@@ -1,0 +1,7 @@
+Filesystem type is: 58465342
+File size of /home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/stale-slot-xfs-direct.mnt/region/wizard-pwfsf-u1000-p3007228-0.region is 4194304 (8192 blocks of 512 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..      15:        192..       207:     16:            
+   1:       16..      31:        104..       119:     16:        208:
+   2:       32..    8191:        208..      8367:   8160:        120: last,eof
+/home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/stale-slot-xfs-direct.mnt/region/wizard-pwfsf-u1000-p3007228-0.region: 3 extents found

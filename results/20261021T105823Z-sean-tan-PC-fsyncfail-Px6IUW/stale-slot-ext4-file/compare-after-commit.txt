@@ -1,0 +1,9 @@
+buffered_read_ok 1
+direct_read_ok 1
+buffered_sha256 14167ad887a6c9e48705939342ad7767fb9fe955b650599bff9f7b4ee83bfd6f
+direct_sha256 e9df89234641db9d98c7e39ead5f8636b56cd9de1dcf0f6e11f5ad30acdcf7f6
+equal 0
+nonce_in_buffered 1
+nonce_in_direct 0
+buffered_slots 2,3
+direct_slots 2,1

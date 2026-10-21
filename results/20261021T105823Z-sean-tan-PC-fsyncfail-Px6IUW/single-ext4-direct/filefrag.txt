@@ -1,0 +1,5 @@
+Filesystem type is: ef53
+File size of /home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/single-ext4-direct.mnt/region/wizard-pwfsf-u1000-p3002060-0.region is 2097152 (4096 blocks of 512 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..    4095:     266240..    270335:   4096:             last,eof
+/home/sean-tan/pwfsyncfail/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW-ZIE9Ne/single-ext4-direct.mnt/region/wizard-pwfsf-u1000-p3002060-0.region: 1 extent found

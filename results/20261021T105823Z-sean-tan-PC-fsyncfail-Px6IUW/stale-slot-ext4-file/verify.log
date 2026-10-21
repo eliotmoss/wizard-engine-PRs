@@ -1,0 +1,21 @@
+scenario stale-slot
+next_acked 1
+found_header_valid 1
+found_slot0_seq 4
+found_slot1_seq 1
+recovery REPLAYED
+latched 0
+m 1545188719679681071
+x 14228137217296397337
+m_is A
+x_is D
+leaks_reclaimed 0
+sieve_invariants ok
+allocator_invariants ok
+cursor 130560
+count 12211
+acks LOST
+acks_reason M holds N-2's value A: the acknowledged N-1's write is undone
+verdict LOST
+reason M holds N-2's value A: the acknowledged N-1's write is undone
+verify_exit 1

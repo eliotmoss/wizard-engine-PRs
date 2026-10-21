@@ -1,0 +1,21 @@
+scenario tear
+next_acked 0
+found_header_valid 1
+found_slot0_seq 2
+found_slot1_seq 1
+recovery REPLAYED
+latched 0
+m 2566481641669095473
+x 8264404395133929362
+m_is B
+x_is E
+leaks_reclaimed 0
+sieve_invariants ok
+allocator_invariants ok
+cursor 65024
+count 6495
+acks TORN
+acks_reason N (unacknowledged) is partly present: its Z = E is durable and its M = C is undone (M holds N-1's B)
+verdict TORN
+reason N (unacknowledged) is partly present: its Z = E is durable and its M = C is undone (M holds N-1's B)
+verify_exit 5

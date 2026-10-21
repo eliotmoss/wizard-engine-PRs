@@ -1,0 +1,21 @@
+scenario stale-slot
+next_acked 1
+found_header_valid 1
+found_slot0_seq 2
+found_slot1_seq 3
+recovery REPLAYED
+latched 0
+m 16760636449646990645
+x 2763736972879549747
+m_is B
+x_is D
+leaks_reclaimed 0
+sieve_invariants ok
+allocator_invariants ok
+cursor 130560
+count 12211
+acks CONSISTENT
+acks_reason every acknowledged transaction is present; N (unacknowledged) is absent
+verdict CONSISTENT
+reason every acknowledged transaction is present; N (unacknowledged) is absent
+verify_exit 0

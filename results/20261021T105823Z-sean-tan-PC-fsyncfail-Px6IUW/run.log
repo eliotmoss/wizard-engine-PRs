@@ -1,0 +1,62 @@
+# 3 scenario(s): single stale-slot tear; file systems: ext4 xfs; backends: file, direct
+
+==== single: one transaction after a clean close; the log chunk fails
+# commit = commit() succeeded; latched = requiresRecovery() after it
+# same-boot = the reopen in the same process: recovery, marker visible
+# log x/yz = buffered and O_DIRECT copies of the log chunk equal (x), nonce in buffered (y) and direct (z)
+# after-drop = fault-verify after umount + mount: recovery, visible, verdict
+# fs = rw or ro after the reopen (ro: a journal failure, not the case under test)
+case                     commit latched same-boot    visible log@commit     log@reopen     log@drop     after-drop   visible verdict      fs
+==== single-ext4-file
+armed: sectors 266248+8 fail; neighbours read
+single-ext4-file         0      1       REPLAYED     1       0/10           0/10           1            CLEAN        1       CONSISTENT   rw
+==== single-ext4-direct
+armed: sectors 266248+8 fail; neighbours read
+single-ext4-direct       0      1       CLEAN        0       1/00           1/00           1            CLEAN        0       CONSISTENT   rw
+==== single-xfs-file
+armed: sectors 112+8 fail; neighbours read
+single-xfs-file          0      1       REPLAYED     1       0/10           0/10           1            CLEAN        1       CONSISTENT   rw
+==== single-xfs-direct
+armed: sectors 104+8 fail; neighbours read
+single-xfs-direct        0      1       CLEAN        0       1/00           1/00           1            CLEAN        0       CONSISTENT   rw
+
+==== stale-slot: N-2 (M = A) and N-1 (M = B) acknowledged; N stores M = C, only slot N mod 2's page fails; next stores M2 = D
+# commit = commit N succeeded; latched = requiresRecovery() after it
+# same-boot = the reopen: recovery; M = its value then (A, B, C, D, 0, other)
+# next = next's commit() result / sequence (0: none)
+# log x/b/d = buffered and O_DIRECT copies of the log chunk equal (x); slot 0,1 sequences in the buffered (b) and O_DIRECT (d) copy, - = no record
+# after-drop = fault-verify-acks after umount + mount: recovery; slots found; M; M2; verdict (every acknowledged transaction present, N whole or absent)
+case                         commit latched same-boot  M     next  log@commit  log@reopen  log@next    log@drop    after-drop slots  M     M2    verdict      fs
+==== stale-slot-ext4-file
+armed: sectors 266264+8 fail; neighbours read; the other slot's page (sector 266256) reads
+stale-slot-ext4-file         0      1       REPLAYED   C     1/4   0/2,3/2,1   0/2,3/2,1   0/4,3/4,1   1/4,1/4,1   REPLAYED   4,1    A     D     LOST         rw
+==== stale-slot-ext4-direct
+armed: sectors 266264+8 fail; neighbours read; the other slot's page (sector 266256) reads
+stale-slot-ext4-direct       0      1       REPLAYED   B     1/3   1/2,1/2,1   1/2,1/2,1   1/2,3/2,3   1/2,3/2,3   REPLAYED   2,3    B     D     CONSISTENT   rw
+==== stale-slot-xfs-file
+armed: sectors 120+8 fail; neighbours read; the other slot's page (sector 112) reads
+stale-slot-xfs-file          0      1       REPLAYED   C     1/4   0/2,3/2,1   0/2,3/2,1   0/4,3/4,1   1/4,1/4,1   REPLAYED   4,1    A     D     LOST         rw
+==== stale-slot-xfs-direct
+armed: sectors 112+8 fail; neighbours read; the other slot's page (sector 104) reads
+stale-slot-xfs-direct        0      1       REPLAYED   B     1/3   1/2,1/2,1   1/2,1/2,1   1/2,3/2,3   1/2,3/2,3   REPLAYED   2,3    B     D     CONSISTENT   rw
+
+==== tear: N-2 (M = A) and N-1 (M = B) acknowledged; N stores M = C and Z = E; the page holding both slots fails
+# commit = commit N succeeded; latched = requiresRecovery() after it
+# same-boot = the reopen: recovery; M and Z then (A, B, C, E, 0, other)
+# log x/b/d = buffered and O_DIRECT copies of the log chunk equal (x); slot 0,1 sequences in the buffered (b) and O_DIRECT (d) copy, - = no record
+# after-drop = fault-verify-acks after umount + mount: recovery; slots found; M; Z; verdict (N-1 present, N whole or absent)
+case                   commit latched same-boot  M     Z     log@commit  log@reopen  log@drop    after-drop slots  M     Z     verdict      fs
+==== tear-ext4-file
+armed: sectors 266248+8 fail; neighbours read; the other slot shares the failing page (tear)
+tear-ext4-file         0      1       REPLAYED   C     E     0/2,3/2,1   0/2,3/2,1   1/2,1/2,1   REPLAYED   2,1    B     E     TORN         rw
+==== tear-ext4-direct
+armed: sectors 266248+8 fail; neighbours read; the other slot shares the failing page (tear)
+tear-ext4-direct       0      1       REPLAYED   B     0     1/2,1/2,1   1/2,1/2,1   1/2,1/2,1   REPLAYED   2,1    B     0     CONSISTENT   rw
+==== tear-xfs-file
+armed: sectors 112+8 fail; neighbours read; the other slot shares the failing page (tear)
+tear-xfs-file          0      1       REPLAYED   C     E     0/2,3/2,1   0/2,3/2,1   1/2,1/2,1   REPLAYED   2,1    B     E     TORN         rw
+==== tear-xfs-direct
+armed: sectors 104+8 fail; neighbours read; the other slot shares the failing page (tear)
+tear-xfs-direct        0      1       REPLAYED   B     0     1/2,1/2,1   1/2,1/2,1   1/2,1/2,1   REPLAYED   2,1    B     0     CONSISTENT   rw
+results -> /home/sean-tan/research/wizard-engine-PRs/results/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW
+predictions: /home/sean-tan/research/wizard-engine-PRs/results/20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW/predictions.txt

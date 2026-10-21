@@ -1,0 +1,11 @@
+scenario tear
+block_size 4096
+log_offset 4096
+log_bytes 4096
+slot_bytes 1984
+slot0_offset 4160
+slot1_offset 6144
+test_slot 1
+fail_offset 4096
+fail_bytes 4096
+other_slot_page 4096

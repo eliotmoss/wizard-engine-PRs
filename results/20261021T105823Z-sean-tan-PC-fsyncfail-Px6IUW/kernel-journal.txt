@@ -1,0 +1,88 @@
+# Kernel messages for this run, read after it from the journal by sean-tan (no root):
+#   journalctl -k --since '2026-10-21 21:58:00' --until '2026-10-21 22:00:00' -o short-precise
+# with UFW, AppArmor and 'async page read' lines dropped. The per-case dmesg.txt files are
+# incomplete: the script finds its window by counting ring-buffer lines, which shifts once
+# the buffer wraps (stale-slot-ext4-file's is empty; tear-xfs-file's lacks the writeback error).
+Oct 21 21:58:24.159282 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:24.199273 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem db8bfda5-b00c-46f1-8332-5ea89df566f6 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:24.547357 pc-ubuntu kernel: EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 14 starting block 33281)
+Oct 21 21:58:24.547526 pc-ubuntu kernel: Buffer I/O error on device dm-0, logical block 33281
+Oct 21 21:58:24.922281 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem db8bfda5-b00c-46f1-8332-5ea89df566f6.
+Oct 21 21:58:24.928264 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem db8bfda5-b00c-46f1-8332-5ea89df566f6 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:25.111269 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem db8bfda5-b00c-46f1-8332-5ea89df566f6.
+Oct 21 21:58:25.243294 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:25.283268 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem d8ca018b-7d98-4118-a162-78bf081ad367 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:26.150329 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem d8ca018b-7d98-4118-a162-78bf081ad367.
+Oct 21 21:58:26.161277 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem d8ca018b-7d98-4118-a162-78bf081ad367 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:26.562276 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem d8ca018b-7d98-4118-a162-78bf081ad367.
+Oct 21 21:58:26.715269 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:26.830370 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 2d60f88d-e9b3-459e-a95c-d216c13c5ee4
+Oct 21 21:58:26.834275 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:27.987272 pc-ubuntu kernel: dm-0: writeback error on inode 132, offset 4096, sector 112
+Oct 21 21:58:27.987341 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 2d60f88d-e9b3-459e-a95c-d216c13c5ee4
+Oct 21 21:58:27.995330 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 2d60f88d-e9b3-459e-a95c-d216c13c5ee4
+Oct 21 21:58:27.999327 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:28.391389 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 2d60f88d-e9b3-459e-a95c-d216c13c5ee4
+Oct 21 21:58:28.555369 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:28.677331 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 2c234d80-c768-4c00-8fc5-a8b9aee72e1b
+Oct 21 21:58:28.681296 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:29.859330 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 2c234d80-c768-4c00-8fc5-a8b9aee72e1b
+Oct 21 21:58:29.866264 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 2c234d80-c768-4c00-8fc5-a8b9aee72e1b
+Oct 21 21:58:29.869268 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:30.181352 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 2c234d80-c768-4c00-8fc5-a8b9aee72e1b
+Oct 21 21:58:30.356308 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:30.472386 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem 9838762a-acdf-4c98-8385-01044dded702 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:31.369371 pc-ubuntu kernel: EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 14 starting block 33283)
+Oct 21 21:58:31.369490 pc-ubuntu kernel: Buffer I/O error on device dm-0, logical block 33283
+Oct 21 21:58:32.676261 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem 9838762a-acdf-4c98-8385-01044dded702.
+Oct 21 21:58:32.681263 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem 9838762a-acdf-4c98-8385-01044dded702 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:32.951288 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem 9838762a-acdf-4c98-8385-01044dded702.
+Oct 21 21:58:33.044267 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:33.082268 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem c2cf0669-d614-4ff0-be1f-76f69d183979 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:34.581271 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem c2cf0669-d614-4ff0-be1f-76f69d183979.
+Oct 21 21:58:34.587260 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem c2cf0669-d614-4ff0-be1f-76f69d183979 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:34.889366 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem c2cf0669-d614-4ff0-be1f-76f69d183979.
+Oct 21 21:58:35.026286 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:35.129279 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 89f6f255-ceae-4e73-aeb0-36eb88f62d49
+Oct 21 21:58:35.131264 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:36.343265 pc-ubuntu kernel: dm-0: writeback error on inode 132, offset 12288, sector 120
+Oct 21 21:58:36.343305 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 89f6f255-ceae-4e73-aeb0-36eb88f62d49
+Oct 21 21:58:36.347262 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 89f6f255-ceae-4e73-aeb0-36eb88f62d49
+Oct 21 21:58:36.349260 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:36.627292 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 89f6f255-ceae-4e73-aeb0-36eb88f62d49
+Oct 21 21:58:36.755267 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:36.793266 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 1d54b9fd-b35b-478a-b392-622058de7a7b
+Oct 21 21:58:36.794261 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:37.192267 pc-ubuntu kernel: buffer_io_error: 22 callbacks suppressed
+Oct 21 21:58:38.382262 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 1d54b9fd-b35b-478a-b392-622058de7a7b
+Oct 21 21:58:38.386260 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 1d54b9fd-b35b-478a-b392-622058de7a7b
+Oct 21 21:58:38.389291 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:38.867295 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 1d54b9fd-b35b-478a-b392-622058de7a7b
+Oct 21 21:58:39.036268 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:39.075267 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem 7849a47b-cf41-4919-959f-14785169d6b0 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:39.632374 pc-ubuntu kernel: EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 14 starting block 33281)
+Oct 21 21:58:39.632513 pc-ubuntu kernel: Buffer I/O error on device dm-0, logical block 33281
+Oct 21 21:58:40.675376 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem 7849a47b-cf41-4919-959f-14785169d6b0.
+Oct 21 21:58:40.682277 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem 7849a47b-cf41-4919-959f-14785169d6b0 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:41.333337 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem 7849a47b-cf41-4919-959f-14785169d6b0.
+Oct 21 21:58:41.479369 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:41.593340 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem b6681a6e-45ce-4dd4-9528-9bfd9ab19171 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:43.538270 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem b6681a6e-45ce-4dd4-9528-9bfd9ab19171.
+Oct 21 21:58:43.544298 pc-ubuntu kernel: EXT4-fs (dm-0): mounted filesystem b6681a6e-45ce-4dd4-9528-9bfd9ab19171 r/w with ordered data mode. Quota mode: none.
+Oct 21 21:58:44.171286 pc-ubuntu kernel: EXT4-fs (dm-0): unmounting filesystem b6681a6e-45ce-4dd4-9528-9bfd9ab19171.
+Oct 21 21:58:44.323278 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:44.455339 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 617d508c-c056-458e-a22a-5326014f77b2
+Oct 21 21:58:44.458291 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:44.933274 pc-ubuntu kernel: buffer_io_error: 6 callbacks suppressed
+Oct 21 21:58:45.890287 pc-ubuntu kernel: dm-0: writeback error on inode 132, offset 4096, sector 112
+Oct 21 21:58:45.890378 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 617d508c-c056-458e-a22a-5326014f77b2
+Oct 21 21:58:45.897274 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem 617d508c-c056-458e-a22a-5326014f77b2
+Oct 21 21:58:45.900268 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:46.556291 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem 617d508c-c056-458e-a22a-5326014f77b2
+Oct 21 21:58:46.698270 pc-ubuntu kernel: loop24: detected capacity change from 0 to 2097152
+Oct 21 21:58:46.786277 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem d004f0d4-f661-4541-84f7-5fbcc15a53a5
+Oct 21 21:58:46.789264 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:48.862279 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem d004f0d4-f661-4541-84f7-5fbcc15a53a5
+Oct 21 21:58:48.869278 pc-ubuntu kernel: XFS (dm-0): Mounting V5 Filesystem d004f0d4-f661-4541-84f7-5fbcc15a53a5
+Oct 21 21:58:48.873275 pc-ubuntu kernel: XFS (dm-0): Ending clean mount
+Oct 21 21:58:49.455341 pc-ubuntu kernel: XFS (dm-0): Unmounting Filesystem d004f0d4-f661-4541-84f7-5fbcc15a53a5
