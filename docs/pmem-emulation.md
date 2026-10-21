@@ -342,7 +342,7 @@ administrator-privileged DIMM health query of 2026-09-01 is:
 167-segment descriptor table filled. Every restart replayed a WAL record rather
 than finding a clean log, so every kill landed mid-transaction; the workload's
 cross-object invariants held after each recovery; progress never went backwards;
-three leaked extents were reclaimed at mount, the alloc-then-publish leak
+three leaked chunks were reclaimed at mount, the alloc-then-publish leak
 appearing on physical media exactly as it does on a file; and the durable answer
 matched an independent in-process sieve. The same geometry on the file backend
 reaches the identical 5,429,504 / 376,256 result, so the two backends agree.
@@ -433,7 +433,7 @@ identical crash loop with `elide-clwb` appended, at the same 512 x 4096 = 2 MiB
 geometry and the same seed. The banner confirmed the mutation and the mount's
 provider assertion passed, so this was genuinely the mutant on genuine DAX. It
 reported `OK`: 11 iterations before the 167-segment descriptor table filled,
-every restart reporting `REPLAYED`, three leaked extents reclaimed, and the
+every restart reporting `REPLAYED`, three leaked chunks reclaimed, and the
 reference check passing at 376,256 primes below 5,429,504.
 
 The iteration count differs from the ordinary run's 13 (11 advanced, one child
@@ -725,7 +725,7 @@ at all is a run on filesystem DAX.
 This command passed on Magpie on 2026-09-01: 13 iterations at 512 x 4096 = 2 MiB
 before the sieve's 167-segment descriptor table filled, every restart reporting
 `DualWalRecovery.REPLAYED`, invariants holding after each recovery, three leaked
-extents reclaimed at mount, and 376,256 primes below 5,429,504 matching an
+chunks reclaimed at mount, and 376,256 primes below 5,429,504 matching an
 independent in-process sieve. See the discrimination note in the Magpie section
 above: this establishes software crash consistency on physical media and clean
 execution of the production writeback/fence path, but it is **not** sensitive to

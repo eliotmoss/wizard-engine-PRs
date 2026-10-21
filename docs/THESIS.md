@@ -464,7 +464,7 @@ another property: `PersistentSieveProperty` runs the allocator walk and then
 assumed: `persistent_sieve:` corrupts two bytes of a durable bitmap, which the
 allocator walk accepts and the sieve property rejects. What the allocator
 finished is checked by count, not by the sweeps: the lazy image at the end of
-each allocation scenario must hold one more used extent per finished
+each allocation scenario must hold one more used chunk per finished
 allocation (`PersistentAllocatorTest.v3`). (Corrected 2026-10-19: this
 paragraph called the three a ladder, each strictly stronger than the one
 before, which the code does not bear out.)
@@ -704,7 +704,7 @@ Chapter 6 must report what the method actually *found*, not only that it
 passed. The two defects the `SIGKILL` crash loop surfaced are the strongest
 available evidence that the workload-level invariants are not vacuous:
 
-- the alloc-then-publish leak is real, at 8–18 extents per run, and without
+- the alloc-then-publish leak is real, at 8–18 chunks per run, and without
   reclamation a small region stops making progress after about six crashes; and
 - a crash between a segment's publication and the retirement that follows it
   leaves one extra live segment, so the instantaneous invariant is

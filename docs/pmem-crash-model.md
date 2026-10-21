@@ -1221,7 +1221,7 @@ same day `openArray()` itself moved to an anonymous mapping, and
 `persistent_recovery:failing_mount_survives_a_collection` force a collection
 under each, and fail on the array. Without their address check, over the
 array, two allocations made after the collection returned the same block, so
-the image handed on held one used extent too few, while the invariant walk,
+the image handed on held one used chunk too few, while the invariant walk,
 which reads through `regionStart`, found nothing wrong; and a complete record
 written after the collection did not replay on a remount, because the WAL
 computes its checksum by reading the record back through the raw address. The move gives
@@ -1311,8 +1311,8 @@ mount path run WAL recovery, and walks the resulting structure.
 violation as a string rather than asserting, so one implementation serves both
 a unit test and a crash-model property. It requires the memory-order chain to be
 acyclic, index-increasing and doubly linked through to the region marker; every
-free extent to be classified by its actual span and to appear exactly once on the
-matching free list; free extents never to be adjacent; a used entry to be on no
+free chunk to be classified by its actual span and to appear exactly once on the
+matching free list; free chunks never to be adjacent; a used entry to be on no
 list; and the mount to be neither recovery-required nor left with buffered
 writes. `persistent_alloc:walker_detects_a_broken_chain` corrupts one byte of a
 durable block table and requires the walk to report it — a walk that cannot fail

@@ -2590,8 +2590,8 @@ out of scope; the sieve above is this project's workload.
 
 **Method.**
 
-- **One extent, alternating.** Allocations and frees run on a freshly
-  formatted 1 MiB region (256 × 4 KiB) whose user blocks are one free extent.
+- **One chunk, alternating.** Allocations and frees run on a freshly
+  formatted 1 MiB region (256 × 4 KiB) whose user blocks are one free chunk.
   `alloc-n` splits it and `free-n` coalesces it back, so each operation leaves
   the allocator as it found it, and every operation of a kind does the same
   work: an allocation commits 16 entries and a free 10, whatever n. For each n
@@ -3787,7 +3787,7 @@ readU8(addr)
 
 **File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `PWRegion`)
 
-`PWRegion` implements a first-fit block allocator over the persistent region; it hands out extents, runs of one or more contiguous blocks. Once the region is formatted, every allocator metadata mutation (block-table entries, sentinels, chunk headers, the durable root) goes through `RegionTransaction`, so it is WAL-protected. Two kinds of store do not: `format()` writes its structures directly through the region's `DirectRegionWriter` (see *Format vs. mount*), and the transient Immix line marks are stored through a `DirectRegionWriter` with no writeback or fence (see *Immix GC extension*). Until 2026-10-20 this paragraph said that all metadata mutations go through `RegionTransaction`, which `format()` never did.
+`PWRegion` implements a first-fit block allocator over the persistent region; it hands out chunks, runs of one or more contiguous blocks. Once the region is formatted, every allocator metadata mutation (block-table entries, sentinels, chunk headers, the durable root) goes through `RegionTransaction`, so it is WAL-protected. Two kinds of store do not: `format()` writes its structures directly through the region's `DirectRegionWriter` (see *Format vs. mount*), and the transient Immix line marks are stored through a `DirectRegionWriter` with no writeback or fence (see *Immix GC extension*). Until 2026-10-20 this paragraph said that all metadata mutations go through `RegionTransaction`, which `format()` never did.
 
 ### Region layout
 
@@ -3796,14 +3796,14 @@ Block 0      PWRegionHeader (88 B), then the free-list sentinels:
              BlockLists.MAX_LISTS = 8 entries x 40 B at offsets 88-407,
              of which SMALL_FREE (0) and LARGE_FREE (1) are used
 Block 1      WAL log chunk
-Block 2..    User data: extents, allocated or free
+Block 2..    User data: chunks, allocated or free
 Last blocks  Metadata, carved down from the region's end: the block table
              (numBlocks + 1 entries) at the end, the descriptor table below
              it, and each descriptor's metadata (e.g. Immix line marks)
              below that
 ```
 
-`format()` sets the sentinels at `PWRegionHeader.size` and records that offset in the header's `sentinels` field; `validGeometry()` reserves all eight. The metadata blocks are the fewest whole blocks that hold the metadata area, and form one `METADATA` extent. Until 2026-10-20 this diagram put the sentinels in the metadata area; they have followed the header since 2025-07-06 (`4d43a8cd`).
+`format()` sets the sentinels at `PWRegionHeader.size` and records that offset in the header's `sentinels` field; `validGeometry()` reserves all eight. The metadata blocks are the fewest whole blocks that hold the metadata area, and form one `METADATA` chunk. Until 2026-10-20 this diagram put the sentinels in the metadata area; they have followed the header since 2025-07-06 (`4d43a8cd`).
 
 ### `PWRegionHeader` (88 bytes, stored at offset 0)
 
@@ -3825,7 +3825,7 @@ Last blocks  Metadata, carved down from the region's end: the block table
 
 `userRoot` is the allocator's only concession to what a caller stores in the
 region. Without it a mounted region is opaque to its owner: the block table
-records which extents are in use, but not which of them the caller wants to
+records which chunks are in use, but not which of them the caller wants to
 reach after a restart, so every caller has to remember an offset out of band.
 `PWRegion.getUserRoot()` / `setUserRoot(offset)` publish and read one
 region-relative offset transactionally, which is enough for a caller to anchor
@@ -3840,7 +3840,7 @@ explicitly so a reformat clears a previous run's root rather than inheriting it.
 
 **Root publication is a separate transaction from the allocation it names.**
 `allocChunk()` commits on its own (see [Design Critique](CRITIQUE.md) #1), so a
-crash between allocating an extent and publishing it leaks that extent: it stays
+crash between allocating a chunk and publishing it leaks that chunk: it stays
 marked used and nothing reaches it. This is a space leak, not an inconsistency
 — the durable state always satisfies the allocator's invariants — and it is the
 cost of the current per-operation commit granularity.
@@ -4003,8 +4003,8 @@ reason traced and the file's length and SHA-1 unchanged, and still arms at
 ### `BlockEntry` (40 bytes)
 
 The block table holds `numBlocks + 1` entries, one per block plus an
-end-of-region marker, but only the entry of an extent's first block is live.
-An extent runs to the next live entry in address order, so its length is not
+end-of-region marker, but only the entry of a chunk's first block is live.
+A chunk runs to the next live entry in address order, so its length is not
 stored. An interior entry belongs to no chain or list; a split gives the
 remainder's first entry a live role.
 
@@ -4012,25 +4012,25 @@ remainder's first entry a live role.
 |---|---|---|
 | `listNum` | i16 | free-list index (see `ListKind`) |
 | `used` | u1 | 1 = allocated |
-| `prev` | i64 | first entry of the previous extent in address order |
-| `next` | i64 | first entry of the next extent in address order |
-| `listPrev` | i64 | previous extent on the same free list, or the list's sentinel |
-| `listNext` | i64 | next extent on the same free list |
+| `prev` | i64 | first entry of the previous chunk in address order |
+| `next` | i64 | first entry of the next chunk in address order |
+| `listPrev` | i64 | previous chunk on the same free list, or the list's sentinel |
+| `listNext` | i64 | next chunk on the same free list |
 
 `ListKind` values: `METADATA(-1)`, `NONE(-2)`, `USED(-3)`, `SMALL_FREE(0)`, `LARGE_FREE(1)`.
-An allocated extent carries `NONE`, which `removeFromList()` sets; `USED` is
+An allocated chunk carries `NONE`, which `removeFromList()` sets; `USED` is
 defined but never stored. The header block and the log block are `METADATA`
-extents of one block each, the metadata blocks one `METADATA` extent, and the
+chunks of one block each, the metadata blocks one `METADATA` chunk, and the
 end marker carries `NONE` with `used` set. Until 2026-10-20 this section said
 each block had an entry of its own in the chains; the allocator has used
-extents since 2025-07-24 (`faed4563`).
+chunks since 2025-07-24 (`faed4563`).
 
 ### Allocation strategy
 
 - Single-block requests try `SMALL_FREE` first, then fall back to `LARGE_FREE`.
 - Multi-block requests search `LARGE_FREE` for a first fit.
-- If the found extent is larger than needed, it is split: the front is allocated, and the remainder, whose first entry becomes live, is re-inserted into the appropriate list.
-- A free coalesces the extent with a free neighbour on either side in address order before inserting it into a list.
+- If the found chunk is larger than needed, it is split: the front is allocated, and the remainder, whose first entry becomes live, is re-inserted into the appropriate list.
+- A free coalesces the chunk with a free neighbour on either side in address order before inserting it into a list.
 - Every allocation or free calls `performCommit()` to commit the updated block table entries atomically via the WAL.
 
 ### Format vs. mount
@@ -4051,8 +4051,8 @@ format(blockSize)                -- every store through the DirectRegionWriter, 
   if numBlocks < metadataBlocks + 3: return     -- too small; magic never stored
   entries: block 0 (header) → block 1 (log), both METADATA
   header.logChunk = block 1; fresh DualTxnWal header   -- the log persists its own
-  block 2 heads one free extent of every user block, alone on LARGE_FREE
-    → first metadata block (one METADATA extent) → end marker (NONE, used)
+  block 2 heads one free chunk of every user block, alone on LARGE_FREE
+    → first metadata block (one METADATA chunk) → end marker (NONE, used)
   backendRegion.persistRange(0, full_size)   -- everything but the magic
   store MAGIC (the tag and FORMAT_VERSION)
   backendRegion.persistRange(magic, 8)       -- then the magic's line alone
@@ -4070,7 +4070,7 @@ mount(blockSize)
 
 Until 2026-10-20 the `format()` sketch above said it linked every user block in
 memory order and inserted each onto `LARGE_FREE`, and left out the descriptors,
-the size guard and the log's initialisation; the code makes one free extent.
+the size guard and the log's initialisation; the code makes one free chunk.
 Until 2026-10-21 `init()` had two outcomes, mounting a region with the magic
 and formatting any other, so a region with an older magic would have been
 formatted; the refusal is described under **Format version** above.
@@ -4346,9 +4346,9 @@ Three ordering decisions carry the design:
   publishes their descriptor. Safe because an unpublished chunk is unreachable,
   so no reader can observe a partial one.
 - **Publication follows allocation, and leaks.** `allocChunk()` commits on its
-  own (see [Design Critique](CRITIQUE.md) #1), so a crash between allocating an
-  extent and naming it leaves a block marked used with nothing pointing at it.
-  Measured, not hypothetical: 8-18 extents per crash-loop run, and without
+  own (see [Design Critique](CRITIQUE.md) #1), so a crash between allocating a
+  chunk and naming it leaves a block marked used with nothing pointing at it.
+  Measured, not hypothetical: 8-18 chunks per crash-loop run, and without
   reclamation a small region stops making progress after about six crashes.
   `open()` sweeps the region's memory-order chain and frees what no descriptor
   names -- only the workload can do this, since the allocator only knows the
