@@ -1,0 +1,7 @@
+Filesystem type is: 58465342
+File size of /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/xfs-direct.mnt/region/wizard-pwfsf-u1000-p2418219-0.region is 2097152 (4096 blocks of 512 bytes)
+ ext:     logical_offset:        physical_offset: length:   expected: flags:
+   0:        0..       7:        112..       119:      8:            
+   1:        8..      15:        104..       111:      8:        120:
+   2:       16..    4095:        192..      4271:   4080:        112: last,eof
+/home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/xfs-direct.mnt/region/wizard-pwfsf-u1000-p2418219-0.region: 3 extents found

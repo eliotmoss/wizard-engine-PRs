@@ -1,0 +1,4 @@
+2026-10-21T20:54:53,912372+11:00 EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 14 starting block 33281)
+2026-10-21T20:54:53,912378+11:00 Buffer I/O error on device dm-0, logical block 33281
+2026-10-21T20:54:54,165202+11:00 EXT4-fs (dm-0): unmounting filesystem 065df9d7-a000-4fc3-9c7d-e7323be2de66.
+2026-10-21T20:54:54,171390+11:00 EXT4-fs (dm-0): mounted filesystem 065df9d7-a000-4fc3-9c7d-e7323be2de66 r/w with ordered data mode. Quota mode: none.

@@ -1,0 +1,11 @@
+region /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/ext4-file.mnt/region/wizard-pwfsf-u1000-p2417041-0.region
+backend file
+blocks 512
+block_size 4096
+setup_steps 2
+setup_cursor 65024
+setup_count 6495
+log_offset 4096
+log_bytes 4096
+marker_offset 12264
+OK

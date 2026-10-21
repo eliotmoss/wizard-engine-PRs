@@ -1,0 +1,90 @@
+recorded 2026-10-21T08:02:28+00:00
+host pc-ubuntu
+kernel Linux 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+boot_id 29bb6e79-e883-484e-9ed0-68868d43bd3a
+owner sean-tan
+commit 4b1f409c6257af734b697b03645fda45e316cb31
+binary_sha256 938af8de6019459f03bf34c375d52608733073512d63a1a84125c41629bcdc81
+script_sha256 9dea7ff176972e336cc16f1279cfd5c352dd94527536ee30054d4cf9e09a3f03
+run_dir /home/sean-tan/pwfsyncfail/20261021T080228Z-sean-tan-PC-fsyncfail-diEiwq-pGrqjQ
+geometry 512 x 4096; setup 2 sieve steps; image 1G sparse; loop --direct-io=on
+fault dm error target over the log chunk's sectors, for one commit (see the script's header for why not dm-flakey)
+cache_drop umount+mount (not drop_caches)
+images deleted after each case; region-before-verify.img keeps each region
+xfs skipped: mkfs.xfs not installed
+---- git status --short
+?? results/20261021T080228Z-sean-tan-PC-fsyncfail-diEiwq/
+---- tools
+losetup from util-linux 2.41.3
+Library version:   1.02.205 (2025-02-27)
+Driver version:    4.50.0
+mke2fs 1.47.2 (1-Jan-2025)
+filefrag 1.47.2 (1-Jan-2025)
+---- dm targets
+striped          v1.7.0
+linear           v1.5.0
+error            v1.7.0
+---- / mount
+/dev/nvme1n1p3 ext4 rw,relatime
+rw
+bsddf
+nogrpid
+block_validity
+dioread_nolock
+nodiscard
+delalloc
+nowarn_on_error
+journal_checksum
+barrier
+auto_da_alloc
+user_xattr
+acl
+noquota
+resuid=0
+resgid=0
+errors=continue
+commit=5
+min_batch_time=0
+max_batch_time=15000
+i_version
+stripe=0
+data=ordered
+inode_readahead_blks=32
+init_itable=10
+max_dir_size_kb=0
+prefetch_block_bitmaps
+---- dm devices before the run
+No devices found
+---- loop devices before the run
+NAME        SIZELIMIT OFFSET AUTOCLEAR RO BACK-FILE                                               DIO LOG-SEC
+/dev/loop1          0      0         1  1 /var/lib/snapd/snaps/bare_5.snap                          0     512
+/dev/loop19         0      0         1  1 /var/lib/snapd/snaps/snap-store_1447.snap                 0     512
+/dev/loop17         0      0         1  1 /var/lib/snapd/snaps/prompting-client_228.snap            0     512
+/dev/loop8          0      0         1  1 /var/lib/snapd/snaps/firefox_9036.snap                    0     512
+/dev/loop15         0      0         1  1 /var/lib/snapd/snaps/gtk-common-themes_1535.snap          0     512
+/dev/loop6          0      0         1  1 /var/lib/snapd/snaps/desktop-security-center_188.snap     0     512
+/dev/loop23         0      0         1  1 /var/lib/snapd/snaps/snapd-desktop-integration_391.snap   0     512
+/dev/loop13         0      0         1  1 /var/lib/snapd/snaps/hwctl_123.snap                       0     512
+/dev/loop4          0      0         1  1 /var/lib/snapd/snaps/core22_2955.snap                     0     512
+/dev/loop21         0      0         1  1 /var/lib/snapd/snaps/snapd_27738.snap                     0     512
+/dev/loop11         0      0         1  1 /var/lib/snapd/snaps/firmware-updater_262.snap            0     512
+/dev/loop2          0      0         1  1 /var/lib/snapd/snaps/canonical-livepatch_418.snap         0     512
+/dev/loop0          0      0         1  1 /var/lib/snapd/snaps/canonical-livepatch_414.snap         0     512
+/dev/loop18         0      0         1  1 /var/lib/snapd/snaps/prompting-client_222.snap            0     512
+/dev/loop9          0      0         1  1 /var/lib/snapd/snaps/firefox_9057.snap                    0     512
+/dev/loop16         0      0         1  1 /var/lib/snapd/snaps/mesa-2404_1839.snap                  0     512
+/dev/loop7          0      0         1  1 /var/lib/snapd/snaps/desktop-security-center_206.snap     0     512
+/dev/loop14         0      0         1  1 /var/lib/snapd/snaps/hwctl_131.snap                       0     512
+/dev/loop5          0      0         1  1 /var/lib/snapd/snaps/core24_2124.snap                     0     512
+/dev/loop22         0      0         1  1 /var/lib/snapd/snaps/snapd_28254.snap                     0     512
+/dev/loop12         0      0         1  1 /var/lib/snapd/snaps/gnome-46-2404_164.snap               0     512
+/dev/loop3          0      0         1  1 /var/lib/snapd/snaps/core24_1643.snap                     0     512
+/dev/loop20         0      0         1  1 /var/lib/snapd/snaps/snap-store_1427.snap                 0     512
+/dev/loop10         0      0         1  1 /var/lib/snapd/snaps/firmware-updater_258.snap            0     512
+---- vm.dirty_*
+dirty_background_bytes 0
+dirty_background_ratio 10
+dirty_bytes 0
+dirty_expire_centisecs 3000
+dirty_ratio 20
+dirty_writeback_centisecs 500

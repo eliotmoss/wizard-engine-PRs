@@ -1,0 +1,12 @@
+recovery CLEAN
+latched 0
+marker 8637402568897403646
+visible 1
+leaks_reclaimed 0
+sieve_invariants ok
+allocator_invariants ok
+cursor 65024
+count 6495
+verdict CONSISTENT
+reason recovery succeeded and every invariant holds
+verify_exit 0

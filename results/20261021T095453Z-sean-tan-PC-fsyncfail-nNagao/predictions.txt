@@ -1,0 +1,45 @@
+PREDICTIONS (not results). One transaction (one redo entry: a nonce in the
+marker word) is committed after a clean close, so it is sequence 1 and lands
+in slot 1 of the log chunk; the error target fails the write of that chunk.
+"Visible" means the marker holds the nonce.
+
+file on ext4 (data=ordered):
+  commit 0, latched: fdatasync returns EIO for the log page's write.
+  same-boot reopen: REPLAYED, visible. ext4 marks the failed page clean but
+    keeps its new bytes (Rebello Table 1, Q4-Q5), and the reopened MAP_SHARED
+    mapping reads that page.
+  log chunk, buffered vs O_DIRECT: differ; the nonce is in the buffered copy
+    only, after the commit and again after the reopen (recovery never stores
+    to a record, so its page stays clean and is never rewritten).
+  after the restore and the cache drop (umount + mount): CLEAN, and still
+    visible. The same-boot replay persisted the after-image through a page
+    outside the failed range, so the disk holds the transaction's data
+    without its record, the reverse of write-ahead order.
+  Together: the same-boot recovery replayed a record the disk lacks, which
+  confirms the thesis's inference for the file backend on ext4.
+
+direct on ext4 (control):
+  commit 0, latched: the O_DIRECT pwrite of the log unit returns EIO.
+  same-boot reopen: CLEAN, not visible: create() reads the region through
+    O_DIRECT, from the device.
+  log chunk, buffered vs O_DIRECT: equal; the nonce is in neither.
+  after the drop: CLEAN, not visible.
+
+What other outcomes would mean:
+  file, same-boot CLEAN: refutes the inference on this kernel; the page kept
+    neither the new bytes nor its place in the cache (as Btrfs reverts it,
+    Table 1, Q5), or the reopen read the device.
+  file, commit 1 (or direct, commit 1): no failure reached the boundary;
+    check dm-tables.txt and dmesg.txt. The case says nothing.
+  file, after the drop REPLAYED: the record reached the disk after all, so
+    something retried the failed write (contradicts Q4 and section 3.3.1).
+  file, after the drop not visible: the replay's own data write did not
+    reach the disk either; read dmesg.txt.
+  file system read-only, shut down, or a failed mount or remount: Rebello's
+    journal-failure case (Table 1, Q8-Q9), not the case under test; the error
+    range was meant to hold file data only.
+  driver killed by SIGBUS: the clean page was evicted while its blocks still
+    failed reads; the run says nothing about the reopen.
+  direct, same-boot REPLAYED or visible: the control read a cached copy and
+    fails as a control.
+  verify INCONSISTENT on any case: a structural failure beyond the contract.

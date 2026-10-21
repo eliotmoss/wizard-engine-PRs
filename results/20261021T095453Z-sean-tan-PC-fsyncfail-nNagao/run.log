@@ -1,0 +1,15 @@
+# commit = commit() succeeded; latched = requiresRecovery() after it
+# same-boot = the reopen in the same process: recovery, marker visible
+# log x/yz = buffered and O_DIRECT copies of the log chunk equal (x), nonce in buffered (y) and direct (z)
+# after-drop = fault-verify after umount + mount: recovery, visible, verdict
+# fs = rw or ro after the reopen (ro: a journal failure, not the case under test)
+case         commit latched same-boot    visible log@commit     log@reopen     log@drop     after-drop   visible verdict      fs
+==== ext4-file
+armed: sectors 266248+8 fail; neighbours read
+ext4-file    0      1       REPLAYED     1       0/10           0/10           1            CLEAN        1       CONSISTENT   rw
+==== ext4-direct
+armed: sectors 266248+8 fail; neighbours read
+ext4-direct  0      1       CLEAN        0       1/00           1/00           1            CLEAN        0       CONSISTENT   rw
+xfs skipped: mkfs.xfs not installed
+results -> /home/sean-tan/research/wizard-engine-PRs/results/20261021T095453Z-sean-tan-PC-fsyncfail-nNagao
+predictions: /home/sean-tan/research/wizard-engine-PRs/results/20261021T095453Z-sean-tan-PC-fsyncfail-nNagao/predictions.txt

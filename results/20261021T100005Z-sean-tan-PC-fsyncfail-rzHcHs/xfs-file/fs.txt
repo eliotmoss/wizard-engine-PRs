@@ -1,0 +1,8 @@
+---- mounted
+/dev/mapper/pwfsf-rzHcHs-xfs-file /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/xfs-file.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+---- after the reopen
+/dev/mapper/pwfsf-rzHcHs-xfs-file /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/xfs-file.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+---- remounted (cache dropped)
+/dev/mapper/pwfsf-rzHcHs-xfs-file /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/xfs-file.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+---- after verify
+/dev/mapper/pwfsf-rzHcHs-xfs-file /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/xfs-file.mnt xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota

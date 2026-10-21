@@ -1,0 +1,4 @@
+NAME        BACK-FILE                                                                                     DIO LOG-SEC
+/dev/loop24 /home/sean-tan/pwfsyncfail/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs-xdgy8P/ext4-file.img   1     512
+loop_dio 1
+dm pwfsf-rzHcHs-ext4-file -> /dev/dm-0, 2097152 sectors

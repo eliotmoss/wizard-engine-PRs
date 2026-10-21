@@ -1,0 +1,8 @@
+---- created: all linear
+0 2097152 linear 7:24 0
+---- armed: log sectors 104+8 -> error
+0 104 linear 7:24 0
+104 8 error
+112 2097040 linear 7:24 112
+---- restored: all linear
+0 2097152 linear 7:24 0

@@ -1,0 +1,5 @@
+log_offset 4096
+log_bytes 4096
+log_sector 266248
+log_sectors 8
+extent_flags -

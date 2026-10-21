@@ -905,7 +905,10 @@ stable-writes A/B (`scripts/desktop-stable-writes.sh`,
 at `b369a1de`: `results/20261021T054239Z-sean-tan-PC-desktop-reboot-ordinary-9eopfe`
 and `results/20261021T054626Z-sean-tan-PC-desktop-reboot-elide-clwb-BExf3S`).
 `b369a1de` changed only docs and results after `dd0c1cc5`. Every figure below
-is from those directories.
+is from those directories. A fourth check, which no follow-up had listed,
+failed one write below the file system, on ext4 and XFS
+(`scripts/desktop-fsyncfail-check.sh`, at `af6f9680`;
+[below](#a-failed-write-below-ext4-and-xfs-the-same-boot-reopen-replays-a-record-the-disk-lacks)).
 
 ### `fdatasync` sends the NVMe a cache flush: observed
 
@@ -1039,10 +1042,92 @@ after the reboot, once, on a copy-preserved image (`region-before-verify.img`):
   mutant loss only through the conditions in `notes.txt`; the mutant lost
   every step, so none did here.
 
+### A failed write below ext4 and XFS: the same-boot reopen replays a record the disk lacks
+
+Sean ran `scripts/desktop-fsyncfail-check.sh run` with sudo on 2026-10-21, at
+`af6f9680`, on kernel 7.0.0-38:
+`results/20261021T095453Z-sean-tan-PC-fsyncfail-nNagao` (ext4) and
+`results/20261021T100005Z-sean-tan-PC-fsyncfail-rzHcHs` (ext4 again, and XFS
+with `mkfs.xfs` 6.18.0). A first attempt,
+`results/20261021T080228Z-sean-tan-PC-fsyncfail-diEiwq`, stopped before
+arming. `/usr/bin/dd` here is uutils coreutils 0.10.0, whose read buffer is
+not 512-byte aligned, so its `O_DIRECT` read of the dm device failed with
+`EINVAL` ("IO error: Invalid input"); the loop device needs 512-byte alignment
+(`dma_alignment` 511) where the NVMe drive needs 4 (3). The script now reads
+with `gnudd`, GNU coreutils 9.7 (`af6f9680`).
+
+**Method.** Each case builds a fresh file system with default options (ext4
+mounts `data=ordered`) on a dm device over a loop file (`--direct-io=on`)
+under the owner's home on `nvme1n1p3`. It prepares a 2 MiB region (512 ×
+4096, two sieve steps, clean close) whose log chunk, at file offset 4096, is
+allocated and written. `filefrag` maps the chunk to eight device sectors,
+checked against an `O_DIRECT` read of the file. One `pwreboot fault-commit`
+process mounts the region, then commits one transaction while the dm table
+sends those sectors to the `error` target. The transaction is one redo entry
+storing a random nonce in an unused word of the sieve's root chunk, at file
+offset 12264, on another page. `dm-flakey` was not used: it also fails the
+device's empty flushes, which aborts the journal, Rebello et al.'s Table 1,
+Q8–Q9, a different case. The script then restores the linear table, compares
+the log chunk read through the page cache with an `O_DIRECT` read, lets the
+process abandon the latched mount and reopen it in the same boot, and compares
+again. Last, it unmounts and remounts the file system, which drops the file's
+pages, and runs `fault-verify`. The direct-I/O backend runs the same steps as
+the control.
+
+| Case | `commit()` | Latched | Same-boot recovery; nonce | Log chunk, cache vs device | After remount: recovery; nonce | Verdict | FS |
+|---|---|---|---|---|---|---|---|
+| ext4, file (2 runs) | 0 | yes | `REPLAYED`; present | differ; nonce in the cache only | `CLEAN`; present | `CONSISTENT` | rw |
+| ext4, direct (2 runs) | 0 | yes | `CLEAN`; absent | equal; no nonce | `CLEAN`; absent | `CONSISTENT` | rw |
+| XFS, file | 0 | yes | `REPLAYED`; present | differ; nonce in the cache only | `CLEAN`; present | `CONSISTENT` | rw |
+| XFS, direct | 0 | yes | `CLEAN`; absent | equal; no nonce | `CLEAN`; absent | `CONSISTENT` | rw |
+
+- **The fault hit the log chunk and nothing else.** ext4 logged `I/O error 10
+  writing to inode 14 starting block 33281`, sector 266,248, the chunk; XFS
+  logged `writeback error on inode 132, offset 4096, sector 112`. Both stayed
+  `rw`, ext4's `errors_count` stayed 0, and XFS's remount reported "Ending
+  clean mount", so this is a failed data write, not a journal failure.
+- **Both file systems kept the failed record in a clean page, and the reopen
+  read it.** That is what Rebello et al. found for ext4 and XFS on Linux 5.2
+  (Table 1, Q4–Q5), seen again on 7.0. The reopened `FileMmapRegion` maps the
+  same file, so it read the record from the page cache, and recovery replayed
+  it. The page stayed clean and nothing rewrote it: after the remount the
+  device's log chunk is byte for byte the pre-commit chunk, SHA-256
+  `806427bd…` in every case, the controls' included.
+- **The disk then holds the transaction's data without its record.** Replay
+  stored the nonce into its own page, outside the failed sectors, and
+  recovery's `persistChanges()` wrote that page through the restored device.
+  After the remount `recover()` returns `CLEAN` with the nonce present. The
+  data became durable and its record never did, the reverse of write-ahead
+  order, and the contract's "`recover() == CLEAN` resolves the attempted
+  transaction as absent" fails for this backend after a same-boot reopen
+  ([Persistence-failure contract](#persistence-failure-contract)). The
+  invariants hold here because the transaction is one word.
+- **The direct-I/O backend is not affected by this failure.** Its `create()`
+  reads the region through `O_DIRECT`, so the reopen saw the device's copy, no
+  record, and replayed nothing.
+- *Inference:* with after-images on several pages, a crash during the replay's
+  write-back would leave part of the transaction durable and no durable record
+  to finish it, so failure atomicity is lost too, not only the transaction's
+  outcome. Not tested.
+- *Inference:* XFS's ten `Buffer I/O error … async page read` lines on sectors
+  112–119, just before its writeback error, are buffered reads of the dm
+  device, most likely udev's probe after the table change, which reads near
+  the device's start, where XFS placed the chunk. The script's own reads use
+  `O_DIRECT`. They read the block device's cache, not the file's, so the
+  result does not depend on them.
+- **Limits.** ext4 twice and XFS once; one transient write error, since the
+  device works again before the reopen, as in the paper's one failed write;
+  4 KiB blocks; a one-word transaction. A lasting error would also fail
+  recovery's own boundary, which latches again. For the direct backend, a
+  completed write followed by a failed device flush remains untested.
+
 ### What the checks leave open
 
 - Repeats of the kernel reset, and cuts other than straight after an
   acknowledgement.
+- Repeats of the failed write, a transaction whose after-images span several
+  pages, a lasting error, and other block sizes; for the direct backend, a
+  failed flush after a completed write.
 - Whether the drive keeps a flushed write through a power failure: B3 and B4's
   device half.
 - What stable writes cost when background writeback overlaps a program's
@@ -3609,6 +3694,13 @@ failures:
 - `recover() == CLEAN` resolves the attempted transaction as absent.
   `recover() == REPLAYED` may include it. `CORRUPT` or `PERSIST_FAILED` leaves
   the region unavailable for normal use.
+- **Not for the file backend on block storage after a same-boot reopen.** With
+  a real write error below ext4 or XFS, the reopen read the failed record from
+  the page cache and replayed it, recovery's boundary made the after-image
+  durable, and the record never reached the device, so a later `CLEAN` came
+  with the transaction's data present (observed 2026-10-21,
+  [sean-tan-PC's root checks](#a-failed-write-below-ext4-and-xfs-the-same-boot-reopen-replays-a-record-the-disk-lacks)). The direct backend
+  reads the device on reopen and was not affected.
 
 Redo entries are `(offset, width, after-image)` stores. Replaying the same
 valid record, including one whose original caller received `0`, is therefore
@@ -4165,7 +4257,10 @@ completes the final-data `fdatasync` before an injected failing slot-scrub
 and remount preserves the allocated structure. These tests do not yet
 clear the kernel page cache, reset a VM, interrupt power, or trace at the kernel
 syscall layer beyond the explicit test seams. A same-kernel remount can observe
-cached data that has not been shown to survive a system crash. Full gaps and
+cached data that has not been shown to survive a system crash. With a real
+write error below the file system it observes data the device lacks: on ext4
+and XFS the remount replays a record that never reached the device
+([sean-tan-PC's root checks](#a-failed-write-below-ext4-and-xfs-the-same-boot-reopen-replays-a-record-the-disk-lacks)). Full gaps and
 priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
 
 The default PMEM-labelled unit coverage is structural only:
