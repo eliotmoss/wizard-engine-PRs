@@ -53,26 +53,51 @@
 // the log chunk to device sectors and fails writes there while fault-commit
 // waits. File and direct backends only: the question is the page cache.
 //
-//   fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps]
+//   fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps] [scenario]
 //       As setup; for the file backend it then rewrites the log chunk's own
 //       bytes and fdatasyncs, so every page of it is allocated and written
 //       before a fault is armed (the direct backend's format writes every
 //       unit). Records the log chunk's offset and length and the marker word.
-//   fault-commit <region> <file|direct> <blocks> <blockSize> <signal-dir> [timeout-s]
+//       Scenario single (the default) stops at the clean close. stale-slot and
+//       tear then mount the closed region again (CLEAN, so the next sequence
+//       is 1), commit N-2 (the marker word M = A) and N-1 (M = B), call
+//       flush(), which persists the applied after-images and scrubs nothing,
+//       and exit WITHOUT closing: both slots keep a valid record and the data
+//       is durable. A read-only WAL instance then checks both slots.
+//   fault-commit <region> <file|direct> <blocks> <blockSize> <signal-dir> [timeout-s [scenario]]
 //       One process: mounts, prints READY, waits for <signal-dir>/go-commit,
 //       commits one transaction storing a fresh nonce in the marker word,
 //       prints the result and the latch, prints ATTEMPTED, waits for
 //       <signal-dir>/go-reopen, then abandons that mount unclosed and opens a
 //       new instance (the production abandon, reopen and recover), prints its
 //       recovery and whether the nonce is visible, and exits without closing.
+//       stale-slot and tear: the mount replays N-2 and N-1; transaction N
+//       stores M = C (tear: and the second word Z = E); before each mount the
+//       slots are read through a read-only WAL instance and printed, with the
+//       slot N mod 2 under test and both slots' offsets. stale-slot then
+//       prints REOPENED, waits for <signal-dir>/go-next, and commits "next",
+//       which stores the second word M2 = D, and prints its result and
+//       sequence.
 //   fault-verify <region> <file|direct> <blocks> <blockSize> <nonce> <setup-cursor> <setup-count>
 //       Later, in a new process: mounts, recovers, reports the marker, and
 //       runs the sieve and allocator checks.
+//   fault-verify-acks <region> <file|direct> <blocks> <blockSize> <stale-slot|tear>
+//                     <setup-cursor> <setup-count> <a> <b> <c> <x> <next-seq>
+//       The same for the two-record scenarios: prints the slots' sequences as
+//       found, mounts, reports M and the second word, runs the checks, and
+//       judges the acknowledgements (judgeAcks() below). <x> is D for
+//       stale-slot and E for tear; <next-seq> is next's sequence, 0 if next
+//       was not acknowledged (always 0 for tear).
+//   fault-verdict-test
+//       Feeds judgeAcks() the predicted and the other possible outcomes of
+//       both scenarios and checks every verdict.
 //
 // The marker word is the base field of the sieve root chunk's last descriptor
-// slot, which no step of these runs reaches (2 of 167 slots at 4 KiB blocks);
-// checkInvariants() reads only the first numSegments descriptors, so the
-// transaction under test changes nothing the workload checks.
+// slot, which no step of these runs reaches (2 of 167 slots at 4 KiB blocks,
+// 2 of 337 at 8 KiB); checkInvariants() reads only the first numSegments
+// descriptors, so the transaction under test changes nothing the workload
+// checks. The second word is the primeCount field of the same descriptor, for
+// the same reason.
 //
 // Exit status: 0 success (verify: SURVIVED; probe-verify: SENSITIVE), 1 LOST
 // (acknowledged state did not survive), 2 usage, 3 INVALID (the flushed
@@ -80,7 +105,9 @@
 // placement), 4 NOT-SENSITIVE (probe-verify: every unflushed line survived).
 // fault-commit exits 0 once its protocol completes, whatever the outcome (the
 // outcome is in its output), and 1 if the protocol could not be completed;
-// fault-verify exits 0 CONSISTENT, 1 INCONSISTENT, 3 INVALID.
+// fault-verify exits 0 CONSISTENT, 1 INCONSISTENT, 3 INVALID;
+// fault-verify-acks exits 0 CONSISTENT, 1 LOST, 3 INVALID, 5 TORN,
+// 6 INCONSISTENT; fault-verdict-test exits 0 if every verdict matched.
 
 def LIVE_SEGMENTS = 2u64;
 def MAX_REFERENCE = 64000000u64;
@@ -91,6 +118,8 @@ def EXIT_LOST = 1;
 def EXIT_USAGE = 2;
 def EXIT_INVALID = 3;
 def EXIT_NOT_SENSITIVE = 4;
+def EXIT_TORN = 5;
+def EXIT_INCONSISTENT = 6;
 
 component RebootConfig {
         def var usePmem = false;
@@ -106,9 +135,11 @@ def usage() -> int {
         System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem|direct> [blocks] [blockSize] [steps]\n");
         System.puts("  pwreboot arm <region> <state-file> <file|pmem|direct> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]\n");
         System.puts("  pwreboot verify <region> <file|pmem|direct> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>\n");
-        System.puts("  pwreboot fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps]\n");
-        System.puts("  pwreboot fault-commit <region> <file|direct> <blocks> <blockSize> <signal-dir> [timeout-s]\n");
+        System.puts("  pwreboot fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps] [single|stale-slot|tear]\n");
+        System.puts("  pwreboot fault-commit <region> <file|direct> <blocks> <blockSize> <signal-dir> [timeout-s [single|stale-slot|tear]]\n");
         System.puts("  pwreboot fault-verify <region> <file|direct> <blocks> <blockSize> <nonce> <setup-cursor> <setup-count>\n");
+        System.puts("  pwreboot fault-verify-acks <region> <file|direct> <blocks> <blockSize> <stale-slot|tear> <setup-cursor> <setup-count> <a> <b> <c> <x> <next-seq>\n");
+        System.puts("  pwreboot fault-verdict-test\n");
         return EXIT_USAGE;
 }
 
@@ -651,8 +682,93 @@ def markerOffset(region: PWRegion, sieve: PWSieve) -> u64 {
                 + u64.!(SieveSegment.base.offset);
 }
 
+// Region-relative offset of the second word: the primeCount field of the
+// marker's descriptor, so as unused as the marker itself.
+def secondWordOffset(region: PWRegion, sieve: PWSieve) -> u64 {
+        return markerOffset(region, sieve)
+                + u64.!(SieveSegment.primeCount.offset - SieveSegment.base.offset);
+}
+
 def hasSpareSlot(sieve: PWSieve) -> bool {
         return sieve.numSegments() + 1u64 < sieve.segmentCapacity();
+}
+
+// single: one transaction after a clean close (both slots scrubbed).
+// stale-slot and tear: two acknowledged records, N-2 and N-1, left in the
+// slots, then N; see the header comment and scripts/desktop-fsyncfail-check.sh.
+enum FaultScenario(arg: string, secondWord: string) {
+        SINGLE("single", "-"),
+        STALE_SLOT("stale-slot", "M2"),
+        TEAR("tear", "Z")
+}
+
+def parseScenario(s: string) -> (bool, FaultScenario) {
+        if (Strings.equal(s, "single")) return (true, FaultScenario.SINGLE);
+        if (Strings.equal(s, "stale-slot")) return (true, FaultScenario.STALE_SLOT);
+        if (Strings.equal(s, "tear")) return (true, FaultScenario.TEAR);
+        System.puts("scenario must be \"single\", \"stale-slot\" or \"tear\"\n");
+        return (false, FaultScenario.SINGLE);
+}
+
+// The two slots as a newly constructed WAL instance validates them
+// (DualTxnWal.validateSlot(), checksum included), and where they lie. Region-
+// relative offsets, which are file offsets.
+class SlotView(headerOk: bool, seq0: u64, seq1: u64, slotBytes: u64, slot0: u64, slot1: u64) {
+        def seq(slot: int) -> u64 { return if(slot == 0, seq0, seq1); }
+        def offset(slot: int) -> u64 { return if(slot == 0, slot0, slot1); }
+        def maxSeq() -> u64 { return if(seq0 > seq1, seq0, seq1); }
+        def minSeq() -> u64 { return if(seq0 < seq1, seq0, seq1); }
+}
+
+// Read the slots through a second backend region over the same file, without
+// mounting: no recovery runs and nothing is stored. The WAL constructor with
+// initializeFresh false only validates the header and scans the slots. The
+// file backend reads what a reopen would read, the page cache; the direct
+// backend reads the device through O_DIRECT. Null if the region cannot be
+// opened; headerOk false if the region or WAL header is not valid.
+def inspectSlots(blocks: u64, blockSize: u64) -> SlotView {
+        def size = blocks * blockSize;
+        def br = openBackend().create(size, BackendProt.READ.mask | BackendProt.WRITE.mask, false);
+        if (br == null) return null;
+        if (checkBackendRegion(br) != null || u64.!(br.range.length) < size) {
+                br.destroy();
+                return null;
+        }
+        def start = u64.view(Pointer.atElement(br.range, 0));
+        def magic = PWRegionUtils.pointerFromU64(start + u64.!(PWRegionHeader.magic.offset)).load<u64>();
+        def logOff = PWRegionUtils.pointerFromU64(start + u64.!(PWRegionHeader.logChunk.offset)).load<u64>();
+        var view: SlotView;
+        if (magic != PWRegions.MAGIC || logOff == 0u64 || logOff % blockSize != 0u64 || logOff > size - blockSize) {
+                view = SlotView.new(false, 0, 0, 0, 0, 0);
+        } else {
+                def wal = DualTxnWal.new(start, start + logOff, blockSize, br, false);
+                view = SlotView.new(wal.openOk, wal.slotSeqs[0], wal.slotSeqs[1], wal.slotBytes,
+                        wal.slotAddr(0) - start, wal.slotAddr(1) - start);
+        }
+        br.destroy();
+        return view;
+}
+
+def sayView(prefix: string, v: SlotView) {
+        if (v == null) {
+                say(kvs(StringBuilder.new().puts(prefix).puts("_view").toString(), "unreadable"));
+                return;
+        }
+        say(kv(StringBuilder.new().puts(prefix).puts("_header_valid").toString(), flag(v.headerOk)));
+        say(kv(StringBuilder.new().puts(prefix).puts("_slot0_seq").toString(), v.seq0));
+        say(kv(StringBuilder.new().puts(prefix).puts("_slot1_seq").toString(), v.seq1));
+}
+
+// A random nonce that is neither 0 nor any value in {avoid}; 0 on failure.
+def drawDistinct(avoid: Array<u64>) -> u64 {
+        for (attempt < 8) {
+                def v = randomNonce();
+                if (v == 0u64) continue;
+                var clash = false;
+                for (a in avoid) if (a == v) clash = true;
+                if (!clash) return v;
+        }
+        return 0;
 }
 
 def exists(path: string) -> bool {
@@ -697,6 +813,12 @@ def faultPrepare(args: Array<string>) -> int {
         def blocks = if(args.length > 4, parseU64(args[4], 512), 512u64);
         def blockSize = if(args.length > 5, parseU64(args[5], 4096), 4096u64);
         def steps = if(args.length > 6, parseU64(args[6], 2), 2u64);
+        var scenario = FaultScenario.SINGLE;
+        if (args.length > 7) {
+                def p = parseScenario(args[7]);
+                if (!p.0) return EXIT_USAGE;
+                scenario = p.1;
+        }
         RebootConfig.elideWriteback = false;
         RebootConfig.path = reservePath(args[1], "wizard-pwfsf");
         if (RebootConfig.path == null) return fail("could not reserve a region file in the directory");
@@ -719,12 +841,22 @@ def faultPrepare(args: Array<string>) -> int {
         def logOffset = region.getHeader().logChunk;
         def logBytes = region.blockSize;
         def marker = markerOffset(region, sieve);
+        def second = secondWordOffset(region, sieve);
         if (region.txn.readU64(region.regionStart + marker) != 0u64) return fail("the marker word is not zero");
+        if (region.txn.readU64(region.regionStart + second) != 0u64) return fail("the second word is not zero");
         // Clean close: after-images durable, both slots scrubbed, so the
         // commit under test is sequence 1 of a clean log.
         region.deallocate();
+
+        var pair: Array<string>;
+        if (scenario != FaultScenario.SINGLE) {
+                pair = preparePair(blocks, blockSize, marker, second);
+                if (pair == null) return EXIT_LOST;     // preparePair() printed why
+        }
         // The direct backend's format already wrote every unit through
         // O_DIRECT; a buffered rewrite would only leave its pages cached.
+        // After preparePair() the reopened mapping is still live: the rewrite
+        // goes through the same page cache and changes no byte.
         if (!RebootConfig.useDirect && !rewriteDurably(RebootConfig.path, logOffset, logBytes)) {
                 return fail("could not rewrite the log chunk durably");
         }
@@ -732,6 +864,7 @@ def faultPrepare(args: Array<string>) -> int {
         def lines = [
                 kvs("region", RebootConfig.path),
                 kvs("backend", backendLabel()),
+                kvs("scenario", scenario.arg),
                 kv("blocks", blocks),
                 kv("block_size", blockSize),
                 kv("setup_steps", steps),
@@ -745,9 +878,73 @@ def faultPrepare(args: Array<string>) -> int {
                 if (!state.line(l)) return fail("could not sync the state file");
                 say(l);
         }
+        if (pair != null) {
+                for (l in pair) {
+                        if (!state.line(l)) return fail("could not sync the state file");
+                        say(l);
+                }
+        }
         state.close();
         say("OK");
         return EXIT_OK;
+}
+
+// stale-slot and tear: after the clean close, mount again and leave two
+// acknowledged records, N-2 (M = A) and N-1 (M = B), with their data durable,
+// then return without closing. Returns the state lines, or null after printing
+// why. The reopened instance is never closed: close() would scrub both slots.
+def preparePair(blocks: u64, blockSize: u64, marker: u64, second: u64) -> Array<string> {
+        def region = openRegion(blocks, blockSize, false);
+        if (region == null || region.txn == null) { fail("the closed region did not mount again"); return null; }
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) { fail(err); return null; }
+        if (region.lastRecovery != DualWalRecovery.CLEAN || region.requiresRecovery()) {
+                fail("the cleanly closed region did not mount CLEAN");
+                return null;
+        }
+        def start = region.regionStart;
+        if (region.txn.readU64(start + marker) != 0u64 || region.txn.readU64(start + second) != 0u64) {
+                fail("the marker or second word is not zero after the clean close");
+                return null;
+        }
+        def a = drawDistinct(Array<u64>.new(0));
+        def b = drawDistinct([a]);
+        if (a == 0u64 || b == 0u64) { fail("could not draw the values A and B"); return null; }
+        // N-2 and N-1, one redo entry each. RegionTransaction.commit() applies
+        // each after-image once its record is durable.
+        region.txn.writeU64(start + marker, a);
+        if (!region.txn.commit()) { fail("N-2 was not acknowledged"); return null; }
+        region.txn.writeU64(start + marker, b);
+        if (!region.txn.commit()) { fail("N-1 was not acknowledged"); return null; }
+        // flush() is DualTxnWal.persistAppliedData(): N-1's applied after-image
+        // becomes durable and dataDurableSeq advances; no slot is scrubbed.
+        if (!region.txn.flush() || region.requiresRecovery()) { fail("flush() failed"); return null; }
+        if (region.txn.readU64(start + marker) != b) { fail("M does not hold B after N-1"); return null; }
+
+        def v = inspectSlots(blocks, blockSize);
+        if (v == null || !v.headerOk) { fail("the slots could not be read back"); return null; }
+        def seqA = v.minSeq(), seqB = v.maxSeq();
+        // A clean log restarts at sequence 1, so N-2 = 1 and N-1 = 2, each in
+        // the slot of its parity (validateSlot() checks the parity).
+        if (seqA != 1u64 || seqB != 2u64) {
+                fail(StringBuilder.new().put2("the slots hold sequences %d and %d, not 1 and 2", v.seq0, v.seq1).toString());
+                return null;
+        }
+        return [
+                kv("seq_a", seqA),
+                kv("seq_b", seqB),
+                kv("value_a", a),
+                kvs("value_a_le_hex", leHex(a)),
+                kv("value_b", b),
+                kvs("value_b_le_hex", leHex(b)),
+                kv("word_m_offset", marker),
+                kv("word_x_offset", second),
+                kv("slot_bytes", v.slotBytes),
+                kv("slot0_offset", v.slot0),
+                kv("slot1_offset", v.slot1),
+                kv("slot0_seq", v.seq0),
+                kv("slot1_seq", v.seq1)
+        ];
 }
 
 def faultCommit(args: Array<string>) -> int {
@@ -758,10 +955,20 @@ def faultCommit(args: Array<string>) -> int {
         def bl = requireU64(args[3], "blocks"), bs = requireU64(args[4], "blockSize");
         if (!bl.0 || !bs.0) return EXIT_USAGE;
         def timeout = if(args.length > 6, parseU64(args[6], 120), 120u64);
+        var scenario = FaultScenario.SINGLE;
+        if (args.length > 7) {
+                def p = parseScenario(args[7]);
+                if (!p.0) return EXIT_USAGE;
+                scenario = p.1;
+        }
         def goCommit = StringBuilder.new().puts(args[5]).puts("/go-commit").toString();
         def goReopen = StringBuilder.new().puts(args[5]).puts("/go-reopen").toString();
-        if (exists(goCommit) || exists(goReopen)) return fail("a go file already exists: use a fresh signal directory");
+        def goNext = StringBuilder.new().puts(args[5]).puts("/go-next").toString();
+        if (exists(goCommit) || exists(goReopen) || exists(goNext)) return fail("a go file already exists: use a fresh signal directory");
         if (!exists(RebootConfig.path)) return fail("region file is missing; run fault-prepare first");
+        if (scenario != FaultScenario.SINGLE) {
+                return faultCommitPair(bl.1, bs.1, scenario, timeout, goCommit, goReopen, goNext);
+        }
 
         def first = openRegion(bl.1, bs.1, false);
         if (first == null || first.txn == null) return fail("the region did not mount");
@@ -804,6 +1011,126 @@ def faultCommit(args: Array<string>) -> int {
         say(kv("reopen_latched", flag(second.requiresRecovery())));
         say(kv("reopen_marker", seen));
         say(kv("reopen_visible", flag(seen == nonce)));
+        say("DONE");
+        // Exit without closing either instance, as a crash would.
+        return EXIT_OK;
+}
+
+// fault-commit for stale-slot and tear. fault-prepare left N-2 and N-1 in the
+// slots; the mount replays both, so N = (N-1) + 1 goes to slot N mod 2, over
+// N-2's record. The script arms the error target over the 4 KiB page that
+// holds that slot and nothing else, from test_slot and the slot offsets
+// printed here.
+def faultCommitPair(blocks: u64, blockSize: u64, scenario: FaultScenario, timeout: u64,
+                goCommit: string, goReopen: string, goNext: string) -> int {
+        say(kvs("scenario", scenario.arg));
+        def pre = inspectSlots(blocks, blockSize);
+        if (pre == null || !pre.headerOk) return fail("the slots could not be read before the mount");
+        sayView("pre", pre);
+        if (pre.minSeq() == 0u64 || pre.maxSeq() != pre.minSeq() + 1u64) {
+                return fail("fault-prepare did not leave two valid records with consecutive sequences");
+        }
+        def first = openRegion(blocks, blockSize, false);
+        if (first == null || first.txn == null) return fail("the region did not mount");
+        def err = checkBackendRegion(first.backendRegion);
+        if (err != null) return fail(err);
+        say(kvs("mount_recovery", first.lastRecovery.name));
+        if (first.lastRecovery != DualWalRecovery.REPLAYED) return fail("the mount did not replay the two prepared records");
+        if (first.requiresRecovery()) return fail("the first mount latched recovery-required");
+        def sieve = PWSieve.new(first, LIVE_SEGMENTS);
+        if (!sieve.open()) return fail("could not reattach to the sieve root");
+        if (!hasSpareSlot(sieve)) return fail("no spare descriptor slot for the marker word");
+        // sieve.open() commits only if it reclaims a leak or finishes a
+        // retirement; either would write a record and move N.
+        if (sieve.leaksReclaimed() != 0) return fail("the mount reclaimed a leaked extent, which commits");
+        def marker = markerOffset(first, sieve);
+        def second = secondWordOffset(first, sieve);
+        def start = first.regionStart;
+        def mBefore = first.txn.readU64(start + marker);
+        def xBefore = first.txn.readU64(start + second);
+        if (mBefore == 0u64) return fail("the marker word holds no prepared value");
+        if (xBefore != 0u64) return fail("the second word is not zero");
+        def c = drawDistinct([mBefore]);
+        def x = drawDistinct([mBefore, c]);
+        if (c == 0u64 || x == 0u64) return fail("could not draw fresh values");
+        def n = pre.maxSeq() + 1u64;
+        def slot = int.!(n % 2u64);
+        def lines = [
+                kv("leaks_reclaimed", u64.!(sieve.leaksReclaimed())),
+                kv("word_m_offset", marker),
+                kv("word_x_offset", second),
+                kvs("x_word", scenario.secondWord),
+                kv("m_before", mBefore),
+                kv("x_before", xBefore),
+                kv("txn_seq", n),
+                kv("test_slot", u64.!(slot)),
+                kv("slot_bytes", pre.slotBytes),
+                kv("slot0_offset", pre.slot0),
+                kv("slot1_offset", pre.slot1),
+                kv("value_c", c),
+                kvs("value_c_le_hex", leHex(c)),
+                kv("value_x", x),
+                kvs("value_x_le_hex", leHex(x))
+        ];
+        for (l in lines) say(l);
+        say("READY");
+        if (!waitForFile(goCommit, timeout)) return fail("timed out waiting for go-commit; nothing was attempted");
+
+        // Transaction N: M = C; for tear also Z = E, a word N-2 and N-1 never
+        // wrote.
+        first.txn.writeU64(start + marker, c);
+        if (scenario == FaultScenario.TEAR) first.txn.writeU64(start + second, x);
+        def ok = first.txn.commit();
+        say(kv("commit_ok", flag(ok)));
+        say(kv("latched", flag(first.requiresRecovery())));
+        say("ATTEMPTED");
+        if (!waitForFile(goReopen, timeout)) return fail("timed out waiting for go-reopen; the first mount was left unrecovered");
+
+        // Abandon the first mount, as faultCommit() does. First read the
+        // slots as the reopen will.
+        def seen = inspectSlots(blocks, blockSize);
+        sayView("reopen_seen", seen);
+        def again = openRegion(blocks, blockSize, false);
+        if (again == null || again.txn == null) return fail("the reopened region did not mount");
+        def err2 = checkBackendRegion(again.backendRegion);
+        if (err2 != null) return fail(err2);
+        say(kvs("reopen_recovery", again.lastRecovery.name));
+        say(kv("reopen_latched", flag(again.requiresRecovery())));
+        say(kv("reopen_m", again.txn.readU64(again.regionStart + marker)));
+        say(kv("reopen_x", again.txn.readU64(again.regionStart + second)));
+        if (scenario == FaultScenario.TEAR) {
+                say("DONE");
+                // Exit without closing either instance, as a crash would.
+                return EXIT_OK;
+        }
+
+        say("REOPENED");
+        if (!waitForFile(goNext, timeout)) return fail("timed out waiting for go-next; next was not attempted");
+        // next: one more transaction on the recovered mount, M2 = D, which N
+        // did not touch. Only on a mount that recovery left usable.
+        def usable = !again.requiresRecovery() && (again.lastRecovery == DualWalRecovery.REPLAYED
+                || again.lastRecovery == DualWalRecovery.CLEAN);
+        if (!usable || seen == null || !seen.headerOk) {
+                say(kv("next_ok", 0u64));
+                say(kvs("next_skipped", "the reopened mount is not usable"));
+                say(kv("next_seq", 0u64));
+                say("DONE");
+                return EXIT_OK;
+        }
+        // recover() sets the next sequence to the larger valid one + 1.
+        def expected = seen.maxSeq() + 1u64;
+        say(kv("next_seq_expected", expected));
+        again.txn.writeU64(again.regionStart + second, x);
+        def nok = again.txn.commit();
+        say(kv("next_ok", flag(nok)));
+        say(kv("next_latched", flag(again.requiresRecovery())));
+        def after = inspectSlots(blocks, blockSize);
+        sayView("next_seen", after);
+        // The sequence next got: the newest record now visible, which must be
+        // in the slot of its parity (validateSlot() checks that).
+        var nextSeq = 0u64;
+        if (nok && after != null && after.headerOk) nextSeq = after.maxSeq();
+        say(kv("next_seq", nextSeq));
         say("DONE");
         // Exit without closing either instance, as a crash would.
         return EXIT_OK;
@@ -860,6 +1187,190 @@ def faultVerify(args: Array<string>) -> int {
         return verdict("CONSISTENT", "recovery succeeded and every invariant holds", EXIT_OK);
 }
 
+// A verdict on the two words, with its reason and exit status.
+class AckVerdict(kind: string, reason: string, code: int) { }
+
+// The acknowledgement contract for the two-record scenarios
+// (docs/persistent-backends.md, "Persistence-failure contract"): every
+// acknowledged transaction must be present, and the unacknowledged N either
+// wholly present or wholly absent. {m} is the marker word M and {x} the second
+// word as found; {a}..{c} and {xv} are the values the transactions stored.
+//   stale-slot: N-2 stores M = a, N-1 M = b (acknowledged), N M = c (not),
+//     next M2 = xv (acknowledged iff {nextAcked}). M must be b or c; M2 must
+//     be xv if next was acknowledged, else 0 or xv.
+//   tear: N-2 stores M = a, N-1 M = b (acknowledged), N M = c and Z = xv (not;
+//     Z is 0 before N). (M, Z) must be (b, 0) or (c, xv); (b, xv) and (c, 0)
+//     are TORN.
+// M = a or 0 is LOST in both: N-1's acknowledged write is undone. A value no
+// transaction stored is INCONSISTENT. LOST wins over TORN; both reasons are
+// given.
+def judgeAcks(scenario: FaultScenario, m: u64, x: u64, a: u64, b: u64, c: u64, xv: u64, nextAcked: bool) -> AckVerdict {
+        def xName = scenario.secondWord;
+        if (m != a && m != b && m != c && m != 0u64) {
+                return AckVerdict.new("INCONSISTENT", "M holds a value no transaction stored", EXIT_INCONSISTENT);
+        }
+        if (x != 0u64 && x != xv) {
+                return AckVerdict.new("INCONSISTENT", Strings.format1("%s holds a value no transaction stored", xName), EXIT_INCONSISTENT);
+        }
+        def mLost = m == a || m == 0u64;
+        def mWhy = if(m == a, "M holds N-2's value A: the acknowledged N-1's write is undone",
+                "M holds its value from before N-2: the acknowledged N-2 and N-1 are undone");
+        if (scenario == FaultScenario.STALE_SLOT) {
+                def xLost = nextAcked && x == 0u64;
+                if (mLost && xLost) return AckVerdict.new("LOST", Strings.format1("%s, and the acknowledged next's M2 is absent", mWhy), EXIT_LOST);
+                if (mLost) return AckVerdict.new("LOST", mWhy, EXIT_LOST);
+                if (xLost) return AckVerdict.new("LOST", "the acknowledged next's M2 is absent", EXIT_LOST);
+                def nWhy = if(m == c, "N (unacknowledged) is present", "N (unacknowledged) is absent");
+                def nextWhy = if(nextAcked, "", if(x == xv, "; next (unacknowledged) is present", "; next (unacknowledged) is absent"));
+                return AckVerdict.new("CONSISTENT", StringBuilder.new()
+                        .puts("every acknowledged transaction is present; ").puts(nWhy).puts(nextWhy).toString(), EXIT_OK);
+        }
+        // tear
+        def zN = x == xv;
+        if (mLost) {
+                def tail = if(zN, ", and N's write to Z is present (N is also torn)", "");
+                return AckVerdict.new("LOST", StringBuilder.new().puts(mWhy).puts(tail).toString(), EXIT_LOST);
+        }
+        def mN = m == c;
+        if (mN && zN) return AckVerdict.new("CONSISTENT", "N-1 is present; N (unacknowledged) is wholly present", EXIT_OK);
+        if (!mN && !zN) return AckVerdict.new("CONSISTENT", "N-1 is present; N (unacknowledged) is wholly absent", EXIT_OK);
+        if (zN) return AckVerdict.new("TORN", "N (unacknowledged) is partly present: its Z = E is durable and its M = C is undone (M holds N-1's B)", EXIT_TORN);
+        return AckVerdict.new("TORN", "N (unacknowledged) is partly present: its M = C is durable and its Z = E is absent", EXIT_TORN);
+}
+
+// A for a, ..., 0 for zero, "other" for anything else: how the summary names a value.
+def valueLabel(v: u64, a: u64, b: u64, c: u64, xv: u64, xLabel: string) -> string {
+        if (v == 0u64) return "0";
+        if (v == a) return "A";
+        if (v == b) return "B";
+        if (v == c) return "C";
+        if (v == xv) return xLabel;
+        return "other";
+}
+
+def faultVerifyAcks(args: Array<string>) -> int {
+        if (args.length < 13) return usage();
+        RebootConfig.path = args[1];
+        if (!parseFaultBackend(args[2])) return EXIT_USAGE;
+        RebootConfig.elideWriteback = false;
+        def p = parseScenario(args[5]);
+        if (!p.0) return EXIT_USAGE;
+        def scenario = p.1;
+        if (scenario == FaultScenario.SINGLE) {
+                System.puts("fault-verify-acks is for stale-slot and tear; use fault-verify for single\n");
+                return EXIT_USAGE;
+        }
+        def bl = requireU64(args[3], "blocks"), bs = requireU64(args[4], "blockSize");
+        def sc = requireU64(args[6], "setup-cursor"), sn = requireU64(args[7], "setup-count");
+        def va = requireU64(args[8], "a"), vb = requireU64(args[9], "b"), vc = requireU64(args[10], "c");
+        def vx = requireU64(args[11], "x"), ns = requireU64(args[12], "next-seq");
+        if (!bl.0 || !bs.0 || !sc.0 || !sn.0 || !va.0 || !vb.0 || !vc.0 || !vx.0 || !ns.0) return EXIT_USAGE;
+        def a = va.1, b = vb.1, c = vc.1, xv = vx.1;
+        def nextAcked = scenario == FaultScenario.STALE_SLOT && ns.1 != 0u64;
+        def xLabel = if(scenario == FaultScenario.STALE_SLOT, "D", "E");
+        say(kvs("scenario", scenario.arg));
+        say(kv("next_acked", flag(nextAcked)));
+        // Every outcome must be distinguishable.
+        if (a == 0u64 || b == 0u64 || c == 0u64 || xv == 0u64 || a == b || a == c || a == xv || b == c || b == xv || c == xv) {
+                return verdict("INVALID", "the values A, B, C and the second word's are not nonzero and distinct", EXIT_INVALID);
+        }
+
+        // As verify: PWRegion formats a region whose magic is missing, so look
+        // at the raw header before mounting.
+        def image = System.fileLoad(RebootConfig.path);
+        if (image == null || u64.!(image.length) != bl.1 * bs.1) {
+                return verdict("INVALID", "the region file is missing or has the wrong size", EXIT_INVALID);
+        }
+        if (le64(image, PWRegionHeader.magic.offset) != PWRegions.MAGIC) {
+                return verdict("INVALID", "the region header's magic is gone", EXIT_INVALID);
+        }
+        // The records recovery is about to find, through the backend.
+        sayView("found", inspectSlots(bl.1, bs.1));
+
+        def region = openRegion(bl.1, bs.1, false);
+        if (region == null || region.txn == null) return verdict("INCONSISTENT", "the region did not mount", EXIT_INCONSISTENT);
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) return fail(err);
+        say(kvs("recovery", region.lastRecovery.name));
+        say(kv("latched", flag(region.requiresRecovery())));
+        if (region.lastRecovery == DualWalRecovery.CORRUPT || region.lastRecovery == DualWalRecovery.PERSIST_FAILED
+                || region.requiresRecovery()) {
+                return verdict("INCONSISTENT", "recovery left the region unavailable", EXIT_INCONSISTENT);
+        }
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return verdict("INCONSISTENT", "the sieve root could not be reattached", EXIT_INCONSISTENT);
+        def m = region.txn.readU64(region.regionStart + markerOffset(region, sieve));
+        def x = region.txn.readU64(region.regionStart + secondWordOffset(region, sieve));
+        say(kv("m", m));
+        say(kv("x", x));
+        say(kvs("m_is", valueLabel(m, a, b, c, xv, xLabel)));
+        say(kvs("x_is", valueLabel(x, a, b, c, xv, xLabel)));
+        say(kv("leaks_reclaimed", u64.!(sieve.leaksReclaimed())));
+        def inv = sieve.checkInvariants();
+        def alloc = PersistentAllocatorInvariants.check(region);
+        say(kvs("sieve_invariants", if(inv == null, "ok", inv)));
+        say(kvs("allocator_invariants", if(alloc == null, "ok", alloc)));
+        def cursor = sieve.cursor(), count = sieve.count();
+        say(kv("cursor", cursor));
+        say(kv("count", count));
+        // The words' verdict is printed whatever the structure's, so a LOST
+        // or TORN under a broken invariant is still on record.
+        def j = judgeAcks(scenario, m, x, a, b, c, xv, nextAcked);
+        say(kvs("acks", j.kind));
+        say(kvs("acks_reason", j.reason));
+        if (inv != null || alloc != null) return verdict("INCONSISTENT", "an invariant is violated", EXIT_INCONSISTENT);
+        if (cursor != sc.1 || count != sn.1) return verdict("INCONSISTENT", "the sieve is not at its setup state", EXIT_INCONSISTENT);
+        if (referenceCount(cursor) != count) return verdict("INCONSISTENT", "the prime count disagrees with an independent sieve", EXIT_INCONSISTENT);
+        return verdict(j.kind, j.reason, j.code);
+}
+
+// Every outcome the predictions name, and the others the scripts' tables can
+// show, through judgeAcks(), against the verdict each must get.
+def faultVerdictTest(args: Array<string>) -> int {
+        def a = 0x1111_1111_1111_1111u64, b = 0x2222_2222_2222_2222u64, c = 0x3333_3333_3333_3333u64;
+        def d = 0x4444_4444_4444_4444u64, other = 0x5555_5555_5555_5555u64;
+        def ss = FaultScenario.STALE_SLOT, tt = FaultScenario.TEAR, z = 0u64;
+        // (scenario, M, second word, next acknowledged, expected, what it is)
+        def cases: Array<(FaultScenario, u64, u64, bool, string, string)> = [
+                (ss, a, d, true, "LOST", "predicted for file: replay of stale N-2 then N+1"),
+                (ss, b, d, true, "CONSISTENT", "predicted for direct: N absent, next = N"),
+                (ss, c, d, true, "CONSISTENT", "no fault: N and next present"),
+                (ss, c, d, false, "CONSISTENT", "next unacknowledged but present"),
+                (ss, b, z, false, "CONSISTENT", "next unacknowledged and absent"),
+                (ss, c, z, true, "LOST", "acknowledged next absent"),
+                (ss, a, z, true, "LOST", "N-1 undone and next absent"),
+                (ss, z, d, true, "LOST", "M back to its value before N-2"),
+                (ss, other, d, true, "INCONSISTENT", "M holds a foreign value"),
+                (ss, b, other, true, "INCONSISTENT", "M2 holds a foreign value"),
+                (tt, b, d, false, "TORN", "predicted for file: N's Z durable, its M undone"),
+                (tt, b, z, false, "CONSISTENT", "predicted for direct: N wholly absent"),
+                (tt, c, d, false, "CONSISTENT", "no fault: N wholly present"),
+                (tt, c, z, false, "TORN", "N's M durable, its Z absent"),
+                (tt, a, d, false, "LOST", "N-1 undone (and N torn)"),
+                (tt, a, z, false, "LOST", "N-1 undone"),
+                (tt, z, z, false, "LOST", "M back to its value before N-2"),
+                (tt, other, z, false, "INCONSISTENT", "M holds a foreign value"),
+                (tt, b, other, false, "INCONSISTENT", "Z holds a foreign value")
+        ];
+        var failed = 0;
+        for (t in cases) {
+                def j = judgeAcks(t.0, t.1, t.2, a, b, c, d, t.3);
+                def xLabel = if(t.0 == ss, "D", "E");
+                def ok = Strings.equal(j.kind, t.4);
+                if (!ok) failed++;
+                say(StringBuilder.new()
+                        .puts(if(ok, "ok   ", "FAIL ")).puts(t.0.arg)
+                        .puts(" M=").puts(valueLabel(t.1, a, b, c, d, xLabel))
+                        .puts(" ").puts(t.0.secondWord).puts("=").puts(valueLabel(t.2, a, b, c, d, xLabel))
+                        .puts(if(t.0 == ss, if(t.3, " next acked", " next unacked"), ""))
+                        .puts(" -> ").puts(j.kind).puts(" (expected ").puts(t.4).puts("): ").puts(t.5)
+                        .toString());
+        }
+        say(kv("verdict_cases", u64.!(cases.length)));
+        say(kv("verdict_failures", u64.!(failed)));
+        return if(failed == 0, EXIT_OK, EXIT_LOST);
+}
+
 def main(args: Array<string>) -> int {
         if (args.length < 1 || args[0] == null) return usage();
         def mode = args[0];
@@ -871,5 +1382,7 @@ def main(args: Array<string>) -> int {
         if (Strings.equal(mode, "fault-prepare")) return faultPrepare(args);
         if (Strings.equal(mode, "fault-commit")) return faultCommit(args);
         if (Strings.equal(mode, "fault-verify")) return faultVerify(args);
+        if (Strings.equal(mode, "fault-verify-acks")) return faultVerifyAcks(args);
+        if (Strings.equal(mode, "fault-verdict-test")) return faultVerdictTest(args);
         return usage();
 }
