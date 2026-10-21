@@ -48,10 +48,39 @@
 // acknowledgement. The probe modes drive clwb/sfence on the provider directly
 // and have no meaning for it, so they refuse it.
 //
+// Three more modes drive a failed persistence boundary under a real EIO
+// from the block layer, for scripts/desktop-fsyncfail-check.sh, which maps
+// the log chunk to device sectors and fails writes there while fault-commit
+// waits. File and direct backends only: the question is the page cache.
+//
+//   fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps]
+//       As setup; for the file backend it then rewrites the log chunk's own
+//       bytes and fdatasyncs, so every page of it is allocated and written
+//       before a fault is armed (the direct backend's format writes every
+//       unit). Records the log chunk's offset and length and the marker word.
+//   fault-commit <region> <file|direct> <blocks> <blockSize> <signal-dir> [timeout-s]
+//       One process: mounts, prints READY, waits for <signal-dir>/go-commit,
+//       commits one transaction storing a fresh nonce in the marker word,
+//       prints the result and the latch, prints ATTEMPTED, waits for
+//       <signal-dir>/go-reopen, then abandons that mount unclosed and opens a
+//       new instance (the production abandon, reopen and recover), prints its
+//       recovery and whether the nonce is visible, and exits without closing.
+//   fault-verify <region> <file|direct> <blocks> <blockSize> <nonce> <setup-cursor> <setup-count>
+//       Later, in a new process: mounts, recovers, reports the marker, and
+//       runs the sieve and allocator checks.
+//
+// The marker word is the base field of the sieve root chunk's last descriptor
+// slot, which no step of these runs reaches (2 of 167 slots at 4 KiB blocks);
+// checkInvariants() reads only the first numSegments descriptors, so the
+// transaction under test changes nothing the workload checks.
+//
 // Exit status: 0 success (verify: SURVIVED; probe-verify: SENSITIVE), 1 LOST
 // (acknowledged state did not survive), 2 usage, 3 INVALID (the flushed
 // control state itself is gone, so the run says nothing about flush
 // placement), 4 NOT-SENSITIVE (probe-verify: every unflushed line survived).
+// fault-commit exits 0 once its protocol completes, whatever the outcome (the
+// outcome is in its output), and 1 if the protocol could not be completed;
+// fault-verify exits 0 CONSISTENT, 1 INCONSISTENT, 3 INVALID.
 
 def LIVE_SEGMENTS = 2u64;
 def MAX_REFERENCE = 64000000u64;
@@ -77,6 +106,9 @@ def usage() -> int {
         System.puts("  pwreboot setup <dax-dir> <state-file> <file|pmem|direct> [blocks] [blockSize] [steps]\n");
         System.puts("  pwreboot arm <region> <state-file> <file|pmem|direct> <ordinary|elide-clwb> <blocks> <blockSize> [steps] [reset-fd]\n");
         System.puts("  pwreboot verify <region> <file|pmem|direct> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>\n");
+        System.puts("  pwreboot fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps]\n");
+        System.puts("  pwreboot fault-commit <region> <file|direct> <blocks> <blockSize> <signal-dir> [timeout-s]\n");
+        System.puts("  pwreboot fault-verify <region> <file|direct> <blocks> <blockSize> <nonce> <setup-cursor> <setup-count>\n");
         return EXIT_USAGE;
 }
 
@@ -580,6 +612,254 @@ def verify(args: Array<string>) -> int {
         return verdict("SURVIVED", "all acknowledged steps are durable and every invariant holds", EXIT_OK);
 }
 
+// ------------------------------------------------------------------ fault
+
+// One output line in one write, so a script polling the log never sees half.
+def say(s: string) {
+        System.puts(StringBuilder.new().puts(s).ln().toString());
+}
+
+def flag(b: bool) -> u64 {
+        return if(b, 1u64, 0u64);
+}
+
+def parseFaultBackend(s: string) -> bool {
+        if (!parseBackend(s)) return false;
+        if (!RebootConfig.usePmem) return true;
+        System.puts("the fault modes test a page cache: backend must be \"file\" or \"direct\"\n");
+        return false;
+}
+
+// The nonce's bytes as they lie in a redo entry (little-endian), in lowercase
+// hex, so the script can look for them in a raw copy of the log chunk.
+def HEX = "0123456789abcdef";
+def leHex(v: u64) -> string {
+        def b = StringBuilder.new();
+        var x = v;
+        for (i < 8) {
+                def octet = int.!(x & 0xFFu64);
+                b.putc(HEX[octet >> 4]).putc(HEX[octet & 15]);
+                x = x >> 8;
+        }
+        return b.toString();
+}
+
+// Region-relative offset of the marker word (see the header comment).
+def markerOffset(region: PWRegion, sieve: PWSieve) -> u64 {
+        return region.getUserRoot() + u64.!(ChunkHeader.size + SieveRoot.size)
+                + (sieve.segmentCapacity() - 1u64) * u64.!(SieveSegment.size)
+                + u64.!(SieveSegment.base.offset);
+}
+
+def hasSpareSlot(sieve: PWSieve) -> bool {
+        return sieve.numSegments() + 1u64 < sieve.segmentCapacity();
+}
+
+def exists(path: string) -> bool {
+        def p = Array<byte>.new(path.length + 1);
+        for (i < path.length) p[i] = path[i];
+        return Linux.syscall(LinuxConst.SYS_access, (Pointer.atContents(p), 0)).0 == 0;
+}
+
+// Wait for the script to create {path}, checking every 20 ms and for at most
+// {seconds}: a script that dies cannot leave this process waiting for ever.
+def waitForFile(path: string, seconds: u64) -> bool {
+        def ts = Array<long>.new(2);
+        def polls = seconds * 50u64;
+        for (i = 0u64; i < polls; i++) {
+                if (exists(path)) return true;
+                ts[0] = 0;
+                ts[1] = 20000000;
+                Linux.syscall(LinuxConst.SYS_nanosleep, (Pointer.atContents(ts), Pointer.NULL));
+        }
+        return exists(path);
+}
+
+// Read {size} bytes at {offset} through an ordinary descriptor, write the same
+// bytes back and fdatasync. Afterwards each of those pages is allocated and
+// written on the device -- not a hole, a delayed allocation or an unwritten
+// extent -- so the failing write under test needs no allocation, extent
+// conversion or other metadata. The bytes do not change.
+def rewriteDurably(path: string, offset: u64, size: u64) -> bool {
+        def fd = RegionFileIO.open(path);
+        if (fd < 0) return false;
+        def buf = Array<byte>.new(int.!(size));
+        def ok = DirectIoFileIO.preadFully(fd, Pointer.atContents(buf), size, offset)
+                && DirectIoFileIO.pwriteFully(fd, Pointer.atContents(buf), size, offset)
+                && RegionFileIO.fdatasync(fd);
+        RegionFileIO.close(fd);
+        return ok;
+}
+
+def faultPrepare(args: Array<string>) -> int {
+        if (args.length < 4) return usage();
+        if (!parseFaultBackend(args[3])) return EXIT_USAGE;
+        def blocks = if(args.length > 4, parseU64(args[4], 512), 512u64);
+        def blockSize = if(args.length > 5, parseU64(args[5], 4096), 4096u64);
+        def steps = if(args.length > 6, parseU64(args[6], 2), 2u64);
+        RebootConfig.elideWriteback = false;
+        RebootConfig.path = reservePath(args[1], "wizard-pwfsf");
+        if (RebootConfig.path == null) return fail("could not reserve a region file in the directory");
+        def state = openState(args[2]);
+        if (state == null) return fail("could not create the state file");
+
+        def region = openRegion(blocks, blockSize, true);
+        if (region == null || region.txn == null) return fail("could not create the region");
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) return fail(err);
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return fail("could not lay out the sieve root");
+        // Each step commits several transactions, so both log slots hold a
+        // record before the clean close below scrubs them.
+        for (i < steps) {
+                if (!sieve.step()) return fail("setup step failed");
+        }
+        if (!hasSpareSlot(sieve)) return fail("no spare descriptor slot for the marker word");
+        def cursor = sieve.cursor(), count = sieve.count();
+        def logOffset = region.getHeader().logChunk;
+        def logBytes = region.blockSize;
+        def marker = markerOffset(region, sieve);
+        if (region.txn.readU64(region.regionStart + marker) != 0u64) return fail("the marker word is not zero");
+        // Clean close: after-images durable, both slots scrubbed, so the
+        // commit under test is sequence 1 of a clean log.
+        region.deallocate();
+        // The direct backend's format already wrote every unit through
+        // O_DIRECT; a buffered rewrite would only leave its pages cached.
+        if (!RebootConfig.useDirect && !rewriteDurably(RebootConfig.path, logOffset, logBytes)) {
+                return fail("could not rewrite the log chunk durably");
+        }
+
+        def lines = [
+                kvs("region", RebootConfig.path),
+                kvs("backend", backendLabel()),
+                kv("blocks", blocks),
+                kv("block_size", blockSize),
+                kv("setup_steps", steps),
+                kv("setup_cursor", cursor),
+                kv("setup_count", count),
+                kv("log_offset", logOffset),
+                kv("log_bytes", logBytes),
+                kv("marker_offset", marker)
+        ];
+        for (l in lines) {
+                if (!state.line(l)) return fail("could not sync the state file");
+                say(l);
+        }
+        state.close();
+        say("OK");
+        return EXIT_OK;
+}
+
+def faultCommit(args: Array<string>) -> int {
+        if (args.length < 6) return usage();
+        RebootConfig.path = args[1];
+        if (!parseFaultBackend(args[2])) return EXIT_USAGE;
+        RebootConfig.elideWriteback = false;
+        def bl = requireU64(args[3], "blocks"), bs = requireU64(args[4], "blockSize");
+        if (!bl.0 || !bs.0) return EXIT_USAGE;
+        def timeout = if(args.length > 6, parseU64(args[6], 120), 120u64);
+        def goCommit = StringBuilder.new().puts(args[5]).puts("/go-commit").toString();
+        def goReopen = StringBuilder.new().puts(args[5]).puts("/go-reopen").toString();
+        if (exists(goCommit) || exists(goReopen)) return fail("a go file already exists: use a fresh signal directory");
+        if (!exists(RebootConfig.path)) return fail("region file is missing; run fault-prepare first");
+
+        def first = openRegion(bl.1, bs.1, false);
+        if (first == null || first.txn == null) return fail("the region did not mount");
+        def err = checkBackendRegion(first.backendRegion);
+        if (err != null) return fail(err);
+        say(kvs("mount_recovery", first.lastRecovery.name));
+        if (first.requiresRecovery()) return fail("the first mount latched recovery-required");
+        def sieve = PWSieve.new(first, LIVE_SEGMENTS);
+        if (!sieve.open()) return fail("could not reattach to the sieve root");
+        if (!hasSpareSlot(sieve)) return fail("no spare descriptor slot for the marker word");
+        def marker = markerOffset(first, sieve);
+        def before = first.txn.readU64(first.regionStart + marker);
+        def nonce = randomNonce();
+        if (nonce == 0u64 || nonce == before) return fail("could not draw a fresh nonce");
+        say(kv("leaks_reclaimed", u64.!(sieve.leaksReclaimed())));
+        say(kv("marker_offset", marker));
+        say(kv("marker_before", before));
+        say(kv("nonce", nonce));
+        say(kvs("nonce_le_hex", leHex(nonce)));
+        say("READY");
+        if (!waitForFile(goCommit, timeout)) return fail("timed out waiting for go-commit; nothing was attempted");
+
+        // The transaction under test: one redo entry, the nonce.
+        first.txn.writeU64(first.regionStart + marker, nonce);
+        def ok = first.txn.commit();
+        say(kv("commit_ok", flag(ok)));
+        say(kv("latched", flag(first.requiresRecovery())));
+        say("ATTEMPTED");
+        if (!waitForFile(goReopen, timeout)) return fail("timed out waiting for go-reopen; the first mount was left unrecovered");
+
+        // Abandon the first mount as the contract requires: no retry, flush or
+        // close. Its mapping and descriptor stay open until exit. A new
+        // instance opens the region afresh and recovers.
+        def second = openRegion(bl.1, bs.1, false);
+        if (second == null || second.txn == null) return fail("the reopened region did not mount");
+        def err2 = checkBackendRegion(second.backendRegion);
+        if (err2 != null) return fail(err2);
+        def seen = second.txn.readU64(second.regionStart + marker);
+        say(kvs("reopen_recovery", second.lastRecovery.name));
+        say(kv("reopen_latched", flag(second.requiresRecovery())));
+        say(kv("reopen_marker", seen));
+        say(kv("reopen_visible", flag(seen == nonce)));
+        say("DONE");
+        // Exit without closing either instance, as a crash would.
+        return EXIT_OK;
+}
+
+def faultVerify(args: Array<string>) -> int {
+        if (args.length < 8) return usage();
+        RebootConfig.path = args[1];
+        if (!parseFaultBackend(args[2])) return EXIT_USAGE;
+        RebootConfig.elideWriteback = false;
+        def bl = requireU64(args[3], "blocks"), bs = requireU64(args[4], "blockSize");
+        def n = requireU64(args[5], "nonce");
+        def sc = requireU64(args[6], "setup-cursor"), sn = requireU64(args[7], "setup-count");
+        if (!bl.0 || !bs.0 || !n.0 || !sc.0 || !sn.0) return EXIT_USAGE;
+        def nonce = n.1;
+
+        // As verify: PWRegion formats a region whose magic is missing, so look
+        // at the raw header before mounting.
+        def image = System.fileLoad(RebootConfig.path);
+        if (image == null || u64.!(image.length) != bl.1 * bs.1) {
+                return verdict("INVALID", "the region file is missing or has the wrong size", EXIT_INVALID);
+        }
+        if (le64(image, PWRegionHeader.magic.offset) != PWRegions.MAGIC) {
+                return verdict("INVALID", "the region header's magic is gone", EXIT_INVALID);
+        }
+
+        def region = openRegion(bl.1, bs.1, false);
+        if (region == null || region.txn == null) return verdict("INCONSISTENT", "the region did not mount", EXIT_LOST);
+        def err = checkBackendRegion(region.backendRegion);
+        if (err != null) return fail(err);
+        say(kvs("recovery", region.lastRecovery.name));
+        say(kv("latched", flag(region.requiresRecovery())));
+        if (region.lastRecovery == DualWalRecovery.CORRUPT || region.lastRecovery == DualWalRecovery.PERSIST_FAILED
+                || region.requiresRecovery()) {
+                return verdict("INCONSISTENT", "recovery left the region unavailable", EXIT_LOST);
+        }
+        def sieve = PWSieve.new(region, LIVE_SEGMENTS);
+        if (!sieve.open()) return verdict("INCONSISTENT", "the sieve root could not be reattached", EXIT_LOST);
+        def seen = region.txn.readU64(region.regionStart + markerOffset(region, sieve));
+        say(kv("marker", seen));
+        say(kv("visible", flag(seen == nonce)));
+        say(kv("leaks_reclaimed", u64.!(sieve.leaksReclaimed())));
+        def inv = sieve.checkInvariants();
+        def alloc = PersistentAllocatorInvariants.check(region);
+        say(kvs("sieve_invariants", if(inv == null, "ok", inv)));
+        say(kvs("allocator_invariants", if(alloc == null, "ok", alloc)));
+        def cursor = sieve.cursor(), count = sieve.count();
+        say(kv("cursor", cursor));
+        say(kv("count", count));
+        if (seen != 0u64 && seen != nonce) return verdict("INCONSISTENT", "the marker holds neither its old value nor the nonce", EXIT_LOST);
+        if (inv != null || alloc != null) return verdict("INCONSISTENT", "an invariant is violated", EXIT_LOST);
+        if (cursor != sc.1 || count != sn.1) return verdict("INCONSISTENT", "the sieve is not at its setup state", EXIT_LOST);
+        if (referenceCount(cursor) != count) return verdict("INCONSISTENT", "the prime count disagrees with an independent sieve", EXIT_LOST);
+        return verdict("CONSISTENT", "recovery succeeded and every invariant holds", EXIT_OK);
+}
+
 def main(args: Array<string>) -> int {
         if (args.length < 1 || args[0] == null) return usage();
         def mode = args[0];
@@ -588,5 +868,8 @@ def main(args: Array<string>) -> int {
         if (Strings.equal(mode, "setup")) return setup(args);
         if (Strings.equal(mode, "arm")) return arm(args);
         if (Strings.equal(mode, "verify")) return verify(args);
+        if (Strings.equal(mode, "fault-prepare")) return faultPrepare(args);
+        if (Strings.equal(mode, "fault-commit")) return faultCommit(args);
+        if (Strings.equal(mode, "fault-verify")) return faultVerify(args);
         return usage();
 }
