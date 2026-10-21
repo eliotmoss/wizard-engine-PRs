@@ -437,6 +437,9 @@ def arm(args: Array<string>) -> int {
 
         def region = openRegion(bl.1, bs.1, false);
         if (region == null) return fail("could not mount the region");
+        // A refused mount (another format version, or other geometry) leaves
+        // no transaction; fail here rather than step an unmounted region.
+        if (region.txn == null) return fail("the region did not mount: run setup again with this build and geometry");
         def err = checkBackendRegion(region.backendRegion);
         if (err != null) return fail(err);
         if (region.requiresRecovery()) return fail("mount latched recovery-required");
@@ -528,7 +531,13 @@ def verify(args: Array<string>) -> int {
         var nonzero = 0;
         for (i < image.length) if (image[i] != 0) nonzero++;
         Trace.OUT.put2("raw image: %d bytes, %d nonzero", image.length, nonzero).ln();
-        if (le64(image, PWRegionHeader.magic.offset) != PWRegions.MAGIC) {
+        def magic = le64(image, PWRegionHeader.magic.offset);
+        if (magic != PWRegions.MAGIC && PWRegions.isTagged(magic)) {
+                // A setup run by a build of another format version: PWRegion
+                // refuses to mount it, so it says nothing about the reboot.
+                return verdict("INVALID", "the region has another format version: run setup again with this build", EXIT_INVALID);
+        }
+        if (magic != PWRegions.MAGIC) {
                 // Setup formatted the header with the production provider and
                 // closed cleanly, so its loss is not the mutant's doing.
                 return verdict("INVALID", "the formatted header is gone: the reserved memory did not survive the reboot", EXIT_INVALID);

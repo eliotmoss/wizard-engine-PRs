@@ -3,9 +3,28 @@
 // =============================================================================
 
 component PWRegions {
-        def MAGIC = 0x50_57_41_53_4Du64; // "PWASM" in hex
+        // The header's magic word: the "PWASM" tag in its low 5 bytes, bytes
+        // 5 and 6 zero, and the format version in its top byte. The version
+        // lives in the magic rather than in a field of its own because a new
+        // field would move the sentinels that follow the header. Version 0 is
+        // every region formatted before the version existed: its magic is the
+        // bare tag, and its header may be the 80-byte one, whose sentinels lie
+        // where this header's userRoot is.
+        def MAGIC_TAG = 0x50_57_41_53_4Du64; // "PWASM" in hex
+        def TAG_MASK = 0x00FF_FFFF_FFFF_FFFFu64; // the tag and the two zero bytes above it
+        def FORMAT_VERSION: u8 = 1;
+        def MAGIC = MAGIC_TAG | (u64.!(FORMAT_VERSION) << 56);
         def blockSize: u64 = 256u64 * 1024u64;
         def sanitize = false;
+
+        // True if {magic} is some format version's magic, this one's or not.
+        def isTagged(magic: u64) -> bool {
+                return (magic & TAG_MASK) == MAGIC_TAG;
+        }
+        // The format version a tagged magic carries.
+        def versionOf(magic: u64) -> u8 {
+                return u8.!(magic >> 56);
+        }
 }
 
 component BlockLists {
@@ -26,7 +45,7 @@ layout PWRegionHeader {
         +32     numDescs:       u64;
         +40     metaData:       u64;    // relative offset to the metadata area
         +48     metaDataDescs:  u64;    // relative offset to the metadata descriptors
-        +56     magic:          u64;    // identifier to confirm region is formatted
+        +56     magic:          u64;    // "PWASM" tag (bytes 0-4), zero (bytes 5-6), format version (byte 7)
         +64     blockSize:      u64;    // block size this region was formatted with
         +72     logChunk:       u64;    // region-relative offset of the WAL log chunk
         +80     userRoot:       u64;    // region-relative offset of the caller's root object (0 = none)
@@ -791,13 +810,23 @@ class PWRegion {
                 return blockTableHandle[index];
         }
 
+        // Mounts a region carrying this format version's magic and formats one
+        // carrying no PWRegion magic at all. A region tagged with another
+        // version is refused as mount() refuses a geometry mismatch: nothing
+        // is written, and txn stays null. Formatting it instead would erase
+        // the caller's data, and mounting it would trust a layout this build
+        // may not share; it must be reformatted with forceFormat.
         private def init(blockSize: u64, forceFormat: bool) {
                 if (forceFormat) {
                         format(blockSize);
                         return;
                 }
-                if (headerGetU64(PWRegionHeader.magic.offset) == PWRegions.MAGIC) {
+                def magic = headerGetU64(PWRegionHeader.magic.offset);
+                if (magic == PWRegions.MAGIC) {
                         mount(blockSize);
+                } else if (PWRegions.isTagged(magic)) {
+                        Trace.OUT.put2("format version mismatch: supported %d, stored %d",
+                                PWRegions.FORMAT_VERSION, PWRegions.versionOf(magic)).ln();
                 } else {
                         format(blockSize);
                 }
@@ -1315,9 +1344,13 @@ class ImmixPWRegion extends PWRegion {
         new(backend: TxnRegionBackend, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, blockSize: u64, forceFormat: bool)
                 super(backend, numBlocks, metaDataDescs, blockSize, forceFormat) {
                 // Backend creation can fail (for example, MAP_SYNC on a non-DAX
-                // filesystem). Leave the Immix view empty just as PWRegion leaves
-                // the failed mount unopened instead of dereferencing address 0.
-                if (backendRegion != null) lineMarks = getLineMarks();
+                // filesystem), and init() can leave a mapped region unopened:
+                // another format version, a stored geometry that does not match,
+                // or a region too small to format. Each way txn stays null. Leave the Immix view empty then, as
+                // PWRegion leaves the region unopened: a refused region's
+                // descriptors follow a layout this build has not validated, and
+                // with no line marks resetAllLineMarks() writes nothing.
+                if (txn != null) lineMarks = getLineMarks();
         }
 
         // Line mark definitions

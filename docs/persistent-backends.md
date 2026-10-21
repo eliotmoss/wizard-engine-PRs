@@ -3560,7 +3560,7 @@ Last blocks  Metadata, carved down from the region's end: the block table
 | `numDescs` | u64 | number of metadata descriptors |
 | `metaData` | u64 | offset to metadata area |
 | `metaDataDescs` | u64 | offset to descriptor table |
-| `magic` | u64 | `0x50_57_41_53_4D` ("PWASM") |
+| `magic` | u64 | `MAGIC_TAG \| FORMAT_VERSION << 56` = `0x0100_0050_5741_534D`: the "PWASM" tag `0x50_57_41_53_4D` in bytes 0–4, bytes 5–6 zero, the format version (1) in byte 7; see **Format version** below |
 | `blockSize` | u64 | bytes per block (wrapper default 512 KiB, `MemRegions.BlockSize = 512u64 * 1024u64`) |
 | `logChunk` | u64 | region-relative offset of the WAL log chunk (block 1 in the current layout) |
 | `userRoot` | u64 | region-relative offset of the caller's root object; `0` = none |
@@ -3593,19 +3593,88 @@ cost of the current per-operation commit granularity.
 after the header (`formatSentinels()` uses `PWRegionHeader.size`), so a region
 formatted by an older build has them at offset 80, where this build's
 `userRoot` lies. `mount()` reads the `sentinels`, `blockTable` and `logChunk`
-offsets from the stored header, and `magic`, `numBlocks` and `blockSize` still
-validate at their unchanged offsets, so such a region still mounts. Its
-`userRoot`, though, is the first 8 bytes of the `SMALL_FREE` sentinel
-(`listNum`, `used` and padding): `getUserRoot()` returns the zero that format
-left there, and `setUserRoot()` stores into the sentinel. The header has no
-version field, so nothing refuses an older region. Older regions are therefore
-unsupported and must be reformatted. When the 72 → 80 growth added `logChunk`,
+offsets from the stored header, and `magic`, `numBlocks` and `blockSize` sat at
+unchanged offsets, so until 2026-10-21 such a region still validated and
+mounted. Its `userRoot`, though, was the first 8 bytes of the `SMALL_FREE`
+sentinel (`listNum`, `used` and padding): `getUserRoot()` returned the zero
+that format left there, and `setUserRoot()` stored into the sentinel. The
+header had no version, so nothing refused an older region; and because
+`init()` formats any region without the magic, changing the magic's value
+alone would have formatted an older region, erasing it, rather than refusing
+it. Since 2026-10-21 the magic carries a format version, and such a region is
+refused (**Format version**, below). When the 72 → 80 growth added `logChunk`,
 `mount()` gained a fallback instead: a stored `logChunk` of 0 means block 1
 (`pwregion_bd:legacy_log_chunk_fallback`). Until 2026-10-20 this paragraph said
 an older region could not be mounted because the sentinel array would be read
 8 bytes early; `mount()` has read the stored `sentinels` offset since
-2026-03-13 (`bf2cf90a`). The mount of an 80-byte region is read from the code,
+2026-03-13 (`bf2cf90a`). The mount of an 80-byte region was read from the code,
 not tested.
+
+**Format version (2026-10-21).** The version sits in the magic word's top
+byte, which the 5-byte "PWASM" tag left unused, rather than in a field of its
+own: a new header field would move the free-list sentinels, which start at
+`PWRegionHeader.size` (88), onto different cache lines and change what a
+measured commit writes back. In `PWRegions`, `MAGIC_TAG` is the tag
+(`0x50_57_41_53_4D`), `FORMAT_VERSION` is 1, and
+`MAGIC = MAGIC_TAG | FORMAT_VERSION << 56`; bytes 5 and 6 stay zero.
+`isTagged(magic)` holds when the low 7 bytes are the tag and those two zero
+bytes, whatever the version; `versionOf(magic)` is the top byte. Version 0 is
+every region formatted before 2026-10-21: its magic is the bare tag, and the
+88-byte regions among them carry the same layout as version 1. `init()` without
+`forceFormat` now does one of three things:
+
+- magic equal to `MAGIC`: mount, as before;
+- magic tagged with another version, older or newer: refuse. `init()`
+  formats and writes nothing, a `format version mismatch` line is traced, and the
+  region is left as `mount()` leaves a block-size or block-count mismatch:
+  `backendRegion` set, `txn` null and `logChunk` null, which is how a caller
+  detects any refused mount. `requiresRecovery()` does not report it, as it
+  does not report the geometry refusals: it is false while `txn` is null.
+  An `ImmixPWRegion` so refused has an empty line table, and
+  `resetAllLineMarks()` on it writes nothing (see **Immix GC extension**);
+- anything else (zero, garbage, the tag with a nonzero byte 5 or 6): format,
+  as before.
+
+The region's bytes are left unchanged only if the opener asks for the file's
+own size. The backend sizes the file in `create()`, before `init()` reads the
+magic: the file backends' `ensureSize()` runs `ftruncate` and `fsync`, so
+reopening a refused region with fewer or more blocks than it has shrinks or
+grows the file first (review, 2026-10-21: a 32 KiB version-0 file reopened at
+four 4 KiB blocks was truncated to 16 KiB, then refused). This predates the
+version and applies equally to the block-size and block-count refusals; it is
+being fixed separately.
+
+`forceFormat` still formats unconditionally, and it is the only way to bring a
+refused region to version 1: there is no in-place upgrade, so a refused region
+must be reformatted, losing its contents. `format()` stores the versioned
+`MAGIC`, still last and under a fence of its own. Of the harnesses,
+`pwbench`, `pwsievebench` and `pwbtreebench` always format, and the `pwsieve`
+and `pwbtree` kill loops format before they remount; `pwopsbench` checks
+`txn`. `pwreboot arm` now fails on a null `txn` before it steps or resets, and
+`pwreboot verify` reads the raw header before it mounts: a region tagged with
+another version gives `INVALID` ("the region has another format version"),
+since setup was run by a different build (run 2026-10-21 on a file-backed
+setup whose magic was then overwritten with the bare tag; the file was
+unchanged). `pwregion_bd:` checks the three outcomes over a file-backed
+region that this build formatted and whose magic is then overwritten:
+`version_0_magic_refused_unchanged` stores the bare tag and
+`future_version_magic_refused_unchanged` version 2, and each requires a null
+`txn` and log chunk, the stored magic intact, and every byte of the backing
+file the same in the mapping while it is open and in the file once it is
+closed; `untagged_magic_reformatted` stores 0, `0xDEAD_BEEF_CAFE_F00D` and the
+tag with byte 5 set or with byte 6 set, and requires a mounted region with
+the current magic and no root; `force_format_replaces_version_0` reformats a
+bare-tag region. A current region's remount is `persist_and_remount` and
+`legacy_log_chunk_fallback`. Made to format a tagged region instead of
+refusing it, the build fails both refusal tests (checked 2026-10-21). Three
+more open a file-backed `ImmixPWRegion` whose 128 line marks were all set to
+`0xA5` and written back: `immix_version_0_refused_unchanged` stores the bare
+tag, `immix_incompatible_descriptor_refused` version 2 with the line-mark
+descriptor's `unitSize` set to 0, and
+`immix_num_blocks_mismatch_refused_unchanged` a stored block count of 7. Each
+requires the refusal above, an empty line table, and the backing file
+unchanged after a `resetAllLineMarks()` on the refused region. No region
+formatted by an older build was opened.
 
 ### `BlockEntry` (40 bytes)
 
@@ -3644,8 +3713,11 @@ extents since 2025-07-24 (`faed4563`).
 
 ```
 PWRegion.__new(backend, numBlocks, metaDataDescs, blockSize, forceFormat)
-  if forceFormat or no magic → format(blockSize)
-  else                       → mount(blockSize)
+  if forceFormat                  → format(blockSize)
+  else if magic == MAGIC          → mount(blockSize)
+  else if isTagged(magic)         → refuse: another format version; write nothing,
+                                    txn and logChunk stay null   -- since 2026-10-21
+  else                            → format(blockSize)            -- no PWRegion magic
 
 format(blockSize)                -- every store through the DirectRegionWriter, not the log
   header: numBlocks, numBytes, blockSize, userRoot = 0
@@ -3658,7 +3730,7 @@ format(blockSize)                -- every store through the DirectRegionWriter, 
   block 2 heads one free extent of every user block, alone on LARGE_FREE
     → first metadata block (one METADATA extent) → end marker (NONE, used)
   backendRegion.persistRange(0, full_size)   -- everything but the magic
-  store the magic
+  store MAGIC (the tag and FORMAT_VERSION)
   backendRegion.persistRange(magic, 8)       -- then the magic's line alone
 
 mount(blockSize)
@@ -3675,6 +3747,9 @@ mount(blockSize)
 Until 2026-10-20 the `format()` sketch above said it linked every user block in
 memory order and inserted each onto `LARGE_FREE`, and left out the descriptors,
 the size guard and the log's initialisation; the code makes one free extent.
+Until 2026-10-21 `init()` had two outcomes, mounting a region with the magic
+and formatting any other, so a region with an older magic would have been
+formatted; the refusal is described under **Format version** above.
 
 **The magic is published last (2026-10-19).** `mount()` trusts any header that
 carries the magic, so the magic must not become durable before what it vouches
@@ -3697,9 +3772,10 @@ images a cut, 4,739 checked in all (`crash_during_format_opens_consistent`,
 counted 2026-10-20; until then this said "up to about 2^61 images each" and
 "4,254 in all", figures from before the explorer counted distinct images). The
 negative control, `early_magic_is_caught`, moves the magic back into the old
-order (a trace whose digest equals the one `afcf5525` records) and must fail
-both checks at the magic's cut, 339 of 596; against `afcf5525`'s own
-`format()` the sweep fails at that cut. The sweep's failing image is the third
+order (until 2026-10-21 a trace whose digest equals the one `afcf5525`
+records; since then the magic's stored value carries the format version, so
+the digests differ) and must fail both checks at the magic's cut, 339 of 596;
+against `afcf5525`'s own `format()` the sweep fails at that cut. The sweep's failing image is the third
 it checks there, an extreme: the header's first line alone at its last, magic
 included, with every other line at its floor (2026-10-20).
 
@@ -3721,6 +3797,7 @@ These are zero-allocation wrappers around raw memory addresses:
 `ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. The persisted line-mark metadata descriptor's `unitSize` controls the line size, and its `fixedBytes` prefix precedes the per-line table; the built-in `MemRegions` descriptor defaults to a 256-byte line size and no prefix.
 
 - `resetAllLineMarks()` — clears all line marks at the start of a GC cycle. Line marks are explicitly transient GC state: mark/reset operations bypass `RegionTransaction` and issue no persistence boundary. A caller mounting after a crash must rebuild them; the allocator does not currently do that automatically.
+- Since 2026-10-21 the constructor rebuilds the line table from the stored descriptors only when `init()` leaves a transaction (`txn` non-null), that is, after a format or a mount. A region that `init()` leaves unopened (another format version, a stored block size or block count that does not match, or a region too small to format) keeps an empty table: `lineMarks` is `(0, 0)` and `numLineMarks` and `lineSize` are 0, so `resetAllLineMarks()` writes nothing. Before, the table was rebuilt whenever the backend region existed. On a refused region the constructor then read descriptors whose layout this build had not validated, and a reset stored into the refused file. A review on 2026-10-21 reproduced both: a version-0 region kept 128 line marks and a reset turned a stored `0xA5` into 0 in the file, and a version-2 image whose line-mark descriptor read as `unitSize` 0 threw `DivideByZeroException` in the constructor instead of returning a refused region. The geometry refusals had the same gap. The `pwregion_bd:immix_*` tests (**Format version**, above) cover all three refusals. With the check back to `backendRegion != null`, the version-0 and block-count tests fail on the non-empty table, and with that assertion removed they fail on the file, which first differs at byte 32,248, the first line mark; the descriptor test throws `DivideByZeroException` (checked 2026-10-21).
 - Since 2026-10-19 the marks' stores go through the persistent-operation seam, as every other store the allocator makes does. `LineMarkHandle.setMark(w, v)` takes the region's `DirectRegionWriter` (`lineMarkWriter()`), like the other non-cached setters, and `resetAllLineMarks()` passes it; before, both stored through a forged `Ref<LineMark>`. A recorded trace therefore shows each mark as a 1-byte `STORE`, and marking and resetting add no `CLWB` or `SFENCE` (`persistent_ops:immix_line_marks_cross_the_seam`). Since the same day `getMark(r)` reads through the region's `DirectRegionReader`, like the other direct getters, rather than through a forged ref.
 
 ---
@@ -3795,7 +3872,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `DualTxnWalTest.v3` | 40 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `PersistentOperationsTest.v3` | 21 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events; the store audit over `PWRegion`; and, since 2026-10-19, the load seam: reader loads equal raw loads, an observer runs before the load it is shown and its rewrite is what the code loads, the load audit (`load_audit_covers_fields`: a mount, recovery and walk observe the header fields mount reads and not the others, the WAL header and both records whole, and every block entry the walk visits) and the inert-bytes audits over every cut of an allocator scenario and a sieve step and every fourth cut of a B+Tree update (bytes neither observed nor stored set to 0x00, 0xFF and a hash change no load, store or verdict), and the B+Tree descents' node fetches, which no reattach exercises |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 80 | allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 94 | (recounted 2026-10-21 from the file's registrations: `pwregion:` 23, `txn_backend:` 12, `pwregion_immix:` 7, `pwregion_wrappers:` 5, `pwregion_recovery:` 2, `pwregion_overflow:` 1, `pwregion_bd:` 44; the table's other rows and the totals above are not recounted) allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, format-version refusal (version 0 and a newer version refused with the backing file unchanged, untagged headers reformatted, and for an Immix region an empty line table on a version or block-count refusal, since 2026-10-21), mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
 | `PWBTreeTest.v3` | 22 | the persistent B+Tree workload (2026-10-14), over regions in anonymous mappings rather than the volatile backend, whose heap array Virgil's copying collector moves under PWRegion's raw addresses (a collection during a test aborted the full binary on 2026-10-14; `pwsieve:` and the `pwregion:` groups still use that backend): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, a full region failing cleanly, three forced collections between mutations, and a corrupted or cyclic image refused rather than walked: a node that is its own child, one at the wrong level and impossible heights by `open()` and `forEach()`; a published root offset whose sum with the block size wraps past zero by `open()`; and a node reached twice by `open()` and by `compare()`, whose keys from `forEach()` must strictly increase, even when the repeated leaf is the size of the one it displaced; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |

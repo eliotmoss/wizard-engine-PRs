@@ -596,6 +596,8 @@ def test_alloc_crash_during_format_opens_consistent(tc: PersistentAllocatorTeste
 // block size and opens no table at all. On 2026-10-19 this rearrangement
 // had the digest of the trace format() recorded at afcf5525, and against that
 // code crash_during_format_opens_consistent failed at the same cut, 339 of 596.
+// Since 2026-10-21 the magic carries a format version, and the digest covers
+// each store's value, so the rearrangement's digest no longer matches.
 def test_alloc_early_magic_is_caught(tc: PersistentAllocatorTester) {
 	def ordinary = tc.recordFormat("pwregion_format");
 	if (ordinary == null) return;

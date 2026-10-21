@@ -1370,6 +1370,13 @@ def BX = [
 	BT("initializes_file_size", test_bd_initializes_file_size),
 	BT("stored_block_size_mismatch_rejected", test_bd_stored_block_size_mismatch_rejected),
 	BT("stored_num_blocks_mismatch_rejected", test_bd_stored_num_blocks_mismatch_rejected),
+	BT("version_0_magic_refused_unchanged", test_bd_version_0_magic_refused_unchanged),
+	BT("future_version_magic_refused_unchanged", test_bd_future_version_magic_refused_unchanged),
+	BT("untagged_magic_reformatted", test_bd_untagged_magic_reformatted),
+	BT("force_format_replaces_version_0", test_bd_force_format_replaces_version_0),
+	BT("immix_version_0_refused_unchanged", test_bd_immix_version_0_refused_unchanged),
+	BT("immix_incompatible_descriptor_refused", test_bd_immix_incompatible_descriptor_refused),
+	BT("immix_num_blocks_mismatch_refused_unchanged", test_bd_immix_num_blocks_mismatch_refused_unchanged),
 	BT("legacy_log_chunk_fallback", test_bd_legacy_log_chunk_fallback),
 	BT("alloc_valid",           test_bd_alloc_valid),
 	BT("alloc_sets_used",       test_bd_alloc_sets_used),
@@ -1408,6 +1415,7 @@ def BX = [
 
 class BlockDevicePWRegionTester(t: Tester) {
 	var region: PWRegion;
+	var immixDescs: Array<Ref<MetaDataDesc>>;	// set: openRegion() opens an ImmixPWRegion
 
 	new() {
 		RegionFileIO.unlink(BD_PATH);
@@ -1429,6 +1437,59 @@ class BlockDevicePWRegionTester(t: Tester) {
 			region = null;
 		}
 		RegionFileIO.unlink(BD_PATH);
+	}
+
+	// Store {magic} in the formatted region's header, close it, and reopen it
+	// without forceFormat. The open must be refused as a geometry mismatch is
+	// (no transaction, no log chunk), and no byte of the backing file may
+	// change, in the mapping while it is open or in the file once it is closed.
+	def checkMagicRefused(magic: u64) {
+		checkReopenRefused(PWRegionHeader.magic.offset, magic);
+	}
+
+	// As checkMagicRefused, for {value} stored at any header {offset}. An
+	// Immix region must also open with an empty line table, and a GC cycle's
+	// resetAllLineMarks() on it must write nothing.
+	def checkReopenRefused(offset: int, value: u64) {
+		t.assertz(true, persistHeaderU64(offset, value));
+		region.deallocate();	// the formatted mount's close may write; snapshot after it
+		region = null;
+		def before = System.fileLoad(BD_PATH);
+		if (before == null) {
+			t.fail("region file missing before the reopen");
+			return;
+		}
+
+		def refused = remount();
+		t.assertz(true, refused.backendRegion != null);
+		if (refused.backendRegion == null) return;
+		t.assertz(true, refused.txn == null);
+		t.assertz(true, refused.logChunk.isNull());
+		t.assert_eq(value, Pointer.atElement(refused.backendRegion.range, offset).load<u64>());
+		if (ImmixPWRegion.?(refused)) {
+			def immix = ImmixPWRegion.!(refused);
+			t.assert_eq(0u64, immix.lineMarks.addr);
+			t.assert_eq(0u64, immix.numLineMarks);
+			immix.resetAllLineMarks();
+		}
+		t.asserti(-1, firstDifference(before, refused.backendRegion.range));
+
+		refused.deallocate();
+		region = null;
+		def after = System.fileLoad(BD_PATH);
+		if (after == null) {
+			t.fail("region file missing after the refused open");
+			return;
+		}
+		t.asserti(before.length, after.length);
+		t.asserti(-1, firstDifference(before, after));
+	}
+
+	// The first index at which {got} differs from {expected}, or -1.
+	private def firstDifference(expected: Array<byte>, got: Range<byte>) -> int {
+		if (got.length < expected.length) return got.length;
+		for (i < expected.length) if (got[i] != expected[i]) return i;
+		return -1;
 	}
 
 	// Wait for a child to reach its deterministic protocol-boundary SIGSTOP,
@@ -2024,7 +2085,26 @@ class BlockDevicePWRegionTester(t: Tester) {
 		region.backendRegion.persistRange(checksumAddr - region.regionStart, 8u64);
 	}
 
+	// Reformat the file as an Immix region with the default line-mark
+	// descriptor, then mark every line with a value no reset produces and
+	// write the table back, so a reset that reaches the file shows in it.
+	def formatImmixMarked() -> ImmixPWRegion {
+		immixDescs = Array<Ref<MetaDataDesc>>.new(1);
+		immixDescs[0] = MemRegions.lineMarkDescRef;
+		def immix = ImmixPWRegion.!(reformat());
+		t.assertz(false, immix.txn == null);
+		t.assertz(true, immix.numLineMarks > 0u64);
+		for (i < immix.numLineMarks) immix.lineMarks[i].setMark(immix.lineMarkWriter(), 0xA5u8);
+		t.assertz(true, immix.backendRegion.persistRange(
+			immix.offsetInRegion(immix.lineMarks.addr), immix.numLineMarks * u64.!(LineMark.size)));
+		return immix;
+	}
+
 	private def openRegion(forceFormat: bool) -> PWRegion {
+		if (immixDescs != null) {
+			return ImmixPWRegion.new(
+				X86_64Backends.getFileMapped(BD_PATH), 8u64, immixDescs, 4096u64, forceFormat);
+		}
 		return PWRegion.new(
 			X86_64Backends.getFileMapped(BD_PATH),
 			8u64,
@@ -2074,6 +2154,88 @@ def test_bd_stored_num_blocks_mismatch_rejected(tc: BlockDevicePWRegionTester) {
 	tc.t.assertz(true, region2.txn == null);
 	tc.t.assertz(true, region2.logChunk.isNull());
 
+	tc.cleanup();
+}
+
+// A region formatted before the format version existed carries the bare
+// "PWASM" tag, version 0, and, if it also predates userRoot, an 80-byte header
+// whose sentinels lie where userRoot is now. Its other fields still validate,
+// so the open must refuse it on the version alone, and must not format it:
+// that would erase its data.
+def test_bd_version_0_magic_refused_unchanged(tc: BlockDevicePWRegionTester) {
+	tc.checkMagicRefused(PWRegions.MAGIC_TAG);
+	tc.cleanup();
+}
+
+// A version this build does not know, newer than its own, is refused the same way.
+def test_bd_future_version_magic_refused_unchanged(tc: BlockDevicePWRegionTester) {
+	tc.t.assertz(true, PWRegions.isTagged(PWRegions.MAGIC));
+	tc.t.assert_eq(PWRegions.FORMAT_VERSION, PWRegions.versionOf(PWRegions.MAGIC));
+	tc.checkMagicRefused(PWRegions.MAGIC_TAG | ((u64.!(PWRegions.FORMAT_VERSION) + 1u64) << 56));
+	tc.cleanup();
+}
+
+// A header with no PWRegion magic -- zero, garbage, or the tag with byte 5 or 6
+// nonzero -- is not a PWRegion of any version, and is formatted as before:
+// the reopened region has a transaction, the current magic, and no root.
+def test_bd_untagged_magic_reformatted(tc: BlockDevicePWRegionTester) {
+	def magics = [0u64, 0xDEAD_BEEF_CAFE_F00Du64,
+		PWRegions.MAGIC_TAG | (1u64 << 40), PWRegions.MAGIC_TAG | (1u64 << 48)];
+	for (magic in magics) {
+		tc.t.assertz(false, PWRegions.isTagged(magic));
+		def region = tc.reformat();
+		def chunk = region.allocChunk(1u32);
+		tc.t.assertz(true, tc.allocSucceeded(chunk));
+		tc.t.assertz(true, region.setUserRoot(region.offsetInRegion(chunk.addr)));
+		tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.magic.offset, magic));
+
+		def region2 = tc.remount();
+		tc.t.assertz(false, region2.txn == null);
+		tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+		tc.t.assert_eq(0u64, region2.getUserRoot());
+	}
+	tc.cleanup();
+}
+
+// forceFormat still formats unconditionally, so it is how a refused region
+// is brought to the current version: there is no in-place upgrade.
+def test_bd_force_format_replaces_version_0(tc: BlockDevicePWRegionTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.magic.offset, PWRegions.MAGIC_TAG));
+	def region2 = tc.reformat();
+	tc.t.assertz(false, region2.txn == null);
+	tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+	tc.cleanup();
+}
+
+// ImmixPWRegion rebuilds its line table from the region's descriptors after
+// init(). A refused version-0 region must leave that table empty: otherwise
+// the refused object hands out the old region's line marks, and a GC cycle's
+// reset zeroes them in the file.
+def test_bd_immix_version_0_refused_unchanged(tc: BlockDevicePWRegionTester) {
+	tc.formatImmixMarked();
+	tc.checkMagicRefused(PWRegions.MAGIC_TAG);
+	tc.cleanup();
+}
+
+// Another version may lay its descriptors out differently. Here the
+// line-mark descriptor reads as a zero line size, which this build would
+// divide by; the refused open must not interpret the descriptor at all.
+def test_bd_immix_incompatible_descriptor_refused(tc: BlockDevicePWRegionTester) {
+	def immix = tc.formatImmixMarked();
+	def desc = immix.getMetaDataDesc(0u64);
+	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkMetaKind, desc.kind);
+	desc.unitSize = 0u32;
+	def descOffset = immix.getHeader().metaDataDescs;
+	tc.t.assertz(true, immix.backendRegion.persistRange(descOffset, u64.!(MetaDataDesc.size)));
+	tc.checkMagicRefused(PWRegions.MAGIC_TAG | ((u64.!(PWRegions.FORMAT_VERSION) + 1u64) << 56));
+	tc.cleanup();
+}
+
+// The geometry refusals leave txn null the same way, and the Immix line table
+// stays empty for them too.
+def test_bd_immix_num_blocks_mismatch_refused_unchanged(tc: BlockDevicePWRegionTester) {
+	tc.formatImmixMarked();
+	tc.checkReopenRefused(PWRegionHeader.numBlocks.offset, 7u64);
 	tc.cleanup();
 }
 
