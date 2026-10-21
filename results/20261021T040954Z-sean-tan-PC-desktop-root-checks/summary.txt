@@ -1,0 +1,64 @@
+---- nvme1n1 requests: complete pwbench processes and equal-length idle windows
+Linux rwbs: leading F = PREFLUSH or standalone FLUSH; F after the operation = FUA.
+F-any is the union, not the sum; a request may carry both flags.
+Traces include setup/close, warm-up, root journal commits (commit=5), desktop IO and /boot/efi IO.
+Counts are grouped by comm for context, never filtered: jbd2/kworker can issue benchmark IO.
+Ratios use the measured persist boundaries count reported by pwbench (one fdatasync each).
+That denominator excludes setup/close and warm-up, which remain in the whole-process numerator.
+file: measured fdatasync boundaries 2000
+  block duration 0.73 seconds (monotonic, 0.01s resolution)
+    all     total 4427, flush/PREFLUSH 2209, FUA 3, F-any 2212
+      per measured fdatasync: requests 2.213500, flush 1.104500, FUA 0.001500, F-any 1.106000
+    pwbench total 2212, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 1.106000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    jbd2    total 3, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.001500, flush 0.000000, FUA 0.000000, F-any 0.000000
+    kworker total 2212, flush/PREFLUSH 2209, FUA 3, F-any 2212
+      per measured fdatasync: requests 1.106000, flush 1.104500, FUA 0.001500, F-any 1.106000
+    other   total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    rwbs WSM      3
+    rwbs WS       2212
+    rwbs FF       2209
+    rwbs WFSM     3
+  idle duration 0.73 seconds (monotonic, 0.01s resolution)
+    all     total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    pwbench total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    jbd2    total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    kworker total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    other   total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+direct: measured fdatasync boundaries 2000
+  block duration 0.70 seconds (monotonic, 0.01s resolution)
+    all     total 4433, flush/PREFLUSH 2209, FUA 3, F-any 2212
+      per measured fdatasync: requests 2.216500, flush 1.104500, FUA 0.001500, F-any 1.106000
+    pwbench total 2218, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 1.109000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    jbd2    total 3, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.001500, flush 0.000000, FUA 0.000000, F-any 0.000000
+    kworker total 2212, flush/PREFLUSH 2209, FUA 3, F-any 2212
+      per measured fdatasync: requests 1.106000, flush 1.104500, FUA 0.001500, F-any 1.106000
+    other   total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    rwbs WSM      3
+    rwbs WS       2218
+    rwbs FF       2209
+    rwbs WFSM     3
+  idle duration 0.71 seconds (monotonic, 0.01s resolution)
+    all     total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    pwbench total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    jbd2    total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    kworker total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+    other   total 0, flush/PREFLUSH 0, FUA 0, F-any 0
+      per measured fdatasync: requests 0.000000, flush 0.000000, FUA 0.000000, F-any 0.000000
+Compare idle traffic and durations with benchmark traffic; background activity is variable, not a subtractable constant.
+Aggregate counts cannot prove one flush/FUA per syscall. Inspect raw traces and logs together.
+This shows requests sent, not that the device makes them durable.

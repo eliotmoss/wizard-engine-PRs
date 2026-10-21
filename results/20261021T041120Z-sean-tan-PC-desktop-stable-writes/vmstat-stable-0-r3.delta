@@ -1,0 +1,5 @@
+nr_dirty before 1174 after 971 delta -203
+nr_writeback before 0 after 0 delta +0
+nr_dirtied before 34483355 after 34492337 delta +8982
+nr_written before 30837926 after 30847111 delta +9185
+nr_throttled_written before 0 after 0 delta +0

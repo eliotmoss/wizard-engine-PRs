@@ -1,0 +1,14 @@
+results -> /home/sean-tan/research/wizard-engine-PRs/results/20261021T041120Z-sean-tan-PC-desktop-stable-writes/stable-1-r4 (pinned cpus 2 (cpu_core))
+  file-block rep=1
+---- per step, median over repetitions (ns unless noted; steps per run in the log)
+config                  reps      wall    wall range    median  compute    alloc   bitmap  publish   retire  persist  bound   lines faults
+file-block                 1   2670283 2670283-2670283   2699610   725568   571376   480508   473937   418665  1944486   4.00     0.0  12.81
+
+---- shares
+file-block              persistence phases (alloc+bitmap+publish+retire)  72.8 % of a step
+
+Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median
+step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence
+boundaries per step (syncs per step on file-*-msync, one per run of marked pages); lines =
+cache-line writebacks per step (pmem only); faults = minor faults per step. A difference of a
+few percent is real only outside the wall range of both.

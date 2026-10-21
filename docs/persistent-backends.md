@@ -505,7 +505,9 @@ whole-process numerator also includes setup, warm-up and close, so those ratios
 and a variable idle baseline cannot establish one flush/FUA per syscall. The
 trace shows requests sent, not that the device makes them durable. INT, TERM
 and HUP stop and wait for the benchmark before removing the private trace
-instance; cleanup failures are reported. Not yet run (2026-10-21).
+instance; cleanup failures are reported. Run 2026-10-21: a cache flush
+followed every boundary's writes
+([below](#sean-tan-pcs-root-checks-2026-10-21)).
 
 1. **A kernel crash on block storage, with discrimination.** `pwreboot` already
    runs the file backend, and `arm` with an inherited `/proc/sysrq-trigger`
@@ -554,7 +556,7 @@ instance; cleanup failures are reported. Not yet run (2026-10-21).
    command to save the post-reboot counters in the run directory. This checks
    kernel/filesystem cache loss while the device stays powered, **not device-cache power-loss
    durability**; both providers surviving would not establish discrimination.
-   No reset or root check has been run with these wrappers yet. `scripts/stage2c.sh` treats
+   No reset has been run with these wrappers yet (2026-10-21). `scripts/stage2c.sh` treats
    the file backend as a dry run without a reboot, so it cannot be used as it
    stands.
 
@@ -630,8 +632,9 @@ instance; cleanup failures are reported. Not yet run (2026-10-21).
    unmount, detach and remove private resources. Busy or failed resources are
    retained and recorded in `cleanup.txt`; interrupted loop attachments are
    rediscovered by backing image. This requires writable loop
-   `queue/stable_writes` support and refuses if setting it fails. No root path
-   or loop-device behavior has been exercised with this wrapper yet.
+   `queue/stable_writes` support and refuses if setting it fails. Run
+   2026-10-21: a median +3.0 % on the sieve step, with no stable-page wait
+   shown ([below](#stable-writes-on-the-sieve-about-3--with-no-stable-page-wait-shown)).
 4. **The A/B under `performance`**, to compare with the 86 % directly:
    `echo performance | sudo tee /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor`,
    then the campaigns above, then set it back to `powersave`. Done for the
@@ -883,6 +886,116 @@ which had been inferred:
   the script.
 - Two repetitions per condition. Each pair agrees to within 1.6 % on wall time
   per step.
+
+## sean-tan-PC's root checks (2026-10-21)
+
+Sean ran two of the desktop's three
+[follow-ups that need root](#follow-ups-that-need-root) with sudo on
+2026-10-21, at `dd0c1cc5` on kernel 7.0.0-38, each binary built by the owner
+first and current under `make -q`: the flush trace
+(`scripts/desktop-root-checks.sh`,
+`results/20261021T040954Z-sean-tan-PC-desktop-root-checks`) and the stable-writes
+A/B (`scripts/desktop-stable-writes.sh`,
+`results/20261021T041120Z-sean-tan-PC-desktop-stable-writes`). The kernel crash
+(`scripts/desktop-reboot-check.sh`) has not been run. Every figure below is from
+those two directories.
+
+### `fdatasync` sends the NVMe a cache flush: observed
+
+The root filesystem is ext4 on `nvme1n1p3`, with `data=ordered`, `delalloc`,
+`dioread_nolock` and `barrier` in effect (`/proc/fs/ext4/nvme1n1p3/options` in
+`block-stack.txt`). The drive reports `write_cache` `write back`, `fua` 1,
+`stable_writes` 0 and `atomic_write_unit_max_bytes` 512. With
+`block:block_rq_issue` traced on `nvme1n1` during pwbench with Magpie's
+parameters (2 MiB, 8 entries, 2,000 measured boundaries after 200 warm-up, one
+`fdatasync` each):
+
+| Backend | Requests | Writes (`WS`), all pwbench | Flushes (`FF`) | jbd2 (`WSM`); FUA (`WFSM`) | Strictly alternating write, flush |
+|---|---|---|---|---|---|
+| `file` | 4,427 | 2,212 | 2,209 | 3; 3 | 2,202 pairs, from the 24th request to the last |
+| `direct` | 4,433 | 2,218 | 2,209 | 3; 3 | 2,203 pairs, from the 28th request to the last |
+
+- **Every write is followed by a cache flush before the next sync's writes.**
+  From the 24th request (`direct`: the 28th) to the last, the trace strictly
+  alternates one pwbench write with one standalone flush (issued from
+  `kworker/*:1H` threads): 2,202 pairs (`direct` 2,203), against the run's
+  2,200 boundaries. The requests before that, in the run's first 6.1 ms
+  (`direct`: 9.1 ms), are setup and the first allocating syncs: groups of one
+  to nine writes (on `direct`, the 2 MiB region written whole), each followed
+  by a standalone flush or by a jbd2 journal commit, whose journal write is
+  followed by a flush and a FUA commit block. No two flushes are adjacent.
+  **Inference:** pwbench is single-threaded and a boundary returns only after
+  its `fdatasync`, so every boundary's writes were followed by a flush before
+  the next boundary began, and in the steady state each boundary sent one
+  write, almost always 8 KiB, and one flush of its own. On `direct` the write
+  is the boundary's `O_DIRECT` `pwrite`, on `file` the `fdatasync`'s own
+  writeback.
+- **No boundary in the steady state uses FUA.** The three FUA writes are jbd2's
+  journal commit blocks in the first few milliseconds, each after a journal
+  write and a flush.
+- **The idle windows are empty.** Each run's idle window of the same length
+  (0.73 s and 0.71 s, after a sync and a 10 s wait) saw no request to
+  `nvme1n1`, so neither trace mixes in the root's journal commits or desktop IO.
+- **What this checks.** The filesystem half of B4 on this host, for the syncs
+  traced: ext4 follows every `fdatasync`'s writes with a cache flush, as `ext4_sync_file()` →
+  `blkdev_issue_flush()` predicts, for the file backend, whose fence is that
+  `fdatasync`, and for the direct backend, whose fence writes its marked units
+  and then calls it. It shows the requests sent, not that the drive makes a
+  flushed write durable: that half of B4, like B3, is what the drive keeps when
+  its power fails, which no test here exercises. Magpie's write-through disk is
+  sent no flush ([above](#what-acknowledges-a-write-on-home)); this drive, with
+  a write-back cache, is sent one after every boundary's writes. The runs were traced, so their
+  boundary times (file median 239.3 µs) are not for comparison.
+
+### Stable writes on the sieve: about 3 %, with no stable-page wait shown
+
+The root ext4 is the only ext4 here and stable writes are read at mount, so the
+script made two fresh ext4 filesystems on 2 GiB images in `/var/tmp`, each on
+a loop device with direct IO (`loop24`, `loop25`), and set one loop's
+`stable_writes` to 0 and the other's to 1 before `mkfs.ext4` and mount
+(`queue-*-mounted.txt`). Each sample is one `file-block` sieve campaign (256 ×
+4096, five rounds of 159 measured steps, the reference sieve checked), pinned
+to CPU 2 under `powersave`; one discarded warm-up campaign per mount, then four
+pairs in ABBA order twice. Wall time per step, in ns:
+
+| Pair | `stable_writes=0` | `stable_writes=1` | Difference |
+|---|---|---|---|
+| 1 | 2,601,693 | 2,632,438 | +1.2 % |
+| 2 | 2,537,149 | 2,652,631 | +4.6 % |
+| 3 | 2,593,308 | 2,588,629 | −0.2 % |
+| 4 | 2,460,313 | 2,670,283 | +8.5 % |
+
+The medians are 2,565,228 against 2,642,534 ns, +3.0 %, and the persistence
+phases' 1,863,736 against 1,913,426 ns, +2.7 % (`summary.txt`).
+
+- **The cost is small and not resolved.** Three pairs of four are slower with
+  stable writes, and the differences span −0.2 to +8.5 %, so four single-run
+  pairs do not separate 3 % from the spread. The one-minute load average rose
+  from 0.34 to 0.84 across the campaigns, and each setting had its own image and
+  loop device, so the setting is confounded with them.
+- **No stable-page wait is shown.** `/proc/vmstat` exposes no named
+  stable-page or writeback-wait counter (`writeback-counter-availability.txt`).
+  A store waits only when it hits a page under writeback, and every fence's
+  `fdatasync` already waits for writeback to finish; with
+  `dirty_expire_centisecs` 3000 and campaigns starting about 3 s apart,
+  background writeback had little chance to overlap the sieve's stores. Each
+  campaign dirtied and wrote about 9,000 pages system-wide (`nr_dirtied`,
+  `nr_written` in `vmstat-*.delta`) with either setting. **Inference:** few or
+  no stores waited, so this prices stable writes for a single-threaded workload
+  whose fences wait for writeback, not for one whose stores overlap background
+  writeback, and on ext4 over a loop device rather than on the NVMe.
+- **Nothing on either host changed.** Neither host's devices request stable
+  writes, so B2 still holds by construction on neither.
+
+### What the checks leave open
+
+- The kernel crash on block storage, the one follow-up that discriminates the
+  file backend's fences (`desktop-reboot-check.sh`; it resets this machine
+  twice).
+- Whether the drive keeps a flushed write through a power failure: B3 and B4's
+  device half.
+- What stable writes cost when background writeback overlaps a program's
+  stores.
 
 ---
 

@@ -1,0 +1,19 @@
+---- mapped-file sieve: stable_writes=1 against 0 (ext4-over-loop)
+stable_writes=0: 4 samples, median wall 2565228 ns/step, persistence 1863736 ns/step
+stable_writes=1: 4 samples, median wall 2642534 ns/step, persistence 1913426 ns/step
+stable writes wall cost: +77306 ns/step (+3.01%)
+pair 1 wall ns/step: stable=0 2601693, stable=1 2632438, delta +30745
+pair 2 wall ns/step: stable=0 2537149, stable=1 2652631, delta +115482
+pair 3 wall ns/step: stable=0 2593308, stable=1 2588629, delta -4679
+pair 4 wall ns/step: stable=0 2460313, stable=1 2670283, delta +209970
+Discarded one warm-up campaign per mount; measured order is ABBA twice (four pairs).
+Each sample: existing file-block campaign, five rounds, warm-up 8, 256x4096, reference sieve checked.
+Pinned CPU 2; governor unchanged. Order and individual campaign summaries/logs are retained.
+Persistence is alloc + bitmap + publish + retire, as in the sieve campaign.
+This prices stable writes on ext4-over-loop, not on the NVMe directly; it is not a crash/durability test.
+A null result must be read with vmstat-*.delta, dirty-* and vm-dirty-settings.txt.
+Counters are system-wide; nr_dirty/nr_writeback are gauges, nr_dirtied/nr_written cumulative page counters.
+Stable-page waits require a store during writeback; fdatasync serializes this single-threaded workload.
+Little background writeback can mean no stable-page waits were exercised; near-zero cost does not establish they are free.
+No named stable-page/writeback-wait counter exposed in /proc/vmstat.
+finished 2026-10-21T04:11:51+00:00

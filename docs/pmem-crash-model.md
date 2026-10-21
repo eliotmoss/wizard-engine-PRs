@@ -1487,9 +1487,8 @@ before that fence's `SFENCE`, which is recorded before the sync is issued. On
 fsdax the assumptions are the baseline profile's own plus the kernel's `fsync`
 contract. On block storage they include one, B2, that no specification
 guarantees, and that holds by construction only when the filesystem has stable
-writes, which sean-tan-PC's NVMe does not request. Magpie's devices are not
-yet checked; `scripts/magpie-root-checks.sh` collects their `stable_writes`
-with the device-mapper table below.
+writes, which sean-tan-PC's NVMe does not request, nor any of Magpie's block
+devices ([checked 2026-10-16](persistent-backends.md#b2-on-magpie)).
 
 **On fsdax.** There is no page cache. The mapping is the media, stores reach it
 through the CPU cache, and dirty lines are evicted when the CPU chooses: the
@@ -1526,7 +1525,7 @@ model's fence, the backend needs:
 | B1 | One writer, and every persistent store through the provider | Checked: the store audit (milestone 2), and the file after every sync is the trace's full image (`file_mmap:boundary_images_are_model_images`) |
 | B2 | Each 64-byte line the device receives holds the line as it stood at one instant | **Argued only; not guaranteed.** Below |
 | B3 | Each naturally aligned 512-byte sector holds, after a crash, the data of one write issued to it or its earlier content: never a mixture, never unreadable | A device property, reported and not checked: sean-tan-PC's NVMe gives `atomic_write_unit_max_bytes` 512 |
-| B4 | A completed flush, or FUA write, makes durable what a read would then return, and the filesystem issues one in every `fdatasync` | Not checked. ext4 issues one per call (`ext4_sync_file()` → `blkdev_issue_flush()`); a write-through device, such as Magpie's controller, is sent none, and its acknowledgement is the boundary |
+| B4 | A completed flush, or FUA write, makes durable what a read would then return, and the filesystem issues one in every `fdatasync` | The filesystem's half observed on sean-tan-PC (2026-10-21): a cache flush followed every boundary's writes to the NVMe, on the file and direct backends, one write and one flush a boundary in the steady state ([trace](persistent-backends.md#fdatasync-sends-the-nvme-a-cache-flush-observed)). The device's half, durability through power loss, not checked. ext4 issues one per call (`ext4_sync_file()` → `blkdev_issue_flush()`); a write-through device, such as Magpie's controller, is sent none, and its acknowledgement is the boundary |
 | B5 | Data is overwritten in place, and a block not yet durably part of the file reads as zeros | Argued for ext4 `data=ordered` and `data=writeback` with delayed allocation, and XFS without reflinked extents; exclusions below |
 
 Two kernel facts complete it, both confirmed in the Linux v7.0 source and the
@@ -1643,8 +1642,10 @@ the trace check.
 **What remains argued.** The device's image *between* fences. Reading the file
 through the page cache shows memory, not the device, and an `O_DIRECT` read of
 a range holding dirty pages makes the kernel write them back first, which
-perturbs the state under test. So B2–B5, X1 and X2 are argued, and B2 is the
-weak one. Three follow-ups would check more; all need root:
+perturbs the state under test. So B2–B5, X1 and X2 are argued, apart from
+B4's flush, which a trace on sean-tan-PC shows following every boundary's
+writes (2026-10-21), and B2 is the weak one. Three follow-ups would check
+more; all need root:
 
 1. **A kernel crash on block storage.** `pwreboot` already runs the file
    backend (`setup`/`arm`/`verify` with `file`), and `arm` with an inherited
@@ -1652,8 +1653,9 @@ weak one. Three follow-ups would check more; all need root:
    last acknowledgement. A warm reset loses the page cache but not, on most
    machines, the device's cache, so the ordinary build must give `SURVIVED`
    and the elided-writeback mutant, whose fences now sync nothing, `LOST`:
-   the discrimination the kill loop cannot make (commands in
+      the discrimination the kill loop cannot make (commands in
    [Persistent Backends](persistent-backends.md#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)).
+   Not yet run (2026-10-21).
 2. **Block-level images.** dm-log-writes logs every write and flush beneath
    the filesystem; `replay-log` (xfstests) rebuilds the device at every entry,
    and each image, once its filesystem is mounted on a copy, can be compared
@@ -1662,6 +1664,10 @@ weak one. Three follow-ups would check more; all need root:
    kernel issued, not B2. Commands in the same section.
 3. **Stable writes.** `echo 1 > /sys/block/<dev>/queue/stable_writes` before
    mounting makes B2 hold by construction; the setting is read only at mount.
+   Priced on sean-tan-PC on 2026-10-21, on ext4 over a loop device: the sieve
+   step's median +3.0 % over four pairs (−0.2 to +8.5 %), with no stable-page
+   wait shown, so likely few or none occurred
+   ([details](persistent-backends.md#stable-writes-on-the-sieve-about-3--with-no-stable-page-wait-shown)).
 
 **What changes against the PMEM model.** Process death loses nothing: the page
 cache is the kernel's. A `SIGKILL` therefore samples the eager image, and the

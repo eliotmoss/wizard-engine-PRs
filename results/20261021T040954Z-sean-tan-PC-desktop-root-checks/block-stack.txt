@@ -1,0 +1,97 @@
+---- findmnt /
+TARGET SOURCE         FSTYPE OPTIONS
+/      /dev/nvme1n1p3 ext4   rw,relatime
+---- /proc/mounts root-device entry (runtime options, including data mode if reported)
+/dev/nvme1n1p3 / ext4 rw,relatime 0 0
+---- tune2fs -l /dev/nvme1n1p3 (read-only superblock defaults/features/journal)
+tune2fs 1.47.2 (1-Jan-2025)
+Filesystem volume name:   <none>
+Last mounted on:          /
+Filesystem UUID:          ad952be1-acba-4c89-9785-7231c3c6d814
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode dir_index orphan_file filetype needs_recovery extent 64bit flex_bg metadata_csum_seed sparse_super large_file huge_file dir_nlink extra_isize metadata_csum orphan_present
+Filesystem flags:         signed_directory_hash 
+Default mount options:    user_xattr acl
+Filesystem state:         clean
+Errors behavior:          Continue
+Filesystem OS type:       Linux
+Inode count:              26148864
+Block count:              104582400
+Reserved block count:     5229120
+Overhead clusters:        1922182
+Free blocks:              80715884
+Free inodes:              23070072
+First block:              0
+Block size:               4096
+Fragment size:            4096
+Group descriptor size:    64
+Reserved GDT blocks:      1024
+Blocks per group:         32768
+Fragments per group:      32768
+Inodes per group:         8192
+Inode blocks per group:   512
+Flex block group size:    16
+Filesystem created:       Thu Sep 17 17:14:45 2026
+Last mount time:          Mon Oct 19 00:38:34 2026
+Last write time:          Wed Oct 21 14:40:48 2026
+Mount count:              49
+Maximum mount count:      -1
+Last checked:             Thu Sep 17 17:14:45 2026
+Check interval:           0 (<none>)
+Lifetime writes:          743 GB
+Reserved blocks uid:      0 (user root)
+Reserved blocks gid:      0 (group root)
+First inode:              11
+Inode size:               256
+Required extra isize:     32
+Desired extra isize:      32
+Journal inode:            8
+Default directory hash:   half_md4
+Directory Hash Seed:      e5a467f9-a8ae-44a0-8e7e-592e1dd63e11
+Journal backup:           inode blocks
+Checksum type:            crc32c
+Checksum:                 0x18acb8b7
+Checksum seed:            0x43c78059
+Orphan file inode:        12
+---- /proc/fs/ext4/nvme1n1p3/options (effective options: data mode, delalloc, dioread_nolock, barrier)
+rw
+bsddf
+nogrpid
+block_validity
+dioread_nolock
+nodiscard
+delalloc
+nowarn_on_error
+journal_checksum
+barrier
+auto_da_alloc
+user_xattr
+acl
+noquota
+resuid=0
+resgid=0
+errors=continue
+commit=5
+min_batch_time=0
+max_batch_time=15000
+i_version
+stripe=0
+data=ordered
+inode_readahead_blks=32
+init_itable=10
+max_dir_size_kb=0
+prefetch_block_bitmaps
+---- nvme1n1 queue (absent attributes are reported explicitly)
+write_cache write back
+fua 1
+stable_writes 0
+atomic_write_boundary_bytes 0
+atomic_write_max_bytes 512
+atomic_write_unit_max_bytes 512
+atomic_write_unit_min_bytes 512
+logical_block_size 512
+physical_block_size 512
+rotational 0
+minimum_io_size 512
+optimal_io_size 0

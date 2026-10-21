@@ -1,0 +1,15 @@
+---- provenance
+commit   dd0c1cc5e4b9f7e2c8072b68d441967054b07c60
+host     pc-ubuntu.tail64e060.ts.net (results tag sean-tan-PC)
+kernel   Linux 7.0.0-38-generic x86_64 GNU/Linux
+started  2026-10-21T04:09:54+00:00
+run by   sean-tan for sean-tan
+block    /home/sean-tan/pwroot-desktop
+pwbench <directory> <file|direct> 2000 8 200 4096 512
+2 MiB; 8 entries; 2000 measured + 200 warm-up commits, as on Magpie.
+?? results/20261021T040954Z-sean-tan-PC-desktop-root-checks/
+binary make -q: up-to-date (built by the owner before sudo)
+09e4fdc5a6ce1c0536320e329d06ec6022175d0c5cdad3f1ff5b9db7c52410ea  /home/sean-tan/research/wizard-engine-PRs/bin/pwbench.x86-64-linux
+16f487a3e274e3c47de5c997ac5f97e2ee459565df055fb4809b2b691e02bf0e  /home/sean-tan/research/wizard-engine-PRs/scripts/desktop-root-checks.sh
+idle-file: synced /home/sean-tan/pwroot-desktop and waited 10 s before tracing
+idle-direct: synced /home/sean-tan/pwroot-desktop and waited 10 s before tracing
