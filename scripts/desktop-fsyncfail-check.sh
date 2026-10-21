@@ -81,7 +81,14 @@ BLOCK_SIZE=4096
 STEPS=2
 IMAGE_SIZE=1G           # sparse; >= 512 MiB so mke2fs uses its default profile, >= 300 MiB for XFS
 DRIVER_TIMEOUT=120      # pwreboot's limit on each wait for a go file, seconds
-TOOLS="losetup dmsetup mkfs.ext4 blkid filefrag setpriv findmnt lsblk blockdev mountpoint dd od cmp paste sha256sum mount umount ps"
+TOOLS="losetup dmsetup mkfs.ext4 blkid filefrag setpriv findmnt lsblk blockdev mountpoint gnudd od cmp paste sha256sum mount umount ps"
+# GNU dd, not /usr/bin/dd: on this Ubuntu dd is uutils coreutils, whose read
+# buffer is not 512-byte aligned (seen at 0x...580 under strace). An O_DIRECT
+# read then fails with EINVAL ("IO error: Invalid input") on the loop device
+# and the dm device over it (queue/dma_alignment 511), though it succeeds on
+# the NVMe drive (dma_alignment 3). GNU dd aligns its buffer to a page.
+# First run, results/20261021T080228Z-sean-tan-PC-fsyncfail-diEiwq.
+DD=gnudd
 if command -v mkfs.xfs > /dev/null; then
     FILESYSTEMS="ext4 xfs"; XFS_NOTE="xfs included: $(mkfs.xfs -V 2>&1 | sed -n 1p)"
 else
@@ -278,6 +285,9 @@ as_user mkdir -p "$REPO/results" "$PARENT"
 [ "$(findmnt -nro TARGET -T "$PARENT")" = / ] || die "$PARENT must be on /"
 OUT=$(as_user mktemp -d "$REPO/results/$(date -u +%Y%m%dT%H%M%SZ)-sean-tan-PC-fsyncfail-XXXXXX")
 RUNID=${OUT##*-}
+# Everything printed from here on also goes to run.log, owned by the user.
+exec > >(as_user tee -a "$OUT/run.log") 2>&1
+TEE_PID=$!
 RUNDIR=$(realpath -e -- "$(as_user mktemp -d "$PARENT/$(basename "$OUT")-XXXXXX")")
 case "$RUNDIR" in "$UHOME"/*) ;; *) die "run directory must be under $UHOME" ;; esac
 as_user cp -- "$SELF" "$OUT/"
@@ -301,6 +311,7 @@ predictions | as_user tee "$OUT/predictions.txt" > /dev/null
     as_user git -C "$REPO" status --short
     say '---- tools'
     losetup --version; dmsetup --version; mke2fs -V 2>&1 | sed -n 1p; filefrag -V 2>&1 | sed -n 1p
+    say "dd $DD: $("$DD" --version | sed -n 1p) (/usr/bin/dd: $(dd --version 2>&1 | sed -n 1p))"
     say '---- dm targets'; dmsetup targets
     say '---- / mount'; findmnt -no SOURCE,FSTYPE,OPTIONS -T /; cat /proc/fs/ext4/nvme1n1p3/options
     say '---- dm devices before the run'; dmsetup ls
@@ -352,6 +363,8 @@ cleanup() {
     teardown_case || rc=3
     [ -n "${RUNDIR:-}" ] && as_user rmdir -- "$RUNDIR" 2> /dev/null
     [ "$rc" = 0 ] || printf 'run stopped (exit %s); its devices were torn down; partial results in %s\n' "$rc" "$OUT" >&2
+    # Let tee write the last lines to the terminal and run.log before exiting.
+    if [ -n "${TEE_PID:-}" ]; then exec > /dev/null 2>&1; wait "$TEE_PID" 2> /dev/null; fi
     exit "$rc"
 }
 set -E
@@ -375,7 +388,7 @@ swap_table() { # table, label
     dmsetup resume "$NAME" || die "dmsetup resume failed ($2)"
     check_table "$1" "$2"
 }
-read_block() { dd if="$DEV" iflag=direct bs=4096 skip="$1" count=1 of=/dev/null status=none 2> /dev/null; }
+read_block() { "$DD" if="$DEV" iflag=direct bs=4096 skip="$1" count=1 of=/dev/null status=none 2> /dev/null; }
 nonce_in() { # bytes on stdin; 1 if the nonce's bytes occur at a byte boundary
     local hex pat
     hex=" $(od -An -v -tx1 -w1 | tr -d ' ' | paste -sd' ') "
@@ -384,8 +397,12 @@ nonce_in() { # bytes on stdin; 1 if the nonce's bytes occur at a byte boundary
 }
 compare_log() { # tag: the log chunk through the page cache and through O_DIRECT
     local b=$CD/log-$1-buffered.bin d=$CD/log-$1-direct.bin sb sd rb=1 rd=1
-    as_user dd if="$R" bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$b" status=none || rb=0
-    as_user dd if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$d" status=none || rd=0
+    as_user "$DD" if="$R" bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$b" status=none || rb=0
+    as_user "$DD" if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$d" status=none || rd=0
+    # A failed read is the tool or the setup, not a result: an empty copy would
+    # read as "differs, nonce absent", the predicted outcome. Stop instead.
+    [ "$rb" = 1 ] && [ "$rd" = 1 ] || die "log read failed at $1 (buffered ok $rb, O_DIRECT ok $rd); see $CD"
+    [ "$(stat -c %s "$b")" = "$LOG_BYTES" ] && [ "$(stat -c %s "$d")" = "$LOG_BYTES" ] || die "short log read at $1; see $CD"
     sb=$(sha256sum < "$b" | cut -d' ' -f1); sd=$(sha256sum < "$d" | cut -d' ' -f1)
     {
         say "buffered_read_ok $rb"
@@ -481,8 +498,8 @@ run_case() { # fs, backend
     done
     N=$((LOG_BYTES / 512))
     [ $((S % 8)) = 0 ] && [ "$S" -ge 8 ] && [ $((S + N)) -lt "$SIZE" ] || die "unexpected log sectors $S+$N of $SIZE"
-    dd if="$DEV" iflag=direct bs=4096 skip=$((S / 8)) count=$((N / 8)) status=none | as_user tee "$CD/log-device-before.bin" > /dev/null
-    as_user dd if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((N / 8)) of="$CD/log-file-before.bin" status=none
+    "$DD" if="$DEV" iflag=direct bs=4096 skip=$((S / 8)) count=$((N / 8)) status=none | as_user tee "$CD/log-device-before.bin" > /dev/null
+    as_user "$DD" if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((N / 8)) of="$CD/log-file-before.bin" status=none
     cmp -s "$CD/log-device-before.bin" "$CD/log-file-before.bin" || die "the device's sectors $S+$N do not hold the file's log chunk"
     [ "$(head -c 8 "$CD/log-device-before.bin")" = DAEHLAWD ] || die "sectors $S+$N do not start with the WAL header magic"
     { say "log_offset $LOG_OFF"; say "log_bytes $LOG_BYTES"; say "log_sector $S"; say "log_sectors $N"; say "extent_flags $FLAGS"; } \
