@@ -20,7 +20,10 @@ plan is specified in [PMEM Crash Model](pmem-crash-model.md).
 `PmemMmapBackend.create()`:
 
 1. opens or creates a path as a regular file;
-2. checks its length and uses `ftruncate()` when it must be resized; and
+2. checks its length: it sizes an empty file with `ftruncate()` and refuses,
+   unchanged, a non-empty file of another size, unless the open is a fresh
+   format, which truncates the file first (until 2026-10-21 it resized any
+   file); and
 3. maps it with `MAP_SHARED_VALIDATE | MAP_SYNC`.
 
 `MAP_SYNC` is supported only for files with DAX mappings. A regular file on

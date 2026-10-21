@@ -718,7 +718,9 @@ class PWRegion {
                 var prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
                 backendRegion = backend.create(size, prot, forceFormat);
                 if (backendRegion == null) {
-                        // Creation failed
+                        // Creation failed, or the backend refused an existing
+                        // file of another size without changing it. Either way
+                        // txn stays null, as for the refusals in init().
                         return;
                 }
                 rng = backendRegion.range;
@@ -1344,9 +1346,10 @@ class ImmixPWRegion extends PWRegion {
         new(backend: TxnRegionBackend, numBlocks: u64, metaDataDescs: Range<Ref<MetaDataDesc>>, blockSize: u64, forceFormat: bool)
                 super(backend, numBlocks, metaDataDescs, blockSize, forceFormat) {
                 // Backend creation can fail (for example, MAP_SYNC on a non-DAX
-                // filesystem), and init() can leave a mapped region unopened:
-                // another format version, a stored geometry that does not match,
-                // or a region too small to format. Each way txn stays null. Leave the Immix view empty then, as
+                // filesystem, or an existing region file of another size), and
+                // init() can leave a mapped region unopened: another format
+                // version, a stored geometry that does not match, or a region
+                // too small to format. Each way txn stays null. Leave the Immix view empty then, as
                 // PWRegion leaves the region unopened: a refused region's
                 // descriptors follow a layout this build has not validated, and
                 // with no line marks resetAllLineMarks() writes nothing.

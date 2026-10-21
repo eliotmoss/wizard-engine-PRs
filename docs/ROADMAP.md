@@ -25,7 +25,7 @@ Work log for the `pwregions` branch. See [Persistent Backends](persistent-backen
 - `FdMmapRegion` base class — owns fd + Mapping, handles destroy/unmap
 - `FileMmapRegion` — file-backed mmap; `msync`/`fdatasync` durability
 - `PmemMmapRegion` — PMEM mmap with `MAP_SYNC`; cache-line writeback selected as `CLWB`, `CLFLUSHOPT`, or `CLFLUSH` from CPUID feature bits, followed by `SFENCE`
-- `RegionFileIO` — `open` (attach to existing), `create` (zero-initialising, `O_TRUNC`), `openBacking` (fresh-or-existing selection), `ensureSize`, `fdatasync`, `close`, `unlink`. Fresh-format intent is threaded to backends via `TxnRegionBackend.create(size, prot, fresh)`.
+- `RegionFileIO` — `open` (attach to existing), `create` (zero-initialising, `O_TRUNC`), `openBacking` (fresh-or-existing selection), `sizeBacking` (sizes an empty file and refuses a non-empty one of another size; `ensureSize`, which resized any file, until 2026-10-21), `fdatasync`, `close`, `unlink`. Fresh-format intent is threaded to backends via `TxnRegionBackend.create(size, prot, fresh)`.
 - `X86_64Backends` factory component
 - `DirectIoRegion` / `DirectIoBackend` — the third persistent backend (2026-09-24): private staging buffer, explicit `pwrite` + `O_DIRECT`, one `fdatasync` per boundary, to a regular file or a raw block device. See the section below.
 

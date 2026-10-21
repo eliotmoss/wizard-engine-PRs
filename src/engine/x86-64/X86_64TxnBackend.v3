@@ -349,7 +349,9 @@ class PmemMmapBackend extends TxnRegionBackend {
 	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
 		def fd = RegionFileIO.openBacking(path, fresh);
 		if (fd < 0) return null;
-		if (!RegionFileIO.ensureSize(fd, size)) {
+		def err = RegionFileIO.sizeBacking(fd, size);
+		if (err != null) {
+			Trace.OUT.puts(err).ln();
 			RegionFileIO.close(fd);
 			return null;
 		}
@@ -389,7 +391,9 @@ class FileMmapBackend extends TxnRegionBackend {
 	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
 		def fd = RegionFileIO.openBacking(path, fresh);
 		if (fd < 0) return null;
-		if (!RegionFileIO.ensureSize(fd, size)) {
+		def err = RegionFileIO.sizeBacking(fd, size);
+		if (err != null) {
+			Trace.OUT.puts(err).ln();
 			RegionFileIO.close(fd);
 			return null;
 		}
@@ -441,7 +445,7 @@ component RegionFileIO {
 	}
 
 	// Create (or re-create) a fresh region file for read/write. O_TRUNC clears any
-	// stale content to length 0; the subsequent ensureSize()->ftruncate() extension
+	// stale content to length 0; the subsequent sizeBacking()->ftruncate() extension
 	// is zero-filled by the kernel, so the resulting region is zero-initialised.
 	def create(path: string) -> int {
 		var pathBuf = toCPath(path);
@@ -471,11 +475,27 @@ component RegionFileIO {
 		return fd;
 	}
 
-	def ensureSize(fd: int, size: u64) -> bool {
+	// Size the file openBacking() returned for a region of {size} bytes: null,
+	// or why it cannot back one. An empty file -- new, missing, or emptied by
+	// a fresh format's O_TRUNC -- is extended to {size}, zero-filled. A
+	// non-empty file is never resized: one of another size is refused,
+	// unchanged, before anything maps or reads it, since the caller has not yet
+	// seen its header. Until 2026-10-21 any file was truncated or extended to
+	// {size} here, so a mount that asked for the wrong geometry cut or grew an
+	// existing region before PWRegion refused it.
+	def sizeBacking(fd: int, size: u64) -> string {
 		def fileSize = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
-		if (fileSize == i64.view(size)) return true;
-		if (Linux.syscall(LinuxConst.SYS_ftruncate, (fd, size)).0 != 0) return false;
-		return Linux.syscall(LinuxConst.SYS_fsync, fd).0 == 0;
+		if (fileSize < 0) return "could not read the size of the region file";
+		if (fileSize == i64.view(size)) return null;
+		if (fileSize != 0) {
+			return StringBuilder.new()
+				.put2("the region file has %d bytes, not the %d requested: refusing to resize it without a fresh format",
+					fileSize, size)
+				.toString();
+		}
+		if (Linux.syscall(LinuxConst.SYS_ftruncate, (fd, size)).0 != 0) return "could not size the region file";
+		if (Linux.syscall(LinuxConst.SYS_fsync, fd).0 != 0) return "could not sync the size of the region file";
+		return null;
 	}
 
 	def fdatasync(fd: int) -> bool {

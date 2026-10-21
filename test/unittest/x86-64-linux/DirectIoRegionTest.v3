@@ -30,6 +30,7 @@ def DX = [
         DT("persist_range_drains_pending", test_persist_range_drains_pending),
         DT("persist_without_pending_is_noop", test_persist_without_pending_is_noop),
         DT("attach_reads_existing_image", test_attach_reads_existing_image),
+        DT("attach_other_size_refused_unchanged", test_attach_other_size_refused_unchanged),
         DT("write_failure_reported", test_write_failure_reported),
         DT("sync_failure_reported", test_sync_failure_reported),
         DT("elided_provider_writes_nothing", test_elided_provider_writes_nothing),
@@ -437,6 +438,57 @@ def test_attach_reads_existing_image(tc: DirectIoTester) {
         def second = tc.openProbe(false);
         if (second == null) return tc.cleanup();
         tc.t.assert_eq(0xC0FFEEu64, Pointer.atElement(second.range, 12296).load<u64>());
+        tc.cleanup();
+}
+
+// A non-empty region file of another size is refused before it is resized,
+// read or switched to O_DIRECT, by the backend and so by PWRegion, and the
+// file keeps its length and every byte. The file target shares
+// FileMmapBackend's sizing helper, which until 2026-10-21 truncated or
+// extended the file first. forceFormat still replaces it at any size.
+def test_attach_other_size_refused_unchanged(tc: DirectIoTester) {
+        if (!tc.ready()) return;
+        def region = tc.openPW(tc.productionBackend(), 4096u64, true);
+        if (region.backendRegion == null || region.txn == null) {
+                tc.t.fail("could not format a region over the direct backend");
+                return tc.cleanup();
+        }
+        tc.t.assert(!region.allocChunk(1u32).isNull(), "allocation failed");
+        tc.dropPW();
+        def before = tc.fileBytes();
+        if (before == null) {
+                tc.t.fail("region file missing before the reopen");
+                return tc.cleanup();
+        }
+        for (n in [DIO_BLOCKS / 2u64, DIO_BLOCKS * 2u64]) {
+                def backend = tc.productionBackend();
+                def raw = backend.create(n * DIO_UNIT, DIO_RW, false);
+                tc.t.assert(raw == null, "a region file of another size was attached");
+                if (raw != null) raw.destroy();
+                tc.t.assert(backend.lastError != null, "the refusal gave no reason");
+                tc.pw = PWRegion.new(tc.productionBackend(), n, Array<Ref<MetaDataDesc>>.new(0), DIO_UNIT, false);
+                tc.t.assert(tc.pw.backendRegion == null && tc.pw.txn == null && tc.pw.logChunk.isNull(),
+                        "a region file of another size was opened");
+                tc.dropPW();
+                def after = tc.fileBytes();
+                tc.t.assert(after != null && after.length == before.length, "the refused open resized the file");
+                if (after == null || after.length != before.length) continue;
+                var differ = 0;
+                for (i < before.length) if (before[i] != after[i]) differ++;
+                tc.t.assert_eq(0, differ);
+        }
+
+        def again = tc.openPW(tc.productionBackend(), 4096u64, false);
+        if (again.backendRegion == null || again.txn == null) {
+                tc.t.fail("the region did not mount at its own size");
+                return tc.cleanup();
+        }
+        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the allocation did not survive the refused opens");
+        tc.dropPW();
+        tc.pw = PWRegion.new(tc.productionBackend(), DIO_BLOCKS * 2u64, Array<Ref<MetaDataDesc>>.new(0), DIO_UNIT, true);
+        tc.t.assert(tc.pw.txn != null, "forceFormat did not format at another size");
+        def file = tc.fileBytes();
+        tc.t.assert(file != null && file.length == int.!(DIO_BLOCKS * 2u64 * DIO_UNIT), "forceFormat did not resize the file");
         tc.cleanup();
 }
 

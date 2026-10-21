@@ -443,7 +443,9 @@ class DirectIoBackend extends TxnRegionBackend {
                 if (DirectIoFileIO.fileType(fd) != DirectIoConst.S_IFREG) {
                         return rejectFd(fd, "the region path is not a regular file");
                 }
-                if (!RegionFileIO.ensureSize(fd, size)) return rejectFd(fd, "could not size the region file");
+                // A non-empty file of another size is refused here, unchanged.
+                def err = RegionFileIO.sizeBacking(fd, size);
+                if (err != null) return rejectFd(fd, err);
                 if (!DirectIoFileIO.setODirect(fd)) return rejectFd(fd, "the filesystem refused O_DIRECT");
                 return fd;
         }

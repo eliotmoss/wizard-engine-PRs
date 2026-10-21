@@ -3310,13 +3310,13 @@ CPUID/writeback/fence path are covered by `PersistentOperationsTest.v3`.
 `RegionFileIO` wraps the raw syscalls needed by the mmap backends:
 
 - `open(path)` — opens an existing file (`O_RDWR`, mode `0644`); returns `-errno` if it does not exist
-- `create(path)` — creates/re-creates a fresh file (`O_RDWR | O_CREAT | O_TRUNC`, mode `0644`); `O_TRUNC` plus the `ensureSize` `ftruncate` extension leaves the region zero-initialised
+- `create(path)` — creates/re-creates a fresh file (`O_RDWR | O_CREAT | O_TRUNC`, mode `0644`); `O_TRUNC` plus the `sizeBacking` `ftruncate` extension leaves the region zero-initialised
 - `openBacking(path, fresh)` — selects `create` for a fresh format, otherwise `open` (falling back to `create` when the file is missing)
-- `ensureSize(fd, size)` — `ftruncate` + `fsync` to guarantee file extent
+- `sizeBacking(fd, size)` — `ftruncate` + `fsync` an empty file to `size`; refuse, unchanged, a non-empty file of any other size (returns the reason, or null). Until 2026-10-21 it was `ensureSize`, which resized any file
 - `fdatasync(fd)` — data-only sync (no metadata)
 - `close(fd)`, `unlink(path)`
 
-Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, prot, fresh)`: `PWRegion` passes its `forceFormat` flag down, so a fresh format zero-initialises the backing store while a mount attaches to the existing one.
+Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, prot, fresh)`: `PWRegion` passes its `forceFormat` flag down, so a fresh format zero-initialises the backing store while a mount attaches to the existing one without resizing it.
 
 ### Supported PMEM path
 
@@ -3333,7 +3333,7 @@ for DAX files, while `PmemMmapBackend` uses the regular-file operations
 `open`, `lseek`, and `ftruncate` before mapping. A raw fsdax block device does
 not itself provide filesystem DAX, and `/dev/daxX.Y` has fixed-size,
 alignment-sensitive character-device semantics that do not fit
-`RegionFileIO.ensureSize()`.
+`RegionFileIO.sizeBacking()`.
 
 For machines without physical PMEM, the recommended development setup is a
 QEMU-emulated NVDIMM exposed as `/dev/pmem0` inside an x86-64 Linux guest,
@@ -3635,14 +3635,52 @@ every region formatted before 2026-10-21: its magic is the bare tag, and the
 - anything else (zero, garbage, the tag with a nonzero byte 5 or 6): format,
   as before.
 
-The region's bytes are left unchanged only if the opener asks for the file's
-own size. The backend sizes the file in `create()`, before `init()` reads the
-magic: the file backends' `ensureSize()` runs `ftruncate` and `fsync`, so
-reopening a refused region with fewer or more blocks than it has shrinks or
-grows the file first (review, 2026-10-21: a 32 KiB version-0 file reopened at
-four 4 KiB blocks was truncated to 16 KiB, then refused). This predates the
-version and applies equally to the block-size and block-count refusals; it is
-being fixed separately.
+Before `init()` runs, the backend checks the file's size (2026-10-21). An
+attach (`create()` without `fresh`) sizes only an empty file, one that was
+missing or has length 0, which is then formatted as before. A non-empty file
+whose length is not `numBlocks * blockSize` is refused before it is mapped or
+read: `RegionFileIO.sizeBacking()` returns the reason, which the mapped
+backends trace (`the region file has N bytes, not the M requested: refusing to
+resize it without a fresh format`) and `DirectIoBackend` keeps in `lastError`,
+and nothing is truncated, extended, synced or written. `PWRegion` is then left
+as after any backend failure: `backendRegion`, `txn` and `logChunk` all null,
+and an `ImmixPWRegion` has an empty line table. A null `txn` therefore still
+detects every refused open. Reopening a region with fewer or more blocks than
+its file holds, of this version or another, changes no byte of it, provided
+no other process changes the file while it is being opened. The check
+runs before anything can read the header, so it also refuses a non-empty file
+of another size that carries no magic, where a resize-and-format would destroy
+whatever the file holds: refusing every such file is the one rule that can
+never destroy a tagged region, and such a file is replaced only by
+`forceFormat` or after it is removed. At the requested size, the three
+outcomes above apply. `forceFormat` still opens the file with `O_TRUNC`, so a
+forced format takes any size. `DirectIoBackend`'s file target shares the
+helper; its `BLOCK_DEVICE` target never sized the device and is unchanged: it
+refuses a device smaller than the region and uses the first `size` bytes of a
+larger one.
+
+**Precondition: one process owns the region file.** The attach path does not
+defend against another process changing the file while it opens it, and two
+races, both older than the check above, remain (review, 2026-10-21, each
+reproduced by pausing the opener): an attach whose `open()` finds no file
+falls back to a create with `O_TRUNC`, so a region that appears in between is
+erased and formatted; and a file seen with length 0 is then sized with
+`ftruncate`, so a region written into it in between is truncated and refused.
+A concurrent shrink of a matching-size file can also raise `SIGBUS`. The
+engine assumes one writer (pmem-crash-model.md, "Agreed baseline persistence
+profile"), and nothing here locks the file. Treating only `ENOENT` as missing
+and creating with `O_EXCL` rather than `O_TRUNC` would close the first race;
+the second needs exclusive ownership of the file (a lock held from the check
+through use). Neither is done.
+
+Until 2026-10-21 the helper, then `ensureSize()`, ran `ftruncate` and `fsync`
+to the requested size on any file before `init()` read the magic. Reopening a
+region with fewer or more blocks than it had shrank or grew the file first and
+then refused it (review, 2026-10-21: a 32 KiB version-0 file reopened at four
+4 KiB blocks was truncated to 16 KiB, then refused; at sixteen it was extended
+to 64 KiB, then refused). This predated the version and applied equally to the
+block-size and block-count refusals, and a file without the magic was resized
+and formatted.
 
 `forceFormat` still formats unconditionally, and it is the only way to bring a
 refused region to version 1: there is no in-place upgrade, so a refused region
@@ -3675,6 +3713,36 @@ descriptor's `unitSize` set to 0, and
 requires the refusal above, an empty line table, and the backing file
 unchanged after a `resetAllLineMarks()` on the refused region. No region
 formatted by an older build was opened.
+
+Eight tests cover the size check (2026-10-21). Four `pwregion_bd:` tests
+reopen an eight-block (32 KiB) file-backed region without `forceFormat` at
+four and at sixteen blocks: `current_version_other_size_refused_unchanged`
+(after an allocation and a root, which a reopen at eight blocks then finds),
+`version_0_other_size_refused_unchanged` (the bare tag),
+`untagged_other_size_refused_unchanged` (magic `0xDEAD_BEEF_CAFE_F00D`;
+formatted when reopened at its own size) and
+`immix_other_size_refused_unchanged` (the marked line table). Each requires a
+null `backendRegion`, `txn` and log chunk, an empty Immix line table after
+`resetAllLineMarks()`, and the closed file's length and every byte unchanged.
+`missing_and_empty_file_sized_and_formatted` opens a missing path at four
+blocks and a zero-length file at sixteen without `forceFormat`, and
+`force_format_other_size_resizes` forces four and then sixteen blocks over
+the formatted file; each requires a formatted region and a file of the
+requested size. `txn_backend:attach_other_size_refused_unchanged` attaches
+`FileMmapBackend` and `PmemMmapBackend` at 4 KiB and at 16 KiB to an 8 KiB
+patterned file and requires no region and the file unchanged. The PMEM
+backend refuses before it maps, so this runs on tmpfs; no DAX mount was
+available, and no PMEM open at a matching size was run.
+`direct_io:attach_other_size_refused_unchanged` checks the same through
+`DirectIoBackend` and `PWRegion`, then remounts at eight blocks and forces
+sixteen. With the old helper restored, the six refusal tests fail and the
+other two pass. A helper that refused every attach at another size, empty
+files included, fails only `missing_and_empty_file_sized_and_formatted`; one
+that checked the size before a forced open's `O_TRUNC` fails only
+`force_format_other_size_resizes` (both checked 2026-10-21). `pwreboot arm`
+over a 512-block file region, at 256 and at 1,024 blocks, fails with the
+reason traced and the file's length and SHA-1 unchanged, and still arms at
+512.
 
 ### `BlockEntry` (40 bytes)
 
@@ -3872,7 +3940,7 @@ unit binary contains 1,884 tests including portable and spec-parser coverage.
 | `DualTxnWalTest.v3` | 40 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement |
 | `PersistentOperationsTest.v3` | 21 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events; the store audit over `PWRegion`; and, since 2026-10-19, the load seam: reader loads equal raw loads, an observer runs before the load it is shown and its rewrite is what the code loads, the load audit (`load_audit_covers_fields`: a mount, recovery and walk observe the header fields mount reads and not the others, the WAL header and both records whole, and every block entry the walk visits) and the inert-bytes audits over every cut of an allocator scenario and a sieve step and every fourth cut of a B+Tree update (bytes neither observed nor stored set to 0x00, 0xFF and a hash change no load, store or verdict), and the B+Tree descents' node fetches, which no reattach exercises |
 | `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 94 | (recounted 2026-10-21 from the file's registrations: `pwregion:` 23, `txn_backend:` 12, `pwregion_immix:` 7, `pwregion_wrappers:` 5, `pwregion_recovery:` 2, `pwregion_overflow:` 1, `pwregion_bd:` 44; the table's other rows and the totals above are not recounted) allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, format-version refusal (version 0 and a newer version refused with the backing file unchanged, untagged headers reformatted, and for an Immix region an empty line table on a version or block-count refusal, since 2026-10-21), mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
+| `TxnPWRegionTest.v3` | 101 | (recounted 2026-10-21 from the file's registrations: `pwregion:` 23, `txn_backend:` 13, `pwregion_immix:` 7, `pwregion_wrappers:` 5, `pwregion_recovery:` 2, `pwregion_overflow:` 1, `pwregion_bd:` 50; the table's other rows and the totals above are not recounted) allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, format-version refusal (version 0 and a newer version refused with the backing file unchanged, untagged headers reformatted, and for an Immix region an empty line table on a version or block-count refusal, since 2026-10-21), mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
 | `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
 | `PWBTreeTest.v3` | 22 | the persistent B+Tree workload (2026-10-14), over regions in anonymous mappings rather than the volatile backend, whose heap array Virgil's copying collector moves under PWRegion's raw addresses (a collection during a test aborted the full binary on 2026-10-14; `pwsieve:` and the `pwregion:` groups still use that backend): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, a full region failing cleanly, three forced collections between mutations, and a corrupted or cyclic image refused rather than walked: a node that is its own child, one at the wrong level and impossible heights by `open()` and `forEach()`; a published root offset whose sum with the block size wraps past zero by `open()`; and a node reached twice by `open()` and by `compare()`, whose keys from `forEach()` must strictly increase, even when the repeated leaf is the size of the one it displaced; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |

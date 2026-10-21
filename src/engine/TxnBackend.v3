@@ -107,6 +107,9 @@ class TxnRegionBackend {
 	// Create a region of the given size with specified protection. `fresh` marks a
 	// fresh format: the backing store must be zero-initialised. When false, attach
 	// to an existing store (backends may fall back to a fresh store if none exists).
+	// An attach must not change an existing store's size: the file backends size
+	// an empty file, and refuse (null) a non-empty one of any other size without
+	// changing it.
 	def create(size: u64, prot: int, fresh: bool) -> BackendRegion;
 	
 	// Check if this backend provides persistence
