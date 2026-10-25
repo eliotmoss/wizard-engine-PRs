@@ -3587,6 +3587,126 @@ one medium is not wrong on the other, merely pointless.
 - The absolute `fdatasync` figures are properties of this host's storage stack,
   not of the design. The ratios are the portable result.
 
+## Toolchain: Virgil revision and build command (recorded 2026-10-25)
+
+Every timed harness and the unit binary are native Virgil programs, so a figure
+depends on the compiler as well as on the engine commit. No campaign's
+`provenance.txt` records either the compiler or the build command (none under
+`results/` mentions `v3c`, Aeneas or Virgil), so this section records both. The
+compiler binary and its source tree both matter: `v3c` is a binary built from a
+Virgil clone at some revision, and each compile also reads that clone's
+`lib/` and `rt/` sources as they stand in its working tree.
+
+**sean-tan-PC: observed on 2026-10-25.**
+
+- **Which compiler.** `v3c` resolves to `~/research/virgil-titzer/bin/v3c`, the
+  only Virgil install in the home directory, added to `PATH` in `~/.bashrc`. It
+  is a symlink to `bin/current/x86-linux/Aeneas`, the compiler `make` bootstrapped
+  from the clone's own source (the checked-in stable III-10.1905 builds
+  `bin/bootstrap`, which builds `bin/current`), not the stable binary.
+  `bin/.setup-v3c` links the first of `current`, `bootstrap`, `stable` that
+  exists for the first host `sense_host` lists, here `x86-linux`: a 32-bit
+  executable that emits x86-64 code under `-target=x86-64-linux`.
+- **Version.** `v3c -version` reports `Aeneas III-11.1975`, `Build Data:
+  x86-linux 2026-09-17 18:36:46 by sean-tan@`. The clone's
+  `aeneas/src/main/Version.v3` says the same version, and HEAD is the commit
+  that last changed it.
+- **Revision.** HEAD `eb52db9784036b89c22edd2c1c9019404709bedb` ("Support
+  Pointer.{load,store}<u64> on 32-bit platforms (#775)", committed 2026-09-11),
+  on `master` tracking `origin/master`, remote `origin`
+  `https://github.com/titzer/virgil.git`. The working tree is clean, no stash,
+  and `git log @{u}..HEAD` is empty: no local commits. `origin/master` is as of
+  the clone, with no fetch since (no `FETCH_HEAD`).
+- **History.** The reflog has one entry, `HEAD@{2026-09-17 18:32:31 +1000}:
+  clone`. The compiler was built four minutes later, and no file in the clone
+  outside `.git` was modified after the same `make` finished: the newest,
+  `TAGS`, is from 2026-09-17 18:36:48 +1000, 1.4 s after the binary `v3c`
+  points to.
+- **Which campaigns.** All 41 earlier desktop directories under `results/` are
+  later than the clone (from `20260923T124723Z-sean-tan-PC-stage2c-probe` to
+  `20261021T105823Z-sean-tan-PC-fsyncfail-Px6IUW`). Inferred, not observed:
+  every desktop campaign was compiled by this binary with this revision's
+  `lib/` and `rt/`. The reflog shows that HEAD never moved, and the
+  modification times show no later write to any file. The inference fails only
+  if a file was edited and its time reset, which nothing suggests.
+
+**The build command: observed on 2026-10-25, the same for every program.** The
+campaign scripts build with `make bin/<prog>.x86-64-linux`, whose recipe is
+`./build.sh <prog> x86-64-linux`. A shell trace of the unit binary's build
+(`env SHELLOPTS=xtrace make bin/unittest.x86-64-linux`, in
+`results/20261025T112614Z-sean-tan-PC-unit-suite/build.log`) and a dry run of
+`build.sh` for the other programs (a stub `v3c-x86-64-linux` first on `PATH`
+printed its arguments) show the two `exec`s:
+
+```
+# build.sh (PATH lookup: $VIRGIL/bin/v3c-x86-64-linux)
+v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m -fun-exprs -simple-bodies \
+    -program-name=<prog>.x86-64-linux -output=bin/ \
+    $ENGINE <program sources> bin/Build-x86-64-linux.v3 $TARGET_X86_64
+# v3c-x86-64-linux ($V3C unset, so $VIRGIL/bin/v3c)
+$VIRGIL/bin/v3c -heap-size=200m -stack-size=2m -target=x86-64-linux \
+    -rt.sttables -rt.gc -rt.gctables \
+    -rt.files="$VIRGIL/rt/x86-64-linux/*.v3 $VIRGIL/rt/native/*.v3 $VIRGIL/rt/gc/*.v3" \
+    <build.sh's arguments>
+
+ENGINE        = src/engine/*.v3 src/util/*.v3 $VIRGIL/lib/util/*.v3
+                src/engine/continuation/UnboxedContinuation.v3
+TARGET_X86_64 = src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3
+                $VIRGIL/lib/asm/x86-64/*.v3
+                src/engine/x86-64/continuation/X86_64UnboxedContinuation.v3
+```
+
+Aeneas parses options left to right and each assignment overwrites the last
+(`lib/util/Option.v3`), so the heap is `build.sh`'s 700 MiB, not the wrapper's
+200 MiB. Only `-program-name` and the program sources differ between programs
+(`T` is `test/unittest/x86-64-linux`):
+
+| Program | Sources besides `$ENGINE` and `$TARGET_X86_64` |
+|---|---|
+| `unittest` | `test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL/lib/test/*.v3 T/*.v3 src/modules/*.v3 src/modules/wasi/*.v3 src/modules/wasi/x86-64-linux/*.v3 $VIRGIL/lib/x86-64-linux/SyscallLayouts.v3` |
+| `pwsievebench` | `T/PWSieve.v3 T/ElidedWritebackOps.v3 test/pwsievebench.main.v3` |
+| `pwopsbench` | `T/PWOps.v3 T/ElidedWritebackOps.v3 test/pwopsbench.main.v3` |
+| `pwbtreebench` | `T/PWBTree.v3 T/PWOps.v3 T/ElidedWritebackOps.v3 test/pwbtreebench.main.v3` |
+| `pwsieve` | `T/PWSieve.v3 T/ElidedWritebackOps.v3 test/pwsieve.main.v3` |
+| `pwbtree` | `T/PWBTree.v3 T/ElidedWritebackOps.v3 test/pwbtree.main.v3` |
+| `pwreboot` | `T/PWSieve.v3 T/ElidedWritebackOps.v3 test/pwreboot.main.v3` |
+
+`bin/Build-x86-64-linux.v3`, which `build.sh` regenerates before every build,
+records the build time, the user and `git rev-list --count HEAD`, not the
+compiler. The globs expand in the locale's collation order (`en_US.UTF-8` on
+sean-tan-PC). That order fixes the order of the sources, and so the order of
+the unit tests, which differs under `C` (see [ROADMAP](ROADMAP.md#tests)).
+
+**Magpie: open.** Magpie's 31 directories under `results/` (2026-09-18 to
+2026-10-16) record no Virgil revision either, and the location of its clone is
+not documented. These commands only read, and they
+establish the revision afterwards. Run them on Magpie as `u7599095`, in the
+kind of shell the campaigns ran from, so that `PATH` is the same:
+
+```
+V3C=$(command -v v3c); echo "v3c $V3C -> $(readlink -f "$V3C")"
+"$V3C" -version; command -v v3c-x86-64-linux
+VL=$(cd "$(dirname "$V3C")/.." && pwd); echo "clone $VL"
+git -C "$VL" log -1 --format='%H %cd %s' --date=iso
+git -C "$VL" status --short --branch; git -C "$VL" stash list
+git -C "$VL" remote -v; git -C "$VL" log --oneline '@{u}..HEAD'
+git -C "$VL" reflog --date=iso
+git -C "$VL" reflog show --date=iso refs/remotes/origin/master
+grep -n version "$VL/aeneas/src/main/Version.v3"
+stat -c '%y %n' "$VL"/bin/current/*/Aeneas "$VL"/bin/bootstrap/*/Aeneas
+find "$VL" -path "$VL/.git" -prune -o -type f -newer "$(readlink -f "$V3C")" -print | head -20
+```
+
+For each Magpie campaign, the source revision is the last reflog entry before
+the directory's stamp (the stamp is UTC; the reflog prints local time with its
+offset). The compiler binary is the one built at the
+`-version` build time, and only the current binary's time can be known. If a
+checkout or pull falls between that build and a campaign, that campaign
+compiled with a binary from one revision and `lib/`/`rt/` from another, so
+record both. A clone that is not a git checkout leaves only `-version`.
+Recording `v3c -version`, the clone's `git rev-parse HEAD` and `git status
+--short` in each campaign's `provenance.txt` would close this for future runs.
+
 ## Layer 1 — Storage Abstraction
 
 **Files:** `src/engine/TxnBackend.v3`, `src/engine/x86-64/X86_64TxnBackend.v3`
