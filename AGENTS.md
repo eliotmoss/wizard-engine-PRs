@@ -109,7 +109,8 @@ PWRegion (block allocator)
               └── BackendRegion (persistence abstraction)
                     ├── VolatileRegion      (Array<byte>, GC-managed)
                     ├── FileMmapRegion      (mmap + pages marked through the provider, one fdatasync per fence)
-                    └── PmemMmapRegion      (mmap + clwb/sfence)
+                    ├── PmemMmapRegion      (mmap + clwb/sfence)
+                    └── DirectIoRegion      (private staging buffer + pwrite/O_DIRECT + fdatasync)
 ```
 
 ### Key Persistence Files
@@ -125,6 +126,7 @@ Files without a directory prefix below are under `src/engine/x86-64/`.
 | `X86_64PersistentExplorer.v3` | Full and reduced crash-image enumeration, state deduplication, budgets, property checks, and counterexample emission. |
 | `X86_64PersistentRecovery.v3` | Production recovery over enumerated images, WAL and allocator properties, invariant checks, two-crash profiles, and injected recovery failures. |
 | `X86_64TxnBackend.v3` | File and PMEM mapped regions, file I/O, and x86-64 backend factories. |
+| `X86_64DirectIoBackend.v3` | Direct-I/O backend: `DirectIoRegion` keeps the region in a private staging buffer and, at each fence, writes the marked 4 KiB units with `pwrite` on an `O_DIRECT` descriptor, then calls `fdatasync`; to a file or a raw block device. |
 | `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, and `ImmixPWRegion`. |
 | `X86_64PWRegion.v3` | Thin x86-64 convenience wrappers for memory, PMEM, block-device, and Immix regions. |
 | `X86_64DualTxnWal.v3` | Active two-slot WAL with parity-selected records, checksums, poisoning, recovery results, overwrite guards, and one steady-state boundary per commit. |
