@@ -2347,9 +2347,14 @@ lookups in ns; the phases are means.
   5.2, 8.7 and 8.2 ms. The sieve's `direct-block` steps earlier the same day
   have no such tail: p90 is 1.18–1.20 times the median, against `file-block`'s
   1.16. The direct backend writes whole 4 KiB units (`WRITE_UNIT`), which rules
-  out a sub-sector read-modify-write. The controller's cache, the candidate for
-  the [block-media regimes](#the-block-media-configuration-is-not-a-controlled-measurement-here),
-  is one here too, and is untested. The share is 99.5–99.8 % with the tail and
+  out a sub-sector read-modify-write. Until 2026-10-25 this bullet named the
+  controller's cache as an untested candidate here, as it was for the
+  [block-media regimes](#the-block-media-configuration-is-not-a-controlled-measurement-here).
+  Magpie's root sitting withdrew it for the regimes: `sda` is passed through
+  with its own write cache disabled, and on Dell's account the controller's
+  cache is not in `/home`'s path
+  ([2026-10-16](#what-acknowledges-a-write-on-home)). That withdraws it here
+  too, and what causes the tail is open. The share is 99.5–99.8 % with the tail and
   `file-block`'s 99.2–99.4 % without it, so the bracket does not depend on it.
 - An insert takes 2.14–2.19 ms (median) on Magpie's `/home` against
   1.40–1.44 ms on the PC's NVMe, and 58.7 µs on Magpie's PMEM, so there the
