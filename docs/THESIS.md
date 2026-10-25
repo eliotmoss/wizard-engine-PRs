@@ -458,9 +458,12 @@ The properties are not a ladder. The WAL's acknowledgement contract checks
 that acknowledged after-images survive; the allocator's structural invariants
 (`PersistentAllocatorInvariants.check()`, the whole of
 `PersistentAllocatorProperty`) check structure and take no acknowledged value,
-so neither contains the other. Only the sieve's cross-object invariants contain
-another property: `PersistentSieveProperty` runs the allocator walk and then
-`PWSieve.checkInvariants()`. That containment is strict, and shown rather than
+so neither contains the other. The workloads' properties contain the
+allocator's: `PersistentSieveProperty` runs the allocator walk and then
+`PWSieve.checkInvariants()`, and the B+-tree's property runs the same walk
+before the tree's invariants and its comparison with the reference
+(`PersistentBTreeTest.v3`, `checkMounted()`). (Until 2026-10-26 this said
+"Only the sieve's cross-object invariants contain another property".) The sieve's containment is strict, and shown rather than
 assumed: `persistent_sieve:` corrupts two bytes of a durable bitmap, which the
 allocator walk accepts and the sieve property rejects. What the allocator
 finished is checked by count, not by the sweeps: the lazy image at the end of

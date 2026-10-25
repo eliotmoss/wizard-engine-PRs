@@ -716,8 +716,10 @@ cut of a sieve step at 12 images per cut with the flag set and must fail. The
 first failing image is at cut 385, one of its 4,147,200 distinct images: the
 ninth the selection takes there, with the line at offset 3456 of the WAL's log
 block alone at its last content and the cut's six other changeable lines at
-their floor. Its mount reports `used block is linked into a free list (block
-2)`. With the checksum compared, that image recovers into a consistent sieve,
+their floor. It mounts, and the allocator's structural walk,
+which the sieve property runs next, reports `used block is linked into a free
+list (block 2)` (`X86_64PersistentRecovery.v3`, the walk's only site of that
+message; until 2026-10-26 this said "Its mount reports"). With the checksum compared, that image recovers into a consistent sieve,
 and the sweep passes over cuts 0 to 385. The catch depends on the budget. On
 2026-10-19 the same sweep passed at 2, 3 and 4 images per cut, and 4 was the
 sieve tests' own budget until 2026-10-20; it failed at cut 660 at 6 and 8, at cut 385 at 10 and
@@ -775,7 +777,8 @@ took 0.13, 0.15, 0.20 and 0.40 s, and the format before its magic 0.07, 0.14,
 the failing image is an extreme, the same under every seed, so each threshold
 is that image's place in the selection's fixed order (the control's fifteenth
 at cut 708, the early magic's third at cut 339), and a change to the order
-moves it. These are six planted bugs, one or two per scenario, and a budget
+moves it. These are six planted bugs, one or two in each of four scenarios (the other
+allocator scenarios have none), and a budget
 that catches them is not shown to catch any other bug.
 
 Since 2026-10-20 the sieve's ordinary sweeps run at 16 images per cut, the

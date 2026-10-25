@@ -416,16 +416,20 @@ same geometry. The two builds are indistinguishable at layer 3 and separated at
 layer 1b, which is the claim this document used to assert and now measures.
 
 **Model half — done.** The four `persistent_control:` unit tests record the same
-sieve `step()` as `persistent_sieve:step_images_satisfy_sieve` and sweep it with
-the same `PersistentSieveProperty`, changing only the provider. The mutant trace
+sieve `step()` as `persistent_sieve:step_images_satisfy_sieve`, under one
+provider or both. Two check the traces (`mutant_trace_is_still_modelable`,
+`mutant_records_no_writeback`, the only one that records both); the other two
+(`ordinary_writeback_holds`, `elided_writeback_is_caught`) sweep the step at 64
+images per cut with the same `PersistentSieveProperty`, changing only the
+provider. (Until 2026-10-26 this said that all four record and sweep.) The mutant trace
 is still modelable (it validates against the baseline), carries zero `CLWB`
 events while its `STORE` and `SFENCE` counts match the ordinary recording
 exactly, and is rejected: a crash 710 events into a 1401-event scenario leaves a
 durable image whose *allocator* invariants already fail, with `free block is on
 the wrong list (block 4)`. Since 2026-10-19, when an over-budget cut began
 checking its extreme images first, the first failing image is 708 events in,
-with `free block is on the wrong free list (block 3)`. The ordinary provider holds over every cut of the
-same scenario. So the model is sensitive to flush placement, and sensitive
+with `free block is on the wrong free list (block 3)`. The ordinary provider holds at every cut of the
+same scenario, within the sweep's budget of 64 images per cut. So the model is sensitive to flush placement, and sensitive
 enough that the structural check alone catches it without the workload's
 cross-object invariants being reached.
 
