@@ -4480,9 +4480,11 @@ replaced nodes after it. Its harnesses:
 | `PWBTreeTest.v3` (`pwbtree_dio:`) | 3b | A child on the direct backend stopped at every phase mark of a root split (height 3 to 4) and of an update, then killed: the tree before the mutation up to the PUBLISH mark and after it from there on, and exactly the expected chunks reclaimed |
 | `test/pwbtree.main.v3` (`make pwbtree`, `make pwbtree-pmem`) | 3a | Random-timer `SIGKILL`, remount, invariants, the whole tree against a DRAM map; every acknowledged mutation survives, and the one in flight lands on the side its last phase mark allows; `OK` needs at least one acknowledgement checked, else `UNCHECKED`. File: `OK` on sean-tan-PC and on Magpie's `/home`. PMEM: `OK` on Magpie's DAX, 49 acknowledged-mutation checks, 0 lost. All 2026-10-14 ([the tree's crash behaviour](#crash-behaviour-of-the-tree)); until 2026-10-25 this row said PMEM was not yet run |
 | `test/pwbtree.main.v3` (`make pwbtree-direct`, `make pwbtree-direct-mutant`) | 3b | The same loop on the direct backend: the ordinary build `OK`, the elided-writeback mutant `LOST` with every acknowledged mutation lost (see [the tree's crash behaviour](#crash-behaviour-of-the-tree)) |
+| `PersistentBTreeTest.v3` (`persistent_btree:`) | 1b | Two recorded puts, an insert that splits a leaf and the root (height 2 to 3) and an update at height 3, through the crash-image explorer: each image mounted through production recovery and checked by the allocator walk, `open()`, `checkInvariants()` and the tree before or after the put as its phase marks allow; every cut bounded, the final cut and the new nodes' durability before the publish complete; the insert with its node writebacks elided is caught (see [what says the tree is consistent](#what-says-the-tree-is-consistent-and-how-far-it-reaches-2026-10-15)) |
 | `test/pwbtreebench.main.v3` (`scripts/pwbtree-bench.sh`) | — | Cost per operation; fails any run whose operations do other persistence work than k + h + 1 boundaries and the audited round's prepare calls and lines |
 
-No crash-image explorer scenario (layer 1b) drives the tree yet.
+Until 2026-10-25 this section said no crash-image explorer scenario (layer 1b)
+drives the tree; `persistent_btree:` has done so since 2026-10-15.
 
 ### Shadow durable-memory test backend
 
