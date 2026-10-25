@@ -108,7 +108,7 @@ PWRegion (block allocator)
         └── DualTxnWal (in-region two-slot redo log, block 1)
               └── BackendRegion (persistence abstraction)
                     ├── VolatileRegion      (Array<byte>, GC-managed)
-                    ├── FileMmapRegion      (mmap + msync/fdatasync)
+                    ├── FileMmapRegion      (mmap + pages marked through the provider, one fdatasync per fence)
                     └── PmemMmapRegion      (mmap + clwb/sfence)
 ```
 
