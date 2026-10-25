@@ -158,6 +158,18 @@ The architectural basis for the profile is the
 [Intel 64 and IA-32 Software Developer's Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html);
 the [Intel Persistent Memory FAQ](https://www.intel.com/content/www/us/en/developer/articles/troubleshooting/persistent-memory-faq.html)
 summarizes the eight-byte power-fail atomicity and flush-plus-fence contract.
+Neither states the persistence half of the profile. The manual gives the
+store order and the ordering of `CLWB` by `SFENCE` only as orders of
+visibility, and the FAQ never names ADR. That the ADR domain holds the memory
+controller's write-pending queues and not the CPU caches, so a store is
+persistent once it reaches them, and that a fence completes earlier
+writebacks into that domain, rest on Yang et al.'s background account (Yang,
+Kim, Hoseinzadeh, Izraelevitz and Swanson, "An Empirical Guide to the Behavior
+and Use of Scalable Persistent Memory", FAST '20, §2.1.1, p. 170, and §2.1.3,
+p. 171), not on an Intel document and not on a measurement. That the
+manual's orders also hold for persistence is the profile's assumption about
+the ADR platform. Until 2026-10-25 this paragraph gave only the two Intel
+documents as the profile's basis.
 
 Target-machine configuration and validation are documented separately in
 [PMEM Emulation](pmem-emulation.md), so this document remains focused on the

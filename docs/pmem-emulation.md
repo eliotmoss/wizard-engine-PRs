@@ -355,7 +355,9 @@ Removing every `CLWB` from the persist path would leave this test still
 reporting `OK`. Since `region0`/`region1` report `memory_controller` — ADR, not
 eADR — ADR drains the memory controller's write-pending queue but **not** the CPU
 caches, so only a real power interruption can lose an un-written-back line and
-thereby discriminate a correct `CLWB` from a missing one.
+thereby discriminate a correct `CLWB` from a missing one. (What ADR covers is
+from Yang et al., FAST '20, §2.1.1, not from an Intel document; see
+[PMEM Crash Model](pmem-crash-model.md#agreed-baseline-persistence-profile).)
 
 That sentence used to read "would *very likely* leave this test still reporting
 `OK`", which was an assertion about the experiment's own blind spot with nothing
@@ -872,7 +874,9 @@ physical target.
 #### Mechanism: what can actually lose a cache line
 
 With a `memory_controller` (ADR) persistence domain, ADR drains the memory
-controller's write-pending queue but not the CPU caches. The Stage 3 event is
+controller's write-pending queue but not the CPU caches (the source is stated
+in [PMEM Crash Model](pmem-crash-model.md#agreed-baseline-persistence-profile)).
+The Stage 3 event is
 therefore any event that loses cache contents, and every such event takes the
 whole machine down.
 
