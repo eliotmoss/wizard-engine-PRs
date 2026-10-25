@@ -1,0 +1,95 @@
+Full x86-64-linux unit suite, engine 8593399a (pwregions), sean-tan-PC, 2026-10-25
+
+Outcome, read from unit.log. The harness (Virgil lib/test/UnitTests.v3) has no
+skip status: every registered test runs and either passes, fails, or fails
+under a name listed in an --expected file ("##-ok (ignored failure: ...)").
+
+  registered and run   2,088  ("##>2088 unit tests"; 2,088 "##+" starts, 2,088 "##-" results)
+  passed               2,081
+  expected failures        7  exactly the 7 names in test/unittest.failures.x86-64-linux:
+                              jit:invalid, lazy:invalid, probe:insert_g1,
+                              jit:dyn_probe_insert_osr, lazy:dyn_probe_insert_osr,
+                              lazy:call_indirect_subtype, lazy:rcall_indirect
+  unexpected failures      0
+  skipped                  0  (the harness cannot skip; see "Not run" below)
+
+The previous dated total, 2,073 on 2026-10-20 (docs/ROADMAP.md, Tests), plus
+the fifteen tests added on 2026-10-21 (f8a310aa, the header's format version:
+7 pwregion_bd:; dd0c1cc5, refusing an existing file of another size: 6
+pwregion_bd:, 1 txn_backend:, 1 direct_io:) gives 2,088.
+
+Implementation-specific (persistence) tests: 377 registrations in twenty files;
+all 377 ran and all 377 passed.
+
+  file                            registered  ran  pass  fail   groups
+  DirectIoRegionTest.v3                   23   23    23     0   direct_io: 23
+  DualTxnWalTest.v3                       43   43    43     0   dual_wal: 43
+  FileMmapRegionTest.v3                    6    6     6     0   file_mmap: 6
+  MultiTxnWalTest.v3                      28   28    28     0   multi_wal: 28
+  PWBTreeTest.v3                          23   23    23     0   pwbtree: 17, pwbtree_bd: 4, pwbtree_dio: 2
+  PWOpsTest.v3                             6    6     6     0   pwops: 6
+  PWSieveTest.v3                          13   13    13     0   pwsieve: 10, pwsieve_bd: 3
+  PersistentAllocatorTest.v3              13   13    13     0   persistent_alloc: 13
+  PersistentBTreeTest.v3                   7    7     7     0   persistent_btree: 7
+  PersistentControlTest.v3                 4    4     4     0   persistent_control: 4
+  PersistentExplorerTest.v3               16   16    16     0   persistent_explore: 16
+  PersistentImageTest.v3                  10   10    10     0   persistent_image: 10
+  PersistentLazyExplorerTest.v3           11   11    11     0   persistent_lazy: 11
+  PersistentOperationsTest.v3             21   21    21     0   persistent_ops: 21
+  PersistentRecoveryTest.v3               14   14    14     0   persistent_recovery: 14
+  PersistentSieveTest.v3                   8    8     8     0   persistent_sieve: 8
+  PersistentTraceTest.v3                  10   10    10     0   persistent_trace: 10
+  RegionTransactionTest.v3                16   16    16     0   region_transaction: 16
+  SingleTxnWalTest.v3                      4    4     4     0   single_wal: 4
+  TxnPWRegionTest.v3                     101  101   101     0   pwregion: 23, pwregion_immix: 7, pwregion_wrappers: 5, pwregion_overflow: 1, pwregion_recovery: 2, txn_backend: 13, pwregion_bd: 50
+  total (twenty files)                   377  377   377     0
+
+What was counted. A registration is a call NAME("case", fn) in a file under
+test/unittest/x86-64-linux/ whose NAME the same file binds with
+`def NAME = UnitTests.registerT("prefix:", _, Tester.new, _);`, ignoring
+commented-out lines (count_regs.py, run on the committed tree with
+`git show <rev>:<file>`; registrations.txt). The implementation-specific files
+are the twenty that register such tests for the persistence work: every file in
+that directory that registers tests except SpcTest.v3 (spc:), WasiTest.v3
+(wasi:) and X86_64LinuxExeTest.v3 (which registers spc:aot:/spc:lazy:/int:dyn:
+cases in a loop); PWBTree.v3, PWOps.v3, PWSieve.v3 and ElidedWritebackOps.v3
+are helpers and register none. The same rule at afcf5525 gives 335 in nineteen
+files, the 2026-10-17 recount the thesis quotes; since then
+PersistentLazyExplorerTest.v3 (11) is the twentieth file and the others gained
+31 (TxnPWRegionTest.v3 +14, PersistentOperationsTest.v3 +7,
+PersistentAllocatorTest.v3 +4, PersistentExplorerTest.v3 +2,
+PersistentSieveTest.v3 +2, PersistentRecoveryTest.v3 +1,
+DirectIoRegionTest.v3 +1). The static count was checked against the run: each
+file's prefixes (summarise.py) name exactly as many tests in unit.log as the
+file registers, and every test in unit.log with a persistence prefix is counted.
+
+Not run.
+- PmemDaxIntegrationTest.v3's 2 opt-in tests (pmem_dax:backend_accepts_map_sync,
+  pmem_dax:clean_remount_and_wal_replay). They are compiled into
+  bin/pmemtest.x86-64-linux, not the unit binary, and need PWASM_PMEM_TEST_DIR
+  on an fsdax mount. On this boot /dev/pmem0 exists (memmap=1G!8G; root:disk
+  0660) but is not mounted, /mnt/pmem0 does not exist, no DAX filesystem is
+  mounted, and sudo asks for a password, so none could be made.
+  `make pmem-integration` built the binary and refused, exit 2
+  (pmem-integration.txt). They were not run.
+- Every other harness: spec (test/spec.sh), regression, monitor tests, and the
+  x86-linux, jvm and v3i unit targets. Only bin/unittest.x86-64-linux ran.
+- The crash loops (pwsieve, pwbtree), the reset harness (pwreboot) and the
+  benchmarks, which are separate binaries outside the suite.
+
+Ran, with part of the check conditional on the host.
+- pwregion_wrappers:pw_nv_region and pwregion_wrappers:immix_pw_nv_region create
+  their region under /tmp; tmpfs refuses MAP_SYNC, so each checked only that the
+  wrapper is safe with no backend, not the PmemMmapRegion type it pins "on a
+  DAX-capable /tmp" (TxnPWRegionTest.v3).
+- txn_backend:pmem_region_tracks_pending_writeback is structural only: it wraps
+  an anonymous mapping and bypasses PmemMmapBackend.create(), MAP_SYNC and DAX
+  (docs/ROADMAP.md, Tests).
+- The O_DIRECT tests (direct_io:, pwbtree_dio:, file_mmap:'s re-read): /tmp is
+  tmpfs, which the backend's probe refuses, so their region files went to bin/
+  on ext4 (nvme1n1p3), which honours O_DIRECT. They ran there and passed.
+
+Files: provenance.txt (revision, host, toolchain, build and run commands),
+build.log (the build's shell trace, every expanded source file), unit.log (the
+harness output, complete), registrations.txt, count_regs.py, summarise.py,
+pmem-integration.txt.

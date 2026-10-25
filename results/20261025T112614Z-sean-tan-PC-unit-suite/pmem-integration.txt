@@ -1,0 +1,15 @@
+recorded 2026-10-25T11:29:25+00:00
+command: env -u PWASM_PMEM_TEST_DIR make pmem-integration
+PWASM_PMEM_TEST_DIR in environment: <unset>
+/mnt/pmem0: ls: cannot access '/mnt/pmem0': No such file or directory
+/dev/pmem0: brw-rw---- 1 root disk 259, 10 Oct 25 00:41 /dev/pmem0
+mounts of /dev/pmem0: none
+dax mounts in /proc/mounts: 0
+sudo -n true: sudo: interactive authentication is required
+---- output
+./build.sh pmemtest x86-64-linux
+PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount
+make: *** [Makefile:82: pmem-integration] Error 2
+exit 2
+---- pmemtest binary
+f73d7f167ecd0893a1f31733056032cfd71b4943ea2e1067c6894d1a2ec529f3  bin/pmemtest.x86-64-linux

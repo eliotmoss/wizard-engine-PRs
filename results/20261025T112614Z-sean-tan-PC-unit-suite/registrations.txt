@@ -1,0 +1,56 @@
+# python3 count_regs.py <engine repo> 8593399a  (registrations per file in test/unittest/x86-64-linux)
+DirectIoRegionTest.v3                23  direct_io: 23
+DualTxnWalTest.v3                    43  dual_wal: 43
+ElidedWritebackOps.v3                 0  
+FileMmapRegionTest.v3                 6  file_mmap: 6
+MultiTxnWalTest.v3                   28  multi_wal: 28
+PWBTree.v3                            0  
+PWBTreeTest.v3                       23  pwbtree: 17, pwbtree_bd: 4, pwbtree_dio: 2
+PWOps.v3                              0  
+PWOpsTest.v3                          6  pwops: 6
+PWSieve.v3                            0  
+PWSieveTest.v3                       13  pwsieve: 10, pwsieve_bd: 3
+PersistentAllocatorTest.v3           13  persistent_alloc: 13
+PersistentBTreeTest.v3                7  persistent_btree: 7
+PersistentControlTest.v3              4  persistent_control: 4
+PersistentExplorerTest.v3            16  persistent_explore: 16
+PersistentImageTest.v3               10  persistent_image: 10
+PersistentLazyExplorerTest.v3        11  persistent_lazy: 11
+PersistentOperationsTest.v3          21  persistent_ops: 21
+PersistentRecoveryTest.v3            14  persistent_recovery: 14
+PersistentSieveTest.v3                8  persistent_sieve: 8
+PersistentTraceTest.v3               10  persistent_trace: 10
+RegionTransactionTest.v3             16  region_transaction: 16
+SingleTxnWalTest.v3                   4  single_wal: 4
+SpcTest.v3                           14  spc: 14
+TxnPWRegionTest.v3                  101  pwregion: 23, pwregion_immix: 7, pwregion_wrappers: 5, pwregion_overflow: 1, pwregion_recovery: 2, txn_backend: 13, pwregion_bd: 50
+WasiTest.v3                           3  wasi: 3
+X86_64LinuxExeTest.v3                 0    [+1 other register call(s)]
+
+# python3 count_regs.py <engine repo> afcf5525  (the 2026-10-17 recount's revision, for comparison)
+DirectIoRegionTest.v3                22  direct_io: 22
+DualTxnWalTest.v3                    43  dual_wal: 43
+ElidedWritebackOps.v3                 0  
+FileMmapRegionTest.v3                 6  file_mmap: 6
+MultiTxnWalTest.v3                   28  multi_wal: 28
+PWBTree.v3                            0  
+PWBTreeTest.v3                       23  pwbtree: 17, pwbtree_bd: 4, pwbtree_dio: 2
+PWOps.v3                              0  
+PWOpsTest.v3                          6  pwops: 6
+PWSieve.v3                            0  
+PWSieveTest.v3                       13  pwsieve: 10, pwsieve_bd: 3
+PersistentAllocatorTest.v3            9  persistent_alloc: 9
+PersistentBTreeTest.v3                7  persistent_btree: 7
+PersistentControlTest.v3              4  persistent_control: 4
+PersistentExplorerTest.v3            14  persistent_explore: 14
+PersistentImageTest.v3               10  persistent_image: 10
+PersistentOperationsTest.v3          14  persistent_ops: 14
+PersistentRecoveryTest.v3            13  persistent_recovery: 13
+PersistentSieveTest.v3                6  persistent_sieve: 6
+PersistentTraceTest.v3               10  persistent_trace: 10
+RegionTransactionTest.v3             16  region_transaction: 16
+SingleTxnWalTest.v3                   4  single_wal: 4
+SpcTest.v3                           14  spc: 14
+TxnPWRegionTest.v3                   87  pwregion: 23, pwregion_immix: 7, pwregion_wrappers: 5, pwregion_overflow: 1, pwregion_recovery: 2, txn_backend: 12, pwregion_bd: 37
+WasiTest.v3                           3  wasi: 3
+X86_64LinuxExeTest.v3                 0    [+1 other register call(s)]

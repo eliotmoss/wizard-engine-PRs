@@ -1,0 +1,50 @@
+---- revision
+commit   8593399a5bf1a2e347cbcd1673085440d3a988cd
+subject  Failed write: an acknowledged write lost, an unacknowledged one torn
+branch   suite-virgil-2026-10-25 (worktree ~/research/wizard-engine-wt-suite), cut from pwregions at that commit
+dirty    no (git status --short before the build and the run: only this directory, untracked)
+build    bin/Build-x86-64-linux.v3: Version.buildData = "x86-64-linux 2026-10-25 22:26:19 by sean-tan@", Version.minorVersion = 3281 (git rev-list --count HEAD)
+---- host
+hostname pc-ubuntu (results tag sean-tan-PC, as in the other desktop directories)
+kernel   Linux 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+boot_id  adfda5e8-6bb6-453e-9d9c-180560e70f34
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-38-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash memmap=1G!8G crashkernel=2G-4G:320M,4G-32G:512M,32G-64G:1024M,64G-128G:2048M,128G-:4096M
+cpu      Intel(R) Core(TM) i7-14700KF, 28 CPUs; cpu0 governor powersave; no_turbo 0
+load     1.37 1.16 0.97 (uptime, 2026-10-25T11:26:50Z, before the run)
+user     sean-tan; sudo -n: "interactive authentication is required" (no root in this run)
+cwd      /home/sean-tan/research/wizard-engine-wt-suite on /dev/nvme1n1p3 ext4 rw,relatime
+/tmp     tmpfs (the backend's O_DIRECT probe refuses it, so the O_DIRECT tests' region files fall back to bin/, on the ext4 above)
+locale   LANG=en_US.UTF-8, LC_COLLATE=en_US.UTF-8 (sets the order build.sh's globs list the sources in, and so the order of the tests)
+---- toolchain
+v3c        /home/sean-tan/research/virgil-titzer/bin/v3c -> bin/current/x86-linux/Aeneas (bin/.setup-v3c's first choice for the first host sense_host lists, x86-linux: current, then bootstrap, then stable)
+version    Aeneas III-11.1975; Build Data: x86-linux 2026-09-17 18:36:46 by sean-tan@
+built      bin/current/x86-linux/Aeneas mtime 2026-09-17 18:36:46.712693778 +1000 (make in the Virgil clone: stable III-10.1905 -> bin/bootstrap -> bin/current)
+virgil     /home/sean-tan/research/virgil-titzer: HEAD eb52db9784036b89c22edd2c1c9019404709bedb, branch master, tracking origin/master; remote origin https://github.com/titzer/virgil.git
+virgil-src aeneas/src/main/Version.v3 at HEAD: version "III-11.1975", last changed by HEAD itself, the same version the binary reports
+local      git status clean; git log @{u}..HEAD empty (no local commits; origin/master as of the last fetch, which is the clone); bin/v3c is git assume-unchanged (bin/.setup-v3c)
+reflog     eb52db978 HEAD@{2026-09-17 18:32:31 +1000}: clone: from https://github.com/titzer/virgil.git (the only entry)
+files      no file under /home/sean-tan/research/virgil-titzer outside .git is newer than TAGS (2026-09-17 18:36:48 +1000), the last file the same make wrote, 1.4 s after bin/current/x86-linux/Aeneas
+x86-64     build.sh execs v3c-x86-64-linux from PATH (/home/sean-tan/research/virgil-titzer/bin/v3c-x86-64-linux), which execs $V3C (unset: bin/v3c) with its runtime options
+tools      GNU Make 4.4.1; GNU bash, version 5.3.9(1)-release (x86_64-pc-linux-gnu); git version 2.53.0
+---- build
+started  2026-10-25T11:26:19+00:00
+finished 2026-10-25T11:26:20+00:00 (wall 1.19 s, exit 0)
+command  env SHELLOPTS=xtrace make bin/unittest.x86-64-linux   (trace in build.log)
+  make   ./build.sh unittest x86-64-linux
+  build.sh exec  v3c-x86-64-linux -symbols -heap-size=700m -stack-size=2m -fun-exprs -simple-bodies -program-name=unittest.x86-64-linux -output=bin/ $SOURCES bin/Build-x86-64-linux.v3 $TARGET_SRC
+  wrapper exec   /home/sean-tan/research/virgil-titzer/bin/v3c -heap-size=200m -stack-size=2m -target=x86-64-linux -rt.sttables -rt.gc -rt.gctables -rt.files="/home/sean-tan/research/virgil-titzer/rt/x86-64-linux/*.v3 /home/sean-tan/research/virgil-titzer/rt/native/*.v3 /home/sean-tan/research/virgil-titzer/rt/gc/*.v3" <build.sh's arguments>
+  (options are parsed left to right and each overwrites, lib/util/Option.v3, so build.sh's -heap-size=700m replaces the wrapper's 200m)
+  SOURCES     src/engine/*.v3 src/util/*.v3 $VIRGIL/lib/util/*.v3 src/engine/continuation/UnboxedContinuation.v3 test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL/lib/test/*.v3 test/unittest/x86-64-linux/*.v3 src/modules/*.v3 src/modules/wasi/*.v3 src/modules/wasi/x86-64-linux/*.v3 $VIRGIL/lib/x86-64-linux/SyscallLayouts.v3
+  TARGET_SRC  src/engine/native/*.v3 src/engine/compiler/*.v3 src/engine/x86-64/*.v3 $VIRGIL/lib/asm/x86-64/*.v3 src/engine/x86-64/continuation/X86_64UnboxedContinuation.v3
+  ($VIRGIL is /home/sean-tan/research/virgil-titzer; build.sh writes it as .../lib//util and so on)
+binary   61401302aa97abda0d12545a796a173cb11b30feb137412e4e77322e5b5b12b0  bin/unittest.x86-64-linux
+---- run
+started  2026-10-25T11:26:54+00:00
+command  TEST_TARGET=x86-64-linux test/unit.sh   (cwd: the worktree root; WIZENG_OPTS unset)
+  ran    bin/unittest.x86-64-linux --expected=/home/sean-tan/research/wizard-engine-wt-suite/test/unittest.failures --expected=/home/sean-tan/research/wizard-engine-wt-suite/test/unittest.failures.x86-64-linux
+  make   unit.sh's own make: "make: 'bin/unittest.x86-64-linux' is up to date." (the binary above was run unchanged)
+  output progress is not on PATH, so unit.sh tees the harness's raw output: unit.log (its copy in /tmp/sean-tan/wizeng-test/unit/x86-64-linux/unit.sh.log is identical); stderr was empty
+  status unit.sh exited 0, which is tee's status and says nothing about the tests; the outcome is read from unit.log (summary.txt)
+finished 2026-10-25T11:28:42+00:00 (wall 107.49 s, max RSS 730,944 KiB)
+---- PMEM DAX
+not run: see pmem-integration.txt
