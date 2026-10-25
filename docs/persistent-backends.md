@@ -136,6 +136,11 @@ regime switches of the
 [block-media configuration](#the-block-media-configuration-is-not-a-controlled-measurement-here)
 were offered as consistent with the controller's cache state changing between
 sittings; with no cache documented in the path, that candidate is withdrawn.
+The withdrawal rests on Dell's documented policy for non-RAID disks (the PERC
+10 User's Guide), not on an observation: the controller caching non-RAID
+writes despite that policy is still an untested candidate for what
+acknowledges the write. (Until 2026-10-25 this paragraph did not say what the
+withdrawal rests on.)
 
 **3. Bypassing the page cache changes little on either host.** At 2 MiB the
 direct and file backends are within 8 % of each other at every size, and in
@@ -745,9 +750,11 @@ drive that ignores its own `Disabled` setting, is not ruled out by anything
 here. So **whether `/home`'s acknowledgements are power-safe is still not
 established**, but the question has moved: the controller's configuration is
 now known, and what is open is what this drive does with a write its own cache
-setting says it does not cache. Seagate's documentation for the model is the
-cheap next step; a power cut is not available on Magpie (Stage 3 in
-`ROADMAP.md`).
+setting says it does not cache, and whether the controller caches non-RAID
+writes despite its documented policy (both candidates above are untested;
+until 2026-10-25 this sentence named only the drive). Seagate's documentation
+for the model is the cheap next step; a power cut is not available on Magpie
+(Stage 3 in `ROADMAP.md`).
 
 **What this changes on this page.** "A RAID controller's acknowledgement" was
 the right reading of what Linux could see, but the controller is not acting as
@@ -757,6 +764,10 @@ acknowledgement given before the platter is written, by a component not yet
 identified. The controller's cache changing state between sittings is no
 longer a candidate for
 [the two block-media regimes](#the-block-media-configuration-is-not-a-controlled-measurement-here).
+That withdrawal rests on Dell's documented policy for non-RAID disks, not on
+an observation; the second candidate above, the controller caching such writes
+regardless, is untested.
+(Until 2026-10-25 this paragraph did not say what the withdrawal rests on.)
 
 A side observation: the two traced runs' region files, each created and removed
 in turn, occupied the same sectors. That is the premise of the untested
@@ -1237,9 +1248,14 @@ writebacks cost the commit: at eight entries that is about 36 %, not 3.3 %. See
 [`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
 
 **Configuration 3 is not a disk (established 2026-09-27).** `/home` is LVM on
-`sda`, behind a MegaRAID SAS3508 that reports `write through`: `fdatasync`
-sends no flush, and the figure is the latency to the controller's
-acknowledgement. See [the direct-I/O backend](#cost-the-same-seam-call-a-different-persistence-point).
+`sda`, which Linux sees as `write through`: `fdatasync` sends no flush, and the
+figure is the latency to an acknowledgement given before the platter can have
+the write. The root sitting of 2026-10-16 found `sda` passed through by a Dell
+PERC H740P (Broadcom's SAS3508) in eHBA mode, with the drive's own write cache
+disabled, and did not identify what gives the acknowledgement
+([root sitting](#what-acknowledges-a-write-on-home)). Until 2026-10-25 this
+paragraph called it the controller's acknowledgement. See
+[the direct-I/O backend](#cost-the-same-seam-call-a-different-persistence-point).
 
 Figures are medians over the runs of each configuration in `results/`
 (five campaigns × three repetitions × four transaction sizes), at 8 entries
@@ -1940,8 +1956,10 @@ type lives in computation, not in the persistence path.
 **On Magpie, with Optane, the step is still computation.** Same geometry and
 protocol, pinned to the namespace's node 0, five repetitions, idle host
 (`results/20260928T102833Z-magpie-pwsieve-bench`). Block storage is `/home`,
-ext4 on LVM behind the write-through RAID controller. Wall time per step,
-median; every PMEM and DAX range is under 0.7 % wide:
+ext4 on LVM on `sda`, a disk the controller passes through with its own write
+cache disabled ([root sitting](#what-acknowledges-a-write-on-home); until
+2026-10-25 this said "behind the write-through RAID controller"). Wall time
+per step, median; every PMEM and DAX range is under 0.7 % wide:
 
 | Configuration | Step | of which compute | persistence phases |
 |---|---|---|---|
@@ -2074,7 +2092,9 @@ cost about 1.7× the two that follow another boundary (bitmap and retire, 247–
 µs). On the direct backend alloc is 466 µs and the bitmap boundary 680 µs, while
 publish and retire are 186–194 µs. Raptor Lake under `powersave` shows neither:
 all four of its boundaries are 248–283 µs. That points at Magpie's storage path
-(LVM, then the write-through controller) rather than the CPU; untested. The
+(LVM, then `sda`, passed through the controller and acknowledged before the
+platter by a component not identified; until 2026-10-25 "the write-through
+controller") rather than the CPU; untested. The
 clock does not explain it. The pattern reproduces in the clock campaign (file:
 alloc 396 and publish 375 µs against bitmap 226 and retire 253 µs), and the two
 slow boundaries are the ones that start at the higher clock, after the sieve
@@ -2282,9 +2302,10 @@ operation of every round:
 **Measured on Magpie, every configuration, 2026-10-14.** The Xeon Gold 6252N
 was pinned to node 0, which owns the namespace. `pmem-auto`, `pmem-none` and
 `file-dax` ran on `/mnt/pmem0.0/sean` (`dax=always`), and `file-block` and
-`direct-block` on `/home/users/u7599095`: ext4 on LVM on the rotational `sda`
-behind the write-through controller
-([above](#cost-the-same-seam-call-a-different-persistence-point)). The host has
+`direct-block` on `/home/users/u7599095`: ext4 on LVM on the rotational `sda`,
+which the controller passes through with its own write cache disabled
+([root sitting](#what-acknowledges-a-write-on-home); until 2026-10-25 "behind
+the write-through controller"). The host has
 no cpufreq driver, so there is no governor. The parameters are the PC run's:
 five repetitions of three measured rounds after the audited one, 5,000 keys and
 then 5,000 operations, a 1 MiB region and seed 1. The campaign took 17 minutes
@@ -2357,10 +2378,13 @@ lookups in ns; the phases are means.
   controller's cache as an untested candidate here, as it was for the
   [block-media regimes](#the-block-media-configuration-is-not-a-controlled-measurement-here).
   Magpie's root sitting withdrew it for the regimes: `sda` is passed through
-  with its own write cache disabled, and on Dell's account the controller's
-  cache is not in `/home`'s path
-  ([2026-10-16](#what-acknowledges-a-write-on-home)). That withdraws it here
-  too, and what causes the tail is open. The share is 99.5–99.8 % with the tail and
+  with its own write cache disabled, and on Dell's documented policy for
+  non-RAID disks (the PERC 10 User's Guide) the controller's cache is not in
+  `/home`'s path. The withdrawal rests on that documentation, not on an
+  observation, and the controller caching non-RAID writes despite the policy
+  is still an untested candidate for what acknowledges the write
+  ([2026-10-16](#what-acknowledges-a-write-on-home)). On the same grounds it
+  is withdrawn here too, and what causes the tail is open. The share is 99.5–99.8 % with the tail and
   `file-block`'s 99.2–99.4 % without it, so the bracket does not depend on it.
 - An insert takes 2.14–2.19 ms (median) on Magpie's `/home` against
   1.40–1.44 ms on the PC's NVMe, and 58.7 µs on Magpie's PMEM, so there the
@@ -2819,8 +2843,9 @@ PMEM path itself.
 (`results/20261013T114908Z-magpie-pwops-bench`). Xeon Gold 6252N pinned to
 node 0, which owns the namespace; `pmem-auto`, `pmem-none` and `file-dax` on
 `/mnt/pmem0.0/sean`, `file-block` and `direct-block` on `/home/users/u7599095`
-(ext4 on LVM on the rotational `sda` behind the write-through controller,
-[above](#cost-the-same-seam-call-a-different-persistence-point)); five
+(ext4 on LVM on the rotational `sda`, which the controller passes through with
+its own write cache disabled, [root sitting](#what-acknowledges-a-write-on-home);
+until 2026-10-25 "behind the write-through controller"); five
 repetitions, 41 minutes, start load 0.01. All 25 runs ended `OK` (`pmem-none`'s
 `OK timing-only`), so every operation did exactly the work expected of it. ns
 per operation, the median over repetitions of each run's median, with the
@@ -3375,7 +3400,11 @@ volume, and the acknowledgement comes from below Linux before the platter is
 written, from a component not yet identified
 ([root sitting](#what-acknowledges-a-write-on-home)). With no cache documented
 in the path, the controller's cache state is withdrawn as a candidate for the
-two regimes; what moves `/home` between them is open.
+two regimes; what moves `/home` between them is open. The withdrawal rests on
+Dell's documented policy (the PERC 10 User's Guide), not on an observation:
+the controller caching non-RAID writes despite that policy is an untested
+candidate for what acknowledges the write. (Until 2026-10-25 this paragraph
+did not say what the withdrawal rests on.)
 
 
 ### Transaction-size sweep on PMEM: the fence is flat, the writeback is linear
