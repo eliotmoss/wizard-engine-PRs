@@ -3480,10 +3480,14 @@ one medium is not wrong on the other, merely pointless.
 - **`fdatasync` on DAX has two costs**, socket-local and cross-socket, differing
   by 23.9 %. Unpinned runs draw one at random. Every figure for configuration 2
   on this page is the socket-local one unless stated.
-- **The block-media configuration measures a RAID controller**, not a disk:
-  `/home` is behind a MegaRAID SAS3508 that reports write-through, so its
-  `fdatasync` sends no flush (2026-09-27). Whether its acknowledgement is
-  power-safe is not established.
+- **The block-media configuration measures an acknowledgement given before
+  the platter**, not a disk: `/home` is on `sda`, which a Dell PERC H740P
+  (Broadcom's SAS3508) in eHBA mode passes through with the drive's own write
+  cache disabled; Linux sees `write through`, so its `fdatasync` sends no flush
+  (2026-09-27; traced 2026-10-16). What acknowledges the write is not
+  identified, and whether that acknowledgement is power-safe is not established
+  ([root sitting](#what-acknowledges-a-write-on-home)). Until 2026-10-25 this
+  bullet said the configuration measures a RAID controller.
 - **The block-media configuration has not reproduced**: at 2 MiB it has two
   regimes, flat at ~133 µs and falling 196 → 165 µs, which differ in shape as
   well as level. It has now switched between them within one day, on a
@@ -3501,11 +3505,14 @@ one medium is not wrong on the other, merely pointless.
   the PMEM boundary identical on both sockets.
 - Treat the ratios as orders of magnitude and the absolute latencies as
   properties of this host's storage stack on the day.
-- The **mechanism** behind configuration 2's slowness is identified from timing
-  and file layout — `fdatasync` writes back a whole 2 MiB DAX entry — but not
-  yet observed in the kernel (`fs_dax:dax_writeback_one`, needs root). Every
-  configuration-2 figure is specific to regions mapped with 2 MiB entries unless
-  a 1 MiB region is named.
+- The **mechanism** behind configuration 2's slowness, that `fdatasync` writes
+  back a whole 2 MiB DAX entry, was identified from timing and file layout and
+  has since been observed in the kernel: `fs_dax:dax_writeback_one` wrote back
+  one whole 2 MiB entry per commit at a 2 MiB region and single 4 KiB pages at
+  1 MiB ([2026-10-16](#fdatasync-on-dax-writes-back-whole-2-mib-entries-observed)).
+  Every configuration-2 figure is specific to regions mapped with 2 MiB entries
+  unless a 1 MiB region is named. Until 2026-10-25 this bullet said the
+  mechanism was not yet observed in the kernel.
 - **Unexplained:** what selects the block configuration's regime at 2 MiB. The
   PMEM backend's faster per-entry growth is explained (2026-09-28): stores into
   lines the previous after-image's `CLWB` just evicted, about 95 % of it,
