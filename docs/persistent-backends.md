@@ -413,9 +413,15 @@ persistence phases, each the median over repetitions, and the share:
   allocation's after-image pages. Here, though, the bitmap's fence grows by
   372–378 µs (646–647 against 269–274 µs), while the publish shrinks by only
   229–233 µs and the retire by 37–39 µs; on sean-tan-PC each moved by 10 µs or
-  less. A plausible reading, untested, is that behind the write-through
-  controller each page written costs time of its own, where the NVMe charges
-  per flush. The two runs were at `cede598e` and `42edc6ff`.
+  less. A plausible reading, untested, is that on `/home` each page written
+  costs time of its own, where the NVMe charges per flush: there `sda` is
+  passed through the controller with its own write cache disabled,
+  `fdatasync` sends it no flush, and a component not yet identified
+  acknowledges each write before the platter can have it
+  ([root sitting](#what-acknowledges-a-write-on-home)). The gap stays
+  unexplained. Until 2026-10-25 this reading put the pages "behind the
+  write-through controller", wording from before the root sitting. The two
+  runs were at `cede598e` and `42edc6ff`.
 - So the sieve section's 55 % (2026-09-28) belongs to the legacy boundary and
   to that sitting. At the current boundary, quote 57.9 % (file) and 58.3 %
   (direct, `20261014T025706Z`), and compare boundaries only within a sitting:
