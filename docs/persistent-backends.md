@@ -30,8 +30,10 @@ All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live u
 persistent backend. The region lives in a process-private anonymous mapping, the
 *staging buffer*; `create()` reads the whole region into it, and write-back is
 explicit: `pwrite` of whole 4 KiB units on an `O_DIRECT` descriptor, then one
-`fdatasync` per boundary. The target is either a preallocated regular file
-(`direct`) or a raw block device (`direct-device`).
+`fdatasync` per boundary. The target is either a regular file, created and
+sized as `FileMmapBackend` does (`direct`; nothing calls `fallocate`), or a raw
+block device (`direct-device`). (Corrected 2026-10-25: this said "a
+preallocated regular file".)
 
 Why a third one. `FileMmapRegion` is a page-cache backend: the kernel owns
 writeback, may write any dirty page at any time, and keeps dirty data across
@@ -91,7 +93,11 @@ sean-tan-PC against a mounted root partition and an ext4 signature.
 
 **What it costs elsewhere.** DRAM equal to the region; a mount reads the whole
 region before `PWRegion` can read its header; regions below 2 GiB, because
-`FdMmapRegion` forges its range with `int.!`.
+`FdMmapRegion` forges its range with `int.!`. That cast is in the base class of
+all three file-backed regions, so the limit is not the direct backend's alone;
+only `DirectIoBackend` refuses a larger region up front (`MAX_REGION`), and a
+PMEM or mapped-file region of 2 GiB or more is inferred, not tested, to trap at
+the cast. (Added 2026-10-25.)
 
 ### Cost: the same seam call, a different persistence point
 

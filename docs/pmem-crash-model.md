@@ -271,8 +271,13 @@ the mark's region-relative offset with the reset value, and no `CLWB` or
 
 Keeping the direct writer and `RegionTransaction` as separate types with
 distinct setter names (`setUsed(w, …)` versus `setUsedCached(txn, …)`) is a
-safety property, not just style: an allocator mutation that accidentally
-bypassed the WAL would fail to compile rather than silently escape the log.
+safety property, not just style: passing the transaction cache to a direct
+setter fails to compile, so a mutation written against the cache cannot
+bypass the WAL by accident. It does not stop a mutation that calls a direct
+setter with the writer: `PWRegion` keeps the writer in a private field that
+all its methods reach (`writer`, `X86_64TxnPWRegion.v3`), and such a call
+compiles. (Corrected 2026-10-25: this paragraph said any accidental bypass
+would fail to compile.)
 
 `PWRegion` validates its geometry before formatting, because the provider
 rejects a misaligned or out-of-range store by aborting the process rather than
