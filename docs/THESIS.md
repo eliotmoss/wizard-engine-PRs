@@ -534,8 +534,8 @@ test at another layer:
 | The provider's `clwb`/`sfence` are `CLWB`/`SFENCE` | `persistent_ops:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
 | The search finds every admitted image | The reduced search equals the full branching search at every cut of four traces, byte for byte; its per-line content classes give exactly the distinct images of every prefix vector at every cut of the small traces and at sampled cuts of a recorded commit (`persistent_explore:line_classes_equal_distinct_images`, 2026-10-19); an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
 | A lazy leaf's verdict holds for every image it stands for (since 2026-10-20) | `persistent_lazy:`: every distinct image lies in exactly one leaf (small traces and the one-commit trace, every cut); each image's eager verdict equals its leaf's (the one-commit trace, and the overwrite guard's 597,079 images); each leaf's least and greatest image, run eagerly, make the lazy run's stores and loads byte for byte; a nondeterministic property is reported. Only for the scenarios these tests run |
-| Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, and Stage 2c's ordinary image. These are the only two places where real bytes are compared with the model |
-| One exploration covers more than one backend | Trace identity between the direct and PMEM backends at 2 KiB and 4 KiB blocks. The file backend has a stated model and no explorer |
+| Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, `file_mmap:boundary_images_are_model_images` (since 2026-10-13: the mapped file after every sync, both as the page cache holds it and as the marked pages alone leave it), and Stage 2c's ordinary image. These are the only places where real bytes are compared with the model. (Corrected 2026-10-25: this row named only the direct check and Stage 2c.) |
+| One exploration covers more than one backend | Trace identity with the PMEM backend at 2 KiB and 4 KiB blocks: the direct backend's and, since 2026-10-13, the mapped file's (`file_mmap:trace_matches_pmem_region`). Both share the explorer's results by restriction ([PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)): the file backend on fsdax under the baseline profile and the kernel's `fsync` contract, on block storage only under B2–B5, of which nothing guarantees B2. (Corrected 2026-10-25: this row said the file backend had a stated model and no explorer.) |
 | "Recovery" means production recovery | Images are mounted through the production mount path (`runDualWal()`, `PersistentImageBackend`), never through a reimplementation |
 
 The bridge runs the other way too. The explorer's scenarios are one sieve step
@@ -641,9 +641,14 @@ Chapter 6 should state coverage in these terms and no stronger:
   (covered at layers 1a and 3a only), exact-fit allocation (layer 3a only; the
   explorer records a split allocation and a coalescing free), the Immix line
   marks (transient; their stores cross the seam since 2026-10-19, but no
-  explored scenario makes one),
-  the file backend (model stated, not implemented) and the emitted instructions
-  (milestone 9, cut).
+  explored scenario makes one) and the emitted instructions (milestone 9,
+  cut). The file backend has no explorer of its own and needs none: since
+  2026-10-13 it emits the PMEM backend's trace, its file after every sync is
+  compared with the model, and it shares the explorer's results by
+  restriction, on block storage only under B2–B5 (see [PMEM Crash
+  Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)).
+  (Corrected 2026-10-25: this bullet listed the file backend as "model stated,
+  not implemented".)
 - **Not attainable:** power loss on the target medium (layer 4).
 
 ### Outline for Chapters 5 and 6
