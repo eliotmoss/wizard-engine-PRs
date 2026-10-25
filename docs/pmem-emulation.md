@@ -496,12 +496,19 @@ falsify the layering claim. See the reproduction note in
 bare-metal reserved-DRAM host and an operator; its runbook is
 [Stage 2c Hand-off](stage2c-handoff.md).
 
-The mutant is deliberately vacuous on the file backend: `FileMmapRegion` never
-calls `clwb()` at all, since its persist path is `msync`/`fdatasync`. A
-file-backed mutant run therefore exercises the wiring and nothing else, and must
-not be reported as a result. That the same mutation is meaningful on one backend
-and empty on the other is itself an instance of the granularity difference the
-unified interface hides.
+Until 2026-10-13 the mutant was vacuous on the file backend: `FileMmapRegion`
+never called `clwb()`, since its persist path was `msync`/`fdatasync`, so a
+file-backed mutant run exercised the wiring and nothing else. Since then its
+`prepareChangedRange` calls `clwb()` for each line through a marking provider,
+the direct backend's `DirectIoOperations`, which marks the line's 4 KiB page,
+and a fence syncs only when a page is marked. The mutant's `clwb()` marks
+nothing, so its fences sync nothing (`file_mmap:elided_provider_syncs_nothing`).
+The mutation is therefore meaningful on the file backend too. Process death
+still leaves the page cache, so the file backend's kill loop cannot separate
+the builds (both `OK`, 2026-10-13), while a kernel reset does (`SURVIVED`
+against `LOST`, sean-tan-PC, 2026-10-21; see
+[Persistent Backends](persistent-backends.md#a-kernel-reset-separates-the-file-backends-builds)).
+Until 2026-10-25 this paragraph still called the file-backed mutant vacuous.
 
 The topology, cache geometry, and CPU flags are readable without elevated
 privileges. The health query is not: `/dev/nmem*` is root-only, so the
