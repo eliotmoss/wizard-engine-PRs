@@ -643,7 +643,8 @@ non-snapshot writeback, fence obligations and background eviction, and
 materializes durable images (milestone 4). `PersistentExplorer` enumerates the
 images a cut admits, by full branching search or by the fence-forced floor plus
 one of each line's distinct contents above it (a per-line prefix product until
-2026-10-19), which are checked against each other at every cut of four traces. Each image goes to production `DualTxnWal` recovery or a
+2026-10-19), which are checked against each other at every cut of four
+hand-written traces (5, 7, 4 and 10 events on one to three lines). Each image goes to production `DualTxnWal` recovery or a
 production `PWRegion` mount, which must satisfy the acknowledgement contract and
 the allocator's structural invariants (milestones 5–6). Crash during recovery
 and failed recovery boundaries run under the bounded two-crash profile
