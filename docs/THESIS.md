@@ -538,8 +538,10 @@ test at another layer:
 | One exploration covers more than one backend | Trace identity with the PMEM backend at 2 KiB and 4 KiB blocks: the direct backend's and, since 2026-10-13, the mapped file's (`file_mmap:trace_matches_pmem_region`). Both share the explorer's results by restriction ([PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)): the file backend on fsdax under the baseline profile and the kernel's `fsync` contract, on block storage only under B2–B5, of which nothing guarantees B2. (Corrected 2026-10-25: this row said the file backend had a stated model and no explorer.) |
 | "Recovery" means production recovery | Images are mounted through the production mount path (`runDualWal()`, `PersistentImageBackend`), never through a reimplementation |
 
-The bridge runs the other way too. The explorer's scenarios are one sieve step
-or at most three transactions. The kill loop runs long histories at arbitrary
+The bridge runs the other way too. The explorer's scenarios are one sieve step,
+one B+-tree put of 7 or 6 commits (since 2026-10-15), or at most three
+transactions. (Corrected 2026-10-25: this sentence left out the B+-tree
+puts.) The kill loop runs long histories at arbitrary
 points until the descriptor table fills, and it is what found the two workload
 defects Chapter 6 reports: the alloc-then-publish leak and `live <= window + 1`.
 
@@ -800,7 +802,12 @@ What genuinely changes, and belongs in the thesis:
   model cannot, and has to name the filesystem.
 - **The crash class differs.** Process termination loses nothing on either
   mmap backend, so their `SIGKILL` evidence is process-crash consistency on
-  both, and host power loss is the only event that discriminates.
+  both. Only an event that discards the page cache or the CPU cache
+  discriminates: for the file backend on block storage a kernel reset does (ordinary
+  `SURVIVED`, mutant `LOST`, one run each on sean-tan-PC, 2026-10-21;
+  [Persistent Backends](persistent-backends.md#a-kernel-reset-separates-the-file-backends-builds)),
+  and on DAX host power loss. (Corrected 2026-10-25: this bullet named host
+  power loss as the only such event.)
 
 The direct backend has a third model, and it is a *restriction* of the PMEM
 one: every image it can leave is one the PMEM model admits for the same trace,
@@ -814,10 +821,22 @@ in [PMEM Crash Model](pmem-crash-model.md#the-direct-backend-is-a-restriction-of
 together with the layout assumption it exposes: at 4 KiB blocks the WAL header
 and both slots share one 4 KiB write unit.
 
-Whether to *implement* a file-backed explorer is out of scope; stating the
-model and its relationship to the PMEM one is in scope, and is the analysis
-half of the item in the triage table. Recorded in full in
-[PMEM Crash Model](pmem-crash-model.md).
+Since 2026-10-13 the file backend is a restriction of the PMEM model as well.
+Its provider is the direct backend's `DirectIoOperations`, which marks each
+written-back line's 4 KiB page, so it emits the PMEM backend's trace for the
+same history (`file_mmap:trace_matches_pmem_region`), and each fence is one
+`fdatasync` when a page is marked. Every image it can leave is one the PMEM
+model admits for that trace: on fsdax under the baseline profile and the
+kernel's `fsync` contract, on block storage only under B2–B5, of which nothing
+guarantees B2. `file_mmap:boundary_images_are_model_images` compares the file
+after every sync with the model. The explorer's results therefore carry over
+to the file backend, and a file-backed explorer is not needed. What the
+bullets above say about the file backend's own image set stays true; the
+restriction shows that set lies inside the PMEM model's. Recorded in
+[PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally).
+(Corrected 2026-10-25: this paragraph said that implementing a file-backed
+explorer was out of scope and that stating the file model and its relationship
+to the PMEM one was the in-scope analysis half of the triage item.)
 
 ---
 
