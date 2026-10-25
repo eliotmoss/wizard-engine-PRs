@@ -630,8 +630,11 @@ The reachable images at a cut are therefore exactly the images of the product
 of the per-line prefix ranges above the floor. That is an argument, so
 `persistent_explore:reduction_agrees_with_full_search` checks it executably
 instead: at every cut of four traces, the two searches must produce the same
-image set, compared byte for byte. The fourth trace, added on 2026-10-19,
-rewrites bytes its lines already hold, so on it the two counts below differ.
+image set, compared byte for byte. The traces are hand-written, not recorded
+from production code: 5, 7, 4 and 10 events on one, two, one and three cache
+lines (`reductionTraces()` in `PersistentExplorerTest.v3`). The fourth, added
+on 2026-10-19, rewrites bytes its lines already hold, so on it the two counts
+below differ.
 
 **One image per distinct content of each line (2026-10-19).** Many prefix
 vectors give the same image: a store that rewrites the bytes its line already
