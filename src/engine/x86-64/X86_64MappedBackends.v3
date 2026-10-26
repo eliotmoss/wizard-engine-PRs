@@ -305,6 +305,10 @@ class PmemBackend extends StorageBackend {
 	new(path) { }
 
 	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		if (size > BackingFile.MAX_REGION) {
+			Trace.OUT.puts(BackingFile.TOO_LARGE).ln();
+			return null;
+		}
 		def fd = BackingFile.openBacking(path, mode);
 		if (fd < 0) return null;
 		def err = BackingFile.sizeBacking(fd, size);
@@ -347,6 +351,10 @@ class MappedFileBackend extends StorageBackend {
 	new(path) { }
 
 	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		if (size > BackingFile.MAX_REGION) {
+			Trace.OUT.puts(BackingFile.TOO_LARGE).ln();
+			return null;
+		}
 		def fd = BackingFile.openBacking(path, mode);
 		if (fd < 0) return null;
 		def err = BackingFile.sizeBacking(fd, size);
@@ -384,6 +392,12 @@ class MappedFileBackend extends StorageBackend {
 component BackingFile {
 	def FILE_MODE = 420;	// 0644 octal
 	def PRIVATE_FILE_MODE = 384;	// 0600 octal
+	// FileBackedRegion forges its range with int.!, so a region must fit an int:
+	// the largest page multiple below 2 GiB. Every backend checks this before it
+	// opens, creates or truncates anything, so a fresh format of a region too
+	// large to build cannot first truncate the file it names.
+	def MAX_REGION = 0x7FFF_F000u64;
+	def TOO_LARGE = "the region must be smaller than 2 GiB";
 
 	// Build a null-terminated C string for the given path.
 	private def toCPath(path: string) -> Array<byte> {

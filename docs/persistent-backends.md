@@ -109,10 +109,15 @@ sean-tan-PC against a mounted root partition and an ext4 signature.
 **What it costs elsewhere.** DRAM equal to the region; a mount reads the whole
 region before `RegionAllocator` can read its header; regions below 2 GiB, because
 `FileBackedRegion` forges its range with `int.!`. That cast is in the base class of
-all three file-backed regions, so the limit is not the direct backend's alone;
-only `DirectIoBackend` refuses a larger region up front (`MAX_REGION`), and a
-PMEM or mapped-file region of 2 GiB or more is inferred, not tested, to trap at
-the cast. (Added 2026-10-25.)
+all three file-backed regions, so the limit is not the direct backend's alone,
+and every backend refuses a larger region up front (`BackingFile.MAX_REGION`),
+before it opens, creates or truncates anything. Until 2026-10-26 only
+`DirectIoBackend` did. `PmemBackend` and `MappedFileBackend` opened the file
+first, so a fresh format of a 2 GiB region truncated it, extended it and then
+trapped at the cast (`TypeCheckException` in `FileBackedRegion.new`); with the
+check disabled, `storage_backend:oversized_region_refused_unchanged` shows this,
+the 8 KiB region it wrote left as 2 GiB of zeros. (Added 2026-10-25; every
+backend since 2026-10-26.)
 
 ### Cost: the same seam call, a different persistence point
 

@@ -42,8 +42,6 @@ component DirectIoConst {
         // (512 and 4096), and the staging buffer is page-aligned, so every run
         // meets O_DIRECT's offset, length and memory alignment.
         def WRITE_UNIT = 4096u64;
-        // FileBackedRegion forges its range with int.!, so the region must fit an int.
-        def MAX_REGION = 0x7FFF_F000u64;
         // Bytes examined for a foreign signature before a fresh format of a raw
         // device; btrfs's superblock magic sits at 65600.
         def SIGNATURE_SCAN = 131072u64;
@@ -296,7 +294,7 @@ class DirectIoBackend extends StorageBackend {
                 if (size == 0 || size % DirectIoConst.WRITE_UNIT != 0) {
                         return reject("the region size must be a nonzero multiple of 4096");
                 }
-                if (size > DirectIoConst.MAX_REGION) return reject("the region must be smaller than 2 GiB");
+                if (size > BackingFile.MAX_REGION) return reject(BackingFile.TOO_LARGE);
                 if ((access & BackendProt.WRITE.mask) == 0) return reject("the staging buffer must be writable");
                 def blockDevice = target == DirectIoTarget.BLOCK_DEVICE;
                 def fd = if(blockDevice, openDevice(size), openFile(size, mode));
