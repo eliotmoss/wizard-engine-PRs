@@ -1,0 +1,38 @@
+# Kernel records for this case, read from /dev/kmsg, kernel timestamps (s since
+# boot); 'fsyncretry:' lines are the script's step markers; UFW and AppArmor
+# lines dropped (0).
+[   3896.488406] fsyncretry: xfs case begins
+[   3896.489983] loop25: detected capacity change from 0 to 1048576
+[   3896.506844] XFS (dm-0): Mounting V5 Filesystem 8716a7a5-f30f-44b3-b69d-310c14799aa6
+[   3896.508887] XFS (dm-0): Ending clean mount
+[   3896.512676] fsyncretry: step 0: reads
+[   3896.512764] fsyncretry: step 1: arm
+[   3896.577879] buffer_io_error: 6 callbacks suppressed
+[   3896.577882] Buffer I/O error on dev dm-0, logical block 200, async page read
+[   3896.577899] Buffer I/O error on dev dm-0, logical block 201, async page read
+[   3896.577906] Buffer I/O error on dev dm-0, logical block 202, async page read
+[   3896.577913] Buffer I/O error on dev dm-0, logical block 203, async page read
+[   3896.577920] Buffer I/O error on dev dm-0, logical block 204, async page read
+[   3896.577927] Buffer I/O error on dev dm-0, logical block 205, async page read
+[   3896.577934] Buffer I/O error on dev dm-0, logical block 206, async page read
+[   3896.577940] Buffer I/O error on dev dm-0, logical block 207, async page read
+[   3896.578006] Buffer I/O error on dev dm-0, logical block 200, async page read
+[   3896.578015] Buffer I/O error on dev dm-0, logical block 201, async page read
+[   3896.581537] fsyncretry: step 1: store B, fdatasync
+[   3896.581869] dm-0: writeback error on inode 131, offset 0, sector 192
+[   3896.581914] fsyncretry: step 2: fdatasync again
+[   3896.582476] fsyncretry: step 3: disarm
+[   3896.595437] fsyncretry: step 3: fdatasync, reads, new descriptor's fdatasync
+[   3896.596155] fsyncretry: step 4: store B again, fdatasync, reads
+[   3896.596917] fsyncretry: step 5: arm
+[   3896.612881] fsyncretry: step 5.1: store C, fdatasync
+[   3896.613117] dm-0: writeback error on inode 131, offset 0, sector 192
+[   3896.613157] fsyncretry: step 5.2: store C, fdatasync
+[   3896.613406] dm-0: writeback error on inode 131, offset 0, sector 192
+[   3896.613431] fsyncretry: step 5.3: store C, fdatasync
+[   3896.613652] dm-0: writeback error on inode 131, offset 0, sector 192
+[   3896.613674] fsyncretry: step 5: disarm, reads
+[   3896.627359] fsyncretry: step 6: munmap, fadvise, read
+[   3896.627616] fsyncretry: steps done
+[   3896.642310] XFS (dm-0): Unmounting Filesystem 8716a7a5-f30f-44b3-b69d-310c14799aa6
+[   3896.736870] fsyncretry: xfs case ends

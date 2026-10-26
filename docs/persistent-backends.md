@@ -1210,12 +1210,96 @@ the script now selects the window by timestamp.
   validates back into its slot before replaying, so that the page is written
   again (§5 #7), at one more boundary per recovery.
 
+#### Without the engine (2026-10-26): the failed page, a retry and a rewrite
+
+Sean ran `scripts/desktop-fsyncretry-check.py run` with sudo on 2026-10-26, at
+`e901e05a`, on kernel 7.0.0-38:
+`results/20261026T011106Z-sean-tan-PC-fsyncretry-yd_4bwf2`, ext4 and XFS once
+each. It runs no engine code. A fresh file system with default options, on a
+dm device over a loop file (`--direct-io=on`) in `/var/tmp` on `nvme1n1p3`,
+holds a 1 MiB file of `A`, written and fsynced. One 4 KiB page, at file offset
+4096, is stored through a `MAP_SHARED` mapping and synced with `fdatasync`, as
+`FileMmapRegion`'s boundary does, while the page's eight sectors go to the dm
+`error` target, as in the runs above; the table is read back after every load
+(`dm-tables.txt`). Before each step the script writes a marker line to
+`/dev/kmsg`, and it reads each case's kernel records back from there with the
+kernel's own timestamps (`kmsg.txt`); journald's timestamps say when it read a
+message, not when the kernel printed it.
+
+| Step | Device | ext4 and XFS |
+|---|---|---|
+| 1. Store B; `fdatasync` | failing | `EIO` |
+| 2. `fdatasync` again | failing | 0 |
+| 3. `fdatasync`; the page through the cache and with `O_DIRECT`; `fdatasync` on a new descriptor | restored | 0; B and A; 0 |
+| 4. Store B again; `fdatasync`; the page with `O_DIRECT` | restored | 0; B |
+| 5. Three times: store C, `fdatasync`; then the page through the cache and with `O_DIRECT` | failing; restored for the reads | `EIO` each time; C and B |
+| 6. `munmap`, `posix_fadvise(POSIX_FADV_DONTNEED)`, the page through the cache | restored | B |
+
+All 17 checks matched the predictions in the script's header (`summary.txt`).
+
+- **The failure is `EIO`, reported once.** The first `fdatasync` after the
+  failed write returned `EIO`; the second returned 0 with the device still
+  failing. In `kmsg.txt` each file system logged one failed write between
+  step 1's markers and one in each of steps 5.1–5.3 (ext4: `I/O error 10
+  writing to inode 13`; XFS: `writeback error on inode 131`), and none between
+  step 2's marker and the restore, when any write of those sectors would have
+  failed and been logged. Four lines each is under the ten per five seconds
+  that ext4's per-file-system warning limit and iomap's `pr_err_ratelimited()`
+  allow (v7.0 `fs/ext4/super.c`, `include/linux/ratelimit_types.h`). So the
+  second `fdatasync` sent no write of the page: it reported success for bytes
+  the device never received. The runs above did not record the errno, since
+  `RegionFileIO.fdatasync()` returns only success or failure.
+- **The failed page keeps its new bytes, and a reopen sees no error.** With
+  the device restored, the page read B through the cache and A with
+  `O_DIRECT`, and `fdatasync` returned 0 on the descriptor that saw the error
+  and on a new one. That is the state from which the same-boot reopen above
+  read its log, seen here on a plain file, as Rebello et al. found on Linux
+  5.2 (Table 1, Q4–Q5).
+- **A page stored again is written again; a lasting error fails each time.**
+  Storing the same bytes again and syncing left the device holding B
+  (step 4). With the error left in place, each of three store-and-sync
+  attempts returned `EIO` and logged a failed write (step 5).
+- **Eviction leaves the device's copy.** After `munmap` and
+  `posix_fadvise(POSIX_FADV_DONTNEED)` the page read B, the device's copy; C,
+  never written, was gone. One run; the call is advice, not a guarantee.
+- **What this says about retrying a failed boundary.** *Inference:* a
+  `DualTxnWal` that retried its boundary would get 0 from the second
+  `fdatasync` (step 2) and acknowledge a record the device lacks, lost at the
+  next reboot even without a reopen; the latch forbids that retry. A retry
+  that first stores the marked pages back would succeed once the error clears
+  (step 4), and `FileMmapRegion` keeps its marks after a failed sync
+  (`syncMarked()` clears them only on success), so it would know which pages
+  to store. Against a lasting error every attempt fails (step 5), so a bounded
+  retry still ends in the latch and the reopen above. Not built.
+- **Reading the kernel log.** ext4's `starting block 2161` names the block
+  after the failed one, 2160 (sector 17,280): `ext4_end_bio()` reads the bio's
+  sector at completion, after dm has trimmed the bio past each target's part
+  (v7.0 `fs/ext4/page-io.c`; `drivers/md/dm.c`, `dm_split_and_process_bio()`).
+  Its `Buffer I/O error` lines list blocks 2159–2168, the buffers before and
+  after the stored page's, so the failed write began at file offset 0; XFS's
+  line gives offset 0, sector 192, with the page at sector 200. Only the eight
+  sectors failed; dm wrote the parts on either side through the linear
+  targets. *Inference:* each failed write covered the whole 1 MiB file, most
+  likely one large folio written whole. ext4's `buffer_io_error: 1014
+  callbacks suppressed`, before this run's first such line, counts the lines
+  suppressed since a run of the same steps at 11:51 the same boot, by a copy
+  of the script before it was committed (no results kept; its four failed
+  writes and ten printed lines are in the journal): 4 × 256 − 10 = 1,014,
+  the file being 256 blocks. XFS's `async page read` errors on sectors
+  200–207 after the first arm are udev's probe of the dm device after the
+  table change, as in the XFS run above: reads of the device, not of the file.
+- **Limits.** One run per file system, on one kernel; a plain file, not the
+  engine; the error is injected below the file system by dm, so what a
+  failing drive and its driver do first (their retries, or a failed request
+  wider than the page) is not tested.
+
 ### What the checks leave open
 
 - Repeats of the kernel reset, and cuts other than straight after an
   acknowledgement.
 - Repeats of the failed-write runs (`single` three times on ext4 and twice on
-  XFS, the two longer histories once each), a lasting error, transactions whose
+  XFS, the two longer histories once each), a lasting error under the engine (a
+  plain file's is [above](#without-the-engine-2026-10-26-the-failed-page-a-retry-and-a-rewrite)), transactions whose
   after-images span more pages, and, for the direct backend, a failed flush
   after a completed write.
 - Whether the drive keeps a flushed write through a power failure: B3 and B4's

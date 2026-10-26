@@ -1,0 +1,7 @@
+---- loop
+NAME        BACK-FILE                             DIO LOG-SEC
+/dev/loop25 /var/tmp/fsyncretry-u3xe1cdw/disk.img   1     512
+---- mkfs
+mkfs.ext4 -q -F -b 4096 -E lazy_itable_init=0,lazy_journal_init=0 /dev/mapper/fsyncretry-960c44ae
+---- mounted
+/dev/mapper/fsyncretry-960c44ae ext4 rw,relatime

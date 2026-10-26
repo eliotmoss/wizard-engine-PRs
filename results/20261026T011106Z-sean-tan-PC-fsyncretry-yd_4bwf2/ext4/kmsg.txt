@@ -1,0 +1,37 @@
+# Kernel records for this case, read from /dev/kmsg, kernel timestamps (s since
+# boot); 'fsyncretry:' lines are the script's step markers; UFW and AppArmor
+# lines dropped (0).
+[   3896.255957] fsyncretry: ext4 case begins
+[   3896.259078] loop25: detected capacity change from 0 to 1048576
+[   3896.277849] EXT4-fs (dm-0): mounted filesystem f90a83df-6982-4956-8e40-feff91558682 r/w with ordered data mode. Quota mode: none.
+[   3896.281263] fsyncretry: step 0: reads
+[   3896.281409] fsyncretry: step 1: arm
+[   3896.350008] fsyncretry: step 1: store B, fdatasync
+[   3896.350348] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+[   3896.350352] buffer_io_error: 1014 callbacks suppressed
+[   3896.350353] Buffer I/O error on device dm-0, logical block 2159
+[   3896.350362] Buffer I/O error on device dm-0, logical block 2160
+[   3896.350366] Buffer I/O error on device dm-0, logical block 2161
+[   3896.350371] Buffer I/O error on device dm-0, logical block 2162
+[   3896.350374] Buffer I/O error on device dm-0, logical block 2163
+[   3896.350378] Buffer I/O error on device dm-0, logical block 2164
+[   3896.350381] Buffer I/O error on device dm-0, logical block 2165
+[   3896.350385] Buffer I/O error on device dm-0, logical block 2166
+[   3896.350388] Buffer I/O error on device dm-0, logical block 2167
+[   3896.350392] Buffer I/O error on device dm-0, logical block 2168
+[   3896.350545] fsyncretry: step 2: fdatasync again
+[   3896.351130] fsyncretry: step 3: disarm
+[   3896.363435] fsyncretry: step 3: fdatasync, reads, new descriptor's fdatasync
+[   3896.364121] fsyncretry: step 4: store B again, fdatasync, reads
+[   3896.364912] fsyncretry: step 5: arm
+[   3896.381788] fsyncretry: step 5.1: store C, fdatasync
+[   3896.382038] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+[   3896.382095] fsyncretry: step 5.2: store C, fdatasync
+[   3896.382315] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+[   3896.382352] fsyncretry: step 5.3: store C, fdatasync
+[   3896.382567] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+[   3896.382597] fsyncretry: step 5: disarm, reads
+[   3896.397420] fsyncretry: step 6: munmap, fadvise, read
+[   3896.397674] fsyncretry: steps done
+[   3896.411565] EXT4-fs (dm-0): unmounting filesystem f90a83df-6982-4956-8e40-feff91558682.
+[   3896.487830] fsyncretry: ext4 case ends

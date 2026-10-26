@@ -1,0 +1,6 @@
+file_offset 4096
+page_bytes 4096
+extent logical 4096 physical 102400 length 4096 flags 0x1
+device_byte 102400
+fail_sector 200
+fail_sectors 8

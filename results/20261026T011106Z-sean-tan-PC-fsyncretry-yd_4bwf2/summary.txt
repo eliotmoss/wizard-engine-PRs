@@ -1,0 +1,20 @@
+# scripts/desktop-fsyncretry-check.py at e901e05ad4fa668d18b32bf4d2af3b1d08d4a4e7; kernel 7.0.0-38-generic
+# per file system the result of each step, then its prediction; * = differs
+step                                                 ext4   xfs    predicted
+0 before: cache                                      A      A      A
+0 before: device (O_DIRECT)                          A      A      A
+1 store B, fdatasync                                 EIO    EIO    EIO
+2 fdatasync again (naive retry)                      ok     ok     ok
+3 device restored, fdatasync                         ok     ok     ok
+3: cache                                             B      B      B
+3: device (O_DIRECT)                                 A      A      A
+3 new descriptor, fdatasync                          ok     ok     ok
+4 store B again (rewrite retry), fdatasync           ok     ok     ok
+4: cache                                             B      B      B
+4: device (O_DIRECT)                                 B      B      B
+5.1 lasting error: store C, fdatasync                EIO    EIO    EIO
+5.2 lasting error: store C, fdatasync                EIO    EIO    EIO
+5.3 lasting error: store C, fdatasync                EIO    EIO    EIO
+5: cache                                             C      C      C
+5: device (O_DIRECT)                                 B      B      B
+6 munmap, fadvise(DONTNEED): cache                   B      B      B

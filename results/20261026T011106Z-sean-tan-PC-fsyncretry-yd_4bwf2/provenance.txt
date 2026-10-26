@@ -1,0 +1,36 @@
+recorded 2026-10-26T01:11:06+00:00
+host pc-ubuntu
+kernel Linux pc-ubuntu 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+boot_id f7f98b3e-674c-4684-b9b0-dd3fad68a0cd
+owner sean-tan
+commit e901e05ad4fa668d18b32bf4d2af3b1d08d4a4e7
+script_sha256 4ca87e3637406966c99cc3668d3bc494629d3d2efa449654b1c9e21e1b1cdbb3
+python 3.14.4
+filesystems ext4 xfs
+image 512 MiB sparse under /var/tmp; loop --direct-io=on
+file 1024 KiB of A, fsynced; test page at file offset 4096
+fault dm error target over the page's 8 sectors, armed for steps 1-2 and for step 5
+printk_devkmsg on
+---- git status --short
+?? results/20261026T011106Z-sean-tan-PC-fsyncretry-yd_4bwf2/
+---- tools
+losetup from util-linux 2.41.3
+Library version:   1.02.205 (2025-02-27)
+Driver version:    4.50.0
+mke2fs 1.47.2 (1-Jan-2025)
+mkfs.xfs version 6.18.0
+---- dm targets
+striped          v1.7.0
+linear           v1.5.0
+error            v1.7.0
+---- /var/tmp
+/dev/nvme1n1p3 ext4 rw,relatime
+---- dm devices before the run
+No devices found
+---- vm.dirty_*
+dirty_background_bytes 0
+dirty_background_ratio 10
+dirty_bytes 0
+dirty_expire_centisecs 3000
+dirty_ratio 20
+dirty_writeback_centisecs 500

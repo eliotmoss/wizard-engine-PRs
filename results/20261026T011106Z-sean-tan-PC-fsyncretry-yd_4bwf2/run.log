@@ -1,0 +1,114 @@
+kernel 7.0.0-38-generic, python 3.14.4, commit e901e05ad4fa668d18b32bf4d2af3b1d08d4a4e7
+==== ext4
+  ext4 rw,relatime
+  page at file offset 4096, device byte 8847360 (sector 17280)
+  0 before: cache                                      A          predicted A        
+  0 before: device (O_DIRECT)                          A          predicted A        
+  1 store B, fdatasync                                 EIO        predicted EIO      
+  2 fdatasync again (naive retry)                      ok         predicted ok       
+  3 device restored, fdatasync                         ok         predicted ok       
+  3: cache                                             B          predicted B        
+  3: device (O_DIRECT)                                 A          predicted A        
+  3 new descriptor, fdatasync                          ok         predicted ok       
+  4 store B again (rewrite retry), fdatasync           ok         predicted ok       
+  4: cache                                             B          predicted B        
+  4: device (O_DIRECT)                                 B          predicted B        
+  5.1 lasting error: store C, fdatasync                EIO        predicted EIO      
+  5.2 lasting error: store C, fdatasync                EIO        predicted EIO      
+  5.3 lasting error: store C, fdatasync                EIO        predicted EIO      
+  5: cache                                             C          predicted C        
+  5: device (O_DIRECT)                                 B          predicted B        
+  6 munmap, fadvise(DONTNEED): cache                   B          predicted B        
+  kernel:
+    [   3896.255957] fsyncretry: ext4 case begins
+    [   3896.259078] loop25: detected capacity change from 0 to 1048576
+    [   3896.277849] EXT4-fs (dm-0): mounted filesystem f90a83df-6982-4956-8e40-feff91558682 r/w with ordered data mode. Quota mode: none.
+    [   3896.281263] fsyncretry: step 0: reads
+    [   3896.281409] fsyncretry: step 1: arm
+    [   3896.350008] fsyncretry: step 1: store B, fdatasync
+    [   3896.350348] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+    [   3896.350352] buffer_io_error: 1014 callbacks suppressed
+    [   3896.350353] Buffer I/O error on device dm-0, logical block 2159
+    [   3896.350362] Buffer I/O error on device dm-0, logical block 2160
+    [   3896.350366] Buffer I/O error on device dm-0, logical block 2161
+    [   3896.350371] Buffer I/O error on device dm-0, logical block 2162
+    [   3896.350374] Buffer I/O error on device dm-0, logical block 2163
+    [   3896.350378] Buffer I/O error on device dm-0, logical block 2164
+    [   3896.350381] Buffer I/O error on device dm-0, logical block 2165
+    [   3896.350385] Buffer I/O error on device dm-0, logical block 2166
+    [   3896.350388] Buffer I/O error on device dm-0, logical block 2167
+    [   3896.350392] Buffer I/O error on device dm-0, logical block 2168
+    [   3896.350545] fsyncretry: step 2: fdatasync again
+    [   3896.351130] fsyncretry: step 3: disarm
+    [   3896.363435] fsyncretry: step 3: fdatasync, reads, new descriptor's fdatasync
+    [   3896.364121] fsyncretry: step 4: store B again, fdatasync, reads
+    [   3896.364912] fsyncretry: step 5: arm
+    [   3896.381788] fsyncretry: step 5.1: store C, fdatasync
+    [   3896.382038] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+    [   3896.382095] fsyncretry: step 5.2: store C, fdatasync
+    [   3896.382315] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+    [   3896.382352] fsyncretry: step 5.3: store C, fdatasync
+    [   3896.382567] EXT4-fs warning (device dm-0): ext4_end_bio:369: I/O error 10 writing to inode 13 starting block 2161)
+    [   3896.382597] fsyncretry: step 5: disarm, reads
+    [   3896.397420] fsyncretry: step 6: munmap, fadvise, read
+    [   3896.397674] fsyncretry: steps done
+    [   3896.411565] EXT4-fs (dm-0): unmounting filesystem f90a83df-6982-4956-8e40-feff91558682.
+    [   3896.487830] fsyncretry: ext4 case ends
+==== xfs
+  xfs rw,relatime,inode64,logbufs=8,logbsize=32k,noquota
+  page at file offset 4096, device byte 102400 (sector 200)
+  0 before: cache                                      A          predicted A        
+  0 before: device (O_DIRECT)                          A          predicted A        
+  1 store B, fdatasync                                 EIO        predicted EIO      
+  2 fdatasync again (naive retry)                      ok         predicted ok       
+  3 device restored, fdatasync                         ok         predicted ok       
+  3: cache                                             B          predicted B        
+  3: device (O_DIRECT)                                 A          predicted A        
+  3 new descriptor, fdatasync                          ok         predicted ok       
+  4 store B again (rewrite retry), fdatasync           ok         predicted ok       
+  4: cache                                             B          predicted B        
+  4: device (O_DIRECT)                                 B          predicted B        
+  5.1 lasting error: store C, fdatasync                EIO        predicted EIO      
+  5.2 lasting error: store C, fdatasync                EIO        predicted EIO      
+  5.3 lasting error: store C, fdatasync                EIO        predicted EIO      
+  5: cache                                             C          predicted C        
+  5: device (O_DIRECT)                                 B          predicted B        
+  6 munmap, fadvise(DONTNEED): cache                   B          predicted B        
+  kernel:
+    [   3896.488406] fsyncretry: xfs case begins
+    [   3896.489983] loop25: detected capacity change from 0 to 1048576
+    [   3896.506844] XFS (dm-0): Mounting V5 Filesystem 8716a7a5-f30f-44b3-b69d-310c14799aa6
+    [   3896.508887] XFS (dm-0): Ending clean mount
+    [   3896.512676] fsyncretry: step 0: reads
+    [   3896.512764] fsyncretry: step 1: arm
+    [   3896.577879] buffer_io_error: 6 callbacks suppressed
+    [   3896.577882] Buffer I/O error on dev dm-0, logical block 200, async page read
+    [   3896.577899] Buffer I/O error on dev dm-0, logical block 201, async page read
+    [   3896.577906] Buffer I/O error on dev dm-0, logical block 202, async page read
+    [   3896.577913] Buffer I/O error on dev dm-0, logical block 203, async page read
+    [   3896.577920] Buffer I/O error on dev dm-0, logical block 204, async page read
+    [   3896.577927] Buffer I/O error on dev dm-0, logical block 205, async page read
+    [   3896.577934] Buffer I/O error on dev dm-0, logical block 206, async page read
+    [   3896.577940] Buffer I/O error on dev dm-0, logical block 207, async page read
+    [   3896.578006] Buffer I/O error on dev dm-0, logical block 200, async page read
+    [   3896.578015] Buffer I/O error on dev dm-0, logical block 201, async page read
+    [   3896.581537] fsyncretry: step 1: store B, fdatasync
+    [   3896.581869] dm-0: writeback error on inode 131, offset 0, sector 192
+    [   3896.581914] fsyncretry: step 2: fdatasync again
+    [   3896.582476] fsyncretry: step 3: disarm
+    [   3896.595437] fsyncretry: step 3: fdatasync, reads, new descriptor's fdatasync
+    [   3896.596155] fsyncretry: step 4: store B again, fdatasync, reads
+    [   3896.596917] fsyncretry: step 5: arm
+    [   3896.612881] fsyncretry: step 5.1: store C, fdatasync
+    [   3896.613117] dm-0: writeback error on inode 131, offset 0, sector 192
+    [   3896.613157] fsyncretry: step 5.2: store C, fdatasync
+    [   3896.613406] dm-0: writeback error on inode 131, offset 0, sector 192
+    [   3896.613431] fsyncretry: step 5.3: store C, fdatasync
+    [   3896.613652] dm-0: writeback error on inode 131, offset 0, sector 192
+    [   3896.613674] fsyncretry: step 5: disarm, reads
+    [   3896.627359] fsyncretry: step 6: munmap, fadvise, read
+    [   3896.627616] fsyncretry: steps done
+    [   3896.642310] XFS (dm-0): Unmounting Filesystem 8716a7a5-f30f-44b3-b69d-310c14799aa6
+    [   3896.736870] fsyncretry: xfs case ends
+0 step(s) differ from the prediction
+results: results/20261026T011106Z-sean-tan-PC-fsyncretry-yd_4bwf2

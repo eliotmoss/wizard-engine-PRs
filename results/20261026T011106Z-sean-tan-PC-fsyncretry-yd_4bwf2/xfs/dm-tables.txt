@@ -1,0 +1,14 @@
+---- created: all linear
+0 1048576 linear 7:25 0
+---- armed
+0 200 linear 7:25 0
+200 8 error 
+208 1048368 linear 7:25 208
+---- restored: all linear
+0 1048576 linear 7:25 0
+---- armed
+0 200 linear 7:25 0
+200 8 error 
+208 1048368 linear 7:25 208
+---- restored: all linear
+0 1048576 linear 7:25 0
