@@ -1,0 +1,100 @@
+Full x86-64-linux unit suite, engine 1e2824b4 (pwregions), sean-tan-PC, 2026-10-26
+
+The first run after the persistence rename (1e2824b4, docs/naming.md), which
+changes names only. Outcome, read from unit.log. The harness (Virgil
+lib/test/UnitTests.v3) has no skip status: every registered test runs and
+either passes, fails, or fails under a name listed in an --expected file
+("##-ok (ignored failure: ...)").
+
+  registered and run   2,088  ("##>2088 unit tests"; 2,088 "##+" starts, 2,088 "##-" results)
+  passed               2,081
+  expected failures        7  exactly the 7 names in test/unittest.failures.x86-64-linux:
+                              jit:invalid, lazy:invalid, probe:insert_g1,
+                              jit:dyn_probe_insert_osr, lazy:dyn_probe_insert_osr,
+                              lazy:call_indirect_subtype, lazy:rcall_indirect
+  unexpected failures      0
+  skipped                  0  (the harness cannot skip)
+
+The same tests as 20261025T112614Z (engine 8593399a): mapping that run's
+persistence prefixes to the new ones (docs/naming.md, "Test groups") gives
+exactly the 2,088 names in this unit.log, each once. Only the order differs,
+because build.sh's glob lists the renamed test files in a different order.
+
+Implementation-specific (persistence) tests: 377 registrations in twenty files;
+all 377 ran and all 377 passed.
+
+  file                            registered  ran  pass  fail   groups
+  AllocatorCrashTest.v3                   13   13    13     0   allocator_crash: 13
+  BTreeCrashTest.v3                        7    7     7     0   btree_crash: 7
+  CrashControlTest.v3                      4    4     4     0   crash_control: 4
+  CrashExplorerTest.v3                    16   16    16     0   crash_explorer: 16
+  CrashModelTest.v3                       10   10    10     0   crash_model: 10
+  CrashRecoveryTest.v3                    14   14    14     0   crash_recovery: 14
+  DirectIoRegionTest.v3                   23   23    23     0   direct_io: 23
+  MappedFileRegionTest.v3                  6    6     6     0   mapped_file: 6
+  PWBTreeTest.v3                          23   23    23     0   pwbtree: 17, pwbtree_file: 4, pwbtree_dio: 2
+  PWOpsTest.v3                             6    6     6     0   pwops: 6
+  PWSieveTest.v3                          13   13    13     0   pwsieve: 10, pwsieve_file: 3
+  PersistenceTraceTest.v3                 10   10    10     0   persistence_trace: 10
+  ProviderTest.v3                         21   21    21     0   provider: 21
+  ReadDrivenExplorerTest.v3               11   11    11     0   read_driven: 11
+  RegionAllocatorTest.v3                 101  101   101     0   allocator: 23, allocator_immix: 7, allocator_factories: 5, allocator_overflow: 1, allocator_recovery: 2, storage_backend: 13, allocator_file: 50
+  RingWalTest.v3                          28   28    28     0   ring_wal: 28
+  SieveCrashTest.v3                        8    8     8     0   sieve_crash: 8
+  SingleTxnWalTest.v3                      4    4     4     0   single_wal: 4
+  TransactionCacheTest.v3                 16   16    16     0   transaction_cache: 16
+  TwoSlotWalTest.v3                       43   43    43     0   two_slot_wal: 43
+  total (twenty files)                   377  377   377     0
+
+Old file names (8593399a -> 1e2824b4): PersistentAllocatorTest ->
+AllocatorCrashTest, PersistentBTreeTest -> BTreeCrashTest,
+PersistentControlTest -> CrashControlTest, PersistentExplorerTest ->
+CrashExplorerTest, PersistentImageTest -> CrashModelTest,
+PersistentRecoveryTest -> CrashRecoveryTest, FileMmapRegionTest ->
+MappedFileRegionTest, PersistentTraceTest -> PersistenceTraceTest,
+PersistentOperationsTest -> ProviderTest, PersistentLazyExplorerTest ->
+ReadDrivenExplorerTest, TxnPWRegionTest -> RegionAllocatorTest,
+MultiTxnWalTest -> RingWalTest, PersistentSieveTest -> SieveCrashTest,
+RegionTransactionTest -> TransactionCacheTest, DualTxnWalTest ->
+TwoSlotWalTest; per file the counts are 20261025T112614Z's.
+
+What was counted: as in 20261025T112614Z (count_regs.py, run on the
+committed tree with `git show 1e2824b4:<file>`; registrations.txt;
+summarise.py groups unit.log by registering file, summarise-out.txt). The
+implementation-specific files are every file in test/unittest/x86-64-linux/
+that registers tests except SpcTest.v3, WasiTest.v3 and
+X86_64LinuxExeTest.v3; PWBTree.v3, PWOps.v3, PWSieve.v3 and
+ElidedWriteBackProvider.v3 are helpers and register none.
+
+Backend independence (audit.txt, audit.py). The text search of
+docs/persistent-backends.md, "Audit (2026-10-19)", rerun on the allocator's
+and the log's files with comments set aside: at 1e2824b4 none of the eleven
+medium words (pmem, dax, mmap, msync, fdatasync, direct, fsync, clwb, sfence,
+file, volatile) occurs in either file, in code or in a string. At 3c2b879c the
+only one was "direct", in DirectRegionWriter and DirectRegionReader, now
+UnloggedWriter and RegionReader. Neither file tests or casts to a capitalised
+type; the allocator's names StorageRegion and StorageBackend, the log's only
+StorageRegion; the allocator uses a region's close, persist and range, the log
+its writeBack, drain, persist and range (at 3c2b879c: destroy, persistRange,
+range; prepareChangedRange, persistChanges, persistRange, range).
+
+Not run.
+- PmemDaxIntegrationTest.v3's 2 opt-in tests (pmem_dax:). They are compiled
+  into bin/pmemtest.x86-64-linux and need PWASM_PMEM_TEST_DIR on an fsdax
+  mount. This boot has no memmap= and so no /dev/pmem0, no DAX filesystem is
+  mounted, and sudo asks for a password. `make pmem-integration` built the
+  binary and refused, exit 2 (pmem-integration.txt).
+- Every other harness, and the separate binaries (crash loops, pwreboot,
+  benchmarks).
+
+Ran, with part of the check conditional on the host: as in
+20261025T112614Z. allocator_factories:pw_nv_region and
+allocator_factories:immix_pw_nv_region open their region under /tmp, which
+refuses MAP_SYNC, so each checked only that the factory is safe with no
+backend; storage_backend:pmem_region_tracks_pending_writeback is structural
+only; the O_DIRECT tests' region files went to bin/ on ext4, where they ran
+and passed.
+
+Files: provenance.txt, build.log, unit.log, registrations.txt,
+count_regs.py, summarise.py, summarise-out.txt, audit.py, audit.txt,
+pmem-integration.txt.

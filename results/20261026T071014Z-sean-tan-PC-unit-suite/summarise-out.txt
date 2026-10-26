@@ -1,0 +1,26 @@
+file                               static   ran  pass xfail  fail
+AllocatorCrashTest.v3                  13    13    13     0     0
+BTreeCrashTest.v3                       7     7     7     0     0
+CrashControlTest.v3                     4     4     4     0     0
+CrashExplorerTest.v3                   16    16    16     0     0
+CrashModelTest.v3                      10    10    10     0     0
+CrashRecoveryTest.v3                   14    14    14     0     0
+DirectIoRegionTest.v3                  23    23    23     0     0
+MappedFileRegionTest.v3                 6     6     6     0     0
+PWBTreeTest.v3                         23    23    23     0     0
+PWOpsTest.v3                            6     6     6     0     0
+PWSieveTest.v3                         13    13    13     0     0
+PersistenceTraceTest.v3                10    10    10     0     0
+ProviderTest.v3                        21    21    21     0     0
+ReadDrivenExplorerTest.v3              11    11    11     0     0
+RegionAllocatorTest.v3                101   101   101     0     0
+RingWalTest.v3                         28    28    28     0     0
+SieveCrashTest.v3                       8     8     8     0     0
+SingleTxnWalTest.v3                     4     4     4     0     0
+TransactionCacheTest.v3                16    16    16     0     0
+TwoSlotWalTest.v3                      43    43    43     0     0
+SpcTest.v3                             14    24    24     0     0
+WasiTest.v3                             3     3     3     0     0
+(other)                                 -  1684  1677     7     0
+persistence files: 20, static registrations 377, ran 377, pass 377, expected-fail 0, fail 0
+whole binary: ran 2088, pass 2081, expected-fail 7, fail 0

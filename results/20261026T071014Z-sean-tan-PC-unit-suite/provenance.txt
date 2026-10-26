@@ -1,0 +1,38 @@
+---- revision
+commit   1e2824b47543c05d0cd90d80e4dbb70785c1ec61
+subject  refactor(persistence): name classes, files, methods and tests by role
+branch   pwregions (= origin/pwregions); run in a detached worktree ~/research/wizard-engine-wt-suite at that commit
+dirty    no (git status --short before the build and the run: empty; bin/ is ignored)
+build    bin/Build-x86-64-linux.v3: Version.buildData = "x86-64-linux 2026-10-26 18:10:14 by sean-tan@", Version.minorVersion = 3311 (git rev-list --count HEAD)
+---- host
+hostname pc-ubuntu (results tag sean-tan-PC, as in the other desktop directories)
+kernel   Linux 7.0.0-38-generic #38-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 09:10:14 UTC 2026 x86_64 GNU/Linux
+boot_id  f7f98b3e-674c-4684-b9b0-dd3fad68a0cd
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-38-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash (no memmap=: this boot has no /dev/pmem0)
+cpu      Intel(R) Core(TM) i7-14700KF, 28 CPUs; cpu0 governor powersave; no_turbo 0
+load     2.65 1.76 1.24 (/proc/loadavg, 2026-10-26T07:10:20Z, before the run)
+user     sean-tan; sudo -n: "interactive authentication is required" (no root in this run)
+cwd      /home/sean-tan/research/wizard-engine-wt-suite on /dev/nvme1n1p3 ext4
+/tmp     tmpfs (the backend's O_DIRECT probe refuses it, so the O_DIRECT tests' region files fall back to bin/, on the ext4 above)
+locale   LANG=en_US.UTF-8, LC_COLLATE=en_US.UTF-8 (sets the order build.sh's globs list the sources in, and so the order of the tests)
+---- toolchain
+v3c        /home/sean-tan/research/virgil-titzer/bin/v3c -> bin/current/x86-linux/Aeneas
+version    Aeneas III-11.1975; Build Data: x86-linux 2026-09-17 18:36:46 by sean-tan@ (the binary of results/20261025T112614Z-sean-tan-PC-unit-suite)
+virgil     /home/sean-tan/research/virgil-titzer: HEAD eb52db9784036b89c22edd2c1c9019404709bedb, git status clean, no commits ahead of origin/master
+tools      GNU Make 4.4.1; GNU bash, version 5.3.9(1)-release (x86_64-pc-linux-gnu); git version 2.53.0
+---- build
+started  2026-10-26T07:10:14+00:00
+finished 2026-10-26T07:10:15+00:00 (wall 1.13 s, exit 0)
+command  env SHELLOPTS=xtrace make bin/unittest.x86-64-linux   (trace in build.log)
+  make   ./build.sh unittest x86-64-linux (the same build.sh command and source globs as 20261025T112614Z; the expanded file list is in build.log)
+binary   860dc529b11904f9fbc3ff19d68b7318eae2890e4b571d7fc72dad6f0a7728d5  bin/unittest.x86-64-linux
+---- run
+started  2026-10-26T07:10:20+00:00
+command  /usr/bin/time -v env TEST_TARGET=x86-64-linux test/unit.sh   (cwd: the worktree root; WIZENG_OPTS unset)
+  ran    bin/unittest.x86-64-linux --expected=<worktree>/test/unittest.failures --expected=<worktree>/test/unittest.failures.x86-64-linux
+  make   unit.sh's own make found the binary up to date and ran it unchanged
+  output progress is not on PATH, so unit.sh tees the harness's raw output: unit.log. Its copy in /tmp/sean-tan/wizeng-test/unit/x86-64-linux/unit.sh.log is identical except the first line, where unit.log also has the "Testing unit x86-64-linux |" banner print_testing writes; stderr was empty
+  status unit.sh exited 0, which is tee's status and says nothing about the tests; the outcome is read from unit.log (summary.txt)
+finished 2026-10-26T07:12:23+00:00 (wall 2:02.94, max RSS 730,972 KiB, /usr/bin/time -v)
+---- PMEM DAX
+not run: see pmem-integration.txt

@@ -60,25 +60,40 @@ completes every outstanding CLWB. Two consequences:
 - Because the dirty marking lives in the provider, the elided-writeback mutant
   works unchanged: its no-op `writeBackLine()` leaves nothing to write back.
 
-**Audit (2026-10-19).** A text search of the allocator and the log,
-`X86_64RegionAllocator.v3` and `X86_64TwoSlotWal.v3`, at `afcf5525` and again at
+**Audit (2026-10-19).** (Under the names of the time; [Names](naming.md) maps
+them.) A text search of the allocator and the log,
+`X86_64TxnPWRegion.v3` and `X86_64DualTxnWal.v3`, at `afcf5525` and again at
 `fc7466a3` (after the change to `format()` below), with comments set aside.
 Neither file has a type test (`.?`) or a cast to a backend or region class, or
-names a backend or region class other than the abstract `StorageRegion` and
-`StorageBackend`. Of the medium words searched for (pmem, dax, mmap, msync,
+names a backend or region class other than the abstract `BackendRegion` and
+`TxnRegionBackend`. Of the medium words searched for (pmem, dax, mmap, msync,
 fdatasync, direct, and also fsync, clwb, sfence, file and volatile), only
-"direct" occurs, in the name of `UnloggedWriter`, the allocator's
+"direct" occurs, in the name of `DirectRegionWriter`, the allocator's
 non-transactional writer. `backendRegion` is used only through
-`writeBack`, `drain`, `persist`, `range` and `destroy`,
-besides null checks and being handed to `NativeProviders.installIfAbsent()` and
-`TwoSlotWal`; the region itself comes from `StorageBackend.open()`. The
+`prepareChangedRange`, `persistChanges`, `persistRange`, `range` and `destroy`,
+besides null checks and being handed to `X86_64PersistentOps.ensureFor()` and
+`DualTxnWal`; the region itself comes from `TxnRegionBackend.create()`. The
 backend is chosen outside both files: by `X86_64Backends`
-(`X86_64MappedBackends.v3`) and `Backends` (`StorageRegion.v3`), through the wrappers
-in `X86_64RegionAllocators.v3`, or by a caller that passes its own `StorageBackend`.
+(`X86_64TxnBackend.v3`) and `Backends` (`TxnBackend.v3`), through the wrappers
+in `X86_64PWRegion.v3`, or by a caller that passes its own `TxnRegionBackend`.
 The change to `format()` adds one `backendRegion` call, a second
-`persist()`, for the magic. This is a search of the two files' text, not a
+`persistRange()`, for the magic. This is a search of the two files' text, not a
 proof: it does not follow the calls into the providers and regions, where the
 backends differ by design.
+
+**Rerun (2026-10-26).** The same search at `1e2824b4`, after the rename, on
+`X86_64RegionAllocator.v3` and `X86_64TwoSlotWal.v3`
+(`results/20261026T071014Z-sean-tan-PC-unit-suite/audit.txt`, `audit.py`): none of the
+eleven words occurs in either file, in code or in a string; "direct" went with
+the old names of the writer and the reader, now `UnloggedWriter` and
+`RegionReader`. Neither file has a type test or cast to a capitalised type; the
+allocator names `StorageRegion` and `StorageBackend`, the log only
+`StorageRegion`. The allocator uses a region's `close`, `persist` and `range`,
+the log its `writeBack`, `drain`, `persist` and `range`. The backend is chosen
+by `X86_64Backends` (`X86_64MappedBackends.v3`), `Backends`
+(`StorageRegion.v3`), the `RegionAllocators` factories
+(`X86_64RegionAllocators.v3`), or a caller that passes its own
+`StorageBackend`.
 
 **Safeguards.** Setting `O_DIRECT` proves little, so `open()` checks behaviour:
 a misaligned one-byte `pwrite` must fail with `EINVAL`. That refuses tmpfs (which

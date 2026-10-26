@@ -1,0 +1,63 @@
+# python3 audit.py <engine repo> 1e2824b4
+== src/engine/x86-64/X86_64RegionAllocator.v3 at 1e2824b4
+  pmem       code: -; strings: -
+  dax        code: -; strings: -
+  mmap       code: -; strings: -
+  msync      code: -; strings: -
+  fdatasync  code: -; strings: -
+  direct     code: -; strings: -
+  fsync      code: -; strings: -
+  clwb       code: -; strings: -
+  sfence     code: -; strings: -
+  file       code: -; strings: -
+  volatile   code: -; strings: -
+  type tests/casts to a capitalised type: -
+  backend/region classes named: StorageRegion, StorageBackend
+  region members used: close, persist, range
+== src/engine/x86-64/X86_64TwoSlotWal.v3 at 1e2824b4
+  pmem       code: -; strings: -
+  dax        code: -; strings: -
+  mmap       code: -; strings: -
+  msync      code: -; strings: -
+  fdatasync  code: -; strings: -
+  direct     code: -; strings: -
+  fsync      code: -; strings: -
+  clwb       code: -; strings: -
+  sfence     code: -; strings: -
+  file       code: -; strings: -
+  volatile   code: -; strings: -
+  type tests/casts to a capitalised type: -
+  backend/region classes named: StorageRegion
+  region members used: drain, persist, range, writeBack
+
+# the same at 3c2b879c (old file names), for comparison
+== src/engine/x86-64/X86_64TxnPWRegion.v3 at 3c2b879c
+  pmem       code: -; strings: -
+  dax        code: -; strings: -
+  mmap       code: -; strings: -
+  msync      code: -; strings: -
+  fdatasync  code: -; strings: -
+  direct     code: DirectRegionReader, DirectRegionWriter; strings: -
+  fsync      code: -; strings: -
+  clwb       code: -; strings: -
+  sfence     code: -; strings: -
+  file       code: -; strings: -
+  volatile   code: -; strings: -
+  type tests/casts to a capitalised type: -
+  backend/region classes named: BackendRegion, TxnRegionBackend
+  region members used: destroy, persistRange, range
+== src/engine/x86-64/X86_64DualTxnWal.v3 at 3c2b879c
+  pmem       code: -; strings: -
+  dax        code: -; strings: -
+  mmap       code: -; strings: -
+  msync      code: -; strings: -
+  fdatasync  code: -; strings: -
+  direct     code: DirectRegionReader; strings: -
+  fsync      code: -; strings: -
+  clwb       code: -; strings: -
+  sfence     code: -; strings: -
+  file       code: -; strings: -
+  volatile   code: -; strings: -
+  type tests/casts to a capitalised type: -
+  backend/region classes named: BackendRegion
+  region members used: persistChanges, persistRange, prepareChangedRange, range
