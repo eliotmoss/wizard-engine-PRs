@@ -697,6 +697,31 @@ This exact command passed both `pmem_dax:backend_accepts_map_sync` and
 instruction encoding and production-path smoke tests also passed on that host
 before the DAX suite.
 
+**2026-10-26: a crash at `de6e9c38`, and the fix.** At `de6e9c38`, whose code
+is `8593399a`'s, the same command failed on Magpie.
+`backend_accepts_map_sync` passed, and `clean_remount_and_wal_replay` died with
+`!NullCheckException` at its first `CLWB`, which in this binary is the first
+use of a pre-generated stub (`results/20261026T014838Z-magpie-pmem-dax-suite`).
+strace and gdb (`results/20261026T015941Z-magpie-pmem-dax-suite-diag`) show
+`SEGV_ACCERR` on a store in `X86_64PreGenStubs.gen()`, into an `r-xp` range
+cut out of the binary's data. `deserializeOrGenerateCode()` starts the stubs at
+the first page boundary after `pregen_buffer`'s header and protects them
+read+execute in whole pages. When the buffer starts within a header's length
+(8 + 232 bytes) of a page end, that boundary is the buffer's second, and with
+one page of slack the rounded protection passed the buffer's end and made the
+statics after it read-only. Where the buffer lands depends on the compiler's
+layout: for this binary Magpie's Virgil III-11.1968 hits the case and
+sean-tan-PC's III-11.1975 does not. The Virgil runtime reports SIGSEGV and
+SIGBUS alike as `NullCheckException`. The persistence code only triggers the
+stubs' generation. `8b4dc856` makes the buffer two pages longer than the code,
+which holds while the code is at most 23 pages (it is 90,826 bytes); its
+commit message records a reproduction on sean-tan-PC with Magpie's compiler
+and the full unit binary with the fix (2,088 tests, 2,081 passed, the 7
+expected failures). With it both tests passed on Magpie on 2026-10-26
+(`results/20261026T022951Z-magpie-pmem-dax-suite`), whose `pregen-layout.txt`
+shows the case that crashed, guarded: the buffer 3,960 bytes into its page,
+the code from its second page boundary, and the protection inside the buffer.
+
 The target builds a separate `bin/pmemtest.x86-64-linux` binary. Its two tests
 are not registered in the default unit suite or run by CI. The runner never
 unlinks a caller-selected filename: it atomically reserves a new `0600` file in
