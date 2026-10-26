@@ -1,0 +1,14 @@
+commit daa2e614c445b65b032d02f7da5df01544c4c0a9
+8c1e37e699a00e2a92ab0d3a4fd15f2b1a290176dad1a9434d64702235220938  bin/pmemtest.x86-64-linux
+---- df
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/pmem0      732G  381G  314G  55% /mnt/pmem0.0
+---- badblocks
+---- leftovers
+total 4104
+drwxr-sr-x 2 u7599095 users        4096 Oct 26 12:48 .
+drwxrwsr-- 7 u1093210 ssh-users    4096 Aug 24 15:31 ..
+-rw------- 1 u7599095 users     4194304 Oct 26 12:48 wizard-pmem-u7599095-p251658-0.region
+---- tools
+/usr/bin/gdb
+/usr/bin/strace

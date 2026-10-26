@@ -1,0 +1,44 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+Using temporary PMEM region: /mnt/pmem0.0/sean/wizard-pmem-u7599095-p251800-0.region
+##>2 unit tests
+##+pmem_dax:backend_accepts_map_sync
+##-ok
+##+pmem_dax:clean_remount_and_wal_replay
+
+Program received signal SIGSEGV, Segmentation fault.
+0x000000000820dd28 in X86_64PreGenStubs.gen ()
+$1 = 11
+$2 = 2
+$3 = (void *) 0x82d6fe0
+rip            0x820dd28           0x820dd28 <X86_64PreGenStubs.gen+88>
+rsi            0x82fdac8           137353928
+rdi            0x17307             94983
+rsp            0x81ffae0           0x81ffae0
+=> 0x820dd28 <X86_64PreGenStubs.gen+88>:	mov    %rax,0x82d6fe0
+   0x820dd30 <X86_64PreGenStubs.gen+96>:	ret
+   0x820dd31 <X86_64PreGenStubs.gen+97>:	ret
+0x81ffae0:	0x000000000820dc6d	0x00000000082d6f78
+process 251800
+Mapped address spaces:
+
+          Start Addr           End Addr       Size     Offset  Perms  objfile
+           0x8000000          0x8002000     0x2000        0x0  rw-p   
+           0x8002000          0x8003000     0x1000        0x0  ---p   
+           0x8003000          0x8200000   0x1fd000        0x0  rw-p   
+           0x8200000          0x82b5000    0xb5000        0x0  r-xp   /home/users/u7599095/wizard-engine-PRs/bin/pmemtest.x86-64-linux
+           0x82bd000          0x82c0000     0x3000    0xb4000  rw-p   /home/users/u7599095/wizard-engine-PRs/bin/pmemtest.x86-64-linux
+           0x82c0000          0x82d7000    0x17000    0xb7000  r-xp   /home/users/u7599095/wizard-engine-PRs/bin/pmemtest.x86-64-linux
+           0x82d7000          0x82fe000    0x27000    0xce000  rw-p   /home/users/u7599095/wizard-engine-PRs/bin/pmemtest.x86-64-linux
+           0x82fe000         0x33efe000 0x2bc00000        0x0  rw-p   
+      0x7ffff7a00000     0x7ffff7e00000   0x400000        0x0  rw-s   /mnt/pmem0.0/sean/wizard-pmem-u7599095-p251800-0.region
+      0x7ffff7ff7000     0x7ffff7ff8000     0x1000        0x0  rw-p   
+      0x7ffff7ff8000     0x7ffff7ff9000     0x1000        0x0  ---p   
+      0x7ffff7ff9000     0x7ffff7ffd000     0x4000        0x0  r--p   [vvar]
+      0x7ffff7ffd000     0x7ffff7fff000     0x2000        0x0  r-xp   [vdso]
+      0x7ffffffde000     0x7ffffffff000    0x21000        0x0  rw-p   [stack]
+  0xffffffffff600000 0xffffffffff601000     0x1000        0x0  --xp   [vsyscall]
