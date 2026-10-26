@@ -1,0 +1,61 @@
+Full x86-64-linux unit suite, engine 95e055fa (pwregions), sean-tan-PC, 2026-10-26
+
+The first run after 95e055fa, which makes every backend refuse a region of
+2 GiB or more before it opens anything and adds one test,
+storage_backend:oversized_region_refused_unchanged. Outcome, read from
+unit.log. The harness (Virgil lib/test/UnitTests.v3) has no skip status: every
+registered test runs and either passes, fails, or fails under a name listed in
+an --expected file ("##-ok (ignored failure: ...)").
+
+  registered and run   2,089  ("##>2089 unit tests"; 2,089 "##+" starts, 2,089 "##-" results)
+  passed               2,082
+  expected failures        7  exactly the 7 names in test/unittest.failures.x86-64-linux:
+                              jit:invalid, lazy:invalid, probe:insert_g1,
+                              jit:dyn_probe_insert_osr, lazy:dyn_probe_insert_osr,
+                              lazy:call_indirect_subtype, lazy:rcall_indirect
+  unexpected failures      0
+  skipped                  0  (the harness cannot skip)
+
+The same tests as 20261026T071014Z (engine 1e2824b4) plus the new one: the
+sorted "##+" names of the two unit.logs differ only by
+storage_backend:oversized_region_refused_unchanged.
+
+Implementation-specific (persistence) tests: 378 registrations in twenty files;
+all 378 ran and all 378 passed. RegionAllocatorTest.v3 has 102 (storage_backend:
+14), one more than at 1e2824b4; every other file is unchanged.
+
+file                               static   ran  pass xfail  fail
+AllocatorCrashTest.v3                  13    13    13     0     0
+BTreeCrashTest.v3                       7     7     7     0     0
+CrashControlTest.v3                     4     4     4     0     0
+CrashExplorerTest.v3                   16    16    16     0     0
+CrashModelTest.v3                      10    10    10     0     0
+CrashRecoveryTest.v3                   14    14    14     0     0
+DirectIoRegionTest.v3                  23    23    23     0     0
+MappedFileRegionTest.v3                 6     6     6     0     0
+PWBTreeTest.v3                         23    23    23     0     0
+PWOpsTest.v3                            6     6     6     0     0
+PWSieveTest.v3                         13    13    13     0     0
+PersistenceTraceTest.v3                10    10    10     0     0
+ProviderTest.v3                        21    21    21     0     0
+ReadDrivenExplorerTest.v3              11    11    11     0     0
+RegionAllocatorTest.v3                102   102   102     0     0
+RingWalTest.v3                         28    28    28     0     0
+SieveCrashTest.v3                       8     8     8     0     0
+SingleTxnWalTest.v3                     4     4     4     0     0
+TransactionCacheTest.v3                16    16    16     0     0
+TwoSlotWalTest.v3                      43    43    43     0     0
+SpcTest.v3                             14    24    24     0     0
+WasiTest.v3                             3     3     3     0     0
+(other)                                 -  1684  1677     7     0
+persistence files: 20, static registrations 378, ran 378, pass 378, expected-fail 0, fail 0
+whole binary: ran 2089, pass 2082, expected-fail 7, fail 0
+
+The new test with the check disabled (not part of this run): on the uncommitted
+tree before 95e055fa, with "if (false && size > BackingFile.MAX_REGION)" in
+both mapped backends, the test trapped with TypeCheckException in
+FileBackedRegion.new (MappedFileRegion.new <- MappedFileBackend.open), and the
+8 KiB region file it had written was left as a 2 GiB sparse file whose first
+8 KiB were zero. The commit message of 95e055fa records this.
+
+The DAX suite was not run: this boot has no /dev/pmem0 (pmem-integration.txt).

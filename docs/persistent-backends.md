@@ -481,8 +481,9 @@ Run from a clean tree at the commit under test; each campaign interleaves its
 configurations and pins to the DAX namespace's node.
 
 ```
-# Unit tests: the full binary (at 8593399a on sean-tan-PC, 2,081 of 2,088 pass
-# and the 7 known failures fail; results/20261025T112614Z-sean-tan-PC-unit-suite;
+# Unit tests: the full binary (at 95e055fa on sean-tan-PC, 2,082 of 2,089 pass
+# and the 7 known failures fail; results/20261026T120025Z-sean-tan-PC-unit-suite;
+# 2,081 of 2,088 at 8593399a, results/20261025T112614Z-sean-tan-PC-unit-suite;
 # 2,031 of 2,038 on 2026-10-14), then the file backend's restriction
 # checks on their own, then the
 # opt-in PMEM DAX integration tests
@@ -4576,7 +4577,10 @@ pass; the full unit binary contains 2,088 tests including portable and
 spec-parser coverage, of which 2,081 pass and the 7 listed in
 `test/unittest.failures.x86-64-linux` fail (sean-tan-PC;
 `results/20261025T112614Z-sean-tan-PC-unit-suite`, whose `summary.txt` gives
-the per-file counts and what was counted). The table below lists twelve of the
+the per-file counts and what was counted). At `95e055fa` (2026-10-26), which
+makes every backend refuse a region of 2 GiB or more before opening it, the
+twenty files register 378, all passing, and the full binary 2,089, of which
+2,082 pass and the same 7 fail (`results/20261026T120025Z-sean-tan-PC-unit-suite`). The table below lists twelve of the
 twenty files. The other eight are `DirectIoRegionTest.v3` (23),
 `CrashExplorerTest.v3` (16), `CrashRecoveryTest.v3` (14),
 `AllocatorCrashTest.v3` (13), `ReadDrivenExplorerTest.v3` (11),

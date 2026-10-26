@@ -1,0 +1,28 @@
+# python3 count_regs.py <engine repo> 95e055fa  (registrations per file in test/unittest/x86-64-linux)
+AllocatorCrashTest.v3                13  allocator_crash: 13
+BTreeCrashTest.v3                     7  btree_crash: 7
+CrashControlTest.v3                   4  crash_control: 4
+CrashExplorerTest.v3                 16  crash_explorer: 16
+CrashModelTest.v3                    10  crash_model: 10
+CrashRecoveryTest.v3                 14  crash_recovery: 14
+DirectIoRegionTest.v3                23  direct_io: 23
+ElidedWriteBackProvider.v3            0  
+MappedFileRegionTest.v3               6  mapped_file: 6
+PWBTree.v3                            0  
+PWBTreeTest.v3                       23  pwbtree: 17, pwbtree_file: 4, pwbtree_dio: 2
+PWOps.v3                              0  
+PWOpsTest.v3                          6  pwops: 6
+PWSieve.v3                            0  
+PWSieveTest.v3                       13  pwsieve: 10, pwsieve_file: 3
+PersistenceTraceTest.v3              10  persistence_trace: 10
+ProviderTest.v3                      21  provider: 21
+ReadDrivenExplorerTest.v3            11  read_driven: 11
+RegionAllocatorTest.v3              102  allocator: 23, allocator_immix: 7, allocator_factories: 5, allocator_overflow: 1, allocator_recovery: 2, storage_backend: 14, allocator_file: 50
+RingWalTest.v3                       28  ring_wal: 28
+SieveCrashTest.v3                     8  sieve_crash: 8
+SingleTxnWalTest.v3                   4  single_wal: 4
+SpcTest.v3                           14  spc: 14
+TransactionCacheTest.v3              16  transaction_cache: 16
+TwoSlotWalTest.v3                    43  two_slot_wal: 43
+WasiTest.v3                           3  wasi: 3
+X86_64LinuxExeTest.v3                 0    [+1 other register call(s)]

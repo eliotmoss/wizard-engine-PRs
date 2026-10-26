@@ -1,0 +1,6 @@
+The PMEM DAX integration suite (two tests outside the unit binary) was not run
+at 95e055fa: this boot (boot_id f7f98b3e-674c-4684-b9b0-dd3fad68a0cd) has no
+memmap= on the kernel command line and no /dev/pmem0. Its last run is
+results/20261026T022951Z-magpie-pmem-dax-suite, at 8b4dc856. 95e055fa changes
+PmemBackend.open only by the size check before the file is opened, which those
+two tests' regions (well under 2 GiB) pass.
