@@ -36,7 +36,7 @@
 //       probe-arm, it resets the machine instead of exiting, straight after
 //       the fsync that makes the last acknowledgement durable.
 //   verify <region> <file|pmem|direct> <blocks> <blockSize> <setup-cursor> <acked-cursor> <acked-count>
-//       After the reboot: checks the raw image before mounting (PWRegion
+//       After the reboot: checks the raw image before mounting (RegionAllocator
 //       formats a region whose header is missing, which would destroy the
 //       evidence), then mounts, recovers, and checks acknowledged progress,
 //       the allocator and sieve invariants, and the prime count.
@@ -50,14 +50,14 @@
 //
 // Three more modes drive a failed persistence boundary under a real EIO
 // from the block layer, for scripts/desktop-fsyncfail-check.sh, which maps
-// the log chunk to device sectors and fails writes there while fault-commit
+// the log block to device sectors and fails writes there while fault-commit
 // waits. File and direct backends only: the question is the page cache.
 //
 //   fault-prepare <dir> <state-file> <file|direct> [blocks] [blockSize] [steps] [scenario]
-//       As setup; for the file backend it then rewrites the log chunk's own
+//       As setup; for the file backend it then rewrites the log block's own
 //       bytes and fdatasyncs, so every page of it is allocated and written
 //       before a fault is armed (the direct backend's format writes every
-//       unit). Records the log chunk's offset and length and the marker word.
+//       unit). Records the log block's offset and length and the marker word.
 //       Scenario single (the default) stops at the clean close. stale-slot and
 //       tear then mount the closed region again (CLEAN, so the next sequence
 //       is 1), commit N-2 (the marker word M = A) and N-1 (M = B), call
@@ -192,24 +192,24 @@ def parseProvider(s: string) -> bool {
         return false;
 }
 
-def openBackend() -> TxnRegionBackend {
-        var backend: TxnRegionBackend;
-        if (RebootConfig.usePmem) backend = X86_64Backends.getPersistent(RebootConfig.path);
+def openBackend() -> StorageBackend {
+        var backend: StorageBackend;
+        if (RebootConfig.usePmem) backend = X86_64Backends.pmem(RebootConfig.path);
         else if (RebootConfig.useDirect) backend = DirectIoBackend.new(RebootConfig.path, DirectIoTarget.FILE);
-        else backend = X86_64Backends.getFileMapped(RebootConfig.path);
-        if (RebootConfig.elideWriteback) return ElidedWritebackBackend.new(backend);
+        else backend = X86_64Backends.mappedFile(RebootConfig.path);
+        if (RebootConfig.elideWriteback) return ElidedWriteBackBackend.new(backend);
         return backend;
 }
 
 // The same anti-fallback checks as the crash loop: a file mapping reported as
 // a PMEM run, or an ordinary provider reported as the mutant, would invert the
 // comparison this experiment exists to make.
-def checkBackendRegion(region: BackendRegion) -> string {
+def checkStorageRegion(region: StorageRegion) -> string {
         if (region == null) return "backend region could not be created";
-        if (RebootConfig.usePmem && !PmemMmapRegion.?(region)) return "pmem mode did not produce a PmemMmapRegion";
+        if (RebootConfig.usePmem && !PmemRegion.?(region)) return "pmem mode did not produce a PmemRegion";
         if (RebootConfig.useDirect && !DirectIoRegion.?(region)) return "direct mode did not produce a DirectIoRegion";
-        if (!RebootConfig.usePmem && !RebootConfig.useDirect && !FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
-        def elided = ElidedWritebackOperations.?(region.persistentOperations());
+        if (!RebootConfig.usePmem && !RebootConfig.useDirect && !MappedFileRegion.?(region)) return "file mode did not produce a MappedFileRegion";
+        def elided = ElidedWriteBackProvider.?(region.provider());
         if (RebootConfig.elideWriteback && !elided) return "elide-clwb did not install the elided-writeback provider";
         if (!RebootConfig.elideWriteback && elided) return "an ordinary run installed the elided-writeback provider";
         return null;
@@ -232,9 +232,9 @@ def reservePath(dir: string, stem: string) -> string {
                         .puts(dir).puts("/").puts(stem).puts("-u").putd(uid)
                         .puts("-p").putd(pid).puts("-").putd(attempt).puts(".region")
                         .toString();
-                def fd = RegionFileIO.createExclusive(path);
+                def fd = BackingFile.createExclusive(path);
                 if (fd >= 0) {
-                        RegionFileIO.close(fd);
+                        BackingFile.close(fd);
                         return path;
                 }
                 if (fd != -LinuxConst.EEXIST) return null;
@@ -251,11 +251,11 @@ class StateFile(fd: int) {
                 System.fileWriteK(fd, bytes, 0, bytes.length);
                 return Linux.syscall(LinuxConst.SYS_fsync, fd).0 == 0;
         }
-        def close() { RegionFileIO.close(fd); }
+        def close() { BackingFile.close(fd); }
 }
 
 def openState(path: string) -> StateFile {
-        def fd = RegionFileIO.create(path);
+        def fd = BackingFile.create(path);
         if (fd < 0) return null;
         return StateFile.new(fd);
 }
@@ -337,10 +337,10 @@ def probeArm(args: Array<string>) -> int {
         def state = openState(args[2]);
         if (state == null) return fail("could not create the state file");
 
-        def region = openBackend().create(bytes, BackendProt.READ.mask | BackendProt.WRITE.mask, true);
-        def err = checkBackendRegion(region);
+        def region = openBackend().open(bytes, BackendProt.READ.mask | BackendProt.WRITE.mask, OpenMode.FORMAT);
+        def err = checkStorageRegion(region);
         if (err != null) return fail(err);
-        def ops = X86_64PersistentOps.ensureFor(region);
+        def ops = NativeProviders.installIfAbsent(region);
         def lines = bytes / u64.!(LINE);
 
         // Recorded before any store, so a reboot at any later point still
@@ -357,9 +357,9 @@ def probeArm(args: Array<string>) -> int {
         for (line = 0u64; line < lines; line += 2u64) {
                 def base = line * u64.!(LINE);
                 for (w = 0u64; w < 8u64; w++) ops.storeU64(base + w * 8u64, expectedWord(nonce, line, w));
-                ops.clwb(base);
+                ops.writeBackLine(base);
         }
-        ops.sfence();
+        ops.fence();
         // Unflushed set last, so the flushed set's traffic cannot evict it:
         // every odd line stored, never written back. The fence orders the
         // stores but does not make them durable.
@@ -367,7 +367,7 @@ def probeArm(args: Array<string>) -> int {
                 def base = line * u64.!(LINE);
                 for (w = 0u64; w < 8u64; w++) ops.storeU64(base + w * 8u64, expectedWord(nonce, line, w));
         }
-        ops.sfence();
+        ops.fence();
         // No window: nothing between the last store and the reset, not even
         // the state file's fsync, which could idle the CPU.
         if (resetFd >= 0 && !requestReset(resetFd)) return fail("could not write to the reset descriptor");
@@ -440,8 +440,8 @@ def probeVerify(args: Array<string>) -> int {
 
 // ------------------------------------------------------------------ sieve
 
-def openRegion(blocks: u64, blockSize: u64, fresh: bool) -> PWRegion {
-        return PWRegion.new(openBackend(), blocks, Array<Ref<MetaDataDesc>>.new(0), blockSize, fresh);
+def openRegion(blocks: u64, blockSize: u64, fresh: bool) -> RegionAllocator {
+        return RegionAllocator.new(openBackend(), blocks, Array<Ref<MetadataDescriptor>>.new(0), blockSize, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
 }
 
 def setup(args: Array<string>) -> int {
@@ -458,7 +458,7 @@ def setup(args: Array<string>) -> int {
 
         def region = openRegion(blocks, blockSize, true);
         if (region == null) return fail("could not create the region");
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) return fail(err);
         def sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return fail("could not lay out the sieve root");
@@ -503,7 +503,7 @@ def arm(args: Array<string>) -> int {
         // A refused mount (another format version, or other geometry) leaves
         // no transaction; fail here rather than step an unmounted region.
         if (region.txn == null) return fail("the region did not mount: run setup again with this build and geometry");
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) return fail(err);
         if (region.requiresRecovery()) return fail("mount latched recovery-required");
         def sieve = PWSieve.new(region, LIVE_SEGMENTS);
@@ -583,7 +583,7 @@ def verify(args: Array<string>) -> int {
         if (!bl.0 || !bs.0 || !sc.0 || !ac.0 || !an.0) return EXIT_USAGE;
         def blocks = bl.1, blockSize = bs.1, setupCursor = sc.1, ackedCursor = ac.1, ackedCount = an.1;
 
-        // Inspect the raw image first. PWRegion formats a region whose header
+        // Inspect the raw image first. RegionAllocator formats a region whose header
         // magic is missing, so mounting before this check would erase the
         // evidence and report a fresh, empty region.
         def image = System.fileLoad(RebootConfig.path);
@@ -594,27 +594,27 @@ def verify(args: Array<string>) -> int {
         var nonzero = 0;
         for (i < image.length) if (image[i] != 0) nonzero++;
         Trace.OUT.put2("raw image: %d bytes, %d nonzero", image.length, nonzero).ln();
-        def magic = le64(image, PWRegionHeader.magic.offset);
-        if (magic != PWRegions.MAGIC && PWRegions.isTagged(magic)) {
-                // A setup run by a build of another format version: PWRegion
+        def magic = le64(image, RegionHeader.magic.offset);
+        if (magic != RegionFormat.MAGIC && RegionFormat.isTagged(magic)) {
+                // A setup run by a build of another format version: RegionAllocator
                 // refuses to mount it, so it says nothing about the reboot.
                 return verdict("INVALID", "the region has another format version: run setup again with this build", EXIT_INVALID);
         }
-        if (magic != PWRegions.MAGIC) {
+        if (magic != RegionFormat.MAGIC) {
                 // Setup formatted the header with the production provider and
                 // closed cleanly, so its loss is not the mutant's doing.
                 return verdict("INVALID", "the formatted header is gone: the reserved memory did not survive the reboot", EXIT_INVALID);
         }
-        if (le64(image, PWRegionHeader.userRoot.offset) == 0) {
+        if (le64(image, RegionHeader.userRoot.offset) == 0) {
                 return verdict("INVALID", "the sieve root published during setup is gone", EXIT_INVALID);
         }
 
         def region = openRegion(blocks, blockSize, false);
         if (region == null || region.backendRegion == null) return verdict("LOST", "the region did not mount", EXIT_LOST);
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) return fail(err);
         Trace.OUT.put1("recovery: %s", region.lastRecovery.name).ln();
-        if (region.lastRecovery == DualWalRecovery.CORRUPT) return verdict("LOST", "the WAL header was corrupt", EXIT_LOST);
+        if (region.lastRecovery == WalRecovery.CORRUPT) return verdict("LOST", "the WAL header was corrupt", EXIT_LOST);
         if (region.requiresRecovery()) return verdict("LOST", "the mount latched recovery-required", EXIT_LOST);
         def sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return verdict("LOST", "the sieve root could not be reattached", EXIT_LOST);
@@ -662,7 +662,7 @@ def parseFaultBackend(s: string) -> bool {
 }
 
 // The nonce's bytes as they lie in a redo entry (little-endian), in lowercase
-// hex, so the script can look for them in a raw copy of the log chunk.
+// hex, so the script can look for them in a raw copy of the log block.
 def HEX = "0123456789abcdef";
 def leHex(v: u64) -> string {
         def b = StringBuilder.new();
@@ -676,7 +676,7 @@ def leHex(v: u64) -> string {
 }
 
 // Region-relative offset of the marker word (see the header comment).
-def markerOffset(region: PWRegion, sieve: PWSieve) -> u64 {
+def markerOffset(region: RegionAllocator, sieve: PWSieve) -> u64 {
         return region.getUserRoot() + u64.!(ChunkHeader.size + SieveRoot.size)
                 + (sieve.segmentCapacity() - 1u64) * u64.!(SieveSegment.size)
                 + u64.!(SieveSegment.base.offset);
@@ -684,7 +684,7 @@ def markerOffset(region: PWRegion, sieve: PWSieve) -> u64 {
 
 // Region-relative offset of the second word: the primeCount field of the
 // marker's descriptor, so as unused as the marker itself.
-def secondWordOffset(region: PWRegion, sieve: PWSieve) -> u64 {
+def secondWordOffset(region: RegionAllocator, sieve: PWSieve) -> u64 {
         return markerOffset(region, sieve)
                 + u64.!(SieveSegment.primeCount.offset - SieveSegment.base.offset);
 }
@@ -711,7 +711,7 @@ def parseScenario(s: string) -> (bool, FaultScenario) {
 }
 
 // The two slots as a newly constructed WAL instance validates them
-// (DualTxnWal.validateSlot(), checksum included), and where they lie. Region-
+// (TwoSlotWal.validateSlot(), checksum included), and where they lie. Region-
 // relative offsets, which are file offsets.
 class SlotView(headerOk: bool, seq0: u64, seq1: u64, slotBytes: u64, slot0: u64, slot1: u64) {
         def seq(slot: int) -> u64 { return if(slot == 0, seq0, seq1); }
@@ -728,24 +728,24 @@ class SlotView(headerOk: bool, seq0: u64, seq1: u64, slotBytes: u64, slot0: u64,
 // opened; headerOk false if the region or WAL header is not valid.
 def inspectSlots(blocks: u64, blockSize: u64) -> SlotView {
         def size = blocks * blockSize;
-        def br = openBackend().create(size, BackendProt.READ.mask | BackendProt.WRITE.mask, false);
+        def br = openBackend().open(size, BackendProt.READ.mask | BackendProt.WRITE.mask, OpenMode.ATTACH);
         if (br == null) return null;
-        if (checkBackendRegion(br) != null || u64.!(br.range.length) < size) {
-                br.destroy();
+        if (checkStorageRegion(br) != null || u64.!(br.range.length) < size) {
+                br.close();
                 return null;
         }
         def start = u64.view(Pointer.atElement(br.range, 0));
-        def magic = PWRegionUtils.pointerFromU64(start + u64.!(PWRegionHeader.magic.offset)).load<u64>();
-        def logOff = PWRegionUtils.pointerFromU64(start + u64.!(PWRegionHeader.logChunk.offset)).load<u64>();
+        def magic = RegionUtils.pointerFromU64(start + u64.!(RegionHeader.magic.offset)).load<u64>();
+        def logOff = RegionUtils.pointerFromU64(start + u64.!(RegionHeader.logBlock.offset)).load<u64>();
         var view: SlotView;
-        if (magic != PWRegions.MAGIC || logOff == 0u64 || logOff % blockSize != 0u64 || logOff > size - blockSize) {
+        if (magic != RegionFormat.MAGIC || logOff == 0u64 || logOff % blockSize != 0u64 || logOff > size - blockSize) {
                 view = SlotView.new(false, 0, 0, 0, 0, 0);
         } else {
-                def wal = DualTxnWal.new(start, start + logOff, blockSize, br, false);
+                def wal = TwoSlotWal.new(start, start + logOff, blockSize, br, OpenMode.ATTACH);
                 view = SlotView.new(wal.openOk, wal.slotSeqs[0], wal.slotSeqs[1], wal.slotBytes,
                         wal.slotAddr(0) - start, wal.slotAddr(1) - start);
         }
-        br.destroy();
+        br.close();
         return view;
 }
 
@@ -797,13 +797,13 @@ def waitForFile(path: string, seconds: u64) -> bool {
 // extent -- so the failing write under test needs no allocation, extent
 // conversion or other metadata. The bytes do not change.
 def rewriteDurably(path: string, offset: u64, size: u64) -> bool {
-        def fd = RegionFileIO.open(path);
+        def fd = BackingFile.open(path);
         if (fd < 0) return false;
         def buf = Array<byte>.new(int.!(size));
         def ok = DirectIoFileIO.preadFully(fd, Pointer.atContents(buf), size, offset)
                 && DirectIoFileIO.pwriteFully(fd, Pointer.atContents(buf), size, offset)
-                && RegionFileIO.fdatasync(fd);
-        RegionFileIO.close(fd);
+                && BackingFile.fdatasync(fd);
+        BackingFile.close(fd);
         return ok;
 }
 
@@ -827,7 +827,7 @@ def faultPrepare(args: Array<string>) -> int {
 
         def region = openRegion(blocks, blockSize, true);
         if (region == null || region.txn == null) return fail("could not create the region");
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) return fail(err);
         def sieve = PWSieve.new(region, LIVE_SEGMENTS);
         if (!sieve.open()) return fail("could not lay out the sieve root");
@@ -838,7 +838,7 @@ def faultPrepare(args: Array<string>) -> int {
         }
         if (!hasSpareSlot(sieve)) return fail("no spare descriptor slot for the marker word");
         def cursor = sieve.cursor(), count = sieve.count();
-        def logOffset = region.getHeader().logChunk;
+        def logOffset = region.getHeader().logBlock;
         def logBytes = region.blockSize;
         def marker = markerOffset(region, sieve);
         def second = secondWordOffset(region, sieve);
@@ -858,7 +858,7 @@ def faultPrepare(args: Array<string>) -> int {
         // After preparePair() the reopened mapping is still live: the rewrite
         // goes through the same page cache and changes no byte.
         if (!RebootConfig.useDirect && !rewriteDurably(RebootConfig.path, logOffset, logBytes)) {
-                return fail("could not rewrite the log chunk durably");
+                return fail("could not rewrite the log block durably");
         }
 
         def lines = [
@@ -896,9 +896,9 @@ def faultPrepare(args: Array<string>) -> int {
 def preparePair(blocks: u64, blockSize: u64, marker: u64, second: u64) -> Array<string> {
         def region = openRegion(blocks, blockSize, false);
         if (region == null || region.txn == null) { fail("the closed region did not mount again"); return null; }
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) { fail(err); return null; }
-        if (region.lastRecovery != DualWalRecovery.CLEAN || region.requiresRecovery()) {
+        if (region.lastRecovery != WalRecovery.CLEAN || region.requiresRecovery()) {
                 fail("the cleanly closed region did not mount CLEAN");
                 return null;
         }
@@ -910,13 +910,13 @@ def preparePair(blocks: u64, blockSize: u64, marker: u64, second: u64) -> Array<
         def a = drawDistinct(Array<u64>.new(0));
         def b = drawDistinct([a]);
         if (a == 0u64 || b == 0u64) { fail("could not draw the values A and B"); return null; }
-        // N-2 and N-1, one redo entry each. RegionTransaction.commit() applies
+        // N-2 and N-1, one redo entry each. TransactionCache.commit() applies
         // each after-image once its record is durable.
         region.txn.writeU64(start + marker, a);
         if (!region.txn.commit()) { fail("N-2 was not acknowledged"); return null; }
         region.txn.writeU64(start + marker, b);
         if (!region.txn.commit()) { fail("N-1 was not acknowledged"); return null; }
-        // flush() is DualTxnWal.persistAppliedData(): N-1's applied after-image
+        // flush() is TwoSlotWal.persistAfterImages(): N-1's applied after-image
         // becomes durable and dataDurableSeq advances; no slot is scrubbed.
         if (!region.txn.flush() || region.requiresRecovery()) { fail("flush() failed"); return null; }
         if (region.txn.readU64(start + marker) != b) { fail("M does not hold B after N-1"); return null; }
@@ -972,7 +972,7 @@ def faultCommit(args: Array<string>) -> int {
 
         def first = openRegion(bl.1, bs.1, false);
         if (first == null || first.txn == null) return fail("the region did not mount");
-        def err = checkBackendRegion(first.backendRegion);
+        def err = checkStorageRegion(first.backendRegion);
         if (err != null) return fail(err);
         say(kvs("mount_recovery", first.lastRecovery.name));
         if (first.requiresRecovery()) return fail("the first mount latched recovery-required");
@@ -1004,7 +1004,7 @@ def faultCommit(args: Array<string>) -> int {
         // instance opens the region afresh and recovers.
         def second = openRegion(bl.1, bs.1, false);
         if (second == null || second.txn == null) return fail("the reopened region did not mount");
-        def err2 = checkBackendRegion(second.backendRegion);
+        def err2 = checkStorageRegion(second.backendRegion);
         if (err2 != null) return fail(err2);
         def seen = second.txn.readU64(second.regionStart + marker);
         say(kvs("reopen_recovery", second.lastRecovery.name));
@@ -1032,10 +1032,10 @@ def faultCommitPair(blocks: u64, blockSize: u64, scenario: FaultScenario, timeou
         }
         def first = openRegion(blocks, blockSize, false);
         if (first == null || first.txn == null) return fail("the region did not mount");
-        def err = checkBackendRegion(first.backendRegion);
+        def err = checkStorageRegion(first.backendRegion);
         if (err != null) return fail(err);
         say(kvs("mount_recovery", first.lastRecovery.name));
-        if (first.lastRecovery != DualWalRecovery.REPLAYED) return fail("the mount did not replay the two prepared records");
+        if (first.lastRecovery != WalRecovery.REPLAYED) return fail("the mount did not replay the two prepared records");
         if (first.requiresRecovery()) return fail("the first mount latched recovery-required");
         def sieve = PWSieve.new(first, LIVE_SEGMENTS);
         if (!sieve.open()) return fail("could not reattach to the sieve root");
@@ -1092,7 +1092,7 @@ def faultCommitPair(blocks: u64, blockSize: u64, scenario: FaultScenario, timeou
         sayView("reopen_seen", seen);
         def again = openRegion(blocks, blockSize, false);
         if (again == null || again.txn == null) return fail("the reopened region did not mount");
-        def err2 = checkBackendRegion(again.backendRegion);
+        def err2 = checkStorageRegion(again.backendRegion);
         if (err2 != null) return fail(err2);
         say(kvs("reopen_recovery", again.lastRecovery.name));
         say(kv("reopen_latched", flag(again.requiresRecovery())));
@@ -1108,8 +1108,8 @@ def faultCommitPair(blocks: u64, blockSize: u64, scenario: FaultScenario, timeou
         if (!waitForFile(goNext, timeout)) return fail("timed out waiting for go-next; next was not attempted");
         // next: one more transaction on the recovered mount, M2 = D, which N
         // did not touch. Only on a mount that recovery left usable.
-        def usable = !again.requiresRecovery() && (again.lastRecovery == DualWalRecovery.REPLAYED
-                || again.lastRecovery == DualWalRecovery.CLEAN);
+        def usable = !again.requiresRecovery() && (again.lastRecovery == WalRecovery.REPLAYED
+                || again.lastRecovery == WalRecovery.CLEAN);
         if (!usable || seen == null || !seen.headerOk) {
                 say(kv("next_ok", 0u64));
                 say(kvs("next_skipped", "the reopened mount is not usable"));
@@ -1147,23 +1147,23 @@ def faultVerify(args: Array<string>) -> int {
         if (!bl.0 || !bs.0 || !n.0 || !sc.0 || !sn.0) return EXIT_USAGE;
         def nonce = n.1;
 
-        // As verify: PWRegion formats a region whose magic is missing, so look
+        // As verify: RegionAllocator formats a region whose magic is missing, so look
         // at the raw header before mounting.
         def image = System.fileLoad(RebootConfig.path);
         if (image == null || u64.!(image.length) != bl.1 * bs.1) {
                 return verdict("INVALID", "the region file is missing or has the wrong size", EXIT_INVALID);
         }
-        if (le64(image, PWRegionHeader.magic.offset) != PWRegions.MAGIC) {
+        if (le64(image, RegionHeader.magic.offset) != RegionFormat.MAGIC) {
                 return verdict("INVALID", "the region header's magic is gone", EXIT_INVALID);
         }
 
         def region = openRegion(bl.1, bs.1, false);
         if (region == null || region.txn == null) return verdict("INCONSISTENT", "the region did not mount", EXIT_LOST);
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) return fail(err);
         say(kvs("recovery", region.lastRecovery.name));
         say(kv("latched", flag(region.requiresRecovery())));
-        if (region.lastRecovery == DualWalRecovery.CORRUPT || region.lastRecovery == DualWalRecovery.PERSIST_FAILED
+        if (region.lastRecovery == WalRecovery.CORRUPT || region.lastRecovery == WalRecovery.PERSIST_FAILED
                 || region.requiresRecovery()) {
                 return verdict("INCONSISTENT", "recovery left the region unavailable", EXIT_LOST);
         }
@@ -1174,7 +1174,7 @@ def faultVerify(args: Array<string>) -> int {
         say(kv("visible", flag(seen == nonce)));
         say(kv("leaks_reclaimed", u64.!(sieve.leaksReclaimed())));
         def inv = sieve.checkInvariants();
-        def alloc = PersistentAllocatorInvariants.check(region);
+        def alloc = AllocatorInvariants.check(region);
         say(kvs("sieve_invariants", if(inv == null, "ok", inv)));
         say(kvs("allocator_invariants", if(alloc == null, "ok", alloc)));
         def cursor = sieve.cursor(), count = sieve.count();
@@ -1275,13 +1275,13 @@ def faultVerifyAcks(args: Array<string>) -> int {
                 return verdict("INVALID", "the values A, B, C and the second word's are not nonzero and distinct", EXIT_INVALID);
         }
 
-        // As verify: PWRegion formats a region whose magic is missing, so look
+        // As verify: RegionAllocator formats a region whose magic is missing, so look
         // at the raw header before mounting.
         def image = System.fileLoad(RebootConfig.path);
         if (image == null || u64.!(image.length) != bl.1 * bs.1) {
                 return verdict("INVALID", "the region file is missing or has the wrong size", EXIT_INVALID);
         }
-        if (le64(image, PWRegionHeader.magic.offset) != PWRegions.MAGIC) {
+        if (le64(image, RegionHeader.magic.offset) != RegionFormat.MAGIC) {
                 return verdict("INVALID", "the region header's magic is gone", EXIT_INVALID);
         }
         // The records recovery is about to find, through the backend.
@@ -1289,11 +1289,11 @@ def faultVerifyAcks(args: Array<string>) -> int {
 
         def region = openRegion(bl.1, bs.1, false);
         if (region == null || region.txn == null) return verdict("INCONSISTENT", "the region did not mount", EXIT_INCONSISTENT);
-        def err = checkBackendRegion(region.backendRegion);
+        def err = checkStorageRegion(region.backendRegion);
         if (err != null) return fail(err);
         say(kvs("recovery", region.lastRecovery.name));
         say(kv("latched", flag(region.requiresRecovery())));
-        if (region.lastRecovery == DualWalRecovery.CORRUPT || region.lastRecovery == DualWalRecovery.PERSIST_FAILED
+        if (region.lastRecovery == WalRecovery.CORRUPT || region.lastRecovery == WalRecovery.PERSIST_FAILED
                 || region.requiresRecovery()) {
                 return verdict("INCONSISTENT", "recovery left the region unavailable", EXIT_INCONSISTENT);
         }
@@ -1307,7 +1307,7 @@ def faultVerifyAcks(args: Array<string>) -> int {
         say(kvs("x_is", valueLabel(x, a, b, c, xv, xLabel)));
         say(kv("leaks_reclaimed", u64.!(sieve.leaksReclaimed())));
         def inv = sieve.checkInvariants();
-        def alloc = PersistentAllocatorInvariants.check(region);
+        def alloc = AllocatorInvariants.check(region);
         say(kvs("sieve_invariants", if(inv == null, "ok", inv)));
         say(kvs("allocator_invariants", if(alloc == null, "ok", alloc)));
         def cursor = sieve.cursor(), count = sieve.count();

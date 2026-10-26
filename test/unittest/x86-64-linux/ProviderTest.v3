@@ -1,7 +1,7 @@
 // Persistent-operation seam and trace-recorder tests. These use ordinary
 // anonymous memory; no DAX mapping or PMEM hardware is required.
 
-def POT = UnitTests.registerT("persistent_ops:", _, PersistentOperationsTester.new, _);
+def POT = UnitTests.registerT("provider:", _, ProviderTester.new, _);
 def POTX = [
 	POT("native_instruction_encodings", test_persistent_native_instruction_encodings),
 	POT("native_instruction_smoke", test_persistent_native_instruction_smoke),
@@ -27,31 +27,31 @@ def POTX = [
 	()
 ];
 
-// Geometry of the traced region used by the PWRegion format tests.
-component TracePWRegions {
+// Geometry of the traced region used by the RegionAllocator format tests.
+component TraceAllocators {
 	def BLOCKS = 8u64;
 	def BLOCK_SIZE = 4096u64;
 	def SIZE = 32768u64;                    // BLOCKS * BLOCK_SIZE
 	def LOG_CHUNK_START = 4096u64;          // block 1
 	def LOG_CHUNK_END = 8192u64;
 	def BLOCK_TABLE_ENTRIES = 9u64;         // numBlocks + 1
-	def BLOCK_TABLE_START = 32408u64;       // SIZE - BLOCK_TABLE_ENTRIES * BlockEntry.size
-	def SENTINEL_START = 88u64;             // PWRegionHeader.size
-	def SENTINEL_COUNT = 8u64;              // BlockLists.MAX_LISTS
+	def BLOCK_TABLE_START = 32408u64;       // SIZE - BLOCK_TABLE_ENTRIES * BlockTableEntry.size
+	def SENTINEL_START = 88u64;             // RegionHeader.size
+	def SENTINEL_COUNT = 8u64;              // FreeLists.MAX_LISTS
 }
 
-// Installs the trace recorder on the region *before* PWRegion ever sees it.
-// This is precisely why PWRegion must read its provider from the region rather
+// Installs the trace recorder on the region *before* RegionAllocator ever sees it.
+// This is precisely why RegionAllocator must read its provider from the region rather
 // than construct one unconditionally: the recorder has to already be the
 // region's single provider when format() issues its very first store.
-class TracePWRegionBackend extends TxnRegionBackend {
-	var region: PmemMmapRegion;
+class TraceAllocatorBackend extends StorageBackend {
+	var region: PmemRegion;
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
-		def mapping = Mmap.reserve(size, MmapRegionUtils.convertProt(prot));
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		def mapping = Mmap.reserve(size, RegionMapping.convertProt(access));
 		if (mapping == null) return null;
-		region = PmemMmapRegion.new(mapping, -1);
-		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		region = PmemRegion.new(mapping, -1);
+		region.setProvider(RecordingProvider.new(region.range));
 		return region;
 	}
 
@@ -63,49 +63,49 @@ class TracePWRegionBackend extends TxnRegionBackend {
 		return "trace-pmem";
 	}
 
-	def recorder() -> RecordingPersistentOperations {
+	def recorder() -> RecordingProvider {
 		if (region == null) return null;
-		return RecordingPersistentOperations.!(region.persistentOperations());
+		return RecordingProvider.!(region.provider());
 	}
 }
 
-class PersistentOperationsTester(t: Tester) {
+class ProviderTester(t: Tester) {
 	var data = Array<byte>.new(4096);
-	var recorder = RecordingPersistentOperations.new(data[0 ..+ data.length]);
+	var recorder = RecordingProvider.new(data[0 ..+ data.length]);
 
-	def assertSequences(events: Vector<PersistentTraceEvent>) {
+	def assertSequences(events: Vector<PersistenceEvent>) {
 		for (i < events.length) t.assert_eq(u64.!(i + 1), events[i].seq);
 	}
 
-	def assertStore(event: PersistentTraceEvent, seq: u64,
+	def assertStore(event: PersistenceEvent, seq: u64,
 		offset: u64, width: u8, value: u64) {
-		t.assertz(true, event.kind == PersistentEventKind.STORE);
+		t.assertz(true, event.kind == PersistenceEventKind.STORE);
 		t.assert_eq(seq, event.seq);
 		t.assert_eq(offset, event.offset);
 		t.assert_eq(width, event.width);
 		t.assert_eq(value, event.value);
 	}
 
-	def makePmemRegion() -> PmemMmapRegion {
+	def makePmemRegion() -> PmemRegion {
 		def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
-		def region = PmemMmapRegion.new(mapping, -1);
-		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		def region = PmemRegion.new(mapping, -1);
+		region.setProvider(RecordingProvider.new(region.range));
 		return region;
 	}
 
-	def recorderOf(region: PmemMmapRegion) -> RecordingPersistentOperations {
-		return RecordingPersistentOperations.!(region.persistentOperations());
+	def recorderOf(region: PmemRegion) -> RecordingProvider {
+		return RecordingProvider.!(region.provider());
 	}
 
 	// Every recorded store must satisfy the crash model's scalar-atomicity
 	// baseline (docs/pmem-crash-model.md): a naturally aligned 1/2/4/8-byte
 	// store that lies inside the region and never spans two cache lines. A
 	// store violating this could tear in a way the explorer does not model.
-	// PersistentTrace.validate() is the single definition of that baseline, so
+	// PersistenceTrace.validate() is the single definition of that baseline, so
 	// this checks the frozen trace rather than restating the rules.
-	def assertStoreContract(events: Vector<PersistentTraceEvent>, regionSize: u64) {
-		def check = PersistentTrace.new("store-contract", regionSize, events.copy()).validate();
+	def assertStoreContract(events: Vector<PersistenceEvent>, regionSize: u64) {
+		def check = PersistenceTrace.new("store-contract", regionSize, events.copy()).validate();
 		if (!check.ok()) {
 			t.fail(check.render(StringBuilder.new().puts("store contract violated: ")).toString());
 		}
@@ -113,31 +113,31 @@ class PersistentOperationsTester(t: Tester) {
 
 	// Mark every byte covered by a recorded store, so a format trace can be
 	// checked for complete structural coverage instead of event-by-event.
-	def storeCoverage(events: Vector<PersistentTraceEvent>, regionSize: u64) -> Array<bool> {
+	def storeCoverage(events: Vector<PersistenceEvent>, regionSize: u64) -> Array<bool> {
 		def covered = Array<bool>.new(int.!(regionSize));
 		for (i < events.length) {
 			def e = events[i];
-			if (e.kind != PersistentEventKind.STORE) continue;
+			if (e.kind != PersistenceEventKind.STORE) continue;
 			for (b < int.view(e.width)) covered[int.!(e.offset) + b] = true;
 		}
 		return covered;
 	}
 
-	def firstFence(events: Vector<PersistentTraceEvent>) -> int {
-		for (i < events.length) if (events[i].kind == PersistentEventKind.SFENCE) return i;
+	def firstFence(events: Vector<PersistenceEvent>) -> int {
+		for (i < events.length) if (events[i].kind == PersistenceEventKind.SFENCE) return i;
 		return -1;
 	}
 
 	// Whether a CLWB of {line} was recorded at or after {from} and before the
 	// last fence in the trace.
-	def clwbBeforeLastFence(recorder: RecordingPersistentOperations, from: int, line: u64) -> bool {
+	def clwbBeforeLastFence(recorder: RecordingProvider, from: int, line: u64) -> bool {
 		var lastFence = -1;
 		for (i < recorder.events.length) {
-			if (recorder.events[i].kind == PersistentEventKind.SFENCE) lastFence = i;
+			if (recorder.events[i].kind == PersistenceEventKind.SFENCE) lastFence = i;
 		}
 		for (i = from; i < lastFence; i++) {
 			def e = recorder.events[i];
-			if (e.kind == PersistentEventKind.CLWB && e.offset == line) return true;
+			if (e.kind == PersistenceEventKind.CLWB && e.offset == line) return true;
 		}
 		return false;
 	}
@@ -146,60 +146,60 @@ class PersistentOperationsTester(t: Tester) {
 		for (i < int.!(len)) t.assertz(expected, covered[int.!(start) + i]);
 	}
 
-	// Both the sentinels and the block table are arrays of BlockEntry. Every
-	// field is written by clearBlockEntry(); bytes +3..+8 are layout padding.
+	// Both the sentinels and the block table are arrays of BlockTableEntry. Every
+	// field is written by clearBlockTableEntry(); bytes +3..+8 are layout padding.
 	def assertBlockEntriesCovered(covered: Array<bool>, start: u64, count: u64) {
 		for (i < int.!(count)) {
-			def base = start + u64.!(i) * u64.!(BlockEntry.size);
+			def base = start + u64.!(i) * u64.!(BlockTableEntry.size);
 			assertCovered(covered, base, 3u64, true);           // listNum + used
 			assertCovered(covered, base + 3u64, 5u64, false);   // padding gap
 			assertCovered(covered, base + 8u64, 32u64, true);   // prev/next/listPrev/listNext
 		}
 	}
 
-	def noDescs() -> Array<Ref<MetaDataDesc>> {
-		return Array<Ref<MetaDataDesc>>.new(0);
+	def noDescs() -> Array<Ref<MetadataDescriptor>> {
+		return Array<Ref<MetadataDescriptor>>.new(0);
 	}
 
 	// Two descriptors with distinct, non-default field values, so a swapped or
 	// wrongly-sized descriptor store cannot pass unnoticed.
-	def twoDescs() -> Array<Ref<MetaDataDesc>> {
-		def bytes = Array<byte>.new(MetaDataDesc.size * 2);
-		def other = Ref<MetaDataDesc>.at(bytes, 0);
+	def twoDescs() -> Array<Ref<MetadataDescriptor>> {
+		def bytes = Array<byte>.new(MetadataDescriptor.size * 2);
+		def other = Ref<MetadataDescriptor>.at(bytes, 0);
 		other.kind = 0x4f_54_48_45_52u64; // "OTHER"
 		other.fixedBytes = 3u32;
 		other.unitSize = 1024u32;
 		other.bytesPerUnit = 2u32;
 
-		def line = Ref<MetaDataDesc>.at(bytes, MetaDataDesc.size);
-		line.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		def line = Ref<MetadataDescriptor>.at(bytes, MetadataDescriptor.size);
+		line.kind = ImmixLineMarks.ImmixLineMarkMetaKind;
 		line.fixedBytes = 4u32;
 		line.unitSize = 128u32;
 		line.bytesPerUnit = u32.!(LineMark.size);
 
-		def descs = Array<Ref<MetaDataDesc>>.new(2);
+		def descs = Array<Ref<MetadataDescriptor>>.new(2);
 		descs[0] = other;
 		descs[1] = line;
 		return descs;
 	}
 
-	def lineDescs() -> Array<Ref<MetaDataDesc>> {
-		def bytes = Array<byte>.new(MetaDataDesc.size);
-		def line = Ref<MetaDataDesc>.at(bytes, 0);
-		line.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+	def lineDescs() -> Array<Ref<MetadataDescriptor>> {
+		def bytes = Array<byte>.new(MetadataDescriptor.size);
+		def line = Ref<MetadataDescriptor>.at(bytes, 0);
+		line.kind = ImmixLineMarks.ImmixLineMarkMetaKind;
 		line.fixedBytes = 0u32;
-		line.unitSize = ImmixPWRegions.DefaultImmixLineSize;
+		line.unitSize = ImmixLineMarks.DefaultImmixLineSize;
 		line.bytesPerUnit = u32.!(LineMark.size);
 
-		def descs = Array<Ref<MetaDataDesc>>.new(1);
+		def descs = Array<Ref<MetadataDescriptor>>.new(1);
 		descs[0] = line;
 		return descs;
 	}
 
-	def indexOfStore(events: Vector<PersistentTraceEvent>, offset: u64) -> int {
+	def indexOfStore(events: Vector<PersistenceEvent>, offset: u64) -> int {
 		for (i < events.length) {
 			def e = events[i];
-			if (e.kind == PersistentEventKind.STORE && e.offset == offset) return i;
+			if (e.kind == PersistenceEventKind.STORE && e.offset == offset) return i;
 		}
 		return -1;
 	}
@@ -207,7 +207,7 @@ class PersistentOperationsTester(t: Tester) {
 
 // Pin the exact native stubs used by the PMEM backend. These checks protect the
 // Virgil assembler adaptation as well as the required instruction encodings.
-def test_persistent_native_instruction_encodings(tc: PersistentOperationsTester) {
+def test_persistent_native_instruction_encodings(tc: ProviderTester) {
 	var w = DataWriter.new();
 	var asm = X86_64Assemblers.create64(w);
 	asm.d.clwb(X86_64Regs.RSI.indirect()).ret();
@@ -239,23 +239,23 @@ def test_persistent_native_instruction_encodings(tc: PersistentOperationsTester)
 
 // Exercise the generated CPUID, writeback, and SFENCE stubs without requiring
 // a DAX filesystem. The writeback target is an ordinary live cache line.
-def test_persistent_native_instruction_smoke(tc: PersistentOperationsTester) {
+def test_persistent_native_instruction_smoke(tc: ProviderTester) {
 	def basic = Target.cpuid(0u64, 0u64);
 	tc.t.assertz(true, basic.0 > 0u64);
 	tc.t.assertz(true, Target.supportsClflush() || Target.supportsClflushOpt() || Target.supportsClwb());
 	tc.t.assertz(true, Target.supportsSfence());
 
-	def line = Array<byte>.new(int.!(MmapRegionUtils.CACHE_LINE_SIZE));
+	def line = Array<byte>.new(int.!(CacheLines.CACHE_LINE_SIZE));
 	line[0] = 0xA5u8;
-	MmapRegionUtils.flushCacheLine(Pointer.atElement(line, 0));
-	MmapRegionUtils.storeFence();
+	X86_64CacheControl.writeBackLine(Pointer.atElement(line, 0));
+	X86_64CacheControl.fence();
 	tc.t.assert_eq(0xA5u8, line[0]);
 }
 
 // The recording provider executes the same native scalar stores as production,
 // then records the normalized value and width. The byte assertions pin x86-64
 // little-endian behavior rather than relying only on typed loads.
-def test_persistent_scalar_stores_are_typed_little_endian(tc: PersistentOperationsTester) {
+def test_persistent_scalar_stores_are_typed_little_endian(tc: ProviderTester) {
 	tc.recorder.storeU8(1u64, 0xA5u8);
 	tc.recorder.storeU16(2u64, 0xB1C2u16);
 	tc.recorder.storeU32(4u64, 0xD3E4_F506_u32);
@@ -288,7 +288,7 @@ def test_persistent_scalar_stores_are_typed_little_endian(tc: PersistentOperatio
 
 // PMEM preparation translates byte ranges to every touched 64-byte line in
 // ascending order. A fence appears only when a writeback is pending.
-def test_persistent_pmem_range_translation(tc: PersistentOperationsTester) {
+def test_persistent_pmem_range_translation(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("pmem trace mapping allocation failed");
@@ -296,55 +296,55 @@ def test_persistent_pmem_range_translation(tc: PersistentOperationsTester) {
 	}
 	def recorder = tc.recorderOf(region);
 
-	tc.t.assertz(true, region.prepareChangedRange(4096u64, 0u64));
+	tc.t.assertz(true, region.writeBack(4096u64, 0u64));
 	tc.t.assert_eq(0, recorder.events.length);
-	tc.t.assertz(true, region.persistChanges());
+	tc.t.assertz(true, region.drain());
 	tc.t.assert_eq(0, recorder.events.length);
 
-	tc.t.assertz(true, region.prepareChangedRange(73u64, 1u64));
+	tc.t.assertz(true, region.writeBack(73u64, 1u64));
 	tc.t.assert_eq(1, recorder.events.length);
-	tc.t.assertz(true, recorder.events[0].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[0].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(64u64, recorder.events[0].offset);
-	tc.t.assertz(true, region.persistChanges());
+	tc.t.assertz(true, region.drain());
 	tc.t.assert_eq(2, recorder.events.length);
-	tc.t.assertz(true, recorder.events[1].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, recorder.events[1].kind == PersistenceEventKind.SFENCE);
 
 	recorder.clear();
-	tc.t.assertz(true, region.prepareChangedRange(63u64, 130u64));
+	tc.t.assertz(true, region.writeBack(63u64, 130u64));
 	def expectedLines = [0u64, 64u64, 128u64, 192u64];
 	tc.t.assert_eq(expectedLines.length, recorder.events.length);
 	for (i < expectedLines.length) {
-		tc.t.assertz(true, recorder.events[i].kind == PersistentEventKind.CLWB);
+		tc.t.assertz(true, recorder.events[i].kind == PersistenceEventKind.CLWB);
 		tc.t.assert_eq(expectedLines[i], recorder.events[i].offset);
 	}
 	tc.assertSequences(recorder.events);
-	tc.t.assertz(true, region.persistChanges());
-	tc.t.assertz(true, recorder.events[4].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, region.drain());
+	tc.t.assertz(true, recorder.events[4].kind == PersistenceEventKind.SFENCE);
 	tc.t.assert_eq(5u64, recorder.events[4].seq);
 	def eventCount = recorder.events.length;
-	tc.t.assertz(true, region.persistChanges());
+	tc.t.assertz(true, region.drain());
 	tc.t.assert_eq(eventCount, recorder.events.length);
 
 	// Synchronous range persistence uses the same line translation followed by
-	// its own fence, without creating pending work for persistChanges().
+	// its own fence, without creating pending work for drain().
 	recorder.clear();
-	tc.t.assertz(true, region.persistRange(511u64, 2u64));
+	tc.t.assertz(true, region.persist(511u64, 2u64));
 	tc.t.assert_eq(3, recorder.events.length);
-	tc.t.assertz(true, recorder.events[0].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[0].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(448u64, recorder.events[0].offset);
-	tc.t.assertz(true, recorder.events[1].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[1].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(512u64, recorder.events[1].offset);
-	tc.t.assertz(true, recorder.events[2].kind == PersistentEventKind.SFENCE);
-	def afterPersistRange = recorder.events.length;
-	tc.t.assertz(true, region.persistChanges());
-	tc.t.assert_eq(afterPersistRange, recorder.events.length);
-	region.destroy();
+	tc.t.assertz(true, recorder.events[2].kind == PersistenceEventKind.SFENCE);
+	def afterPersist = recorder.events.length;
+	tc.t.assertz(true, region.drain());
+	tc.t.assert_eq(afterPersist, recorder.events.length);
+	region.close();
 }
 
-// One real DualTxnWal commit produces byte-visible record construction,
+// One real TwoSlotWal commit produces byte-visible record construction,
 // record-line writebacks, the commit fence, then the write-behind after-image
 // store and its line writeback. Explicit flush supplies the completing fence.
-def test_persistent_dual_wal_phase_b_trace(tc: PersistentOperationsTester) {
+def test_persistent_dual_wal_phase_b_trace(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("phase-B trace mapping allocation failed");
@@ -352,7 +352,7 @@ def test_persistent_dual_wal_phase_b_trace(tc: PersistentOperationsTester) {
 	}
 	def recorder = tc.recorderOf(region);
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 	recorder.clear();
 
 	def value = 0x8877_6655_4433_2211_u64;
@@ -362,7 +362,7 @@ def test_persistent_dual_wal_phase_b_trace(tc: PersistentOperationsTester) {
 
 	var firstClwb = -1;
 	for (i < recorder.events.length) {
-		if (firstClwb < 0 && recorder.events[i].kind == PersistentEventKind.CLWB) firstClwb = i;
+		if (firstClwb < 0 && recorder.events[i].kind == PersistenceEventKind.CLWB) firstClwb = i;
 	}
 	tc.t.assertz(true, firstClwb > 0);
 	def recordStart = 1536u64; // odd txnSeq -> slot 1
@@ -375,43 +375,43 @@ def test_persistent_dual_wal_phase_b_trace(tc: PersistentOperationsTester) {
 	}
 	var field = int.!(recordLen);
 	tc.assertStore(recorder.events[field++], u64.!(field), recordStart,
-		8u8, DualTxnWalConstants.RECORD_MAGIC);
+		8u8, WalLayout.RECORD_MAGIC);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.version.offset), 2u8,
-		u64.!(DualTxnWalConstants.RECORD_VERSION));
+		recordStart + u64.view(WalRecordHeader.version.offset), 2u8,
+		u64.!(WalLayout.RECORD_VERSION));
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.headerSize.offset), 2u8,
-		u64.!(TxnRecordHeader.size));
+		recordStart + u64.view(WalRecordHeader.headerSize.offset), 2u8,
+		u64.!(WalRecordHeader.size));
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.entrySize.offset), 2u8,
-		u64.!(LogEntry.size));
+		recordStart + u64.view(WalRecordHeader.entrySize.offset), 2u8,
+		u64.!(WalEntry.size));
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.recordLen.offset), 4u8, recordLen);
+		recordStart + u64.view(WalRecordHeader.recordLen.offset), 4u8, recordLen);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.entryCount.offset), 4u8, 1u64);
+		recordStart + u64.view(WalRecordHeader.entryCount.offset), 4u8, 1u64);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.logEpoch.offset), 8u8, 0u64);
+		recordStart + u64.view(WalRecordHeader.logEpoch.offset), 8u8, 0u64);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		recordStart + u64.view(TxnRecordHeader.txnSeq.offset), 8u8, 1u64);
-	def entryStart = recordStart + u64.!(TxnRecordHeader.size);
+		recordStart + u64.view(WalRecordHeader.txnSeq.offset), 8u8, 1u64);
+	def entryStart = recordStart + u64.!(WalRecordHeader.size);
 	tc.assertStore(recorder.events[field++], u64.!(field), entryStart,
 		8u8, 200u64);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		entryStart + u64.view(LogEntry.value.offset), 8u8, value);
+		entryStart + u64.view(WalEntry.value.offset), 8u8, value);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		entryStart + u64.view(LogEntry.width.offset), 1u8, 8u64);
-	def trailerStart = entryStart + u64.!(LogEntry.size);
+		entryStart + u64.view(WalEntry.width.offset), 1u8, 8u64);
+	def trailerStart = entryStart + u64.!(WalEntry.size);
 	tc.assertStore(recorder.events[field++], u64.!(field), trailerStart,
-		8u8, DualTxnWalConstants.TRAILER_MAGIC);
+		8u8, WalLayout.TRAILER_MAGIC);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		trailerStart + u64.view(TxnCommitTrailer.recordLen.offset), 4u8, recordLen);
+		trailerStart + u64.view(WalRecordTrailer.recordLen.offset), 4u8, recordLen);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		trailerStart + u64.view(TxnCommitTrailer.entryCount.offset), 4u8, 1u64);
+		trailerStart + u64.view(WalRecordTrailer.entryCount.offset), 4u8, 1u64);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		trailerStart + u64.view(TxnCommitTrailer.logEpoch.offset), 8u8, 0u64);
+		trailerStart + u64.view(WalRecordTrailer.logEpoch.offset), 8u8, 0u64);
 	tc.assertStore(recorder.events[field++], u64.!(field),
-		trailerStart + u64.view(TxnCommitTrailer.txnSeq.offset), 8u8, 1u64);
-	def checksumOffset = trailerStart + u64.view(TxnCommitTrailer.checksum.offset);
+		trailerStart + u64.view(WalRecordTrailer.txnSeq.offset), 8u8, 1u64);
+	def checksumOffset = trailerStart + u64.view(WalRecordTrailer.checksum.offset);
 	tc.assertStore(recorder.events[field++], u64.!(field), checksumOffset,
 		8u8, 0u64);
 	def publishedChecksum = Pointer.atElement(region.range, int.!(checksumOffset)).load<u64>();
@@ -421,31 +421,31 @@ def test_persistent_dual_wal_phase_b_trace(tc: PersistentOperationsTester) {
 	def expectedRecordLines = [1536u64, 1600u64, 1664u64];
 	for (i < expectedRecordLines.length) {
 		def event = recorder.events[firstClwb + i];
-		tc.t.assertz(true, event.kind == PersistentEventKind.CLWB);
+		tc.t.assertz(true, event.kind == PersistenceEventKind.CLWB);
 		tc.t.assert_eq(expectedRecordLines[i], event.offset);
 	}
 	def commitFence = firstClwb + expectedRecordLines.length;
 	tc.t.assert_eq(commitFence + 1, recorder.events.length);
-	tc.t.assertz(true, recorder.events[commitFence].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, recorder.events[commitFence].kind == PersistenceEventKind.SFENCE);
 
-	tc.t.assertz(true, wal.applyUpdate(200u64, value, 8u8));
+	tc.t.assertz(true, wal.applyAfterImage(200u64, value, 8u8));
 	tc.t.assert_eq(commitFence + 3, recorder.events.length);
 	tc.assertStore(recorder.events[commitFence + 1],
 		recorder.events[commitFence].seq + 1u64, 200u64, 8u8, value);
-	tc.t.assertz(true, recorder.events[commitFence + 2].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[commitFence + 2].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(192u64, recorder.events[commitFence + 2].offset);
 	def beforeFlush = recorder.events.length;
-	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assertz(true, wal.persistAfterImages());
 	tc.t.assert_eq(beforeFlush + 1, recorder.events.length);
-	tc.t.assertz(true, recorder.events[beforeFlush].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, recorder.events[beforeFlush].kind == PersistenceEventKind.SFENCE);
 	tc.assertSequences(recorder.events);
-	region.destroy();
+	region.close();
 }
 
 // Transaction N's after-image CLWB remains outstanding until transaction N+1
 // commits. Its event precedes N+1's record construction and commit fence, and
 // each commit still contributes exactly one boundary.
-def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTester) {
+def test_persistent_dual_wal_two_transaction_trace(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("two-transaction trace mapping allocation failed");
@@ -453,14 +453,14 @@ def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTeste
 	}
 	def recorder = tc.recorderOf(region);
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 	recorder.clear();
 
 	wal.append(200u64, 0x11u64, 1u8);
 	tc.t.assert_eq(1u64, wal.commit());
-	wal.applyUpdate(200u64, 0x11u64, 1u8);
+	wal.applyAfterImage(200u64, 0x11u64, 1u8);
 	def afterFirst = recorder.events.length;
-	tc.t.assertz(true, recorder.events[afterFirst - 1].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[afterFirst - 1].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(192u64, recorder.events[afterFirst - 1].offset);
 
 	wal.append(201u64, 0x22u64, 1u8);
@@ -468,7 +468,7 @@ def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTeste
 	var fenceCount = 0;
 	var secondFence = -1;
 	for (i < recorder.events.length) {
-		if (recorder.events[i].kind == PersistentEventKind.SFENCE) {
+		if (recorder.events[i].kind == PersistenceEventKind.SFENCE) {
 			fenceCount++;
 			if (fenceCount == 2) secondFence = i;
 		}
@@ -477,26 +477,26 @@ def test_persistent_dual_wal_two_transaction_trace(tc: PersistentOperationsTeste
 	tc.t.assertz(true, secondFence > afterFirst);
 	var eventIndex = afterFirst;
 	while (eventIndex < secondFence) {
-		tc.t.assertz(true, recorder.events[eventIndex].kind != PersistentEventKind.SFENCE);
+		tc.t.assertz(true, recorder.events[eventIndex].kind != PersistenceEventKind.SFENCE);
 		eventIndex++;
 	}
-	wal.applyUpdate(201u64, 0x22u64, 1u8);
+	wal.applyAfterImage(201u64, 0x22u64, 1u8);
 	var afterApplyFenceCount = 0;
 	for (i < recorder.events.length) {
-		if (recorder.events[i].kind == PersistentEventKind.SFENCE) afterApplyFenceCount++;
+		if (recorder.events[i].kind == PersistenceEventKind.SFENCE) afterApplyFenceCount++;
 	}
 	tc.t.assert_eq(2, afterApplyFenceCount); // applying transaction 2 adds no boundary
-	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistenceEventKind.CLWB);
 	tc.assertSequences(recorder.events);
-	region.destroy();
+	region.close();
 }
 
-// storeUpdate() writes an after-image and nothing else; prepareApplied() then
+// storeAfterImage() writes an after-image and nothing else; writeBackAfterImages() then
 // writes each touched line back once, in ascending order, after every store.
 // The after-images are stored out of address order to exercise the sort; 192
 // and 200 share a line, 256 is on the next line (merged into one range), and
 // 400 is on a line of its own.
-def test_persistent_dual_wal_batched_apply_writes_each_line_back_once(tc: PersistentOperationsTester) {
+def test_persistent_dual_wal_batched_apply_writes_each_line_back_once(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("batched-apply trace mapping allocation failed");
@@ -504,45 +504,45 @@ def test_persistent_dual_wal_batched_apply_writes_each_line_back_once(tc: Persis
 	}
 	def recorder = tc.recorderOf(region);
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 	def offsets = [400u64, 256u64, 200u64, 192u64];
 	for (o in offsets) tc.t.assertz(true, wal.append(o, o + 1u64, 8u8));
 	tc.t.assert_eq(1u64, wal.commit());
 	def afterCommit = recorder.events.length;
 
-	for (o in offsets) tc.t.assertz(true, wal.storeUpdate(o, o + 1u64, 8u8));
+	for (o in offsets) tc.t.assertz(true, wal.storeAfterImage(o, o + 1u64, 8u8));
 	tc.t.assert_eq(afterCommit + offsets.length, recorder.events.length);
 	for (i < offsets.length) {
 		def e = recorder.events[afterCommit + i];
 		tc.assertStore(e, e.seq, offsets[i], 8u8, offsets[i] + 1u64);
 	}
 
-	tc.t.assertz(true, wal.prepareApplied());
+	tc.t.assertz(true, wal.writeBackAfterImages());
 	def expectedLines = [192u64, 256u64, 384u64];
 	def firstClwb = afterCommit + offsets.length;
 	tc.t.assert_eq(firstClwb + expectedLines.length, recorder.events.length);
 	for (i < expectedLines.length) {
 		def e = recorder.events[firstClwb + i];
-		tc.t.assertz(true, e.kind == PersistentEventKind.CLWB);
+		tc.t.assertz(true, e.kind == PersistenceEventKind.CLWB);
 		tc.t.assert_eq(expectedLines[i], e.offset);
 	}
 	// Nothing left to prepare: a second call adds no events, and the explicit
 	// boundary contributes only its fence.
-	tc.t.assertz(true, wal.prepareApplied());
+	tc.t.assertz(true, wal.writeBackAfterImages());
 	tc.t.assert_eq(firstClwb + expectedLines.length, recorder.events.length);
-	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assertz(true, wal.persistAfterImages());
 	tc.t.assert_eq(firstClwb + expectedLines.length + 1, recorder.events.length);
-	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, recorder.events[recorder.events.length - 1].kind == PersistenceEventKind.SFENCE);
 	tc.t.assert_eq(1u64, wal.dataDurableSeq);
 	tc.assertSequences(recorder.events);
-	region.destroy();
+	region.close();
 }
 
 // The preparation is the applier's to place but not its to forget: an
 // after-image stored and never prepared is written back by the next boundary
-// that claims it -- the next commit's, or persistAppliedData()'s -- before
+// that claims it -- the next commit's, or persistAfterImages()'s -- before
 // that boundary's fence.
-def test_persistent_dual_wal_boundaries_drain_unprepared_after_images(tc: PersistentOperationsTester) {
+def test_persistent_dual_wal_boundaries_drain_unprepared_after_images(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("drain trace mapping allocation failed");
@@ -550,34 +550,34 @@ def test_persistent_dual_wal_boundaries_drain_unprepared_after_images(tc: Persis
 	}
 	def recorder = tc.recorderOf(region);
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 	recorder.clear();
 
 	tc.t.assertz(true, wal.append(200u64, 0x11u64, 8u8));
 	tc.t.assert_eq(1u64, wal.commit());
-	tc.t.assertz(true, wal.storeUpdate(200u64, 0x11u64, 8u8));
+	tc.t.assertz(true, wal.storeAfterImage(200u64, 0x11u64, 8u8));
 	def storedFirst = recorder.events.length;
 	tc.t.assertz(true, wal.append(264u64, 0x22u64, 8u8));
 	tc.t.assert_eq(2u64, wal.commit());
 	tc.t.assert_eq(1u64, wal.dataDurableSeq);
 	tc.t.assertz(true, tc.clwbBeforeLastFence(recorder, storedFirst, 192u64));
 
-	tc.t.assertz(true, wal.storeUpdate(264u64, 0x22u64, 8u8));
+	tc.t.assertz(true, wal.storeAfterImage(264u64, 0x22u64, 8u8));
 	def storedSecond = recorder.events.length;
-	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assertz(true, wal.persistAfterImages());
 	tc.t.assert_eq(2u64, wal.dataDurableSeq);
 	tc.t.assertz(true, tc.clwbBeforeLastFence(recorder, storedSecond, 256u64));
 	tc.assertSequences(recorder.events);
-	region.destroy();
+	region.close();
 }
 
 // Through the allocator's transaction facade: eleven u64 writes over three
 // lines -- a full line, the line after it, and a line two further on -- are
 // written back as three line writebacks, after all eleven stores.
-def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperationsTester) {
-	def backend = TracePWRegionBackend.new();
-	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
-		TracePWRegions.BLOCK_SIZE, true);
+def test_persistent_pwregion_txn_writes_each_line_back_once(tc: ProviderTester) {
+	def backend = TraceAllocatorBackend.new();
+	def region = RegionAllocator.new(backend, TraceAllocators.BLOCKS, tc.noDescs(),
+		TraceAllocators.BLOCK_SIZE, OpenMode.FORMAT);
 	if (backend.region == null) {
 		tc.t.fail("txn trace mapping allocation failed");
 		return;
@@ -602,10 +602,10 @@ def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperat
 	var stores = 0, clwbs = 0;
 	for (i = fence + 1; i < recorder.events.length; i++) {
 		def e = recorder.events[i];
-		if (e.kind == PersistentEventKind.STORE) {
+		if (e.kind == PersistenceEventKind.STORE) {
 			tc.t.assert_eq(0, clwbs);	// every store precedes every writeback
 			stores++;
-		} else if (e.kind == PersistentEventKind.CLWB) {
+		} else if (e.kind == PersistenceEventKind.CLWB) {
 			tc.t.assert_eq(expectedLines[clwbs], e.offset);
 			clwbs++;
 		}
@@ -616,21 +616,21 @@ def test_persistent_pwregion_txn_writes_each_line_back_once(tc: PersistentOperat
 	region.deallocate();
 }
 
-// The store audit's core regression: PWRegion.format() builds the entire region
+// The store audit's core regression: RegionAllocator.format() builds the entire region
 // image through the seam, so a recorded trace is a complete description of what
 // was written. Asserted structurally -- the trace is several hundred events, and
 // pinning each one would break on any benign layout change.
-def test_persistent_pwregion_format_trace(tc: PersistentOperationsTester) {
-	def backend = TracePWRegionBackend.new();
-	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
-		TracePWRegions.BLOCK_SIZE, true);
+def test_persistent_pwregion_format_trace(tc: ProviderTester) {
+	def backend = TraceAllocatorBackend.new();
+	def region = RegionAllocator.new(backend, TraceAllocators.BLOCKS, tc.noDescs(),
+		TraceAllocators.BLOCK_SIZE, OpenMode.FORMAT);
 	if (backend.region == null) {
 		tc.t.fail("format trace mapping allocation failed");
 		return;
 	}
 	tc.t.assertz(true, region.backendRegion != null);
 	def events = backend.recorder().events;
-	def size = TracePWRegions.SIZE;
+	def size = TraceAllocators.SIZE;
 
 	tc.assertSequences(events);
 	tc.assertStoreContract(events, size);
@@ -639,33 +639,33 @@ def test_persistent_pwregion_format_trace(tc: PersistentOperationsTester) {
 	// and the two known holes stay holes.
 	def covered = tc.storeCoverage(events, size);
 	tc.assertCovered(covered, 0u64, 40u64, true);           // blockTable..numDescs
-	// PWRegionHeader.metaData (+40) is deliberately never written by format();
+	// RegionHeader.metadata (+40) is deliberately never written by format();
 	// it keeps its zero-initialized value. Asserted so the hole is documented
 	// rather than silently absorbed by a weaker check.
 	tc.assertCovered(covered, 40u64, 8u64, false);
-	tc.assertCovered(covered, 48u64, 40u64, true);          // metaDataDescs..userRoot
-	tc.assertBlockEntriesCovered(covered, TracePWRegions.SENTINEL_START,
-		TracePWRegions.SENTINEL_COUNT);
-	tc.assertBlockEntriesCovered(covered, TracePWRegions.BLOCK_TABLE_START,
-		TracePWRegions.BLOCK_TABLE_ENTRIES);
+	tc.assertCovered(covered, 48u64, 40u64, true);          // metadataDescriptors..userRoot
+	tc.assertBlockEntriesCovered(covered, TraceAllocators.SENTINEL_START,
+		TraceAllocators.SENTINEL_COUNT);
+	tc.assertBlockEntriesCovered(covered, TraceAllocators.BLOCK_TABLE_START,
+		TraceAllocators.BLOCK_TABLE_ENTRIES);
 
 	// One total order: the WAL's own fresh-header stores are interleaved into
-	// PWRegion's linkage stores, bounded by the logChunk field store that
+	// RegionAllocator's linkage stores, bounded by the logBlock field store that
 	// precedes ensureWal() and the magic store that ends format().
-	def logChunkField = tc.indexOfStore(events, u64.view(PWRegionHeader.logChunk.offset));
-	def magicField = tc.indexOfStore(events, u64.view(PWRegionHeader.magic.offset));
-	tc.t.assertz(true, logChunkField >= 0);
-	tc.t.assertz(true, magicField > logChunkField);
-	var sawLogChunkStore = false;
+	def logBlockField = tc.indexOfStore(events, u64.view(RegionHeader.logBlock.offset));
+	def magicField = tc.indexOfStore(events, u64.view(RegionHeader.magic.offset));
+	tc.t.assertz(true, logBlockField >= 0);
+	tc.t.assertz(true, magicField > logBlockField);
+	var sawLogBlockStore = false;
 	for (i < events.length) {
 		def e = events[i];
-		if (e.kind != PersistentEventKind.STORE) continue;
-		if (e.offset < TracePWRegions.LOG_CHUNK_START) continue;
-		if (e.offset >= TracePWRegions.LOG_CHUNK_END) continue;
-		sawLogChunkStore = true;
-		tc.t.assertz(true, i > logChunkField && i < magicField);
+		if (e.kind != PersistenceEventKind.STORE) continue;
+		if (e.offset < TraceAllocators.LOG_CHUNK_START) continue;
+		if (e.offset >= TraceAllocators.LOG_CHUNK_END) continue;
+		sawLogBlockStore = true;
+		tc.t.assertz(true, i > logBlockField && i < magicField);
 	}
-	tc.t.assertz(true, sawLogChunkStore);
+	tc.t.assertz(true, sawLogBlockStore);
 
 	// Publication, in two steps: format() flushes the whole region under one
 	// fence before the magic is stored, then stores the magic and writes its
@@ -673,70 +673,70 @@ def test_persistent_pwregion_format_trace(tc: PersistentOperationsTester) {
 	// and nothing is written between the whole-region run and it.
 	def lines = int.!(size / 64u64);
 	def last = events.length - 1;
-	tc.t.assertz(true, events[last].kind == PersistentEventKind.SFENCE);
-	tc.t.assertz(true, events[last - 1].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, events[last].kind == PersistenceEventKind.SFENCE);
+	tc.t.assertz(true, events[last - 1].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(0u64, events[last - 1].offset);  // the magic's line
 	tc.t.assert_eq(last - 2, magicField);
 	def fenceIndex = magicField - 1;
 	def runStart = fenceIndex - lines;
-	tc.t.assertz(true, events[fenceIndex].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, events[fenceIndex].kind == PersistenceEventKind.SFENCE);
 	for (i < lines) {
 		def e = events[runStart + i];
-		tc.t.assertz(true, e.kind == PersistentEventKind.CLWB);
+		tc.t.assertz(true, e.kind == PersistenceEventKind.CLWB);
 		tc.t.assert_eq(u64.!(i) * 64u64, e.offset);
 	}
-	tc.t.assertz(true, events[runStart - 1].kind == PersistentEventKind.STORE);
+	tc.t.assertz(true, events[runStart - 1].kind == PersistenceEventKind.STORE);
 	region.deallocate();
 }
 
 // Descriptor fields are the only place the allocator needs a 4-byte store, so
 // this pins the u32/u64 width split that a Ref<> field assignment used to hide.
-def test_persistent_pwregion_format_descriptor_trace(tc: PersistentOperationsTester) {
-	def backend = TracePWRegionBackend.new();
+def test_persistent_pwregion_format_descriptor_trace(tc: ProviderTester) {
+	def backend = TraceAllocatorBackend.new();
 	def descs = tc.twoDescs();
-	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, descs,
-		TracePWRegions.BLOCK_SIZE, true);
+	def region = RegionAllocator.new(backend, TraceAllocators.BLOCKS, descs,
+		TraceAllocators.BLOCK_SIZE, OpenMode.FORMAT);
 	if (backend.region == null) {
 		tc.t.fail("descriptor trace mapping allocation failed");
 		return;
 	}
 	def events = backend.recorder().events;
-	tc.assertStoreContract(events, TracePWRegions.SIZE);
+	tc.assertStoreContract(events, TraceAllocators.SIZE);
 
 	def hdr = region.getHeader();
 	tc.t.assert_eq(2u64, hdr.numDescs);
-	def descsOffset = hdr.metaDataDescs;
+	def descsOffset = hdr.metadataDescriptors;
 
 	for (d < 2) {
-		def base = descsOffset + u64.!(d) * u64.!(MetaDataDesc.size);
+		def base = descsOffset + u64.!(d) * u64.!(MetadataDescriptor.size);
 		def source = descs[d];
 		// Exactly five stores land in this descriptor, in field order.
-		def found = Vector<PersistentTraceEvent>.new();
+		def found = Vector<PersistenceEvent>.new();
 		for (i < events.length) {
 			def e = events[i];
-			if (e.kind != PersistentEventKind.STORE) continue;
+			if (e.kind != PersistenceEventKind.STORE) continue;
 			if (e.offset < base) continue;
-			if (e.offset >= base + u64.!(MetaDataDesc.size)) continue;
+			if (e.offset >= base + u64.!(MetadataDescriptor.size)) continue;
 			found.put(e);
 		}
 		tc.t.assert_eq(5, found.length);
 		tc.assertStore(found[0], found[0].seq,
-			base + u64.view(MetaDataDesc.kind.offset), 8u8, source.kind);
+			base + u64.view(MetadataDescriptor.kind.offset), 8u8, source.kind);
 		tc.assertStore(found[1], found[1].seq,
-			base + u64.view(MetaDataDesc.fixedBytes.offset), 4u8, u64.!(source.fixedBytes));
+			base + u64.view(MetadataDescriptor.fixedBytes.offset), 4u8, u64.!(source.fixedBytes));
 		tc.assertStore(found[2], found[2].seq,
-			base + u64.view(MetaDataDesc.unitSize.offset), 4u8, u64.!(source.unitSize));
+			base + u64.view(MetadataDescriptor.unitSize.offset), 4u8, u64.!(source.unitSize));
 		tc.assertStore(found[3], found[3].seq,
-			base + u64.view(MetaDataDesc.bytesPerUnit.offset), 4u8, u64.!(source.bytesPerUnit));
+			base + u64.view(MetadataDescriptor.bytesPerUnit.offset), 4u8, u64.!(source.bytesPerUnit));
 		tc.assertStore(found[4], found[4].seq,
-			base + u64.view(MetaDataDesc.offset.offset), 8u8,
-			region.getMetaDataDesc(u64.!(d)).offset);
+			base + u64.view(MetadataDescriptor.offset.offset), 8u8,
+			region.getMetadataDescriptor(u64.!(d)).offset);
 	}
 
 	// The 4-byte layout gap at +20 is never stored.
-	def covered = tc.storeCoverage(events, TracePWRegions.SIZE);
+	def covered = tc.storeCoverage(events, TraceAllocators.SIZE);
 	for (d < 2) {
-		def base = descsOffset + u64.!(d) * u64.!(MetaDataDesc.size);
+		def base = descsOffset + u64.!(d) * u64.!(MetadataDescriptor.size);
 		tc.assertCovered(covered, base + 20u64, 4u64, false);
 	}
 	region.deallocate();
@@ -745,10 +745,10 @@ def test_persistent_pwregion_format_descriptor_trace(tc: PersistentOperationsTes
 // Once the region is mounted, allocator mutations must reach the region only as
 // WAL after-images applied *after* the commit boundary. With every store now
 // observable, that ordering is directly checkable rather than inferred.
-def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentOperationsTester) {
-	def backend = TracePWRegionBackend.new();
-	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
-		TracePWRegions.BLOCK_SIZE, true);
+def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: ProviderTester) {
+	def backend = TraceAllocatorBackend.new();
+	def region = RegionAllocator.new(backend, TraceAllocators.BLOCKS, tc.noDescs(),
+		TraceAllocators.BLOCK_SIZE, OpenMode.FORMAT);
 	if (backend.region == null) {
 		tc.t.fail("alloc trace mapping allocation failed");
 		return;
@@ -760,12 +760,12 @@ def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentO
 	tc.t.assertz(false, chunk.isNull());
 	def events = recorder.events;
 	tc.assertSequences(events);
-	tc.assertStoreContract(events, TracePWRegions.SIZE);
+	tc.assertStoreContract(events, TraceAllocators.SIZE);
 
 	// The commit point is the first fence of the transaction.
 	var commitFence = -1;
 	for (i < events.length) {
-		if (commitFence < 0 && events[i].kind == PersistentEventKind.SFENCE) commitFence = i;
+		if (commitFence < 0 && events[i].kind == PersistenceEventKind.SFENCE) commitFence = i;
 	}
 	tc.t.assertz(true, commitFence > 0);
 
@@ -773,9 +773,9 @@ def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentO
 	var sawAfterImage = false;
 	for (i < events.length) {
 		def e = events[i];
-		if (e.kind != PersistentEventKind.STORE) continue;
-		def inLog = e.offset >= TracePWRegions.LOG_CHUNK_START
-			&& e.offset < TracePWRegions.LOG_CHUNK_END;
+		if (e.kind != PersistenceEventKind.STORE) continue;
+		def inLog = e.offset >= TraceAllocators.LOG_CHUNK_START
+			&& e.offset < TraceAllocators.LOG_CHUNK_END;
 		if (inLog) {
 			// Record construction precedes the commit boundary.
 			sawRecordStore = true;
@@ -785,7 +785,7 @@ def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentO
 			sawAfterImage = true;
 			tc.t.assertz(true, i > commitFence);
 			// The region header is written by format() alone.
-			tc.t.assertz(true, e.offset >= TracePWRegions.SENTINEL_START);
+			tc.t.assertz(true, e.offset >= TraceAllocators.SENTINEL_START);
 		}
 	}
 	tc.t.assertz(true, sawRecordStore);
@@ -798,29 +798,29 @@ def test_persistent_pwregion_alloc_applies_after_commit_boundary(tc: PersistentO
 // every other store the allocator makes, so a trace records each one as a 1-byte
 // store at the mark's region-relative offset, and nothing else. The offsets
 // are derived from the on-region descriptor, not from the handle's own code.
-def test_persistent_immix_line_marks_cross_the_seam(tc: PersistentOperationsTester) {
-	def backend = TracePWRegionBackend.new();
-	def region = ImmixPWRegion.new(backend, TracePWRegions.BLOCKS, tc.lineDescs(),
-		TracePWRegions.BLOCK_SIZE, true);
+def test_persistent_immix_line_marks_cross_the_seam(tc: ProviderTester) {
+	def backend = TraceAllocatorBackend.new();
+	def region = ImmixRegionAllocator.new(backend, TraceAllocators.BLOCKS, tc.lineDescs(),
+		TraceAllocators.BLOCK_SIZE, OpenMode.FORMAT);
 	if (backend.region == null) {
 		tc.t.fail("line-mark trace mapping allocation failed");
 		return;
 	}
 	tc.t.assertz(true, region.backendRegion != null);
-	def desc = region.getMetaDataDesc(0u64);
+	def desc = region.getMetadataDescriptor(0u64);
 	def firstMark = desc.offset + u64.!(desc.fixedBytes);
-	def marks = TracePWRegions.SIZE / u64.!(ImmixPWRegions.DefaultImmixLineSize);
+	def marks = TraceAllocators.SIZE / u64.!(ImmixLineMarks.DefaultImmixLineSize);
 	tc.t.assert_eq(marks, region.numLineMarks);
 	def recorder = backend.recorder();
 	recorder.clear();
 
 	// One mark set: one store, and the mark reads back through the forged ref.
 	def mark = region.lineMarks[3u64];
-	mark.setMark(region.lineMarkWriter(), ImmixPWRegions.LINE_MARKED);
+	mark.setMarkUnlogged(region.lineMarkWriter(), ImmixLineMarks.LINE_MARKED);
 	tc.t.assert_eq(1, recorder.events.length);
 	tc.assertStore(recorder.events[0], 1u64, firstMark + 3u64 * u64.!(LineMark.size),
-		1u8, u64.!(ImmixPWRegions.LINE_MARKED));
-	tc.t.assert_eq(ImmixPWRegions.LINE_MARKED, mark.getMark(region.reader()));
+		1u8, u64.!(ImmixLineMarks.LINE_MARKED));
+	tc.t.assert_eq(ImmixLineMarks.LINE_MARKED, mark.getMarkInRegion(region.reader()));
 
 	// A reset: one store per mark, in table order, each a STORE event, so
 	// none is a writeback or a fence.
@@ -830,18 +830,18 @@ def test_persistent_immix_line_marks_cross_the_seam(tc: PersistentOperationsTest
 	tc.t.assert_eq(int.!(marks), events.length);
 	for (i < events.length) {
 		tc.assertStore(events[i], u64.!(i + 1), firstMark + u64.!(i) * u64.!(LineMark.size),
-			1u8, u64.!(ImmixPWRegions.ImmixLineMarkResetValue));
+			1u8, u64.!(ImmixLineMarks.ImmixLineMarkResetValue));
 	}
 	tc.assertSequences(events);
-	tc.assertStoreContract(events, TracePWRegions.SIZE);
-	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkResetValue, mark.getMark(region.reader()));
+	tc.assertStoreContract(events, TraceAllocators.SIZE);
+	tc.t.assert_eq(ImmixLineMarks.ImmixLineMarkResetValue, mark.getMarkInRegion(region.reader()));
 	region.deallocate();
 }
 
 // Reopen and invoke the production recovery implementation against the same
 // recorded record. Replay uses the identical store seam and its completing
 // writeback/fence are visible in the same total order.
-def test_persistent_dual_wal_recovery_trace(tc: PersistentOperationsTester) {
+def test_persistent_dual_wal_recovery_trace(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("recovery trace mapping allocation failed");
@@ -849,32 +849,32 @@ def test_persistent_dual_wal_recovery_trace(tc: PersistentOperationsTester) {
 	}
 	def recorder = tc.recorderOf(region);
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 	wal.append(200u64, 0xA5u64, 1u8);
 	tc.t.assert_eq(1u64, wal.commit());
 	recorder.clear();
 
-	def reopened = DualTxnWal.new(base, base + 1024u64, 1024u64, region, false);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	def reopened = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.ATTACH);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(3, recorder.events.length);
 	tc.assertStore(recorder.events[0], 1u64, 200u64, 1u8, 0xA5u64);
-	tc.t.assertz(true, recorder.events[1].kind == PersistentEventKind.CLWB);
+	tc.t.assertz(true, recorder.events[1].kind == PersistenceEventKind.CLWB);
 	tc.t.assert_eq(192u64, recorder.events[1].offset);
-	tc.t.assertz(true, recorder.events[2].kind == PersistentEventKind.SFENCE);
+	tc.t.assertz(true, recorder.events[2].kind == PersistenceEventKind.SFENCE);
 	tc.assertSequences(recorder.events);
 	tc.t.assert_eq(0xA5u8, region.range[200]);
-	region.destroy();
+	region.close();
 }
 
 // ---------------------------------------------------------------------------
-// The load seam: DirectRegionReader and PersistentLoadObserver.
+// The load seam: RegionReader and LoadObserver.
 // ---------------------------------------------------------------------------
 
 // What one mount of a crash image did: the verdict of the check run over it,
 // the recovery it performed, and every store, writeback, fence and load it
 // made, in their recorded order.
-class PersistentLoadAuditRun(verdict: string, recovery: DualWalRecovery,
-	stores: Array<PersistentTraceEvent>, loads: Array<PersistentLoadEvent>) {
+class LoadAuditRun(verdict: string, recovery: WalRecovery,
+	stores: Array<PersistenceEvent>, loads: Array<LoadEvent>) {
 
 	// Bytes the run loaded or stored: the bytes that can affect it.
 	def touched(regionBytes: int) -> Array<bool> {
@@ -884,14 +884,14 @@ class PersistentLoadAuditRun(verdict: string, recovery: DualWalRecovery,
 			for (b < e.bytes.length) mask[int.!(e.offset) + b] = true;
 		}
 		for (e in stores) {
-			if (e.kind != PersistentEventKind.STORE) continue;
+			if (e.kind != PersistenceEventKind.STORE) continue;
 			for (b < int.view(e.width)) mask[int.!(e.offset) + b] = true;
 		}
 		return mask;
 	}
 
 	// The first way {that} differs from this run, or null.
-	def difference(that: PersistentLoadAuditRun) -> string {
+	def difference(that: LoadAuditRun) -> string {
 		if (recovery != that.recovery) return "recovery outcome differs";
 		if (verdict == null) {
 			if (that.verdict != null) return "verdict differs";
@@ -916,7 +916,7 @@ class PersistentLoadAuditRun(verdict: string, recovery: DualWalRecovery,
 	}
 }
 
-component PersistentLoadAudits {
+component LoadAudits {
 	// The offsets of the observations {loads} recorded that cover {nodeBytes}
 	// bytes, a B+Tree node's payload, in order; only those made before any
 	// store after the first {before} events, unless {before} is negative.
@@ -933,30 +933,30 @@ component PersistentLoadAudits {
 	// Mount {image} as production mounts a region, through a recording PMEM
 	// container with loads recorded too, run {check} over the mounted
 	// region, and keep what the mount, the recovery and the check did.
-	def run(image: PersistentDurableImage, numBlocks: u64, blockSize: u64,
-		check: PWRegion -> string) -> PersistentLoadAuditRun {
+	def run(image: CrashImage, numBlocks: u64, blockSize: u64,
+		check: RegionAllocator -> string) -> LoadAuditRun {
 
-		def mount = PersistentImageMounts.openMapped(image, true);
+		def mount = CrashImageMounts.openMapped(image, true);
 		if (mount == null) return null;
 		def loads = mount.recorder.recordLoads();
-		def region = PWRegion.new(PreparedRegionBackend.new(mount.region), numBlocks,
-			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		def region = RegionAllocator.new(PreparedStorageBackend.new(mount.region), numBlocks,
+			Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.ATTACH);
 		if (region.backendRegion == null) {
-			return PersistentLoadAuditRun.new("did not mount", DualWalRecovery.CLEAN,
+			return LoadAuditRun.new("did not mount", WalRecovery.CLEAN,
 				mount.recorder.events.copy(), loads.loads.copy());
 		}
 		def verdict = check(region);
-		def result = PersistentLoadAuditRun.new(verdict, region.lastRecovery,
+		def result = LoadAuditRun.new(verdict, region.lastRecovery,
 			mount.recorder.events.copy(), loads.loads.copy());
 		region.deallocate();
 		return result;
 	}
 
 	// {image} with every byte {keep} does not mark replaced by {fill}.
-	def refill(image: PersistentDurableImage, keep: Array<bool>, fill: int -> byte) -> PersistentDurableImage {
+	def refill(image: CrashImage, keep: Array<bool>, fill: int -> byte) -> CrashImage {
 		def bytes = Array<byte>.new(image.size());
 		for (i < bytes.length) bytes[i] = if(keep[i], image.bytes[i], fill(i));
-		return PersistentDurableImage.new(bytes);
+		return CrashImage.new(bytes);
 	}
 
 	def zeroes(i: int) -> byte { return 0x00u8; }
@@ -970,8 +970,8 @@ component PersistentLoadAudits {
 	// its offset. Returns the first difference, or null. A load that reached
 	// the region without being observed, and mattered, shows up here as a
 	// difference in the loads, the stores or the verdict.
-	def checkInert(image: PersistentDurableImage, numBlocks: u64, blockSize: u64,
-		check: PWRegion -> string, outcomes: Array<int>) -> string {
+	def checkInert(image: CrashImage, numBlocks: u64, blockSize: u64,
+		check: RegionAllocator -> string, outcomes: Array<int>) -> string {
 
 		def first = run(image, numBlocks, blockSize, check);
 		if (first == null) return "could not map the image";
@@ -993,14 +993,14 @@ component PersistentLoadAudits {
 
 	// checkInert() over the lazy and the eager image at every {stride}th cut
 	// of {trace}, and at its last cut. Fails {t} with the first difference.
-	def sweepInert(t: Tester, trace: PersistentTrace, initial: Array<byte>,
-		numBlocks: u64, blockSize: u64, stride: int, check: PWRegion -> string) -> Array<int> {
+	def sweepInert(t: Tester, trace: PersistenceTrace, initial: Array<byte>,
+		numBlocks: u64, blockSize: u64, stride: int, check: RegionAllocator -> string) -> Array<int> {
 
-		def outcomes = Array<int>.new(DualWalRecovery.PERSIST_FAILED.tag + 1);
+		def outcomes = Array<int>.new(WalRecovery.PERSIST_FAILED.tag + 1);
 		var cut = 0;
 		while (true) {
-			def images = [PersistentImages.lazyCrash(trace, initial, cut),
-				PersistentImages.eagerCrash(trace, initial, cut)];
+			def images = [CrashImages.lazyCrash(trace, initial, cut),
+				CrashImages.eagerCrash(trace, initial, cut)];
 			for (image in images) {
 				def diff = checkInert(image, numBlocks, blockSize, check, outcomes);
 				if (diff != null) {
@@ -1017,21 +1017,21 @@ component PersistentLoadAudits {
 }
 
 // Checks run over a mounted image by the inert-bytes audits.
-class PersistentLoadAuditChecks(capacity: int, liveSegments: u64) {
-	def allocator(region: PWRegion) -> string {
-		return PersistentAllocatorInvariants.check(region);
+class LoadAuditChecks(capacity: int, liveSegments: u64) {
+	def allocator(region: RegionAllocator) -> string {
+		return AllocatorInvariants.check(region);
 	}
 
-	def sieve(region: PWRegion) -> string {
-		def bad = PersistentAllocatorInvariants.check(region);
+	def sieve(region: RegionAllocator) -> string {
+		def bad = AllocatorInvariants.check(region);
 		if (bad != null) return bad;
 		def sieve = PWSieve.new(region, liveSegments);
 		if (!sieve.open()) return "sieve could not reattach to its root after recovery";
 		return sieve.checkInvariants();
 	}
 
-	def btree(region: PWRegion) -> string {
-		def bad = PersistentAllocatorInvariants.check(region);
+	def btree(region: RegionAllocator) -> string {
+		def bad = AllocatorInvariants.check(region);
 		if (bad != null) return bad;
 		def tree = PWBTree.new(region, capacity);
 		if (!tree.open()) return "the tree could not reopen after recovery";
@@ -1042,18 +1042,18 @@ class PersistentLoadAuditChecks(capacity: int, liveSegments: u64) {
 // With no observer installed, every reader load is the raw load it replaced:
 // each width at every naturally aligned offset of a page of varied bytes, the
 // region-relative form, and every field of each forged layout.
-def test_persistent_reader_matches_raw(tc: PersistentOperationsTester) {
+def test_persistent_reader_matches_raw(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("reader mapping allocation failed");
 		return;
 	}
 	for (i < region.range.length) region.range[i] = u8.view(i * 37 + 11 + (i >> 8));
-	def ops = region.persistentOperations();
+	def ops = region.provider();
 	tc.t.assertz(true, ops.loadObserver == null);
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def r = DirectRegionReader.new(ops, base);
-	def raw = PWRegionUtils.pointerFromU64;
+	def r = RegionReader.new(ops, base);
+	def raw = RegionUtils.pointerFromU64;
 	def size = u64.!(region.range.length);
 
 	for (off = 0u64; off < size; off++) {
@@ -1072,7 +1072,7 @@ def test_persistent_reader_matches_raw(tc: PersistentOperationsTester) {
 	}
 
 	def a = base + 512u64;
-	def e = r.forgeBlockEntry(a);
+	def e = r.forgeBlockTableEntry(a);
 	tc.t.assert_eq(raw(a).load<i16>(), e.listNum);
 	tc.t.assert_eq(raw(a + 8u64).load<i64>(), e.prev);
 	tc.t.assert_eq(raw(a + 16u64).load<i64>(), e.next);
@@ -1084,75 +1084,75 @@ def test_persistent_reader_matches_raw(tc: PersistentOperationsTester) {
 	tc.t.assert_eq(raw(a + 16u64).load<u64>(), c.chunk_limit);
 	tc.t.assert_eq(raw(a + 24u64).load<u64>(), c.linemarks);
 	tc.t.assert_eq(raw(a + 3u64).load<u8>(), r.forgeLineMark(a + 3u64).mark);
-	def d = r.forgeMetaDataDesc(a);
+	def d = r.forgeMetadataDescriptor(a);
 	tc.t.assert_eq(raw(a).load<u64>(), d.kind);
 	tc.t.assert_eq(raw(a + 8u64).load<u32>(), d.fixedBytes);
 	tc.t.assert_eq(raw(a + 12u64).load<u32>(), d.unitSize);
 	tc.t.assert_eq(raw(a + 16u64).load<u32>(), d.bytesPerUnit);
 	tc.t.assert_eq(raw(a + 24u64).load<u64>(), d.offset);
-	def h = r.forgeDualWalHeader(a);
+	def h = r.forgeWalHeader(a);
 	tc.t.assert_eq(raw(a).load<u64>(), h.magic);
 	tc.t.assert_eq(raw(a + 48u64).load<u64>(), h.checksum);
 	def rh = r.forgeRecordHeader(a);
 	tc.t.assert_eq(raw(a).load<u64>(), rh.magic);
-	tc.t.assert_eq(raw(a + u64.view(TxnRecordHeader.txnSeq.offset)).load<u64>(), rh.txnSeq);
-	def ct = r.forgeCommitTrailer(a);
-	tc.t.assert_eq(raw(a + u64.view(TxnCommitTrailer.checksum.offset)).load<u64>(), ct.checksum);
-	def le = r.forgeLogEntry(a);
+	tc.t.assert_eq(raw(a + u64.view(WalRecordHeader.txnSeq.offset)).load<u64>(), rh.txnSeq);
+	def ct = r.forgeRecordTrailer(a);
+	tc.t.assert_eq(raw(a + u64.view(WalRecordTrailer.checksum.offset)).load<u64>(), ct.checksum);
+	def le = r.forgeWalEntry(a);
 	tc.t.assert_eq(raw(a).load<u64>(), le.offset);
 	tc.t.assert_eq(raw(a + 8u64).load<u64>(), le.value);
 	tc.t.assert_eq(raw(a + 16u64).load<u8>(), le.width);
 
 	// The handles' getters are the reader's loads.
-	def entry = BlockEntryHandle(a);
-	tc.t.assert_eq(raw(a).load<i16>(), entry.getListNum(r));
-	tc.t.assertz(raw(a + 2u64).load<u8>() == 1u8, entry.getUsed(r));
-	tc.t.assert_eq(u64.view(i64.view(a) + raw(a + 16u64).load<i64>()), entry.getNext(r).addr);
+	def entry = BlockTableEntryHandle(a);
+	tc.t.assert_eq(raw(a).load<i16>(), entry.getListNumInRegion(r));
+	tc.t.assertz(raw(a + 2u64).load<u8>() == 1u8, entry.getUsedInRegion(r));
+	tc.t.assert_eq(u64.view(i64.view(a) + raw(a + 16u64).load<i64>()), entry.getNextInRegion(r).addr);
 	def chunk = ChunkHandle(a);
-	tc.t.assert_eq(raw(a + 8u64).load<u64>(), chunk.getLimit(r));
-	tc.t.assert_eq(raw(a + 24u64).load<u64>(), chunk.getLinemarks(r));
-	tc.t.assert_eq(raw(a + 5u64).load<u8>(), LineMarkHandle(a + 5u64).getMark(r));
+	tc.t.assert_eq(raw(a + 8u64).load<u64>(), chunk.getLimitInRegion(r));
+	tc.t.assert_eq(raw(a + 24u64).load<u64>(), chunk.getLinemarksInRegion(r));
+	tc.t.assert_eq(raw(a + 5u64).load<u8>(), LineMarkHandle(a + 5u64).getMarkInRegion(r));
 
 	// Reading through the seam stores nothing.
 	tc.t.asserti(0, tc.recorderOf(region).events.length);
-	region.destroy();
+	region.close();
 }
 
 // Rewrites each observed range with one byte value, so a test can tell
 // whether the load that follows saw the observer's bytes.
-class PersistentRewritingObserver(range: Range<byte>) extends PersistentLoadObserver {
+class RewritingLoadObserver(range: Range<byte>) extends LoadObserver {
 	var fill = 0u8;
 	var calls = 0;
 
-	def observe(offset: u64, length: u64) {
+	def beforeLoad(offset: u64, length: u64) {
 		calls++;
 		for (i < int.!(length)) range[int.!(offset) + i] = fill;
 	}
 }
 
-// The observer contract: observe() runs before the load, over region-relative
+// The observer contract: beforeLoad() runs before the load, over region-relative
 // offsets, and what it writes is what the code loads. A recorder installed in
 // front of it records the rewritten bytes, and neither adds a trace event.
-def test_persistent_load_observer_runs_before_the_load(tc: PersistentOperationsTester) {
+def test_persistent_load_observer_runs_before_the_load(tc: ProviderTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("observer mapping allocation failed");
 		return;
 	}
-	def ops = region.persistentOperations();
+	def ops = region.provider();
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def r = DirectRegionReader.new(ops, base);
-	def rewrite = PersistentRewritingObserver.new(region.range);
+	def r = RegionReader.new(ops, base);
+	def rewrite = RewritingLoadObserver.new(region.range);
 	ops.loadObserver = rewrite;
 
 	rewrite.fill = 0x5Au8;
 	tc.t.assert_eq(0x5A5A_5A5A_5A5A_5A5A_u64, r.loadU64(base + 64u64));
 	tc.t.assert_eq(0x5A5Au16, r.loadU16(base + 130u64));
 	rewrite.fill = 0x01u8;
-	def e = r.forgeBlockEntry(base + 256u64);
+	def e = r.forgeBlockTableEntry(base + 256u64);
 	tc.t.assert_eq(0x0101_0101_0101_0101_i64, e.listNext);	// observed once, for the whole layout
 	tc.t.asserti(3, rewrite.calls);
-	r.observe(base + 1000u64, 0u64);			// an empty range is not reported
+	r.beforeLoad(base + 1000u64, 0u64);			// an empty range is not reported
 	tc.t.asserti(3, rewrite.calls);
 
 	def recorder = tc.recorderOf(region);
@@ -1177,7 +1177,7 @@ def test_persistent_load_observer_runs_before_the_load(tc: PersistentOperationsT
 	tc.t.assertz(true, recorder.snapshot("loads").validate().ok());
 	recorder.clear();
 	tc.t.asserti(0, loads.loads.length);
-	region.destroy();
+	region.close();
 }
 
 // The load audit's core regression, the counterpart of the store audit: a
@@ -1188,10 +1188,10 @@ def test_persistent_load_observer_runs_before_the_load(tc: PersistentOperationsT
 // fields mount reads, the WAL header and both records, every block entry the
 // walk visits and the free-list heads; and the header fields mount does not
 // read stay unobserved, so the audit cannot pass by observing everything.
-def test_persistent_load_audit_covers_fields(tc: PersistentOperationsTester) {
-	def backend = TracePWRegionBackend.new();
-	def region = PWRegion.new(backend, TracePWRegions.BLOCKS, tc.noDescs(),
-		TracePWRegions.BLOCK_SIZE, true);
+def test_persistent_load_audit_covers_fields(tc: ProviderTester) {
+	def backend = TraceAllocatorBackend.new();
+	def region = RegionAllocator.new(backend, TraceAllocators.BLOCKS, tc.noDescs(),
+		TraceAllocators.BLOCK_SIZE, OpenMode.FORMAT);
 	if (backend.region == null) {
 		tc.t.fail("load audit mapping allocation failed");
 		return;
@@ -1203,19 +1203,19 @@ def test_persistent_load_audit_covers_fields(tc: PersistentOperationsTester) {
 	def bytes = Array<byte>.new(region.rng.length);
 	for (i < bytes.length) bytes[i] = region.rng[i];
 	region.deallocate();
-	def image = PersistentDurableImage.new(bytes);
+	def image = CrashImage.new(bytes);
 
-	def mount = PersistentImageMounts.openMapped(image, true);
+	def mount = CrashImageMounts.openMapped(image, true);
 	if (mount == null) {
 		tc.t.fail("load audit mount allocation failed");
 		return;
 	}
 	def loads = mount.recorder.recordLoads();
-	def mounted = PWRegion.new(PreparedRegionBackend.new(mount.region), TracePWRegions.BLOCKS,
-		tc.noDescs(), TracePWRegions.BLOCK_SIZE, false);
+	def mounted = RegionAllocator.new(PreparedStorageBackend.new(mount.region), TraceAllocators.BLOCKS,
+		tc.noDescs(), TraceAllocators.BLOCK_SIZE, OpenMode.ATTACH);
 	tc.t.assertz(true, mounted.backendRegion != null);
-	tc.t.assertz(true, mounted.lastRecovery == DualWalRecovery.REPLAYED);
-	def violation = PersistentAllocatorInvariants.check(mounted);
+	tc.t.assertz(true, mounted.lastRecovery == WalRecovery.REPLAYED);
+	def violation = AllocatorInvariants.check(mounted);
 	if (violation != null) tc.t.fail(violation);
 	def afterWalk = loads.loads.length;
 	// A transaction read that misses its write-behind cache reads the region.
@@ -1226,15 +1226,15 @@ def test_persistent_load_audit_covers_fields(tc: PersistentOperationsTester) {
 		return;
 	}
 	def rootLoad = loads.loads[afterWalk];
-	tc.t.assert_eq(u64.view(PWRegionHeader.userRoot.offset), rootLoad.offset);
+	tc.t.assert_eq(u64.view(RegionHeader.userRoot.offset), rootLoad.offset);
 	tc.t.assert_eq(8u64, rootLoad.length);
 
 	// Mount reads the magic before anything else, and before any store.
 	def magic = loads.loads[0];
 	tc.t.asserti(0, magic.afterEvents);
-	tc.t.assert_eq(u64.view(PWRegionHeader.magic.offset), magic.offset);
+	tc.t.assert_eq(u64.view(RegionHeader.magic.offset), magic.offset);
 	tc.t.assert_eq(8u64, magic.length);
-	tc.t.assert_eq(PWRegions.MAGIC, magic.value());
+	tc.t.assert_eq(RegionFormat.MAGIC, magic.value());
 
 	// Every load lies in the region and is placed in the store order; the
 	// trace itself stays modelable.
@@ -1248,38 +1248,38 @@ def test_persistent_load_audit_covers_fields(tc: PersistentOperationsTester) {
 	tc.t.assertz(true, mount.recorder.snapshot("mount").validate().ok());
 
 	def covered = loads.coverage();
-	// Header: blockTable, sentinels, numBlocks; magic, blockSize, logChunk.
+	// Header: blockTable, sentinels, numBlocks; magic, blockSize, logBlock.
 	tc.assertCovered(covered, 0u64, 24u64, true);
 	tc.assertCovered(covered, 56u64, 24u64, true);
-	// numBytes, numDescs, metaData and metaDataDescs are not read by a mount
+	// numBytes, numDescs, metadata and metadataDescriptors are not read by a mount
 	// without descriptors; userRoot is, but only by getUserRoot() above.
 	tc.assertCovered(covered, 24u64, 32u64, false);
 	// The WAL header, whole: its fields, then its checksum over the rest.
-	def log = TracePWRegions.LOG_CHUNK_START;
-	tc.assertCovered(covered, log, u64.!(DualWalHeader.size), true);
+	def log = TraceAllocators.LOG_CHUNK_START;
+	tc.assertCovered(covered, log, u64.!(WalHeader.size), true);
 	// Both records, whole, and nothing of either slot beyond its record.
-	def slotBytes = ((TracePWRegions.BLOCK_SIZE - u64.!(DualWalHeader.size)) / 2u64) & ~63u64;
+	def slotBytes = ((TraceAllocators.BLOCK_SIZE - u64.!(WalHeader.size)) / 2u64) & ~63u64;
 	for (slot < 2) {
-		def start = log + u64.!(DualWalHeader.size) + u64.!(slot) * slotBytes;
-		def recordLen = u64.!(image.read(start + u64.view(TxnRecordHeader.recordLen.offset), 4));
+		def start = log + u64.!(WalHeader.size) + u64.!(slot) * slotBytes;
+		def recordLen = u64.!(image.read(start + u64.view(WalRecordHeader.recordLen.offset), 4));
 		tc.t.assertz(true, recordLen > 0u64 && recordLen < slotBytes);
 		tc.assertCovered(covered, start, recordLen, true);
 		tc.assertCovered(covered, start + recordLen, 64u64, false);
 	}
 	// Every entry in memory order, read from the recovered region, and the
 	// two free-list heads.
-	def walk = DirectRegionReader.new(X86_64PersistentOperations.new(mount.region.range), mounted.regionStart);
+	def walk = RegionReader.new(NativeProvider.new(mount.region.range), mounted.regionStart);
 	var entry = mounted.blockTableHandle[0u64];
 	var visited = 0;
-	while (!entry.isNull() && visited <= int.!(TracePWRegions.BLOCKS)) {
+	while (!entry.isNull() && visited <= int.!(TraceAllocators.BLOCKS)) {
 		tc.assertBlockEntriesCovered(covered, entry.addr - mounted.regionStart, 1u64);
-		entry = entry.getNext(walk);
+		entry = entry.getNextInRegion(walk);
 		visited++;
 	}
 	tc.t.assertz(true, visited >= 4);
-	for (kind in [ListKind.SMALL_FREE, ListKind.LARGE_FREE]) {
+	for (kind in [FreeListKind.SMALL_FREE, FreeListKind.LARGE_FREE]) {
 		def head = mounted.sentinels[u64.!(kind.code)].addr - mounted.regionStart;
-		tc.assertCovered(covered, head + u64.view(BlockEntry.listNext.offset), 8u64, true);
+		tc.assertCovered(covered, head + u64.view(BlockTableEntry.listNext.offset), 8u64, true);
 	}
 	mounted.deallocate();
 }
@@ -1291,28 +1291,28 @@ def test_persistent_load_audit_covers_fields(tc: PersistentOperationsTester) {
 // stores, the recovery outcome and the verdict must not change. Images: the
 // lazy and the eager one at every cut of a recorded two-allocation scenario,
 // so both a replaying and a clean recovery are covered.
-def test_persistent_load_audit_unobserved_bytes_inert(tc: PersistentOperationsTester) {
-	def at = PersistentAllocatorTester.new(tc.t);
+def test_persistent_load_audit_unobserved_bytes_inert(tc: ProviderTester) {
+	def at = AllocatorCrashTester.new(tc.t);
 	if (!at.openRecordingRegion()) {
-		tc.t.fail("could not format a recording PWRegion");
+		tc.t.fail("could not format a recording RegionAllocator");
 		return;
 	}
 	def trace = at.recordAllocations(2, "load_audit_two_allocations");
 	def mounted = at.mounted;
 	at.cleanup();
 	if (trace == null) return;
-	def checks = PersistentLoadAuditChecks.new(0, 0u64);
-	def outcomes = PersistentLoadAudits.sweepInert(tc.t, trace, mounted, at.BLOCKS,
+	def checks = LoadAuditChecks.new(0, 0u64);
+	def outcomes = LoadAudits.sweepInert(tc.t, trace, mounted, at.BLOCKS,
 		at.BLOCK_SIZE, 1, checks.allocator);
-	tc.t.assertz(true, outcomes[DualWalRecovery.CLEAN.tag] > 0);
-	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
+	tc.t.assertz(true, outcomes[WalRecovery.CLEAN.tag] > 0);
+	tc.t.assertz(true, outcomes[WalRecovery.REPLAYED.tag] > 0);
 }
 
 // The same audit over the sieve's reattach: recovery, the allocator walk,
 // PWSieve.open() (which may free leaked extents) and the sieve's invariants,
 // over the images of one recorded step.
-def test_persistent_load_audit_sieve_reattach_inert(tc: PersistentOperationsTester) {
-	def st = PersistentSieveTester.new(tc.t);
+def test_persistent_load_audit_sieve_reattach_inert(tc: ProviderTester) {
+	def st = SieveCrashTester.new(tc.t);
 	if (!st.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -1321,26 +1321,26 @@ def test_persistent_load_audit_sieve_reattach_inert(tc: PersistentOperationsTest
 	def mounted = st.mounted;
 	st.cleanup();
 	if (trace == null) return;
-	def checks = PersistentLoadAuditChecks.new(0, st.LIVE);
-	def outcomes = PersistentLoadAudits.sweepInert(tc.t, trace, mounted, st.BLOCKS,
+	def checks = LoadAuditChecks.new(0, st.LIVE);
+	def outcomes = LoadAudits.sweepInert(tc.t, trace, mounted, st.BLOCKS,
 		st.BLOCK_SIZE, 1, checks.sieve);
-	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
+	tc.t.assertz(true, outcomes[WalRecovery.REPLAYED.tag] > 0);
 }
 
 // And over the B+Tree's reattach: recovery, the allocator walk, PWBTree.open()
 // (its invariants and leak sweep) and checkInvariants(), over the images of an
 // update at height 3, at every fourth cut (the trace has about 3,000 cuts and
 // each image is mounted four times).
-def test_persistent_load_audit_btree_reattach_inert(tc: PersistentOperationsTester) {
-	def bt = PersistentBTreeTester.new(tc.t);
+def test_persistent_load_audit_btree_reattach_inert(tc: ProviderTester) {
+	def bt = BTreeCrashTester.new(tc.t);
 	def trace = bt.recordUpdate("load_audit_btree_update");
 	def mounted = bt.mounted;
 	bt.cleanup();
 	if (trace == null) return;
-	def checks = PersistentLoadAuditChecks.new(bt.CAPACITY, 0u64);
-	def outcomes = PersistentLoadAudits.sweepInert(tc.t, trace, mounted, bt.BLOCKS,
+	def checks = LoadAuditChecks.new(bt.CAPACITY, 0u64);
+	def outcomes = LoadAudits.sweepInert(tc.t, trace, mounted, bt.BLOCKS,
 		bt.BLOCK_SIZE, 4, checks.btree);
-	tc.t.assertz(true, outcomes[DualWalRecovery.REPLAYED.tag] > 0);
+	tc.t.assertz(true, outcomes[WalRecovery.REPLAYED.tag] > 0);
 }
 
 // The descents of get() and put() fetch each node on the key's path through
@@ -1349,8 +1349,8 @@ def test_persistent_load_audit_btree_reattach_inert(tc: PersistentOperationsTest
 // with loads recorded from then on: a lookup observes exactly three whole
 // nodes, root first, each once and none twice; and a put of the same key
 // observes the same three, in the same order, before its first store.
-def test_persistent_load_audit_btree_descents_fetch_the_path(tc: PersistentOperationsTester) {
-	def bt = PersistentBTreeTester.new(tc.t);
+def test_persistent_load_audit_btree_descents_fetch_the_path(tc: ProviderTester) {
+	def bt = BTreeCrashTester.new(tc.t);
 	if (!bt.openRecordingTree()) {
 		tc.t.fail("could not open the recording tree");
 		bt.cleanup();
@@ -1370,7 +1370,7 @@ def test_persistent_load_audit_btree_descents_fetch_the_path(tc: PersistentOpera
 
 	def got = tree.get(key);
 	tc.t.assertz(true, got.0);
-	def path = PersistentLoadAudits.nodeObserves(loads, nodeBytes, -1);
+	def path = LoadAudits.nodeObserves(loads, nodeBytes, -1);
 	if (path.length != 3) {
 		tc.t.fail1("a lookup observed %d whole nodes, not one per level", path.length);
 		bt.cleanup();
@@ -1382,7 +1382,7 @@ def test_persistent_load_audit_btree_descents_fetch_the_path(tc: PersistentOpera
 	loads.clear();
 	def start = bt.recorder.events.length;
 	tc.t.assertz(true, tree.put(key, got.1 + 1u64));
-	def before = PersistentLoadAudits.nodeObserves(loads, nodeBytes, start);
+	def before = LoadAudits.nodeObserves(loads, nodeBytes, start);
 	if (before.length != 3) {
 		tc.t.fail1("a put observed %d whole nodes before its first store, not one per level", before.length);
 		bt.cleanup();

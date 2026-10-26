@@ -9,7 +9,7 @@
 // recovery.
 //
 // Two properties are checked over those images. The allocator's structural
-// invariants are the existing PersistentAllocatorProperty. The stronger one is
+// invariants are the existing AllocatorProperty. The stronger one is
 // the workload's own: mount the image, let PWSieve reattach through the durable
 // root, and require its cross-object invariants to hold. That covers state the
 // allocator has no opinion about -- whether the prime count still matches the
@@ -20,14 +20,14 @@
 // volatile region's persistence boundaries emit no CLWB or SFENCE, so the model
 // would be shown a run in which nothing was ever made durable.
 //
-// Images are mounted in an anonymous mapping (PersistentAnonMounts, which
-// opens PersistentImageBackend's AnonMappedRegion), not in a heap array: the
+// Images are mounted in an anonymous mapping (CrashAnonMounts, which
+// opens CrashImageBackend's AnonMappedRegion), not in a heap array: the
 // sieve allocates while it is checked, a collection can move a heap array, and
-// PWRegion keeps the raw address. The mapping's boundaries succeed without
+// RegionAllocator keeps the raw address. The mapping's boundaries succeed without
 // reaching the writeback hooks; only what recovery and the sieve leave in the
 // bytes is examined. Each image costs an mmap and a munmap.
 
-def PST = UnitTests.registerT("persistent_sieve:", _, PersistentSieveTester.new, _);
+def PST = UnitTests.registerT("sieve_crash:", _, SieveCrashTester.new, _);
 def PSTX = [
 	PST("recorded_step_is_modelable",        test_psieve_recorded_step_is_modelable),
 	PST("final_cut_is_exhaustive",           test_psieve_final_cut_is_exhaustive),
@@ -40,7 +40,7 @@ def PSTX = [
 	()
 ];
 
-class PersistentSieveTester(t: Tester) {
+class SieveCrashTester(t: Tester) {
 	// 2 KB blocks: the smallest geometry the allocator itself supports here,
 	// since a splitting allocation buffers around twenty redo entries and the
 	// WAL slot is (blockSize - 64) / 2 bytes. A 1 KB block gives a 480-byte
@@ -59,18 +59,18 @@ class PersistentSieveTester(t: Tester) {
 	def BUDGET = 16;
 
 	var mounted: Array<byte>;       // durable bytes before the recorded scenario
-	var region: PWRegion;
+	var region: RegionAllocator;
 	var sieve: PWSieve;
-	var recorder: RecordingPersistentOperations;
+	var recorder: RecordingProvider;
 
 	// Format a recording region and lay out the sieve on it. The recorded
 	// scenario starts from a region that already has a published root, so
 	// every enumerated image is one a restart could actually be handed.
 	def openRecordingSieve() -> bool {
-		region = PWRegion.new(RecordingPmemBackend.new(), BLOCKS,
-			Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, true);
+		region = RegionAllocator.new(RecordingPmemBackend.new(), BLOCKS,
+			Array<Ref<MetadataDescriptor>>.new(0), BLOCK_SIZE, OpenMode.FORMAT);
 		if (region.backendRegion == null) return false;
-		recorder = RecordingPersistentOperations.!(region.backendRegion.persistentOperations());
+		recorder = RecordingProvider.!(region.backendRegion.provider());
 		sieve = PWSieve.new(region, LIVE);
 		return sieve.open();
 	}
@@ -82,7 +82,7 @@ class PersistentSieveTester(t: Tester) {
 
 	// Record exactly one step() as a scenario, from a snapshot of the durable
 	// bytes that preceded it.
-	def recordStep(name: string) -> PersistentTrace {
+	def recordStep(name: string) -> PersistenceTrace {
 		snapshotMounted();
 		recorder.clear();
 		if (!sieve.step()) {
@@ -97,12 +97,12 @@ class PersistentSieveTester(t: Tester) {
 		return trace;
 	}
 
-	def allocatorProperty(name: string) -> PersistentImageProperty {
-		return PersistentSieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).allocatorProperty(name);
+	def allocatorProperty(name: string) -> CrashImageProperty {
+		return SieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).allocatorProperty(name);
 	}
 
-	def sieveProperty(name: string) -> PersistentImageProperty {
-		return PersistentSieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).property(name);
+	def sieveProperty(name: string) -> CrashImageProperty {
+		return SieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).property(name);
 	}
 
 	def cleanup() {
@@ -120,13 +120,13 @@ class PersistentSieveTester(t: Tester) {
 // invariants. Reattaching is part of the property, not a precondition -- a
 // restart that cannot find its own root has lost the region as surely as one
 // that finds it inconsistent.
-class PersistentSieveProperty(numBlocks: u64, blockSize: u64, liveSegments: u64) {
+class SieveProperty(numBlocks: u64, blockSize: u64, liveSegments: u64) {
 
-	def check(image: PersistentDurableImage) -> string {
-		def region = PersistentAnonMounts.openRegion(image, numBlocks, blockSize);
+	def check(image: CrashImage) -> string {
+		def region = CrashAnonMounts.openRegion(image, numBlocks, blockSize);
 		if (region == null) return "durable image did not mount as an allocator";
 
-		var violation = PersistentAllocatorInvariants.check(region);
+		var violation = AllocatorInvariants.check(region);
 		if (violation == null) {
 			// open() is the real restart path: it reclaims extents nothing
 			// names and finishes an interrupted retirement, then the
@@ -139,22 +139,22 @@ class PersistentSieveProperty(numBlocks: u64, blockSize: u64, liveSegments: u64)
 		return violation;
 	}
 
-	def property(name: string) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, 0u64, 0, check);
+	def property(name: string) -> CrashImageProperty {
+		return CrashImageProperty.new(name, 0u64, 0, check);
 	}
 
-	// The allocator's structural invariants alone, as PersistentAllocatorProperty
+	// The allocator's structural invariants alone, as AllocatorProperty
 	// checks them, over the same mount as check().
-	def checkAllocator(image: PersistentDurableImage) -> string {
-		def region = PersistentAnonMounts.openRegion(image, numBlocks, blockSize);
+	def checkAllocator(image: CrashImage) -> string {
+		def region = CrashAnonMounts.openRegion(image, numBlocks, blockSize);
 		if (region == null) return "durable image did not mount as an allocator";
-		def violation = PersistentAllocatorInvariants.check(region);
+		def violation = AllocatorInvariants.check(region);
 		region.deallocate();
 		return violation;
 	}
 
-	def allocatorProperty(name: string) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, 0u64, 0, checkAllocator);
+	def allocatorProperty(name: string) -> CrashImageProperty {
+		return CrashImageProperty.new(name, 0u64, 0, checkAllocator);
 	}
 }
 
@@ -163,7 +163,7 @@ class PersistentSieveProperty(numBlocks: u64, blockSize: u64, liveSegments: u64)
 // failure-atomic stores that never cross a cache line -- or nothing downstream
 // means anything. The bulk bitmap write is the interesting part: it goes
 // through the same seam as the log, so it is held to the same contract.
-def test_psieve_recorded_step_is_modelable(tc: PersistentSieveTester) {
+def test_psieve_recorded_step_is_modelable(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -188,7 +188,7 @@ def test_psieve_recorded_step_is_modelable(tc: PersistentSieveTester) {
 // sieve -- from the record if the after-images did not land, from the applied
 // bytes if they did. The search here is complete, so this is evidence rather
 // than a sample.
-def test_psieve_final_cut_is_exhaustive(tc: PersistentSieveTester) {
+def test_psieve_final_cut_is_exhaustive(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -197,7 +197,7 @@ def test_psieve_final_cut_is_exhaustive(tc: PersistentSieveTester) {
 	tc.cleanup();
 	if (trace == null) return;
 
-	def result = PersistentExplorer.checkImages(trace, tc.mounted, trace.length(), 64,
+	def result = CrashExplorer.checkImages(trace, tc.mounted, trace.length(), 64,
 		tc.sieveProperty("every image a completed step permits recovers"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.exhaustive());
@@ -207,7 +207,7 @@ def test_psieve_final_cut_is_exhaustive(tc: PersistentSieveTester) {
 
 // Every crash schedule at every point of one step must leave an allocator a
 // production mount can recover into a structurally sound state.
-def test_psieve_step_images_satisfy_allocator(tc: PersistentSieveTester) {
+def test_psieve_step_images_satisfy_allocator(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -216,7 +216,7 @@ def test_psieve_step_images_satisfy_allocator(tc: PersistentSieveTester) {
 	tc.cleanup();
 	if (trace == null) return;
 
-	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+	def result = CrashExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
 		tc.allocatorProperty("allocator survives every crash schedule of a sieve step"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.imagesChecked > trace.length());
@@ -227,7 +227,7 @@ def test_psieve_step_images_satisfy_allocator(tc: PersistentSieveTester) {
 // The stronger statement: the workload's own state, not just the allocator's.
 // A torn commit that left the prime count disagreeing with the bitmaps would
 // satisfy the allocator's invariants and fail here.
-def test_psieve_step_images_satisfy_sieve(tc: PersistentSieveTester) {
+def test_psieve_step_images_satisfy_sieve(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -236,7 +236,7 @@ def test_psieve_step_images_satisfy_sieve(tc: PersistentSieveTester) {
 	tc.cleanup();
 	if (trace == null) return;
 
-	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+	def result = CrashExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
 		tc.sieveProperty("sieve invariants survive every crash schedule of a step"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.imagesChecked > trace.length());
@@ -247,7 +247,7 @@ def test_psieve_step_images_satisfy_sieve(tc: PersistentSieveTester) {
 // publishing commit followed by a second transaction that unpublishes a
 // descriptor and frees its extent together. A crash between the two is
 // legitimate and must leave a state the next mount can finish.
-def test_psieve_retiring_step_images_stay_consistent(tc: PersistentSieveTester) {
+def test_psieve_retiring_step_images_stay_consistent(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -264,7 +264,7 @@ def test_psieve_retiring_step_images_stay_consistent(tc: PersistentSieveTester) 
 	tc.cleanup();
 	if (trace == null) return;
 
-	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+	def result = CrashExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
 		tc.sieveProperty("a retiring step leaves a recoverable sieve"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.imagesChecked > trace.length());
@@ -273,7 +273,7 @@ def test_psieve_retiring_step_images_stay_consistent(tc: PersistentSieveTester) 
 // The checks above are only worth something if they can fail. Corrupt one byte
 // of a durable bitmap and the sieve property must reject that image, naming
 // the disagreement rather than mounting happily.
-def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
+def test_psieve_property_detects_a_damaged_image(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -285,9 +285,9 @@ def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
 	// The maximal schedule: every dirty line evicted at every boundary, so
 	// everything the step wrote survives. The most complete image the cut
 	// permits, and the right baseline for a damage check.
-	def intact = PersistentImages.eagerCrash(trace, tc.mounted, trace.length());
+	def intact = CrashImages.eagerCrash(trace, tc.mounted, trace.length());
 
-	def property = PersistentSieveProperty.new(tc.BLOCKS, tc.BLOCK_SIZE, tc.LIVE);
+	def property = SieveProperty.new(tc.BLOCKS, tc.BLOCK_SIZE, tc.LIVE);
 	def baseline = property.check(intact);
 	if (baseline != null) tc.t.fail(baseline);
 
@@ -306,7 +306,7 @@ def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
 	damaged[segmentBody] = damaged[segmentBody] ^ 0xFFu8;
 	damaged[segmentBody + 1] = damaged[segmentBody + 1] ^ 0xFFu8;
 
-	def image = PersistentDurableImage.new(damaged);
+	def image = CrashImage.new(damaged);
 	def violation = property.check(image);
 	// Assert *which* check caught it, not merely that something did. A
 	// non-null violation is too weak a claim: damage aimed at the wrong block
@@ -318,11 +318,11 @@ def test_psieve_property_detects_a_damaged_image(tc: PersistentSieveTester) {
 }
 
 // A mounted image must not move under its region: a collection between
-// mounting an image and checking it leaves the bytes where PWRegion's raw
+// mounting an image and checking it leaves the bytes where RegionAllocator's raw
 // regionStart says they are, and the sieve still reattaches and checks clean.
 // In a heap array, which openArray() used until 2026-10-19, the collector
 // moves them, and this fails.
-def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
+def test_psieve_mounted_image_survives_a_collection(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -331,8 +331,8 @@ def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
 	tc.cleanup();
 	if (trace == null) return;
 
-	def image = PersistentImages.eagerCrash(trace, tc.mounted, trace.length());
-	def region = PersistentAnonMounts.openRegion(image, tc.BLOCKS, tc.BLOCK_SIZE);
+	def image = CrashImages.eagerCrash(trace, tc.mounted, trace.length());
+	def region = CrashAnonMounts.openRegion(image, tc.BLOCKS, tc.BLOCK_SIZE);
 	if (region == null) {
 		tc.t.fail("durable image did not mount as an allocator");
 		return;
@@ -348,7 +348,7 @@ def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
 }
 
 // A negative control for recovery rather than for flush placement. With
-// DualTxnWalMutants.skipRecordChecksum set, recovery does not compare a
+// WalFaultInjection.skipRecordChecksum set, recovery does not compare a
 // record's checksum, so it replays a torn record whose header, trailer and
 // entries happen to be complete. The sweep of a sieve step must reject that
 // recovery, and with the checksum compared the same images must pass.
@@ -363,7 +363,7 @@ def test_psieve_mounted_image_survives_a_collection(tc: PersistentSieveTester) {
 // sweep passes at budgets 2 to 4, fails at cut 660 at 6 and 8, and at cut 385
 // at 10 and 12. Hence 12, two above the smallest budget that catches it at cut
 // 385. At BUDGET's 16 the suite's seed catches it earlier, at cut 289.
-def test_psieve_unchecked_record_checksum_is_caught(tc: PersistentSieveTester) {
+def test_psieve_unchecked_record_checksum_is_caught(tc: SieveCrashTester) {
 	if (!tc.openRecordingSieve()) {
 		tc.t.fail("could not lay out a recording sieve");
 		return;
@@ -374,9 +374,9 @@ def test_psieve_unchecked_record_checksum_is_caught(tc: PersistentSieveTester) {
 	def budget = 12;
 	def property = tc.sieveProperty("sieve invariants survive every crash schedule of a step");
 
-	DualTxnWalMutants.skipRecordChecksum = true;
-	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, budget, property);
-	DualTxnWalMutants.skipRecordChecksum = false;
+	WalFaultInjection.skipRecordChecksum = true;
+	def result = CrashExplorer.checkAllCuts(trace, tc.mounted, budget, property);
+	WalFaultInjection.skipRecordChecksum = false;
 	tc.t.assertz(false, result.ok());
 	def cx = result.counterexample;
 	if (cx == null) {
@@ -388,13 +388,13 @@ def test_psieve_unchecked_record_checksum_is_caught(tc: PersistentSieveTester) {
 	tc.t.assertz(true, Strings.startsWith(cx.selectionNote(), "image 9 of 12 chosen from 4147200 distinct images"));
 
 	// The note is enough to find the image again.
-	def replay = PersistentExplorer.selectCrashImages(trace, tc.mounted, cx.crashAfter, budget,
+	def replay = CrashExplorer.selectCrashImages(trace, tc.mounted, cx.crashAfter, budget,
 		result.exploration.seed);
 	tc.t.assertz(true, replay.images[8].sameBytes(cx.durableImage()));
 
 	// With the checksum compared, that image recovers into a consistent sieve,
 	// and so does every image the same sweep checks up to that cut.
 	tc.t.assertz(true, property.check(cx.durableImage()) == null);
-	def ordinary = PersistentExplorer.checkCutRange(trace, tc.mounted, 0, cx.crashAfter, budget, property);
+	def ordinary = CrashExplorer.checkCutRange(trace, tc.mounted, 0, cx.crashAfter, budget, property);
 	if (!ordinary.ok()) tc.t.fail(ordinary.toArtifact());
 }

@@ -1,7 +1,7 @@
 // PWSieve tests
 //
-// Drives the resumable segmented sieve over a PWRegion. The region geometry is
-// the same 8 x 4096 used by TxnPWRegionTest: block 0 header, block 1 WAL,
+// Drives the resumable segmented sieve over a RegionAllocator. The region geometry is
+// the same 8 x 4096 used by RegionAllocatorTest: block 0 header, block 1 WAL,
 // blocks 2-6 allocatable (5), block 7 metadata. The sieve takes one block for
 // its root chunk and one per live segment, so a retention window of 2 leaves
 // the allocator cycling blocks in and out for the whole run.
@@ -33,17 +33,16 @@ def SX = [
 ];
 
 class PWSieveTester(t: Tester) {
-	var region: PWRegion;
+	var region: RegionAllocator;
 	var sieve: PWSieve;
 
 	new() {
-		region = PWRegion.new(
-			Backends.getVolatile(),
+		region = RegionAllocator.new(
+			Backends.volatile(),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			true
-		);
+			OpenMode.FORMAT);
 		sieve = PWSieve.new(region, SIEVE_LIVE);
 	}
 
@@ -66,7 +65,7 @@ class PWSieveTester(t: Tester) {
 	def usedBlocks() -> u64 {
 		var used: u64 = 0;
 		for (i < region.numBlocks) {
-			if (region.blockTableHandle[i].getUsed(region.reader())) used++;
+			if (region.blockTableHandle[i].getUsedInRegion(region.reader())) used++;
 		}
 		return used;
 	}
@@ -267,7 +266,7 @@ def test_sieve_open_enforces_retention_window(tc: PWSieveTester) {
 
 def SIEVE_BD_PATH = "/tmp/wiz_test_sieve_region";
 
-def SBT = UnitTests.registerT("pwsieve_bd:", _, PWSieveFileTester.new, _);
+def SBT = UnitTests.registerT("pwsieve_file:", _, PWSieveFileTester.new, _);
 def SBX = [
 	SBT("resumes_after_remount",       test_sieve_bd_resumes_after_remount),
 	SBT("resume_is_idempotent",        test_sieve_bd_resume_is_idempotent),
@@ -276,23 +275,22 @@ def SBX = [
 ];
 
 class PWSieveFileTester(t: Tester) {
-	var region: PWRegion;
+	var region: RegionAllocator;
 	var sieve: PWSieve;
 
 	new() {
-		RegionFileIO.unlink(SIEVE_BD_PATH);
+		BackingFile.unlink(SIEVE_BD_PATH);
 		region = openRegion(true);
 		sieve = PWSieve.new(region, SIEVE_LIVE);
 	}
 
-	private def openRegion(forceFormat: bool) -> PWRegion {
-		return PWRegion.new(
-			X86_64Backends.getFileMapped(SIEVE_BD_PATH),
+	private def openRegion(forceFormat: bool) -> RegionAllocator {
+		return RegionAllocator.new(
+			X86_64Backends.mappedFile(SIEVE_BD_PATH),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			forceFormat
-		);
+			if(forceFormat, OpenMode.FORMAT, OpenMode.ATTACH));
 	}
 
 	// Close cleanly and mount the same file again, as a restart would.
@@ -316,7 +314,7 @@ class PWSieveFileTester(t: Tester) {
 			region.deallocate();
 			region = null;
 		}
-		RegionFileIO.unlink(SIEVE_BD_PATH);
+		BackingFile.unlink(SIEVE_BD_PATH);
 	}
 }
 

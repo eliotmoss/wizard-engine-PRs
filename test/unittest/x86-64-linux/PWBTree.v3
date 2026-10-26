@@ -1,14 +1,14 @@
-// A persistent B+Tree of u64 keys and values over a PWRegion.
+// A persistent B+Tree of u64 keys and values over a RegionAllocator.
 //
 // This is a workload driver, not engine code, like PWSieve. The sieve computes
 // for ~150 us between boundaries and persists for ~15 us on PMEM; a tree
 // mutation computes little and persists a lot, so the two bracket the
 // interface from opposite ends. Nothing here touches WASM; the only interface
-// under test is PWRegion's.
+// under test is RegionAllocator's.
 //
 // Layout. Every node is one chunk of one block (allocChunk(1)), so the tree
 // needs no object layer above the allocator. A root chunk, published at
-// PWRegion's userRoot, holds a TreeRoot; it is never freed.
+// RegionAllocator's userRoot, holds a TreeRoot; it is never freed.
 //
 //   root chunk:     [ChunkHeader][TreeRoot]
 //   leaf:           [ChunkHeader][tag][count][key, value] * count
@@ -61,10 +61,10 @@ component PWBTreeConst {
         def LINE = 64u64;
 
         // The first cache line a node's stores touch: its payload starts after
-        // the chunk header, and a chunk is block aligned, but PWRegion only
+        // the chunk header, and a chunk is block aligned, but RegionAllocator only
         // requires a block size to be a multiple of 8, so the payload need not
-        // start on a line. Aligned down, as persistRange() aligns its range
-        // (MmapRegionUtils.flushRange).
+        // start on a line. Aligned down, as persist() aligns its range
+        // (CacheLines.writeBackLines).
         def nodeLineStart(offset: u64) -> u64 {
                 def start = offset + u64.!(ChunkHeader.size);
                 return start - start % LINE;
@@ -110,10 +110,10 @@ class PWBTreeImage(words: Array<u64>) {
 }
 
 // {requestedCapacity} 0 asks for the most a node of the region's block size holds.
-class PWBTree(region: PWRegion, requestedCapacity: int) {
-        private var writer: DirectRegionWriter;
-        private var reader: DirectRegionReader;
-        private var ops: PersistentOperations;
+class PWBTree(region: RegionAllocator, requestedCapacity: int) {
+        private var writer: UnloggedWriter;
+        private var reader: RegionReader;
+        private var ops: PersistenceProvider;
         private var rootOffset: u64;            // region-relative offset of the root chunk
         private var cap: int;                   // keys per node
         private var maxWords: int;              // words in a node's payload
@@ -136,9 +136,9 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
 
         new() {
                 if (region != null && region.backendRegion != null) {
-                        ops = X86_64PersistentOps.ensureFor(region.backendRegion);
-                        writer = DirectRegionWriter.new(ops, region.regionStart);
-                        reader = DirectRegionReader.new(ops, region.regionStart);
+                        ops = NativeProviders.installIfAbsent(region.backendRegion);
+                        writer = UnloggedWriter.new(ops, region.regionStart);
+                        reader = RegionReader.new(ops, region.regionStart);
                 }
         }
 
@@ -203,7 +203,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 img.used = 2;
                 img.offset = leaf;
                 storeImage(img);
-                if (!region.backendRegion.persistRange(leaf + header, 16u64)) return false;
+                if (!region.backendRegion.persist(leaf + header, 16u64)) return false;
                 rootOffset = region.offsetInRegion(rootChunk.addr);
                 rootPut(TreeRoot.magic.offset, PWBTreeConst.MAGIC);
                 rootPut(TreeRoot.blockSize.offset, region.blockSize);
@@ -252,8 +252,8 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 var guard = region.numBlocks + 1u64;
                 while (!entry.isNull() && guard > 0u64) {
                         guard--;
-                        def next = entry.getNext(reader);
-                        if (entry.getUsed(reader) && entry.getListNum(reader) == ListKind.NONE.code) {
+                        def next = entry.getNextInRegion(reader);
+                        if (entry.getUsedInRegion(reader) && entry.getListNumInRegion(reader) == FreeListKind.NONE.code) {
                                 // The chain ends in the end-of-region entry,
                                 // which has no block behind it.
                                 def block = region.blockIndexOf(entry);
@@ -423,10 +423,10 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (onPhase != null) onPhase(PWBTreePhase.COMPUTE);
 
                 // Durable before published. Each node's lines are written back
-                // as it is stored; persistRange() over the last ends in the one
+                // as it is stored; persist() over the last ends in the one
                 // fence, which on every backend completes every outstanding
                 // writeback, not only its own range's -- the property the crash
-                // model's images depend on (X86_64TxnBackend.v3, persistRange).
+                // model's images depend on (X86_64MappedBackends.v3, persist).
                 var lines = 0;
                 for (i < k) {
                         def img = images[i];
@@ -435,7 +435,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                         if (i < k - 1) writeBackImage(img);
                 }
                 def last = images[k - 1];
-                if (!region.backendRegion.persistRange(last.offset + u64.!(ChunkHeader.size),
+                if (!region.backendRegion.persist(last.offset + u64.!(ChunkHeader.size),
                         u64.!(last.used) * 8u64)) return false;
                 if (onPhase != null) onPhase(PWBTreePhase.WRITE);
 
@@ -513,7 +513,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         }
 
         // The cache lines the node's stores touch, counted as they are
-        // written back: the same lines persistRange() covers for the last node.
+        // written back: the same lines persist() covers for the last node.
         private def imageLines(img: PWBTreeImage) -> int {
                 return PWBTreeConst.nodeLines(img.offset, img.used);
         }
@@ -522,7 +522,7 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 def end = img.offset + u64.!(ChunkHeader.size) + u64.!(img.used) * 8u64;
                 var line = PWBTreeConst.nodeLineStart(img.offset);
                 while (line < end) {
-                        ops.clwb(line);
+                        ops.writeBackLine(line);
                         line += PWBTreeConst.LINE;
                 }
         }
@@ -668,8 +668,8 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 if (rootGet(TreeRoot.capacity.offset) != u64.!(cap)) return "capacity changed";
                 def marked = Array<bool>.new(int.!(region.numBlocks));
                 marked[int.!(rootOffset / region.blockSize)] = true;
-                def rootEntry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + rootOffset));
-                if (rootEntry.isNull() || !rootEntry.getUsed(reader)) return "the root chunk is not allocated";
+                def rootEntry = region.chunkToBlockTableEntry(ChunkHandle(region.regionStart + rootOffset));
+                if (rootEntry.isNull() || !rootEntry.getUsedInRegion(reader)) return "the root chunk is not allocated";
                 return walk(marked);
         }
 
@@ -695,8 +695,8 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
                 def block = int.!(node / region.blockSize);
                 if (marked[block]) return "a node is reachable twice, or is the root chunk";
                 marked[block] = true;
-                def entry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + node));
-                if (entry.isNull() || !entry.getUsed(reader) || entry.getListNum(reader) != ListKind.NONE.code) {
+                def entry = region.chunkToBlockTableEntry(ChunkHandle(region.regionStart + node));
+                if (entry.isNull() || !entry.getUsedInRegion(reader) || entry.getListNumInRegion(reader) != FreeListKind.NONE.code) {
                         return "a reachable node is not an allocated chunk";
                 }
                 def count = nodeKeys(node);
@@ -763,16 +763,16 @@ class PWBTree(region: PWRegion, requestedCapacity: int) {
         // from a node, and nodeWords()) fetches it: observes the node's whole
         // payload through the reader, once, as the forge helpers observe a
         // layout. Its words are then loaded raw, any number of times, as
-        // PersistentLoadObserver allows. The whole payload, because the word
+        // LoadObserver allows. The whole payload, because the word
         // count is itself read from the node; on a node nodeError() accepts,
         // every word read lies within it.
         private def fetch(offset: u64) -> u64 {
-                reader.observe(nodeAddr(offset), u64.!(maxWords) * 8u64);
+                reader.beforeLoad(nodeAddr(offset), u64.!(maxWords) * 8u64);
                 return offset;
         }
 
         private def word(offset: u64, w: int) -> u64 {
-                return PWRegionUtils.pointerFromU64(nodeAddr(offset) + u64.!(w) * 8u64).load<u64>();
+                return RegionUtils.pointerFromU64(nodeAddr(offset) + u64.!(w) * 8u64).load<u64>();
         }
 
         private def nodeTag(offset: u64) -> u64 { return word(offset, 0); }

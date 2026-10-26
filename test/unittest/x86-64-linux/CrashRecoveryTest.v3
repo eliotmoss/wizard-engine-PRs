@@ -1,10 +1,10 @@
 // Production-recovery-over-enumerated-image tests (milestone 5 of
-// docs/pmem-crash-model.md). Every durable image a recorded DualTxnWal commit
+// docs/pmem-crash-model.md). Every durable image a recorded TwoSlotWal commit
 // can leave behind is mounted and handed to the real recovery path, and the
 // acknowledgement contract is checked against what recovery actually produced.
 // No DAX mapping or PMEM hardware is required.
 
-def PRT = UnitTests.registerT("persistent_recovery:", _, PersistentRecoveryTester.new, _);
+def PRT = UnitTests.registerT("crash_recovery:", _, CrashRecoveryTester.new, _);
 def PRTX = [
 	PRT("recovers_acknowledged_commit_image", test_recovery_recovers_acknowledged_commit_image),
 	PRT("commit_boundary_survives_every_schedule", test_recovery_commit_boundary_survives_every_schedule),
@@ -23,7 +23,7 @@ def PRTX = [
 	()
 ];
 
-class PersistentRecoveryTester(t: Tester) {
+class CrashRecoveryTester(t: Tester) {
 	def VALUE = 0x8877_6655_4433_2211_u64;
 	def OFFSET = 200u64;
 	def LOG_OFFSET = 1024u64;
@@ -43,13 +43,13 @@ class PersistentRecoveryTester(t: Tester) {
 	// mount is formatted and its WAL header persisted before the commit runs, so
 	// the crash model starts from those bytes rather than from zeroes.
 	var mounted: Array<byte>;
-	var trace: PersistentTrace;
+	var trace: PersistenceTrace;
 	var slotOffsets = Array<u64>.new(2);	// region-relative address of each record slot
 	var thirdCommitStart: int;		// event index at which the third transaction begins
 
 	// The batched-apply scenario: transaction 1 writes four after-images, two
 	// sharing a line, one on the next line and one on a line of its own, and
-	// applies them as RegionTransaction does -- every store, then each line
+	// applies them as TransactionCache does -- every store, then each line
 	// prepared once. Transaction 2 is one more after-image, so transaction 1's
 	// data has to ride a real piggybacked boundary; transaction 3 commits into
 	// slot 1 and destroys transaction 1's record, so from then on a line the
@@ -74,12 +74,12 @@ class PersistentRecoveryTester(t: Tester) {
 	def recordCommit() -> bool {
 		def mapping = Mmap.reserve(REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return false;
-		def region = PmemMmapRegion.new(mapping, -1);
-		def recorder = RecordingPersistentOperations.new(region.range);
-		region.setPersistentOperations(recorder);
+		def region = PmemRegion.new(mapping, -1);
+		def recorder = RecordingProvider.new(region.range);
+		region.setProvider(recorder);
 
 		def base = u64.view(Pointer.atElement(region.range, 0));
-		def wal = DualTxnWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, true);
+		def wal = TwoSlotWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, OpenMode.FORMAT);
 		mounted = Array<byte>.new(region.range.length);
 		for (i < mounted.length) mounted[i] = region.range[i];
 
@@ -88,7 +88,7 @@ class PersistentRecoveryTester(t: Tester) {
 		ok = ok && wal.commit() == 1u64;
 		trace = recorder.snapshot("dual_wal_commit");
 		ok = ok && trace.validate().ok();
-		region.destroy();
+		region.close();
 		return ok;
 	}
 
@@ -101,12 +101,12 @@ class PersistentRecoveryTester(t: Tester) {
 	def recordThreeCommits() -> bool {
 		def mapping = Mmap.reserve(REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return false;
-		def region = PmemMmapRegion.new(mapping, -1);
-		def recorder = RecordingPersistentOperations.new(region.range);
-		region.setPersistentOperations(recorder);
+		def region = PmemRegion.new(mapping, -1);
+		def recorder = RecordingProvider.new(region.range);
+		region.setProvider(recorder);
 
 		def base = u64.view(Pointer.atElement(region.range, 0));
-		def wal = DualTxnWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, true);
+		def wal = TwoSlotWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, OpenMode.FORMAT);
 		for (i < 2) slotOffsets[i] = wal.slotAddr(i) - base;
 		mounted = Array<byte>.new(region.range.length);
 		for (i < mounted.length) mounted[i] = region.range[i];
@@ -120,7 +120,7 @@ class PersistentRecoveryTester(t: Tester) {
 		ok = ok && commitOne(wal, OFFSET_C, VALUE_C, 3u64);
 		trace = recorder.snapshot("dual_wal_three_commits");
 		ok = ok && trace.validate().ok();
-		region.destroy();
+		region.close();
 		return ok;
 	}
 
@@ -131,12 +131,12 @@ class PersistentRecoveryTester(t: Tester) {
 	def recordBatchedApply() -> bool {
 		def mapping = Mmap.reserve(REGION_BYTES, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return false;
-		def region = PmemMmapRegion.new(mapping, -1);
-		def recorder = RecordingPersistentOperations.new(region.range);
-		region.setPersistentOperations(recorder);
+		def region = PmemRegion.new(mapping, -1);
+		def recorder = RecordingProvider.new(region.range);
+		region.setProvider(recorder);
 
 		def base = u64.view(Pointer.atElement(region.range, 0));
-		def wal = DualTxnWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, true);
+		def wal = TwoSlotWal.new(base, base + LOG_OFFSET, LOG_SIZE, region, OpenMode.FORMAT);
 		for (i < 2) slotOffsets[i] = wal.slotAddr(i) - base;
 		mounted = Array<byte>.new(region.range.length);
 		for (i < mounted.length) mounted[i] = region.range[i];
@@ -146,70 +146,70 @@ class PersistentRecoveryTester(t: Tester) {
 		for (o in BATCH_OFFSETS) ok = ok && wal.append(o, batchValue(o), 8u8);
 		ok = ok && wal.commit() == 1u64;
 		batchAckStart = recorder.events.length;
-		for (o in BATCH_OFFSETS) ok = ok && wal.storeUpdate(o, batchValue(o), 8u8);
-		ok = ok && wal.prepareApplied();
+		for (o in BATCH_OFFSETS) ok = ok && wal.storeAfterImage(o, batchValue(o), 8u8);
+		ok = ok && wal.writeBackAfterImages();
 		batchApplyEnd = recorder.events.length;
 		ok = ok && wal.append(BATCH_B_OFFSET, batchValue(BATCH_B_OFFSET), 8u8);
 		ok = ok && wal.commit() == 2u64;
-		ok = ok && wal.storeUpdate(BATCH_B_OFFSET, batchValue(BATCH_B_OFFSET), 8u8);
-		ok = ok && wal.prepareApplied();
+		ok = ok && wal.storeAfterImage(BATCH_B_OFFSET, batchValue(BATCH_B_OFFSET), 8u8);
+		ok = ok && wal.writeBackAfterImages();
 		batchThirdStart = recorder.events.length;
 		ok = ok && wal.append(BATCH_C_OFFSET, batchValue(BATCH_C_OFFSET), 8u8);
 		ok = ok && wal.commit() == 3u64;
-		ok = ok && wal.storeUpdate(BATCH_C_OFFSET, batchValue(BATCH_C_OFFSET), 8u8);
-		ok = ok && wal.prepareApplied();
+		ok = ok && wal.storeAfterImage(BATCH_C_OFFSET, batchValue(BATCH_C_OFFSET), 8u8);
+		ok = ok && wal.writeBackAfterImages();
 		trace = recorder.snapshot("dual_wal_batched_apply");
 		ok = ok && trace.validate().ok();
-		region.destroy();
+		region.close();
 		return ok;
 	}
 
-	def batchedProperty(name: string, ackA: bool, ackB: bool, ackC: bool) -> PersistentImageProperty {
+	def batchedProperty(name: string, ackA: bool, ackB: bool, ackC: bool) -> CrashImageProperty {
 		def n = BATCH_OFFSETS.length;
-		def images = Array<PersistentWalAfterImage>.new(n + 2);
+		def images = Array<WalAfterImage>.new(n + 2);
 		for (i < n) {
 			def o = BATCH_OFFSETS[i];
-			images[i] = PersistentWalAfterImage.new(o, 8, batchValue(o), ackA);
+			images[i] = WalAfterImage.new(o, 8, batchValue(o), ackA);
 		}
-		images[n] = PersistentWalAfterImage.new(BATCH_B_OFFSET, 8, batchValue(BATCH_B_OFFSET), ackB);
-		images[n + 1] = PersistentWalAfterImage.new(BATCH_C_OFFSET, 8, batchValue(BATCH_C_OFFSET), ackC);
-		return PersistentWalHistoryProperty.new(LOG_OFFSET, LOG_SIZE, images)
+		images[n] = WalAfterImage.new(BATCH_B_OFFSET, 8, batchValue(BATCH_B_OFFSET), ackB);
+		images[n + 1] = WalAfterImage.new(BATCH_C_OFFSET, 8, batchValue(BATCH_C_OFFSET), ackC);
+		return WalHistoryProperty.new(LOG_OFFSET, LOG_SIZE, images)
 			.property(name, slotOffsets[1], 64);
 	}
 
-	// One transaction as RegionTransaction drives it: buffer the after-image,
+	// One transaction as TransactionCache drives it: buffer the after-image,
 	// commit it, then apply it write-behind. The apply's persist is deferred to
 	// the next commit's boundary, which is what makes the piggybacked boundary
 	// -- and the durability the overwrite guard relies on -- part of the trace.
-	private def commitOne(wal: DualTxnWal, offset: u64, value: u64, expectSeq: u64) -> bool {
+	private def commitOne(wal: TwoSlotWal, offset: u64, value: u64, expectSeq: u64) -> bool {
 		if (!wal.append(offset, value, 8u8)) return false;
 		if (wal.commit() != expectSeq) return false;
-		return wal.applyUpdate(offset, value, 8u8);
+		return wal.applyAfterImage(offset, value, 8u8);
 	}
 
 	// The whole recorded history, with each transaction's after-image required
 	// to survive or not according to {acknowledged}: an unacknowledged
 	// transaction may be absent, but must never recover as a value that was
 	// never committed.
-	def historyProperty(name: string, ackA: bool, ackB: bool, ackC: bool) -> PersistentImageProperty {
-		return PersistentWalHistoryProperty.new(LOG_OFFSET, LOG_SIZE, [
-			PersistentWalAfterImage.new(OFFSET, 8, VALUE, ackA),
-			PersistentWalAfterImage.new(OFFSET_B, 8, VALUE_B, ackB),
-			PersistentWalAfterImage.new(OFFSET_C, 8, VALUE_C, ackC)
+	def historyProperty(name: string, ackA: bool, ackB: bool, ackC: bool) -> CrashImageProperty {
+		return WalHistoryProperty.new(LOG_OFFSET, LOG_SIZE, [
+			WalAfterImage.new(OFFSET, 8, VALUE, ackA),
+			WalAfterImage.new(OFFSET_B, 8, VALUE_B, ackB),
+			WalAfterImage.new(OFFSET_C, 8, VALUE_C, ackC)
 		]).property(name, slotOffsets[1], 64);
 	}
 
-	def slotSeq(image: PersistentDurableImage, slot: int) -> u64 {
-		return image.read(slotOffsets[slot] + u64.view(TxnRecordHeader.txnSeq.offset), 8);
+	def slotSeq(image: CrashImage, slot: int) -> u64 {
+		return image.read(slotOffsets[slot] + u64.view(WalRecordHeader.txnSeq.offset), 8);
 	}
 
-	def survivesProperty() -> PersistentImageProperty {
-		return PersistentWalRecoveryProperty.new(LOG_OFFSET, LOG_SIZE, OFFSET, 8, VALUE, true)
+	def survivesProperty() -> CrashImageProperty {
+		return WalRecoveryProperty.new(LOG_OFFSET, LOG_SIZE, OFFSET, 8, VALUE, true)
 			.property("acknowledged transaction survives recovery");
 	}
 
-	def noInventedStateProperty() -> PersistentImageProperty {
-		return PersistentWalRecoveryProperty.new(LOG_OFFSET, LOG_SIZE, OFFSET, 8, VALUE, false)
+	def noInventedStateProperty() -> CrashImageProperty {
+		return WalRecoveryProperty.new(LOG_OFFSET, LOG_SIZE, OFFSET, 8, VALUE, false)
 			.property("recovery never invents an uncommitted value");
 	}
 
@@ -228,21 +228,21 @@ class PersistentRecoveryTester(t: Tester) {
 // The end-to-end path: enumerate the image a crash right after the commit
 // boundary leaves, mount it, and let the production WAL recover it. The
 // after-image was never applied before the crash, so only replay can restore it.
-def test_recovery_recovers_acknowledged_commit_image(tc: PersistentRecoveryTester) {
+def test_recovery_recovers_acknowledged_commit_image(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
 	// The crash caught the record, not the data: offset 200 is untouched.
 	tc.t.assert_eq(0u64, image.read(tc.OFFSET, 8));
 
-	def run = PersistentRecoveries.runDualWal(image, tc.LOG_OFFSET, tc.LOG_SIZE);
+	def run = CrashRecoveries.runTwoSlotWal(image, tc.LOG_OFFSET, tc.LOG_SIZE);
 	if (run == null) {
 		tc.t.fail("could not map a region for the durable image");
 		return;
 	}
-	tc.t.assertz(true, run.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, run.recovery == WalRecovery.REPLAYED);
 	tc.t.assertz(false, run.requiresRecovery);
 	tc.t.assert_eq(tc.VALUE, run.recovered.read(tc.OFFSET, 8));
 	tc.t.assert_eq(2u64, run.nextTxnSeq);
@@ -252,12 +252,12 @@ def test_recovery_recovers_acknowledged_commit_image(tc: PersistentRecoveryTeste
 // The commit point, checked against production recovery rather than asserted:
 // once the boundary has returned, every image the model permits must recover
 // the acknowledged after-image.
-def test_recovery_commit_boundary_survives_every_schedule(tc: PersistentRecoveryTester) {
+def test_recovery_commit_boundary_survives_every_schedule(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def result = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+	def result = CrashExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
 		tc.survivesProperty());
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.exhaustive());
@@ -277,12 +277,12 @@ def test_recovery_commit_boundary_survives_every_schedule(tc: PersistentRecovery
 // 1,404 distinct images: one at each of cuts 0 to 192 and at the commit point,
 // and 1,210 at the 21 cuts that catch the record partly written, at most 168 at
 // one cut. The default budget covers every cut.
-def test_recovery_torn_record_images_never_invent_state(tc: PersistentRecoveryTester) {
+def test_recovery_torn_record_images_never_invent_state(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 0,
+	def result = CrashExplorer.checkAllCuts(tc.trace, tc.mounted, 0,
 		tc.noInventedStateProperty());
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.exhaustive());
@@ -294,19 +294,19 @@ def test_recovery_torn_record_images_never_invent_state(tc: PersistentRecoveryTe
 // Recovery must be replayable: mounting the bytes recovery produced and
 // recovering again changes nothing. A second crash during recovery therefore
 // costs correctness nothing.
-def test_recovery_recovery_is_idempotent(tc: PersistentRecoveryTester) {
+def test_recovery_recovery_is_idempotent(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def first = PersistentRecoveries.runDualWal(
-		PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length()),
+	def first = CrashRecoveries.runTwoSlotWal(
+		CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length()),
 		tc.LOG_OFFSET, tc.LOG_SIZE);
 	if (first == null) {
 		tc.t.fail("could not map a region for the durable image");
 		return;
 	}
-	def second = PersistentRecoveries.runDualWal(first.recovered, tc.LOG_OFFSET, tc.LOG_SIZE);
+	def second = CrashRecoveries.runTwoSlotWal(first.recovered, tc.LOG_OFFSET, tc.LOG_SIZE);
 	tc.t.assert_eq(tc.VALUE, second.recovered.read(tc.OFFSET, 8));
 	tc.t.assert_eq(first.nextTxnSeq, second.nextTxnSeq);
 	tc.t.assertz(false, second.requiresRecovery);
@@ -318,12 +318,12 @@ def test_recovery_recovery_is_idempotent(tc: PersistentRecoveryTester) {
 // A property that does not hold produces a usable artifact: the durable bytes
 // that broke it, the crash cut that produced them, and what recovery reported.
 // Requiring survival before the commit boundary is exactly such a property.
-def test_recovery_unmet_property_yields_image_counterexample(tc: PersistentRecoveryTester) {
+def test_recovery_unmet_property_yields_image_counterexample(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def result = PersistentExplorer.checkImages(tc.trace, tc.mounted, 1, 0, tc.survivesProperty());
+	def result = CrashExplorer.checkImages(tc.trace, tc.mounted, 1, 0, tc.survivesProperty());
 	tc.t.assertz(false, result.ok());
 	tc.t.assertz(false, result.exhaustive());
 
@@ -344,28 +344,28 @@ def test_recovery_unmet_property_yields_image_counterexample(tc: PersistentRecov
 // region, its stores, cache-line writebacks and fences are captured in one
 // trace. That trace, started from the image recovery was handed, is what a
 // second crash is explored over.
-def test_recovery_recovery_records_its_own_trace(tc: PersistentRecoveryTester) {
+def test_recovery_recovery_records_its_own_trace(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
-	def recording = PersistentRecoveries.recordDualWalRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def recording = CrashRecoveries.recordWalRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
 		"dual_wal_recovery");
 	if (recording == null) {
 		tc.t.fail("could not map a region for the durable image");
 		return;
 	}
 
-	tc.t.assertz(true, recording.run.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, recording.run.recovery == WalRecovery.REPLAYED);
 	tc.t.assert_eq(tc.VALUE, recording.run.recovered.read(tc.OFFSET, 8));
 
 	def trace = recording.trace;
 	tc.t.assertz(true, trace.validate().ok());
 	tc.t.assert_eq(tc.REGION_BYTES, trace.regionBytes);
 	// Replay stores the after-image and publishes it with one boundary.
-	tc.t.assertz(true, trace.count(PersistentEventKind.STORE) > 0);
-	tc.t.assertz(true, trace.count(PersistentEventKind.SFENCE) > 0);
+	tc.t.assertz(true, trace.count(PersistenceEventKind.STORE) > 0);
+	tc.t.assertz(true, trace.count(PersistenceEventKind.SFENCE) > 0);
 	// The after-image's line is among the lines replay touched.
 	def line = tc.OFFSET - tc.OFFSET % 64u64;
 	var touched = false;
@@ -382,13 +382,13 @@ def test_recovery_recovery_records_its_own_trace(tc: PersistentRecoveryTester) {
 // again anywhere during recovery. Every image that second crash can leave must
 // still recover the acknowledged after-image -- recovery never scrubbed the
 // record, and replay is idempotent, so a remount reaches the same state.
-def test_recovery_crash_during_recovery_still_recovers(tc: PersistentRecoveryTester) {
+def test_recovery_crash_during_recovery_still_recovers(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
-	def result = PersistentRecoveries.checkCrashDuringRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def result = CrashRecoveries.checkCrashDuringRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
 		16, tc.survivesProperty());
 	if (result == null) {
 		tc.t.fail("could not map a region for the durable image");
@@ -406,28 +406,28 @@ def test_recovery_crash_during_recovery_still_recovers(tc: PersistentRecoveryTes
 // A recovery that cannot persist what it replayed must latch rather than claim
 // a durability it did not reach -- and must leave the record intact, so a later
 // mount still restores the acknowledged after-image.
-def test_recovery_failed_replay_persist_latches_and_reopens(tc: PersistentRecoveryTester) {
+def test_recovery_failed_replay_persist_latches_and_reopens(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
 
-	def failed = PersistentRecoveries.runDualWalWithFailure(image, tc.LOG_OFFSET, tc.LOG_SIZE, 1);
-	tc.t.assertz(true, failed.recovery == DualWalRecovery.PERSIST_FAILED);
+	def failed = CrashRecoveries.runTwoSlotWalWithFailure(image, tc.LOG_OFFSET, tc.LOG_SIZE, 1);
+	tc.t.assertz(true, failed.recovery == WalRecovery.PERSIST_FAILED);
 	tc.t.assertz(true, failed.requiresRecovery);
 
 	// The same instance is unusable, but the durable bytes are not: a fresh
 	// mount replays the record the failed attempt did not destroy.
-	def reopened = PersistentRecoveries.runDualWal(failed.recovered, tc.LOG_OFFSET, tc.LOG_SIZE);
-	tc.t.assertz(true, reopened.recovery == DualWalRecovery.REPLAYED);
+	def reopened = CrashRecoveries.runTwoSlotWal(failed.recovered, tc.LOG_OFFSET, tc.LOG_SIZE);
+	tc.t.assertz(true, reopened.recovery == WalRecovery.REPLAYED);
 	tc.t.assertz(false, reopened.requiresRecovery);
 	tc.t.assert_eq(tc.VALUE, reopened.recovered.read(tc.OFFSET, 8));
 	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
 
 	// An injection that never fires leaves recovery ordinary.
-	def clean = PersistentRecoveries.runDualWalWithFailure(image, tc.LOG_OFFSET, tc.LOG_SIZE, 0);
-	tc.t.assertz(true, clean.recovery == DualWalRecovery.REPLAYED);
+	def clean = CrashRecoveries.runTwoSlotWalWithFailure(image, tc.LOG_OFFSET, tc.LOG_SIZE, 0);
+	tc.t.assertz(true, clean.recovery == WalRecovery.REPLAYED);
 	tc.t.assertz(false, clean.requiresRecovery);
 }
 
@@ -435,26 +435,26 @@ def test_recovery_failed_replay_persist_latches_and_reopens(tc: PersistentRecove
 // failed recovery persist leaves behind must never recover as a value that was
 // never committed, and a latch must always come with the failure that caused
 // it.
-def test_recovery_failed_replay_persist_never_loses_a_record(tc: PersistentRecoveryTester) {
+def test_recovery_failed_replay_persist_never_loses_a_record(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def property = PersistentRecoveryFailureProperty.new(tc.LOG_OFFSET, tc.LOG_SIZE,
+	def property = CrashRecoveryFailureProperty.new(tc.LOG_OFFSET, tc.LOG_SIZE,
 		tc.OFFSET, 8, tc.VALUE, false, 1)
 		.property("a failed recovery persist never loses or invents a record");
 
-	def result = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, 0, property);
+	def result = CrashExplorer.checkAllCuts(tc.trace, tc.mounted, 0, property);
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.exhaustive());
 	tc.t.asserti(1404, result.imagesChecked);
 
 	// At the commit boundary the transaction is acknowledged, so the stronger
 	// half of the contract holds there and that cut is exhaustive.
-	def acknowledged = PersistentRecoveryFailureProperty.new(tc.LOG_OFFSET, tc.LOG_SIZE,
+	def acknowledged = CrashRecoveryFailureProperty.new(tc.LOG_OFFSET, tc.LOG_SIZE,
 		tc.OFFSET, 8, tc.VALUE, true, 1)
 		.property("a failed recovery persist keeps an acknowledged transaction");
-	def atBoundary = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+	def atBoundary = CrashExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
 		acknowledged);
 	if (!atBoundary.ok()) tc.t.fail(atBoundary.toArtifact());
 	tc.t.assertz(true, atBoundary.exhaustive());
@@ -465,12 +465,12 @@ def test_recovery_failed_replay_persist_never_loses_a_record(tc: PersistentRecov
 // record is destroyed while the WAL is still running. What makes that safe is
 // that transaction 1's after-image is durable DATA by then -- it rode the
 // second commit's boundary -- so the log copy is redundant before it goes.
-def test_recovery_three_commits_reclaim_the_oldest_slot(tc: PersistentRecoveryTester) {
+def test_recovery_three_commits_reclaim_the_oldest_slot(tc: CrashRecoveryTester) {
 	if (!tc.recordThreeCommits()) {
 		tc.t.fail("could not record three production WAL commits");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
 
 	// Slot 1 now holds transaction 3; transaction 1's record is gone.
 	tc.t.assert_eq(3u64, tc.slotSeq(image, 1));
@@ -483,12 +483,12 @@ def test_recovery_three_commits_reclaim_the_oldest_slot(tc: PersistentRecoveryTe
 	tc.t.assert_eq(tc.VALUE_B, image.read(tc.OFFSET_B, 8));
 	tc.t.assert_eq(0u64, image.read(tc.OFFSET_C, 8));
 
-	def run = PersistentRecoveries.runDualWal(image, tc.LOG_OFFSET, tc.LOG_SIZE);
+	def run = CrashRecoveries.runTwoSlotWal(image, tc.LOG_OFFSET, tc.LOG_SIZE);
 	if (run == null) {
 		tc.t.fail("could not map a region for the durable image");
 		return;
 	}
-	tc.t.assertz(true, run.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, run.recovery == WalRecovery.REPLAYED);
 	tc.t.assertz(false, run.requiresRecovery);
 	tc.t.assert_eq(4u64, run.nextTxnSeq);
 	tc.t.assert_eq(tc.VALUE, run.recovered.read(tc.OFFSET, 8));
@@ -502,7 +502,7 @@ def test_recovery_three_commits_reclaim_the_oldest_slot(tc: PersistentRecoveryTe
 // image those cuts permit must recover both -- however much of the new record
 // reached the region, and even at the cuts where slot 1 has been zeroed and
 // transaction 1 exists nowhere in the log at all.
-def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecoveryTester) {
+def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: CrashRecoveryTester) {
 	if (!tc.recordThreeCommits()) {
 		tc.t.fail("could not record three production WAL commits");
 		return;
@@ -510,7 +510,7 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 	// A range starting at the third commit, because the claim starts there: at
 	// the earlier cuts transaction 2 is not yet acknowledged and transaction 1
 	// may not be either.
-	def result = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.thirdCommitStart,
+	def result = CrashExplorer.checkCutRange(tc.trace, tc.mounted, tc.thirdCommitStart,
 		tc.trace.length(), tc.THREE_COMMIT_BUDGET,
 		tc.historyProperty("reclaiming a slot never loses an acknowledged transaction",
 			true, true, false));
@@ -524,7 +524,7 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 	// The sweep would notice a transaction going missing: requiring the third
 	// one to survive at the cut where its commit has not yet begun fails. A
 	// property that holds because it asks nothing is not evidence.
-	def unmet = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.thirdCommitStart, 0,
+	def unmet = CrashExplorer.checkImages(tc.trace, tc.mounted, tc.thirdCommitStart, 0,
 		tc.historyProperty("an unacknowledged transaction is not required to survive",
 			true, true, true));
 	tc.t.assertz(false, unmet.ok());
@@ -533,7 +533,7 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 	// record touched was flushed and fenced, so the only freedom left is the
 	// third after-image's own line, applied write-behind and not yet persisted:
 	// two images, both of which must recover all three transactions.
-	def atBoundary = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+	def atBoundary = CrashExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
 		tc.historyProperty("a reclaiming commit acknowledges all three transactions",
 			true, true, true));
 	if (!atBoundary.ok()) tc.t.fail(atBoundary.toArtifact());
@@ -543,7 +543,7 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 	// The whole trace, with nothing required to survive: no cut may recover a
 	// value that was never committed, including the cuts that catch a slot
 	// half-overwritten.
-	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, tc.THREE_COMMIT_BUDGET,
+	def sweep = CrashExplorer.checkAllCuts(tc.trace, tc.mounted, tc.THREE_COMMIT_BUDGET,
 		tc.historyProperty("a reclaimed slot never invents a transaction",
 			false, false, false));
 	if (!sweep.ok()) tc.t.fail(sweep.toArtifact());
@@ -554,13 +554,13 @@ def test_recovery_overwrite_guard_keeps_acknowledged_data(tc: PersistentRecovery
 // point, then crash again anywhere during the mount that recovers it. Recovery
 // replays both surviving records, and every image that second crash can leave
 // must still produce all three after-images.
-def test_recovery_crash_during_three_commit_recovery_recovers(tc: PersistentRecoveryTester) {
+def test_recovery_crash_during_three_commit_recovery_recovers(tc: CrashRecoveryTester) {
 	if (!tc.recordThreeCommits()) {
 		tc.t.fail("could not record three production WAL commits");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
-	def result = PersistentRecoveries.checkCrashDuringRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def result = CrashRecoveries.checkCrashDuringRecovery(image, tc.LOG_OFFSET, tc.LOG_SIZE,
 		16, tc.historyProperty("a reclaiming history survives a crash during its recovery",
 			true, true, true));
 	if (result == null) {
@@ -583,12 +583,12 @@ def test_recovery_crash_during_three_commit_recovery_recovers(tc: PersistentReco
 // transaction 1's record, so its cuts are where a line the apply failed to
 // write back would be lost. Every sweep here mounts every distinct image of
 // every cut it covers.
-def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTester) {
+def test_recovery_batched_apply_keeps_acknowledged_data(tc: CrashRecoveryTester) {
 	if (!tc.recordBatchedApply()) {
 		tc.t.fail("could not record a batched-apply WAL history");
 		return;
 	}
-	def apply = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchAckStart,
+	def apply = CrashExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchAckStart,
 		tc.batchApplyEnd, 0,
 		tc.batchedProperty("a batched apply never loses its acknowledged transaction", true, false, false));
 	if (!apply.ok()) tc.t.fail(apply.toArtifact());
@@ -599,7 +599,7 @@ def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTe
 	tc.t.asserti(8, tc.batchApplyEnd - tc.batchAckStart + 1);
 	tc.t.assertz(true, apply.imagesChecked > 2 * (tc.batchApplyEnd - tc.batchAckStart + 1));
 
-	def second = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchApplyEnd,
+	def second = CrashExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchApplyEnd,
 		tc.batchThirdStart, 0,
 		tc.batchedProperty("the next commit keeps the batched transaction", true, false, false));
 	if (!second.ok()) tc.t.fail(second.toArtifact());
@@ -608,31 +608,31 @@ def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTe
 	// From transaction 3's first event, transactions 1 and 2 are acknowledged
 	// and transaction 1's record is about to be destroyed: only the lines the
 	// batched apply wrote back can keep it.
-	def reclaim = PersistentExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchThirdStart,
+	def reclaim = CrashExplorer.checkCutRange(tc.trace, tc.mounted, tc.batchThirdStart,
 		tc.trace.length(), tc.BATCHED_BUDGET,
 		tc.batchedProperty("reclaiming the batched transaction's slot loses nothing", true, true, false));
 	if (!reclaim.ok()) tc.t.fail(reclaim.toArtifact());
 	tc.t.assertz(true, reclaim.exhaustive());
 
-	def atEnd = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
+	def atEnd = CrashExplorer.checkImages(tc.trace, tc.mounted, tc.trace.length(), 0,
 		tc.batchedProperty("all three transactions survive the third commit", true, true, true));
 	if (!atEnd.ok()) tc.t.fail(atEnd.toArtifact());
 	tc.t.assertz(true, atEnd.exhaustive());
 
 	// Nothing required, whole trace: no cut recovers a value never committed.
-	def sweep = PersistentExplorer.checkAllCuts(tc.trace, tc.mounted, tc.BATCHED_BUDGET,
+	def sweep = CrashExplorer.checkAllCuts(tc.trace, tc.mounted, tc.BATCHED_BUDGET,
 		tc.batchedProperty("a batched apply never invents state", false, false, false));
 	if (!sweep.ok()) tc.t.fail(sweep.toArtifact());
 	tc.t.assertz(true, sweep.exhaustive());
 
 	// The check can fail: transaction 2 is not yet committed at the first cut.
-	def unmet = PersistentExplorer.checkImages(tc.trace, tc.mounted, tc.batchAckStart, 0,
+	def unmet = CrashExplorer.checkImages(tc.trace, tc.mounted, tc.batchAckStart, 0,
 		tc.batchedProperty("an uncommitted transaction is not required to survive", true, true, false));
 	tc.t.assertz(false, unmet.ok());
 }
 
-// The failure-injecting container (PersistentImageMounts.openFailing(), in
-// which runDualWalWithFailure() and runPWRegionWithFailure() mount every
+// The failure-injecting container (CrashImageMounts.openFailing(), in
+// which runTwoSlotWalWithFailure() and runAllocatorWithFailure() mount every
 // image) must not move under its WAL. Mount the image a crash at the commit
 // boundary leaves and force a collection: the bytes must stay where the WAL's
 // raw base says. Recovery then replays at the first boundary, and a commit
@@ -645,13 +645,13 @@ def test_recovery_batched_apply_keeps_acknowledged_data(tc: PersistentRecoveryTe
 // check, the remount restored the first after-image but not the second: the
 // WAL computes a record's checksum by reading the record back through its raw
 // address, which after the collection reads the old copy.
-def test_recovery_failing_mount_survives_a_collection(tc: PersistentRecoveryTester) {
+def test_recovery_failing_mount_survives_a_collection(tc: CrashRecoveryTester) {
 	if (!tc.recordCommit()) {
 		tc.t.fail("could not record a production WAL commit");
 		return;
 	}
-	def image = PersistentImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
-	def mount = PersistentImageMounts.openFailing(image, 2);
+	def image = CrashImages.lazyCrash(tc.trace, tc.mounted, tc.trace.length());
+	def mount = CrashImageMounts.openFailing(image, 2);
 	if (mount == null) {
 		tc.t.fail("could not map a region for the durable image");
 		return;
@@ -660,8 +660,8 @@ def test_recovery_failing_mount_survives_a_collection(tc: PersistentRecoveryTest
 	Target.forceGC();
 	tc.t.assert_eq(base, mount.regionStart());
 
-	def wal = DualTxnWal.new(base, base + tc.LOG_OFFSET, tc.LOG_SIZE, mount.region, false);
-	tc.t.assertz(true, wal.recover() == DualWalRecovery.REPLAYED);
+	def wal = TwoSlotWal.new(base, base + tc.LOG_OFFSET, tc.LOG_SIZE, mount.region, OpenMode.ATTACH);
+	tc.t.assertz(true, wal.recover() == WalRecovery.REPLAYED);
 	tc.t.assertz(true, wal.append(tc.OFFSET_B, tc.VALUE_B, 8u8));
 	tc.t.assert_eq(0u64, wal.commit());
 	tc.t.assertz(true, wal.requiresRecovery());
@@ -669,12 +669,12 @@ def test_recovery_failing_mount_survives_a_collection(tc: PersistentRecoveryTest
 	def left = mount.freeze();
 	mount.close();
 
-	def reopened = PersistentRecoveries.runDualWal(left, tc.LOG_OFFSET, tc.LOG_SIZE);
+	def reopened = CrashRecoveries.runTwoSlotWal(left, tc.LOG_OFFSET, tc.LOG_SIZE);
 	if (reopened == null) {
 		tc.t.fail("could not map a region for the bytes the failed commit left");
 		return;
 	}
-	tc.t.assertz(true, reopened.recovery == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recovery == WalRecovery.REPLAYED);
 	tc.t.assertz(false, reopened.requiresRecovery);
 	tc.t.assert_eq(tc.VALUE, reopened.recovered.read(tc.OFFSET, 8));
 	tc.t.assert_eq(tc.VALUE_B, reopened.recovered.read(tc.OFFSET_B, 8));

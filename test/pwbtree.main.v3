@@ -89,9 +89,9 @@ component TreeLoopConfig {
                                 .putd(attempt)
                                 .puts(".region")
                                 .toString();
-                        def fd = RegionFileIO.createExclusive(path);
+                        def fd = BackingFile.createExclusive(path);
                         if (fd >= 0) {
-                                RegionFileIO.close(fd);
+                                BackingFile.close(fd);
                                 return true;
                         }
                         if (fd != -LinuxConst.EEXIST) {
@@ -143,36 +143,36 @@ def mutation(i: u64) -> (u64, u64) {
 
 var lastDirectBackend: DirectIoBackend;
 
-def openBackend(elide: bool) -> TxnRegionBackend {
-        var backend: TxnRegionBackend;
+def openBackend(elide: bool) -> StorageBackend {
+        var backend: StorageBackend;
         def path = TreeLoopConfig.path;
         match (TreeLoopConfig.backend) {
-                PMEM => backend = X86_64Backends.getPersistent(path);
-                FILE => backend = X86_64Backends.getFileMapped(path);
+                PMEM => backend = X86_64Backends.pmem(path);
+                FILE => backend = X86_64Backends.mappedFile(path);
                 DIRECT => backend = lastDirectBackend = DirectIoBackend.new(path, DirectIoTarget.FILE);
         }
         // Wrapped, not replaced: the real backend still opens the real file and
         // takes the real mapping, and only the provider differs.
-        if (elide) return ElidedWritebackBackend.new(backend);
+        if (elide) return ElidedWriteBackBackend.new(backend);
         return backend;
 }
 
-def openRegion(fresh: bool, elide: bool) -> PWRegion {
-        return PWRegion.new(openBackend(elide), TreeLoopConfig.blocks,
-                Array<Ref<MetaDataDesc>>.new(0), TreeLoopConfig.blockSize, fresh);
+def openRegion(fresh: bool, elide: bool) -> RegionAllocator {
+        return RegionAllocator.new(openBackend(elide), TreeLoopConfig.blocks,
+                Array<Ref<MetadataDescriptor>>.new(0), TreeLoopConfig.blockSize, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
 }
 
 // pwsieve's anti-fallback check, on every mount.
-def wiringError(region: BackendRegion, expectElided: bool) -> string {
+def wiringError(region: StorageRegion, expectElided: bool) -> string {
         if (region == null) return "the backend region could not be created";
         match (TreeLoopConfig.backend) {
-                PMEM => if (!PmemMmapRegion.?(region)) return "pmem mode did not produce a PmemMmapRegion";
-                FILE => if (!FileMmapRegion.?(region)) return "file mode did not produce a FileMmapRegion";
+                PMEM => if (!PmemRegion.?(region)) return "pmem mode did not produce a PmemRegion";
+                FILE => if (!MappedFileRegion.?(region)) return "file mode did not produce a MappedFileRegion";
                 DIRECT => if (!DirectIoRegion.?(region) || DirectIoRegion.!(region).blockDevice) {
                         return "direct mode did not produce a file-backed DirectIoRegion";
                 }
         }
-        def elided = ElidedWritebackOperations.?(region.persistentOperations());
+        def elided = ElidedWriteBackProvider.?(region.provider());
         if (expectElided && !elided) return "elide-clwb did not install the elided-writeback provider";
         if (!expectElided && elided) return "a production mount installed the elided-writeback provider";
         return null;
@@ -313,7 +313,7 @@ def main(args: Array<string>) -> int {
         var region = openRegion(true, false);
         if (region == null || region.backendRegion == null) {
                 if (TreeLoopConfig.backend == TreeBackend.PMEM) {
-                        return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                        return fail("PmemBackend.open failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
                 }
                 if (lastDirectBackend != null && lastDirectBackend.lastError != null) {
                         return fail(Strings.format1("DirectIoBackend.create failed: %s", lastDirectBackend.lastError));
@@ -385,8 +385,8 @@ def main(args: Array<string>) -> int {
                 if (region == null || region.backendRegion == null) return fail("could not remount after the kill");
                 def remountWiring = wiringError(region.backendRegion, false);
                 if (remountWiring != null) return fail(remountWiring);
-                if (region.lastRecovery == DualWalRecovery.REPLAYED) replayed++;
-                if (region.lastRecovery == DualWalRecovery.CORRUPT) return fail("WAL reported CORRUPT after an abrupt kill");
+                if (region.lastRecovery == WalRecovery.REPLAYED) replayed++;
+                if (region.lastRecovery == WalRecovery.CORRUPT) return fail("WAL reported CORRUPT after an abrupt kill");
                 if (region.requiresRecovery()) return fail("remount latched recovery-required");
                 tree = PWBTree.new(region, TreeLoopConfig.capacity);
                 if (!tree.open()) {
@@ -467,7 +467,7 @@ def main(args: Array<string>) -> int {
                 retained();
                 return 3;
         }
-        if (!RegionFileIO.unlink(TreeLoopConfig.path)) {
+        if (!BackingFile.unlink(TreeLoopConfig.path)) {
                 System.puts("Could not remove the region file printed above.\n");
                 return 2;
         }

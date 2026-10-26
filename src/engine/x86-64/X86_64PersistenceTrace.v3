@@ -1,6 +1,6 @@
 // Deterministic capture of recorded persistent-operation traces.
 //
-// Milestone 3 of docs/pmem-crash-model.md. RecordingPersistentOperations
+// Milestone 3 of docs/pmem-crash-model.md. RecordingProvider
 // produces a live, growing event stream; this layer freezes it into an
 // immutable scenario artifact that can be:
 //
@@ -16,7 +16,7 @@
 // deliberately still out of scope; they arrive with milestones 4 and 5.
 
 // Why a recorded trace cannot be used as a crash-model input.
-enum PersistentTraceDefect(text: string) {
+enum TraceDefect(text: string) {
 	NONE("none"),
 	NON_ASCENDING_SEQ("sequence number does not ascend"),
 	UNSUPPORTED_WIDTH("store width is not 1/2/4/8 bytes"),
@@ -29,25 +29,25 @@ enum PersistentTraceDefect(text: string) {
 
 // Result of validating a trace: the first defect found and the event index at
 // which it was found (-1 when the trace is usable).
-type PersistentTraceCheck(defect: PersistentTraceDefect, index: int) #unboxed {
+type TraceCheck(defect: TraceDefect, index: int) #unboxed {
 	def ok() -> bool {
-		return defect == PersistentTraceDefect.NONE;
+		return defect == TraceDefect.NONE;
 	}
 
 	def render(buf: StringBuilder) -> StringBuilder {
-		if (defect == PersistentTraceDefect.NONE) return buf.puts("ok");
+		if (defect == TraceDefect.NONE) return buf.puts("ok");
 		return buf.put2("%s at event %d", defect.text, index);
 	}
 }
 
 // An immutable, named snapshot of one recorded scenario.
-class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTraceEvent>) {
+class PersistenceTrace(name: string, regionBytes: u64, events: Array<PersistenceEvent>) {
 
 	def length() -> int {
 		return events.length;
 	}
 
-	def count(kind: PersistentEventKind) -> int {
+	def count(kind: PersistenceEventKind) -> int {
 		var n = 0;
 		for (i < events.length) if (events[i].kind == kind) n++;
 		return n;
@@ -56,60 +56,60 @@ class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTr
 	// The trace as it stood after exactly {count} events -- i.e. a crash cut
 	// immediately after that event. Out-of-range cuts clamp, so an explorer can
 	// walk 0..length() without special-casing the ends.
-	def prefix(count: int) -> PersistentTrace {
+	def prefix(count: int) -> PersistenceTrace {
 		var n = count;
 		if (n < 0) n = 0;
 		if (n > events.length) n = events.length;
-		def cut = Array<PersistentTraceEvent>.new(n);
+		def cut = Array<PersistenceEvent>.new(n);
 		for (i < n) cut[i] = events[i];
-		return PersistentTrace.new(name, regionBytes, cut);
+		return PersistenceTrace.new(name, regionBytes, cut);
 	}
 
 	// Check the trace against the agreed persistence profile. A store that is
 	// unaligned, oversized, out of region, or spanning two cache lines can tear
 	// in ways the model does not represent, so such a trace must not be
 	// explored and reported as evidence.
-	def validate() -> PersistentTraceCheck {
+	def validate() -> TraceCheck {
 		var lastSeq = 0u64;
 		for (i < events.length) {
 			def e = events[i];
 			if (e.seq <= lastSeq) {
-				return PersistentTraceCheck(PersistentTraceDefect.NON_ASCENDING_SEQ, i);
+				return TraceCheck(TraceDefect.NON_ASCENDING_SEQ, i);
 			}
 			lastSeq = e.seq;
 			match (e.kind) {
 				STORE => {
 					def width = u64.view(e.width);
 					if (width != 1 && width != 2 && width != 4 && width != 8) {
-						return PersistentTraceCheck(PersistentTraceDefect.UNSUPPORTED_WIDTH, i);
+						return TraceCheck(TraceDefect.UNSUPPORTED_WIDTH, i);
 					}
 					// Range before containment, so the sum below cannot overflow.
 					if (e.offset > regionBytes || width > regionBytes - e.offset) {
-						return PersistentTraceCheck(PersistentTraceDefect.STORE_OUT_OF_RANGE, i);
+						return TraceCheck(TraceDefect.STORE_OUT_OF_RANGE, i);
 					}
 					// Containment before alignment: natural alignment already implies
 					// single-line containment for these widths, so checking it first is
 					// what keeps the tearing rule an independently reachable defect.
-					def line = MmapRegionUtils.CACHE_LINE_SIZE;
+					def line = CacheLines.CACHE_LINE_SIZE;
 					if (e.offset / line != (e.offset + width - 1u64) / line) {
-						return PersistentTraceCheck(PersistentTraceDefect.STORE_CROSSES_LINE, i);
+						return TraceCheck(TraceDefect.STORE_CROSSES_LINE, i);
 					}
 					if (e.offset % width != 0) {
-						return PersistentTraceCheck(PersistentTraceDefect.UNALIGNED_STORE, i);
+						return TraceCheck(TraceDefect.UNALIGNED_STORE, i);
 					}
 				}
 				CLWB => {
-					if (e.offset % MmapRegionUtils.CACHE_LINE_SIZE != 0u64) {
-						return PersistentTraceCheck(PersistentTraceDefect.CLWB_UNALIGNED, i);
+					if (e.offset % CacheLines.CACHE_LINE_SIZE != 0u64) {
+						return TraceCheck(TraceDefect.CLWB_UNALIGNED, i);
 					}
 					if (e.offset >= regionBytes) {
-						return PersistentTraceCheck(PersistentTraceDefect.CLWB_OUT_OF_RANGE, i);
+						return TraceCheck(TraceDefect.CLWB_OUT_OF_RANGE, i);
 					}
 				}
 				SFENCE => ;
 			}
 		}
-		return PersistentTraceCheck(PersistentTraceDefect.NONE, -1);
+		return TraceCheck(TraceDefect.NONE, -1);
 	}
 
 	// Distinct 64-byte cache lines written by this trace, ascending. This is the
@@ -119,8 +119,8 @@ class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTr
 		def lines = Vector<u64>.new();
 		for (i < events.length) {
 			def e = events[i];
-			if (e.kind != PersistentEventKind.STORE) continue;
-			def line = e.offset - e.offset % MmapRegionUtils.CACHE_LINE_SIZE;
+			if (e.kind != PersistenceEventKind.STORE) continue;
+			def line = e.offset - e.offset % CacheLines.CACHE_LINE_SIZE;
 			var pos = 0;
 			while (pos < lines.length && lines[pos] < line) pos++;
 			if (pos < lines.length && lines[pos] == line) continue;
@@ -157,11 +157,11 @@ class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTr
 	def render(buf: StringBuilder) -> StringBuilder {
 		buf.put1("--- pmem-trace %s", name).ln();
 		buf.put3("region-bytes=%d cache-line=%d events=%d ",
-			regionBytes, MmapRegionUtils.CACHE_LINE_SIZE, events.length);
+			regionBytes, CacheLines.CACHE_LINE_SIZE, events.length);
 		buf.put3("stores=%d clwbs=%d fences=%d ",
-			count(PersistentEventKind.STORE),
-			count(PersistentEventKind.CLWB),
-			count(PersistentEventKind.SFENCE));
+			count(PersistenceEventKind.STORE),
+			count(PersistenceEventKind.CLWB),
+			count(PersistenceEventKind.SFENCE));
 		buf.put1("lines=%d digest=0x", touchedLines().length).putx_64(digest()).ln();
 		for (i < events.length) events[i].render(buf).ln();
 		buf.put1("--- end pmem-trace %s", name).ln();
@@ -172,7 +172,7 @@ class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTr
 		return render(StringBuilder.new()).toString();
 	}
 
-	private def kindCode(kind: PersistentEventKind) -> u64 {
+	private def kindCode(kind: PersistenceEventKind) -> u64 {
 		var code = 0u64;
 		match (kind) {
 			STORE => code = 1u64;
@@ -192,10 +192,10 @@ class PersistentTrace(name: string, regionBytes: u64, events: Array<PersistentTr
 // at which a property failed, and enough of the trace to reproduce it. Its
 // rendering is stable so a failing exploration can be stored and diffed rather
 // than re-derived from a run that may not repeat.
-class PersistentCounterexample(scenario: string, property: string, detail: string,
-	trace: PersistentTrace, crashAfter: int) {
+class CrashCounterexample(scenario: string, property: string, detail: string,
+	trace: PersistenceTrace, crashAfter: int) {
 
-	private var image: PersistentDurableImage;
+	private var image: CrashImage;
 	private var windowOffset = 0u64;
 	private var windowLength = 0;
 	private var selection: string;
@@ -204,21 +204,21 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 	// worth printing (a record slot, an after-image). Without this the artifact
 	// carries only the schedule prefix, which is all a counterexample could
 	// carry before durable images were modelled.
-	def withImage(durable: PersistentDurableImage, offset: u64, length: int) -> PersistentCounterexample {
+	def withImage(durable: CrashImage, offset: u64, length: int) -> CrashCounterexample {
 		image = durable;
 		windowOffset = offset;
 		windowLength = length;
 		return this;
 	}
 
-	def durableImage() -> PersistentDurableImage {
+	def durableImage() -> CrashImage {
 		return image;
 	}
 
 	// Say how the search chose the failing image among those the cut admits
 	// -- its place in the order, and the seed of any random choice -- so the
 	// same search finds it again.
-	def withSelection(note: string) -> PersistentCounterexample {
+	def withSelection(note: string) -> CrashCounterexample {
 		selection = note;
 		return this;
 	}
@@ -228,7 +228,7 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 	}
 
 	// The events that had executed when the crash was injected.
-	def cutTrace() -> PersistentTrace {
+	def cutTrace() -> PersistenceTrace {
 		return trace.prefix(crashAfter);
 	}
 
@@ -255,13 +255,13 @@ class PersistentCounterexample(scenario: string, property: string, detail: strin
 	}
 }
 
-component PersistentTraces {
+component PersistenceTraces {
 	// Record one named scenario from a clean recorder and freeze the result.
 	// Capturing through this helper is what makes a scenario reproducible: the
 	// recorder is reset first, so the artifact contains that scenario's events
 	// and nothing left over from earlier work on the same region.
-	def capture(recorder: RecordingPersistentOperations, name: string,
-		run: void -> void) -> PersistentTrace {
+	def capture(recorder: RecordingProvider, name: string,
+		run: void -> void) -> PersistenceTrace {
 		recorder.clear();
 		run();
 		return recorder.snapshot(name);

@@ -1,14 +1,14 @@
-// A resumable segmented Sieve of Eratosthenes over a PWRegion.
+// A resumable segmented Sieve of Eratosthenes over a RegionAllocator.
 //
 // This is a workload driver, not engine code. It exists to exercise the block
 // allocator the way a real program would: it stops at an arbitrary point, and
 // the next run finds its own data through the region's durable root and
 // continues from there. Nothing here touches WASM -- the WASM-facing
 // persistence layer is separate work -- so the only interface under test is
-// PWRegion's.
+// RegionAllocator's.
 //
 // Layout. The root chunk holds a SieveRoot followed by a fixed-capacity table
-// of SieveSegment descriptors, and is published at PWRegion's userRoot. Each
+// of SieveSegment descriptors, and is published at RegionAllocator's userRoot. Each
 // segment covers a contiguous span of integers, one bit each, in its own
 // allocated chunk. Segments older than the retention window have their chunks
 // freed but keep their descriptors, so the historical prime count survives
@@ -39,7 +39,7 @@ component PWSieveConst {
 enum PWSievePhase {
         COMPUTE,        // sieve the segment in DRAM; count its primes
         ALLOC,          // allocChunk(), its own commit
-        BITMAP,         // the direct bitmap stores and their persistRange()
+        BITMAP,         // the direct bitmap stores and their persist()
         PUBLISH,        // descriptor and root counters, one commit
         RETIRE          // free the segment leaving the window, one commit (or none)
 }
@@ -68,9 +68,9 @@ def SIEVE_NOTBIT: Array<byte> = [0xFE, 0xFD, 0xFB, 0xF7, 0xEF, 0xDF, 0xBF, 0x7F]
 
 // {liveSegments} is the retention window: the newest N segments keep their
 // bitmap chunks, older ones are freed.
-class PWSieve(region: PWRegion, liveSegments: u64) {
-        private var writer: DirectRegionWriter;
-        private var reader: DirectRegionReader;
+class PWSieve(region: RegionAllocator, liveSegments: u64) {
+        private var writer: UnloggedWriter;
+        private var reader: RegionReader;
         private var rootOffset: u64;            // region-relative offset of the root chunk
         private var span: u64;                  // integers per segment
         private var capacity: u64;              // descriptor slots
@@ -83,9 +83,9 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
 
         new() {
                 if (region != null && region.backendRegion != null) {
-                        def ops = X86_64PersistentOps.ensureFor(region.backendRegion);
-                        writer = DirectRegionWriter.new(ops, region.regionStart);
-                        reader = DirectRegionReader.new(ops, region.regionStart);
+                        def ops = NativeProviders.installIfAbsent(region.backendRegion);
+                        writer = UnloggedWriter.new(ops, region.regionStart);
+                        reader = RegionReader.new(ops, region.regionStart);
                 }
         }
 
@@ -165,11 +165,11 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                 var guard = region.numBlocks + 1u64;
                 while (!entry.isNull() && guard > 0u64) {
                         guard--;
-                        def next = entry.getNext(reader);
+                        def next = entry.getNextInRegion(reader);
                         // METADATA blocks (header, WAL, metadata overhead) are
                         // not allocations and freeChunk() would refuse them
                         // anyway; skipping them keeps the intent explicit.
-                        if (entry.getUsed(reader) && entry.getListNum(reader) == ListKind.NONE.code) {
+                        if (entry.getUsedInRegion(reader) && entry.getListNumInRegion(reader) == FreeListKind.NONE.code) {
                                 def offset = region.blockIndexOf(entry) * region.blockSize;
                                 if (offset != rootOffset && !isSegmentChunk(offset, n)) {
                                         if (region.freeChunk(ChunkHandle(region.regionStart + offset))) freed++;
@@ -349,9 +349,9 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                                 live++;
                                 if (chunkOffset >= regionBytes) return "live segment chunk outside the region";
                                 if (chunkOffset % region.blockSize != 0) return "live segment chunk is not block aligned";
-                                def entry = region.chunkToBlockEntry(ChunkHandle(region.regionStart + chunkOffset));
+                                def entry = region.chunkToBlockTableEntry(ChunkHandle(region.regionStart + chunkOffset));
                                 if (entry.isNull()) return "live segment chunk has no block entry";
-                                if (!entry.getUsed(reader)) return "live segment chunk is not allocated";
+                                if (!entry.getUsedInRegion(reader)) return "live segment chunk is not allocated";
 
                                 def bits = readBitmap(chunkOffset);
                                 if (popcountBits(bits) != primes) return "segment bitmap disagrees with its descriptor";
@@ -421,11 +421,11 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                         writer.writeU8(addr + u64.!(i), bits[i]);
                         i++;
                 }
-                // persistRange() rather than prepareChangedRange() +
-                // persistChanges(): this is not log-ordered metadata, and
+                // persist() rather than writeBack() +
+                // drain(): this is not log-ordered metadata, and
                 // draining the WAL's queued ranges here would hide a missing
                 // commit boundary from the tests.
-                return region.backendRegion.persistRange(
+                return region.backendRegion.persist(
                         chunkOffset + u64.!(ChunkHeader.size), u64.!(bits.length));
         }
 
@@ -433,8 +433,8 @@ class PWSieve(region: PWRegion, liveSegments: u64) {
                 def bytes = int.!(span / 8u64);
                 def out = Array<byte>.new(bytes);
                 def addr = bitmapAddr(chunkOffset);
-                reader.observe(addr, u64.!(bytes));
-                def base = PWRegionUtils.pointerFromU64(addr);
+                reader.beforeLoad(addr, u64.!(bytes));
+                def base = RegionUtils.pointerFromU64(addr);
                 for (i < bytes) out[i] = (base + i).load<byte>();
                 return out;
         }

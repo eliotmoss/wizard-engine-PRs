@@ -14,12 +14,12 @@ class PWOpsRecord(txnSeq: u64, entryCount: u32, recordLen: u32, recordOffset: u6
         // The cache lines one commit of this record writes back on PMEM. The
         // record's own: the WAL prepares the recordLen bytes from its slot's
         // region-relative offset, recordOffset, and the provider writes back
-        // every line that range touches (MmapRegionUtils.flushRange). A slot
-        // starts on a line when the log chunk does, as at 4 KiB blocks, and then
-        // that is recordLen / 64 lines; PWRegion allows any block size that is a
+        // every line that range touches (CacheLines.writeBackLines). A slot
+        // starts on a line when the log block does, as at 4 KiB blocks, and then
+        // that is recordLen / 64 lines; RegionAllocator allows any block size that is a
         // multiple of 8, and at others (4,104 bytes, say) a slot starts inside a
         // line and the record touches one more. Then, once applied, each line
-        // its after-images touch, once: DualTxnWal.prepareApplied() merges
+        // its after-images touch, once: TwoSlotWal.writeBackAfterImages() merges
         // extents whose lines touch and prepares each merged range, which covers
         // exactly the lines written.
         def commitLines() -> int {
@@ -27,7 +27,7 @@ class PWOpsRecord(txnSeq: u64, entryCount: u32, recordLen: u32, recordOffset: u6
         }
 
         def recordLines() -> int {
-                def line = MmapRegionUtils.CACHE_LINE_SIZE;
+                def line = CacheLines.CACHE_LINE_SIZE;
                 def first = recordOffset - recordOffset % line;
                 def end = recordOffset + u64.view(recordLen);
                 return int.!((end - first + line - 1u64) / line);
@@ -35,21 +35,21 @@ class PWOpsRecord(txnSeq: u64, entryCount: u32, recordLen: u32, recordOffset: u6
 }
 
 component PWOps {
-        // The region-relative offset of the log chunk, read from the header as
-        // PWRegion.mount() reads it (0 means the pre-field default, block 1).
-        def logChunkOffset(range: Range<byte>, blockSize: u64) -> u64 {
-                def hdr = Ref<PWRegionHeader>.of(range[0 ..+ PWRegionHeader.size]);
-                return if(hdr.logChunk == 0, blockSize, hdr.logChunk);
+        // The region-relative offset of the log block, read from the header as
+        // RegionAllocator.mount() reads it (0 means the pre-field default, block 1).
+        def logBlockOffset(range: Range<byte>, blockSize: u64) -> u64 {
+                def hdr = Ref<RegionHeader>.of(range[0 ..+ RegionHeader.size]);
+                return if(hdr.logBlock == 0, blockSize, hdr.logBlock);
         }
 
         // The newest record that validates in either slot of {region}'s log, or
-        // null. Reads through a second DualTxnWal over the same log, which only
+        // null. Reads through a second TwoSlotWal over the same log, which only
         // loads: its constructor validates the header and scans the slots, and
         // validateSlot() checks the checksum exactly as recovery would.
-        def latestRecord(region: PWRegion) -> PWOpsRecord {
-                def offset = logChunkOffset(region.rng, region.blockSize);
-                def wal = DualTxnWal.new(region.regionStart, region.regionStart + offset,
-                        region.blockSize, region.backendRegion, false);
+        def latestRecord(region: RegionAllocator) -> PWOpsRecord {
+                def offset = logBlockOffset(region.rng, region.blockSize);
+                def wal = TwoSlotWal.new(region.regionStart, region.regionStart + offset,
+                        region.blockSize, region.backendRegion, OpenMode.ATTACH);
                 if (!wal.openOk) return null;
                 def seq0 = wal.validateSlot(0), seq1 = wal.validateSlot(1);
                 def seq = if(seq0 > seq1, seq0, seq1);
@@ -58,13 +58,13 @@ component PWOps {
                 def header = wal.recordHeaderAt(addr);
                 def count = header.entryCount;
                 def lines = Vector<u64>.new();
-                var entryAddr = addr + u64.!(TxnRecordHeader.size);
+                var entryAddr = addr + u64.!(WalRecordHeader.size);
                 for (i < count) {
-                        def line = wal.logEntryAt(entryAddr).offset >> 6;
+                        def line = wal.walEntryAt(entryAddr).offset >> 6;
                         var seen = false;
                         for (j < lines.length) if (lines[j] == line) seen = true;
                         if (!seen) lines.put(line);
-                        entryAddr += u64.!(LogEntry.size);
+                        entryAddr += u64.!(WalEntry.size);
                 }
                 return PWOpsRecord.new(seq, count, header.recordLen, addr - region.regionStart, lines.length);
         }
@@ -74,18 +74,18 @@ component PWOps {
         // u64 entries at {offset}, {offset} + 8, ..., of {value}, {value} + 1,
         // .... Returns the record's txnSeq, or 0 if it could not be committed.
         //
-        // This is PmemDaxIntegrationTest's recipe, and DualTxnWalTest's
-        // writeTxn(): the production DualTxnWal appends and commits, so the
+        // This is PmemDaxIntegrationTest's recipe, and TwoSlotWalTest's
+        // writeTxn(): the production TwoSlotWal appends and commits, so the
         // record and its commit-point boundary are exactly what a
-        // RegionTransaction commit writes. Nothing is applied, and the caller
-        // destroys {raw} without close(), which would persist the data and
+        // TransactionCache commit writes. Nothing is applied, and the caller
+        // closes {raw} without the log's close(), which would persist the data and
         // scrub the record. The durable result is the state a crash leaves
         // right after a commit point: the record valid, its after-images
         // absent, so the next mount must replay them.
-        def commitUnapplied(raw: BackendRegion, blockSize: u64, offset: u64, count: int, value: u64) -> u64 {
+        def commitUnapplied(raw: StorageRegion, blockSize: u64, offset: u64, count: int, value: u64) -> u64 {
                 def regionStart = u64.view(Pointer.atElement(raw.range, 0));
-                def wal = DualTxnWal.new(regionStart, regionStart + logChunkOffset(raw.range, blockSize),
-                        blockSize, raw, false);
+                def wal = TwoSlotWal.new(regionStart, regionStart + logBlockOffset(raw.range, blockSize),
+                        blockSize, raw, OpenMode.ATTACH);
                 if (!wal.openOk) return 0u64;
                 for (i < count) {
                         if (!wal.append(offset + u64.!(i) * 8u64, value + u64.!(i), 8u8)) return 0u64;

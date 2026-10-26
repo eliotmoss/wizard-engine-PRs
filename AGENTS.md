@@ -71,7 +71,7 @@ The engine has three execution tiers under `src/engine/`:
 | `src/engine/Type.v3` | Wasm types, subtyping, assignability, and least-upper-bound logic. |
 | `src/engine/Value.v3` | Primitive and reference Wasm values. |
 | `src/engine/WasmStack.v3` | Abstract stack interface implemented by `V3Interpreter`. |
-| `src/engine/TxnBackend.v3` | Pluggable persistence interfaces (`BackendRegion`, `TxnRegionBackend`) used by `PWRegion`. |
+| `src/engine/StorageRegion.v3` | Pluggable persistence interfaces (`StorageRegion`, `StorageBackend`) used by `RegionAllocator`. |
 | `src/util/ErrorGen.v3` | Decode, validate, and instantiate error generation kept out of mainline logic. |
 | `src/engine/Extension.v3` | Individually enabled Wasm proposals and extensions. |
 
@@ -103,74 +103,77 @@ This branch adds transactional persistent storage for Wasm, targeting byte-addre
 ### Layer Structure
 
 ```text
-PWRegion (block allocator)
-  └── RegionTransaction (write-behind cache + WAL facade)
-        └── DualTxnWal (in-region two-slot redo log, block 1)
-              └── BackendRegion (persistence abstraction)
+RegionAllocator (block allocator)
+  └── TransactionCache (write-behind cache + WAL facade)
+        └── TwoSlotWal (in-region two-slot redo log, block 1)
+              └── StorageRegion (persistence abstraction)
                     ├── VolatileRegion      (Array<byte>, GC-managed)
-                    ├── FileMmapRegion      (mmap + pages marked through the provider, one fdatasync per fence)
-                    ├── PmemMmapRegion      (mmap + clwb/sfence)
+                    ├── MappedFileRegion      (mmap + pages marked through the provider, one fdatasync per fence)
+                    ├── PmemRegion      (mmap + clwb/sfence)
                     └── DirectIoRegion      (private staging buffer + pwrite/O_DIRECT + fdatasync)
 ```
 
 ### Key Persistence Files
 
+The persistence code was renamed on 2026-10-26 without changing behaviour. `docs/naming.md` maps the old names, which results and commits before then use, to the new ones.
+
 Files without a directory prefix below are under `src/engine/x86-64/`.
 
 | File | Role |
 |---|---|
-| `src/engine/TxnBackend.v3` | Abstract backends, `VolatileBackend`, and the `PersistentOperations` store/flush/fence seam. |
-| `X86_64PersistentOperations.v3` | Production and trace-recording operation providers; gives active persistent stores a single total `STORE`/`CLWB`/`SFENCE` order. |
-| `X86_64PersistentTrace.v3` | Immutable trace snapshots, validation, crash cuts, digests, touched-line reporting, stable rendering, and counterexample artifacts. |
-| `X86_64PersistentImage.v3` | Durable-byte crash model with asynchronous writeback, fence obligations, background eviction, and lazy/eager schedules. |
-| `X86_64PersistentExplorer.v3` | Full and reduced crash-image enumeration, state deduplication, budgets, property checks, and counterexample emission. |
-| `X86_64PersistentRecovery.v3` | Production recovery over enumerated images, WAL and allocator properties, invariant checks, two-crash profiles, and injected recovery failures. |
-| `X86_64TxnBackend.v3` | File and PMEM mapped regions, file I/O, and x86-64 backend factories. |
+| `src/engine/StorageRegion.v3` | Abstract backends, `VolatileBackend`, and the `PersistenceProvider` store/flush/fence seam. |
+| `X86_64Providers.v3` | The providers (native, recording, and marking over store-only) and the x86-64 cache-control instructions; gives active persistent stores a single total `STORE`/`CLWB`/`SFENCE` order. |
+| `X86_64PersistenceTrace.v3` | Immutable trace snapshots, validation, crash cuts, digests, touched-line reporting, stable rendering, and counterexample artifacts. |
+| `X86_64CrashModel.v3` | Durable-byte crash model with asynchronous writeback, fence obligations, background eviction, and lazy/eager schedules. |
+| `X86_64CrashExplorer.v3` | Full and reduced crash-image enumeration, state deduplication, budgets, property checks, and counterexample emission. |
+| `X86_64CrashRecovery.v3` | Production recovery over enumerated images, WAL and allocator properties, invariant checks, two-crash profiles, and injected recovery failures. |
+| `X86_64MappedBackends.v3` | File and PMEM mapped regions, file I/O, and x86-64 backend factories. |
 | `X86_64DirectIoBackend.v3` | Direct-I/O backend: `DirectIoRegion` keeps the region in a private staging buffer and, at each fence, writes the marked 4 KiB units with `pwrite` on an `O_DIRECT` descriptor, then calls `fdatasync`; to a file or a raw block device. |
-| `X86_64TxnPWRegion.v3` | Layouts, handle types, `RegionTransaction`, `PWRegion`, and `ImmixPWRegion`. |
-| `X86_64PWRegion.v3` | Thin x86-64 convenience wrappers for memory, PMEM, block-device, and Immix regions. |
-| `X86_64DualTxnWal.v3` | Active two-slot WAL with parity-selected records, checksums, poisoning, recovery results, overwrite guards, and one steady-state boundary per commit. |
+| `X86_64RegionAllocator.v3` | Layouts, handle types, `TransactionCache`, `RegionAllocator`, and `ImmixRegionAllocator`. |
+| `X86_64RegionAllocators.v3` | `RegionAllocators`: factories that open an allocator over memory, PMEM, a mapped file, or direct I/O, and Immix variants. |
+| `X86_64TwoSlotWal.v3` | Active two-slot WAL with parity-selected records, checksums, poisoning, recovery results, overwrite guards, and one steady-state boundary per commit. |
+| `X86_64WalRecord.v3` | The record layout shared by the two-slot and ring WALs. |
 | `X86_64SingleTxnWal.v3` | Superseded, unwired single-transaction WAL retained for comparison. |
-| `X86_64MultiTxnWal.v3` | Superseded, unwired multi-transaction ring WAL retained for comparison. |
+| `X86_64RingWal.v3` | Superseded, unwired multi-transaction ring WAL retained for comparison. |
 
 Focused tests live in `test/unittest/x86-64-linux/`:
 
-- `TxnPWRegionTest.v3` and `RegionTransactionTest.v3` cover allocator, backend, cache, remount, and recovery behavior.
-- `DualTxnWalTest.v3` covers the active commit, recovery, guard, and failure paths.
-- `PersistentOperationsTest.v3`, `PersistentTraceTest.v3`, `PersistentImageTest.v3`, and `PersistentExplorerTest.v3` cover the persistence seam and crash explorer.
-- `PersistentRecoveryTest.v3` and `PersistentAllocatorTest.v3` run production recovery and allocator invariants over enumerated images.
-- `PersistentLazyExplorerTest.v3` checks the lazy search (`X86_64PersistentLazyExplorer.v3`): partition, verdict agreement, representatives and replay.
-- `MultiTxnWalTest.v3` covers the retained comparison implementation.
+- `RegionAllocatorTest.v3` and `TransactionCacheTest.v3` cover allocator, backend, cache, remount, and recovery behavior.
+- `TwoSlotWalTest.v3` covers the active commit, recovery, guard, and failure paths.
+- `ProviderTest.v3`, `PersistenceTraceTest.v3`, `CrashModelTest.v3`, and `CrashExplorerTest.v3` cover the persistence seam and crash explorer.
+- `CrashRecoveryTest.v3` and `AllocatorCrashTest.v3` run production recovery and allocator invariants over enumerated images.
+- `ReadDrivenExplorerTest.v3` checks the lazy search (`X86_64ReadDrivenExplorer.v3`): partition, verdict agreement, representatives and replay.
+- `RingWalTest.v3` covers the retained comparison implementation.
 
 ### On-Region Layout
 
 ```text
-Block 0:      Region header (PWRegionHeader) + sentinels
-Block 1:      WAL log chunk (DualWalHeader + two fixed record slots)
+Block 0:      Region header (RegionHeader) + sentinels
+Block 1:      WAL log block (WalHeader + two fixed record slots)
 Blocks 2…N-2: User data blocks (SMALL_FREE / LARGE_FREE / USED)
-Block N-1:    Metadata overhead (block table, MetaDataDesc[])
+Block N-1:    Metadata overhead (block table, MetadataDescriptor[])
 Entry N:      End-of-region marker (no backing data)
 ```
 
 ### Active WAL Commit Protocol
 
-1. `RegionTransaction` buffers writes in a `HashMap`-backed write-behind cache.
+1. `TransactionCache` buffers writes in a `HashMap`-backed write-behind cache.
 2. `commit()` performs `appendToWal → wal.commit → applyToRegion → clear`. `wal.commit` writes one checksummed record to slot `txnSeq % 2`, then uses one persistence boundary to persist that record together with the previous transaction's applied after-images. The current transaction's after-images ride the next boundary.
-3. `RegionTransaction.flush()` is the explicit idle boundary. On unmount, `PWRegion.deallocate()` calls `wal.close()` to persist deferred data and scrub reclaimable slots so a clean remount is replay-free.
-4. Mount validates `DualWalHeader` and both slots, replays valid records in ascending `txnSeq`, persists the idempotent after-images, and sets `nextTxnSeq` to the maximum plus one. Recovery returns `CLEAN`, `REPLAYED`, `CORRUPT`, or `PERSIST_FAILED`.
+3. `TransactionCache.flush()` is the explicit idle boundary. On unmount, `RegionAllocator.deallocate()` calls `wal.close()` to persist deferred data and scrub reclaimable slots so a clean remount is replay-free.
+4. Mount validates `WalHeader` and both slots, replays valid records in ascending `txnSeq`, persists the idempotent after-images, and sets `nextTxnSeq` to the maximum plus one. Recovery returns `CLEAN`, `REPLAYED`, `CORRUPT`, or `PERSIST_FAILED`.
 
-A valid record N+1 proves the boundary at its commit completed, so transaction N's data is durable. An overwrite guard protects slots covering not-yet-durable data. A failed commit-point persist retries the same sequence in the same parity slot, preventing duplicate-sequence records. `RegionTransaction` guarantees that a committed transaction's entries are applied before the next commit.
+A valid record N+1 proves the boundary at its commit completed, so transaction N's data is durable. An overwrite guard protects slots covering not-yet-durable data. A failed commit-point persist retries the same sequence in the same parity slot, preventing duplicate-sequence records. `TransactionCache` guarantees that a committed transaction's entries are applied before the next commit.
 
-The retained `SingleTxnWal` and `MultiTxnWal` protocols are not wired into the allocator. Consult `docs/wal-comparison.md` before reasoning about or changing WAL behavior.
+The retained `SingleTxnWal` and `RingWal` protocols are not wired into the allocator. Consult `docs/wal-comparison.md` before reasoning about or changing WAL behavior.
 
 ### Known Limitations
 
 Treat `docs/ROADMAP.md` and `docs/CRITIQUE.md` as authoritative because this list can change:
 
-- `SingleTxnWal.append()` silently drops overflowing entries; this affects only the retained comparison WAL. Active `DualTxnWal` reports oversized transactions through a failed commit.
+- `SingleTxnWal.append()` silently drops overflowing entries; this affects only the retained comparison WAL. Active `TwoSlotWal` reports oversized transactions through a failed commit.
 - `Backends.getMmap()` is declared but not implemented.
 - Immix line marks are deliberately transient, bypass the WAL, and must be rebuilt after a crash.
-- `RegionTransaction` supports aligned, exact-address accesses only; mixed-width overlapping reads can miss cached writes.
+- `TransactionCache` supports aligned, exact-address accesses only; mixed-width overlapping reads can miss cached writes.
 
 ## Coding Style & Naming Conventions
 

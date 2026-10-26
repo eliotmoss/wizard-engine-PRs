@@ -1,16 +1,16 @@
-// PWRegion Tests
-// Tests the block-based region allocator (PWRegion) and its WAL commit flow.
+// RegionAllocator Tests
+// Tests the block-based region allocator (RegionAllocator) and its WAL commit flow.
 //
-// Setup: numBlocks=8, blockSize=4096, no metaDataDescs, forceFormat=true.
+// Setup: numBlocks=8, blockSize=4096, no metadataDescriptors, forceFormat=true.
 // With these params, the layout after format() is:
 //   Block 0: region header (METADATA, used)
-//   Block 1: WAL log chunk (METADATA, used)
+//   Block 1: WAL log block (METADATA, used)
 //   Blocks 2-6: one contiguous LARGE_FREE entry (5 allocatable blocks)
 //   Block 7: metadata overhead block (METADATA, used) -- contains block table
 //   Entry 8: end-of-region marker (NONE, used) -- no backing data block
 //
 
-def T = UnitTests.registerT("pwregion:", _, PWRegionTester.new, _);
+def T = UnitTests.registerT("allocator:", _, AllocatorTester.new, _);
 def X = [
 	T("format_magic",              test_format_magic),
 	T("format_header_fields",      test_format_header_fields),
@@ -38,17 +38,16 @@ def X = [
 	()
 ];
 
-class PWRegionTester(t: Tester) {
-	var region: PWRegion;
+class AllocatorTester(t: Tester) {
+	var region: RegionAllocator;
 
 	new() {
-		region = PWRegion.new(
-			Backends.getVolatile(),
+		region = RegionAllocator.new(
+			Backends.volatile(),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			true
-		);
+			OpenMode.FORMAT);
 	}
 
 	// True if alloc succeeded. allocChunk returns ChunkHandle(Pointer.NULL) on failure
@@ -63,31 +62,31 @@ class PWRegionTester(t: Tester) {
 // =============================================================================
 
 // After format(), the MAGIC constant must be stamped in the header.
-def test_format_magic(tc: PWRegionTester) {
+def test_format_magic(tc: AllocatorTester) {
 	var hdr = tc.region.getHeader();
-	tc.t.assert_eq(PWRegions.MAGIC, hdr.magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, hdr.magic);
 }
 
 // Header fields must match the constructor arguments.
-def test_format_header_fields(tc: PWRegionTester) {
+def test_format_header_fields(tc: AllocatorTester) {
 	var hdr = tc.region.getHeader();
 	tc.t.assert_eq(8u64, hdr.numBlocks);
 	tc.t.assert_eq(4096u64, hdr.blockSize);
 	tc.t.assert_eq(8u64 * 4096u64, hdr.numBytes);
-	tc.t.assert_eq(4096u64, hdr.logChunk); // block 1 at blockSize 4096
+	tc.t.assert_eq(4096u64, hdr.logBlock); // block 1 at blockSize 4096
 }
 
 // Both sentinel handles must point into the region (non-NULL addresses).
-def test_format_sentinels(tc: PWRegionTester) {
+def test_format_sentinels(tc: AllocatorTester) {
 	tc.t.assertz(false, tc.region.smallSentinel.isNull());
 	tc.t.assertz(false, tc.region.largeSentinel.isNull());
 }
 
 // The large free list must have at least one entry after format.
 // format() writes directly to memory (not through the cache), so
-// getListNextCached falls through to memory and reads the correct value.
-def test_format_free_list_nonempty(tc: PWRegionTester) {
-	var firstFree = tc.region.largeSentinel.getListNextCached(tc.region.txn);
+// getListNext falls through to memory and reads the correct value.
+def test_format_free_list_nonempty(tc: AllocatorTester) {
+	var firstFree = tc.region.largeSentinel.getListNext(tc.region.txn);
 	tc.t.assertz(false, firstFree.isNull());
 }
 
@@ -97,20 +96,20 @@ def test_format_free_list_nonempty(tc: PWRegionTester) {
 // =============================================================================
 
 // allocChunk(1) must return a valid chunk on a fresh region.
-def test_alloc_1_valid(tc: PWRegionTester) {
+def test_alloc_1_valid(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 }
 
 // allocChunk(3) must also succeed -- there are 5 free blocks available.
-def test_alloc_multi_valid(tc: PWRegionTester) {
+def test_alloc_multi_valid(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(3u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 }
 
 // Zero is not a meaningful chunk size. Reject it before the split path so it
 // cannot create a zero-length chunk or rewrite the existing free-list entry.
-def test_alloc_zero_rejected(tc: PWRegionTester) {
+def test_alloc_zero_rejected(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(0u32);
 	tc.t.assertz(false, tc.allocSucceeded(chunk));
 	tc.t.assertz(false, tc.region.txn.isDirty());
@@ -119,7 +118,7 @@ def test_alloc_zero_rejected(tc: PWRegionTester) {
 
 // A request larger than all user data must report ordinary exhaustion without
 // buffering allocator mutations.
-def test_alloc_oversized_rejected(tc: PWRegionTester) {
+def test_alloc_oversized_rejected(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(6u32);
 	tc.t.assertz(false, tc.allocSucceeded(chunk));
 	tc.t.assertz(false, tc.region.txn.isDirty());
@@ -128,20 +127,20 @@ def test_alloc_oversized_rejected(tc: PWRegionTester) {
 
 // After allocChunk(1), the block entry's used flag must be true when read
 // directly from memory (allocChunk commits before returning).
-def test_alloc_sets_used(tc: PWRegionTester) {
+def test_alloc_sets_used(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
+	var entry = tc.region.chunkToBlockTableEntry(chunk);
+	tc.t.assertz(true, entry.getUsedInRegion(tc.region.reader()));
 }
 
 // After allocChunk(1), the chunk header fields must reflect the initial
 // allocation state written by createChunk().
-def test_alloc_chunk_header(tc: PWRegionTester) {
+def test_alloc_chunk_header(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	// offset = ChunkHeader.size (start of usable space past the header)
-	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset(tc.region.reader()));
+	tc.t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffsetInRegion(tc.region.reader()));
 	// limit = 1 block * 4096 bytes/block
-	tc.t.assert_eq(4096u64, chunk.getLimit(tc.region.reader()));
+	tc.t.assert_eq(4096u64, chunk.getLimitInRegion(tc.region.reader()));
 }
 
 
@@ -150,14 +149,14 @@ def test_alloc_chunk_header(tc: PWRegionTester) {
 // =============================================================================
 
 // Null is the allocation-failure sentinel, not a valid chunk to free.
-def test_free_null_rejected(tc: PWRegionTester) {
+def test_free_null_rejected(tc: AllocatorTester) {
 	tc.t.assertz(false, tc.region.freeChunk(tc.region.blankChunkHandle));
 	tc.t.assertz(false, tc.region.txn.isDirty());
 }
 
 // The first free succeeds and commits; the second must be rejected without
 // adding writes to the shared transaction.
-def test_free_double_rejected(tc: PWRegionTester) {
+def test_free_double_rejected(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.region.freeChunk(chunk));
 	tc.t.assertz(false, tc.region.freeChunk(chunk));
@@ -166,33 +165,32 @@ def test_free_double_rejected(tc: PWRegionTester) {
 
 // A chunk allocated by another region must be rejected before its address is
 // translated into this region's block-table index.
-def test_free_foreign_rejected(tc: PWRegionTester) {
-	var foreignRegion = PWRegion.new(
-		Backends.getVolatile(),
+def test_free_foreign_rejected(tc: AllocatorTester) {
+	var foreignRegion = RegionAllocator.new(
+		Backends.volatile(),
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		true
-	);
+		OpenMode.FORMAT);
 	var foreignChunk = foreignRegion.allocChunk(1u32);
 
 	tc.t.assertz(true, !foreignChunk.isNull());
 	tc.t.assertz(false, tc.region.freeChunk(foreignChunk));
 	tc.t.assertz(false, tc.region.txn.isDirty());
-	tc.t.assertz(true, foreignRegion.chunkToBlockEntry(foreignChunk).getUsed(foreignRegion.reader()));
+	tc.t.assertz(true, foreignRegion.chunkToBlockTableEntry(foreignChunk).getUsedInRegion(foreignRegion.reader()));
 }
 
 // After alloc+free, the block entry must show used == false.
-def test_free_clears_used(tc: PWRegionTester) {
+def test_free_clears_used(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.region.freeChunk(chunk);
-	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
+	var entry = tc.region.chunkToBlockTableEntry(chunk);
+	tc.t.assertz(false, entry.getUsedInRegion(tc.region.reader()));
 }
 
 // After alloc+free, a subsequent alloc must succeed (the block was returned to
 // the free list).
-def test_free_then_realloc(tc: PWRegionTester) {
+def test_free_then_realloc(tc: AllocatorTester) {
 	var chunk1 = tc.region.allocChunk(5u32);
 	tc.region.freeChunk(chunk1);
 	var chunk2 = tc.region.allocChunk(5u32);
@@ -207,7 +205,7 @@ def test_free_then_realloc(tc: PWRegionTester) {
 // With numBlocks=8 and no metadata descriptors, exactly 5 user blocks are
 // available (indices 2-6). The first 5 alloc(1) calls must succeed; the 6th
 // must return blankChunkHandle.
-def test_exhaust_free_blocks(tc: PWRegionTester) {
+def test_exhaust_free_blocks(tc: AllocatorTester) {
 	for (i < 5) {
 		var c = tc.region.allocChunk(1u32);
 		if (!tc.allocSucceeded(c)) {
@@ -230,7 +228,7 @@ def test_exhaust_free_blocks(tc: PWRegionTester) {
 //   - right-coalesce (blocks 4-6 are large-free)
 // yielding one 5-block free entry spanning blocks 2-6.
 // A subsequent alloc(2) must succeed, proving coalescing occurred.
-def test_coalesce_right(tc: PWRegionTester) {
+def test_coalesce_right(tc: AllocatorTester) {
 	// Alloc block 2 and block 3. Each allocation commits before returning.
 	var chunk2 = tc.region.allocChunk(1u32);
 	var chunk3 = tc.region.allocChunk(1u32);
@@ -254,7 +252,7 @@ def test_coalesce_right(tc: PWRegionTester) {
 
 // The transaction must report clean after an alloc, since allocChunk
 // performs its own commit at the end of the transaction boundary.
-def test_commit_clears_transaction(tc: PWRegionTester) {
+def test_commit_clears_transaction(tc: AllocatorTester) {
 	tc.t.assertz(false, tc.region.txn.isDirty());
 	tc.region.allocChunk(1u32);
 	tc.t.assertz(false, tc.region.txn.isDirty());
@@ -265,34 +263,32 @@ def test_commit_clears_transaction(tc: PWRegionTester) {
 // misaligned one. A block size that is not a multiple of 8 would misalign the
 // block table, so it must be refused at construction instead of reaching the
 // provider. Rejection uses the existing failure contract: a null backend region.
-def test_unaligned_block_size_rejected(tc: PWRegionTester) {
-	def region = PWRegion.new(
-		Backends.getVolatile(),
+def test_unaligned_block_size_rejected(tc: AllocatorTester) {
+	def region = RegionAllocator.new(
+		Backends.volatile(),
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4095u64,
-		true
-	);
+		OpenMode.FORMAT);
 	tc.t.assertz(true, region.backendRegion == null);
 	tc.t.assertz(true, region.txn == null);
 }
 
-// The header, WAL log chunk, metadata blocks and at least one free block must
+// The header, WAL log block, metadata blocks and at least one free block must
 // all fit. Below that, format()'s unsigned userDataBlocks computation would
 // underflow and its linkage stores would target a null block-table entry.
 // Rejected before the region is stamped, so nothing advertises itself as valid.
-def test_undersized_region_rejected(tc: PWRegionTester) {
-	def region = PWRegion.new(
-		Backends.getVolatile(),
+def test_undersized_region_rejected(tc: AllocatorTester) {
+	def region = RegionAllocator.new(
+		Backends.volatile(),
 		2u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		true
-	);
+		OpenMode.FORMAT);
 	// Geometry is legal, so construction proceeds; format() bails before
 	// stamping the magic, leaving the region unmountable rather than corrupt.
 	tc.t.assertz(true, region.backendRegion != null);
-	tc.t.assertz(false, region.getHeader().magic == PWRegions.MAGIC);
+	tc.t.assertz(false, region.getHeader().magic == RegionFormat.MAGIC);
 }
 
 
@@ -307,14 +303,14 @@ def test_undersized_region_rejected(tc: PWRegionTester) {
 // A freshly formatted region publishes "no root". format() stores the zero
 // explicitly, so this also proves the field is not merely inheriting a
 // zero-initialized backing buffer.
-def test_user_root_initially_zero(tc: PWRegionTester) {
+def test_user_root_initially_zero(tc: AllocatorTester) {
 	tc.t.assert_eq(0u64, tc.region.getUserRoot());
 	tc.t.assert_eq(0u64, tc.region.getHeader().userRoot);
 }
 
 // The root a caller publishes is the root it reads back, both through the
 // transaction and in the durable header.
-def test_user_root_round_trips(tc: PWRegionTester) {
+def test_user_root_round_trips(tc: AllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 
@@ -331,7 +327,7 @@ def test_user_root_round_trips(tc: PWRegionTester) {
 // An offset that cannot name a byte in this region is refused before it
 // reaches the log, so a later mount cannot hand the caller a wild address.
 // The rejection is an ordinary one: the mount stays usable.
-def test_user_root_out_of_range_rejected(tc: PWRegionTester) {
+def test_user_root_out_of_range_rejected(tc: AllocatorTester) {
 	def size = 8u64 * 4096u64;
 	tc.t.assertz(true, tc.region.setUserRoot(size - 1u64));
 	tc.t.assert_eq(size - 1u64, tc.region.getUserRoot());
@@ -346,7 +342,7 @@ def test_user_root_out_of_range_rejected(tc: PWRegionTester) {
 }
 
 
-def IRT = UnitTests.registerT("pwregion_immix:", _, ImmixPWRegionTester.new, _);
+def IRT = UnitTests.registerT("allocator_immix:", _, ImmixAllocatorTester.new, _);
 def IRX = [
 	IRT("metadata_descriptors_persisted", test_immix_metadata_descriptors_persisted),
 	IRT("descriptor_controls_line_size", test_immix_descriptor_controls_line_size),
@@ -361,12 +357,12 @@ def IRX = [
 // Count persistence calls while retaining ordinary volatile byte storage. Immix
 // line marks are intentionally transient GC metadata, so their direct updates
 // must not accidentally enter the allocator WAL or persistence boundary.
-class ImmixTrackingBackend extends TxnRegionBackend {
+class ImmixTrackingBackend extends StorageBackend {
 	var data: Array<byte>;
 	var region: ImmixTrackingRegion;
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
-		if (data == null || fresh) data = Array<byte>.new(int.!(size));
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		if (data == null || (mode == OpenMode.FORMAT)) data = Array<byte>.new(int.!(size));
 		region = ImmixTrackingRegion.new(data[0 ..+ data.length]);
 		return region;
 	}
@@ -380,78 +376,78 @@ class ImmixTrackingBackend extends TxnRegionBackend {
 	}
 }
 
-class ImmixTrackingRegion extends BackendRegion {
-	var prepareChangedRangeCount = 0;
-	var persistRangeCount = 0;
-	var persistChangesCount = 0;
+class ImmixTrackingRegion extends StorageRegion {
+	var writeBackCount = 0;
+	var persistCount = 0;
+	var drainCount = 0;
 
 	new(range: Range<byte>) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
-		prepareChangedRangeCount++;
+	def writeBack(offset: u64, size: u64) -> bool {
+		writeBackCount++;
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
-		persistRangeCount++;
+	def persist(offset: u64, size: u64) -> bool {
+		persistCount++;
 		return true;
 	}
 
-	def persistChanges() -> bool {
-		persistChangesCount++;
+	def drain() -> bool {
+		drainCount++;
 		return true;
 	}
 }
 
-class ImmixPWRegionTester(t: Tester) {
+class ImmixAllocatorTester(t: Tester) {
 	var descBytes: Array<byte>;
-	var descs: Array<Ref<MetaDataDesc>>;
+	var descs: Array<Ref<MetadataDescriptor>>;
 	var backend: ImmixTrackingBackend;
-	var region: ImmixPWRegion;
+	var region: ImmixRegionAllocator;
 
 	new() {
-		descBytes = Array<byte>.new(MetaDataDesc.size * 2);
-		def otherDesc = Ref<MetaDataDesc>.at(descBytes, 0);
+		descBytes = Array<byte>.new(MetadataDescriptor.size * 2);
+		def otherDesc = Ref<MetadataDescriptor>.at(descBytes, 0);
 		otherDesc.kind = 0x4f_54_48_45_52u64; // "OTHER"
 		otherDesc.fixedBytes = 3u32;
 		otherDesc.unitSize = 1024u32;
 		otherDesc.bytesPerUnit = 2u32;
 
-		def lineDesc = Ref<MetaDataDesc>.at(descBytes, MetaDataDesc.size);
-		lineDesc.kind = ImmixPWRegions.ImmixLineMarkMetaKind;
+		def lineDesc = Ref<MetadataDescriptor>.at(descBytes, MetadataDescriptor.size);
+		lineDesc.kind = ImmixLineMarks.ImmixLineMarkMetaKind;
 		lineDesc.fixedBytes = 4u32;
 		lineDesc.unitSize = 128u32;
 		lineDesc.bytesPerUnit = u32.!(LineMark.size);
 
-		descs = Array<Ref<MetaDataDesc>>.new(2);
+		descs = Array<Ref<MetadataDescriptor>>.new(2);
 		descs[0] = otherDesc;
 		descs[1] = lineDesc;
 		backend = ImmixTrackingBackend.new();
-		region = ImmixPWRegion.new(backend, 8u64, descs, 4096u64, true);
+		region = ImmixRegionAllocator.new(backend, 8u64, descs, 4096u64, OpenMode.FORMAT);
 	}
 }
 
 // Formatting copies every descriptor field into the on-region descriptor
 // table and assigns each metadata area its own region-relative offset.
-def test_immix_metadata_descriptors_persisted(tc: ImmixPWRegionTester) {
+def test_immix_metadata_descriptors_persisted(tc: ImmixAllocatorTester) {
 	def hdr = tc.region.getHeader();
-	def otherDesc = tc.region.getMetaDataDesc(0u64);
-	def lineDesc = tc.region.getMetaDataDesc(1u64);
+	def otherDesc = tc.region.getMetadataDescriptor(0u64);
+	def lineDesc = tc.region.getMetadataDescriptor(1u64);
 
 	tc.t.assert_eq(2u64, hdr.numDescs);
-	tc.t.assertz(true, hdr.metaDataDescs < hdr.numBytes);
+	tc.t.assertz(true, hdr.metadataDescriptors < hdr.numBytes);
 	tc.t.assert_eq(0x4f_54_48_45_52u64, otherDesc.kind);
 	tc.t.assert_eq(3u32, otherDesc.fixedBytes);
 	tc.t.assert_eq(1024u32, otherDesc.unitSize);
 	tc.t.assert_eq(2u32, otherDesc.bytesPerUnit);
-	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkMetaKind, lineDesc.kind);
+	tc.t.assert_eq(ImmixLineMarks.ImmixLineMarkMetaKind, lineDesc.kind);
 	tc.t.assert_eq(4u32, lineDesc.fixedBytes);
 	tc.t.assert_eq(128u32, lineDesc.unitSize);
 	tc.t.assert_eq(u32.!(LineMark.size), lineDesc.bytesPerUnit);
 	tc.t.assertz(true, lineDesc.offset < otherDesc.offset);
-	tc.t.assertz(true, otherDesc.offset < hdr.metaDataDescs);
+	tc.t.assertz(true, otherDesc.offset < hdr.metadataDescriptors);
 
 	// Prove these are stored copies, not aliases of the caller's descriptors.
 	tc.descs[1].unitSize = 64u32;
@@ -460,9 +456,9 @@ def test_immix_metadata_descriptors_persisted(tc: ImmixPWRegionTester) {
 
 // The persisted metadata descriptor, rather than a global constant, controls
 // both the line-table geometry and chunk-to-line-mark indexing.
-def test_immix_descriptor_controls_line_size(tc: ImmixPWRegionTester) {
+def test_immix_descriptor_controls_line_size(tc: ImmixAllocatorTester) {
 	def expectedMarks = (8u64 * 4096u64 + 127u64) / 128u64;
-	def lineDesc = tc.region.getMetaDataDesc(1u64);
+	def lineDesc = tc.region.getMetadataDescriptor(1u64);
 
 	tc.t.assert_eq(128u64, tc.region.lineSize);
 	tc.t.assert_eq(expectedMarks, tc.region.numLineMarks);
@@ -473,7 +469,7 @@ def test_immix_descriptor_controls_line_size(tc: ImmixPWRegionTester) {
 
 // The line-mark table supports its entire persisted range and returns the null
 // handle exactly at and beyond its upper bound.
-def test_immix_line_mark_lookup_bounds(tc: ImmixPWRegionTester) {
+def test_immix_line_mark_lookup_bounds(tc: ImmixAllocatorTester) {
 	def first = tc.region.lineMarks[0u64];
 	def last = tc.region.lineMarks[tc.region.numLineMarks - 1u64];
 	def pastEnd = tc.region.lineMarks[tc.region.numLineMarks];
@@ -487,24 +483,24 @@ def test_immix_line_mark_lookup_bounds(tc: ImmixPWRegionTester) {
 
 // createChunk() must link to the mark covering the chunk's actual region
 // offset, not merely to the start of the global line-mark table.
-def test_immix_chunk_links_first_line_mark(tc: ImmixPWRegionTester) {
+def test_immix_chunk_links_first_line_mark(tc: ImmixAllocatorTester) {
 	def chunk = tc.region.allocChunk(1u32);
 	def lineIndex = tc.region.offsetInRegion(chunk.addr) / tc.region.lineSize;
 	def expectedOffset = tc.region.lineMarks[lineIndex].addr - tc.region.regionStart;
 
 	tc.t.assertz(false, chunk.isNull());
 	tc.t.assertz(false, expectedOffset == 0);
-	tc.t.assert_eq(expectedOffset, chunk.getLinemarks(tc.region.reader()));
+	tc.t.assert_eq(expectedOffset, chunk.getLinemarksInRegion(tc.region.reader()));
 }
 
 // A GC-cycle reset clears every per-unit mark without overwriting the
 // descriptor's fixed metadata prefix.
-def test_immix_reset_all_line_marks(tc: ImmixPWRegionTester) {
-	def lineDesc = tc.region.getMetaDataDesc(1u64);
-	def prefix = PWRegionUtils.pointerFromU64(tc.region.regionStart + lineDesc.offset);
+def test_immix_reset_all_line_marks(tc: ImmixAllocatorTester) {
+	def lineDesc = tc.region.getMetadataDescriptor(1u64);
+	def prefix = RegionUtils.pointerFromU64(tc.region.regionStart + lineDesc.offset);
 	for (i < int.!(lineDesc.fixedBytes)) (prefix + i).store<u8>(0xa5u8);
 	for (i < tc.region.numLineMarks) {
-		tc.region.lineMarks[i].setMark(tc.region.lineMarkWriter(), ImmixPWRegions.LINE_MARKED);
+		tc.region.lineMarks[i].setMarkUnlogged(tc.region.lineMarkWriter(), ImmixLineMarks.LINE_MARKED);
 	}
 
 	tc.region.resetAllLineMarks();
@@ -513,42 +509,42 @@ def test_immix_reset_all_line_marks(tc: ImmixPWRegionTester) {
 		tc.t.assert_eq(0xa5u8, (prefix + i).load<u8>());
 	}
 	for (i < tc.region.numLineMarks) {
-		tc.t.assert_eq(ImmixPWRegions.LINE_FREE, tc.region.lineMarks[i].getMark(tc.region.reader()));
+		tc.t.assert_eq(ImmixLineMarks.LINE_FREE, tc.region.lineMarks[i].getMarkInRegion(tc.region.reader()));
 	}
 }
 
 // Line marks are transient tracing state, not allocator consistency metadata.
-// Mark/reset therefore stays outside RegionTransaction and every persistence
+// Mark/reset therefore stays outside TransactionCache and every persistence
 // boundary: its stores cross the seam, but it prepares and persists nothing.
-def test_immix_line_marks_bypass_wal(tc: ImmixPWRegionTester) {
+def test_immix_line_marks_bypass_wal(tc: ImmixAllocatorTester) {
 	def tracked = tc.backend.region;
-	def prepareCount = tracked.prepareChangedRangeCount;
-	def persistRangeCount = tracked.persistRangeCount;
-	def persistChangesCount = tracked.persistChangesCount;
+	def prepareCount = tracked.writeBackCount;
+	def persistCount = tracked.persistCount;
+	def drainCount = tracked.drainCount;
 
-	tc.region.lineMarks[3u64].setMark(tc.region.lineMarkWriter(), ImmixPWRegions.LINE_MARKED);
+	tc.region.lineMarks[3u64].setMarkUnlogged(tc.region.lineMarkWriter(), ImmixLineMarks.LINE_MARKED);
 	tc.region.resetAllLineMarks();
 
 	tc.t.assertz(false, tc.region.txn.isDirty());
-	tc.t.assert_eq(prepareCount, tracked.prepareChangedRangeCount);
-	tc.t.assert_eq(persistRangeCount, tracked.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, tracked.persistChangesCount);
+	tc.t.assert_eq(prepareCount, tracked.writeBackCount);
+	tc.t.assert_eq(persistCount, tracked.persistCount);
+	tc.t.assert_eq(drainCount, tracked.drainCount);
 }
 
 // Mount reconstructs the line table solely from the copied on-region
 // descriptors; caller-owned formatting descriptors are not required again.
-def test_immix_metadata_remount_restores_line_table(tc: ImmixPWRegionTester) {
+def test_immix_metadata_remount_restores_line_table(tc: ImmixAllocatorTester) {
 	def formattedOffset = tc.region.lineMarks.addr - tc.region.regionStart;
 	tc.region.deallocate();
 
-	tc.region = ImmixPWRegion.new(
+	tc.region = ImmixRegionAllocator.new(
 		tc.backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false);
+		OpenMode.ATTACH);
 
-	def lineDesc = tc.region.getMetaDataDesc(1u64);
+	def lineDesc = tc.region.getMetadataDescriptor(1u64);
 	tc.t.assert_eq(2u64, tc.region.getHeader().numDescs);
 	tc.t.assert_eq(128u64, tc.region.lineSize);
 	tc.t.assert_eq(formattedOffset, tc.region.lineMarks.addr - tc.region.regionStart);
@@ -560,7 +556,7 @@ def test_immix_metadata_remount_restores_line_table(tc: ImmixPWRegionTester) {
 // x86-64 platform wrapper coverage
 // =============================================================================
 
-def WRT = UnitTests.registerT("pwregion_wrappers:", _, PWRegionWrapperTester.new, _);
+def WRT = UnitTests.registerT("allocator_factories:", _, AllocatorFactoryTester.new, _);
 def WRX = [
 	WRT("pw_mem_region", test_wrapper_pw_mem_region),
 	WRT("pw_nv_region", test_wrapper_pw_nv_region),
@@ -574,74 +570,74 @@ def WRAPPER_FILE_PATH = "/tmp/wiz_test_wrapper_file_region";
 def WRAPPER_PMEM_PATH = "/tmp/wiz_test_wrapper_pmem_region";
 def WRAPPER_IMMIX_PMEM_PATH = "/tmp/wiz_test_wrapper_immix_pmem_region";
 
-class PWRegionWrapperTester(t: Tester) {
-	def emptyDescs() -> Array<Ref<MetaDataDesc>> {
-		return Array<Ref<MetaDataDesc>>.new(0);
+class AllocatorFactoryTester(t: Tester) {
+	def emptyDescs() -> Array<Ref<MetadataDescriptor>> {
+		return Array<Ref<MetadataDescriptor>>.new(0);
 	}
 
-	def lineDescs() -> Array<Ref<MetaDataDesc>> {
-		var descs = Array<Ref<MetaDataDesc>>.new(1);
-		descs[0] = MemRegions.lineMarkDescRef;
+	def lineDescs() -> Array<Ref<MetadataDescriptor>> {
+		var descs = Array<Ref<MetadataDescriptor>>.new(1);
+		descs[0] = RegionDefaults.lineMarkDescRef;
 		return descs;
 	}
 }
 
-def test_wrapper_pw_mem_region(tc: PWRegionWrapperTester) {
-	var region = X86_64PWMemRegion.new(8u64, tc.emptyDescs(), true);
+def test_wrapper_pw_mem_region(tc: AllocatorFactoryTester) {
+	var region = RegionAllocators.inMemory(8u64, tc.emptyDescs(), OpenMode.FORMAT);
 	tc.t.assertz(false, region.backendRegion == null);
 	tc.t.assertz(true, VolatileRegion.?(region.backendRegion));
-	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+	tc.t.assert_eq(RegionDefaults.BlockSize, region.blockSize);
 	tc.t.assertz(false, region.allocChunk(1u32).isNull());
 	region.deallocate();
 }
 
 // Ordinary CI filesystems normally reject MAP_SYNC. The wrapper must still be
 // safe to instantiate and tear down; on a DAX-capable /tmp, also pin its type.
-def test_wrapper_pw_nv_region(tc: PWRegionWrapperTester) {
-	RegionFileIO.unlink(WRAPPER_PMEM_PATH);
-	var region = X86_64PWNVRegion.new(WRAPPER_PMEM_PATH, 8u64, tc.emptyDescs(), true);
-	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+def test_wrapper_pw_nv_region(tc: AllocatorFactoryTester) {
+	BackingFile.unlink(WRAPPER_PMEM_PATH);
+	var region = RegionAllocators.onPmem(WRAPPER_PMEM_PATH, 8u64, tc.emptyDescs(), OpenMode.FORMAT);
+	tc.t.assert_eq(RegionDefaults.BlockSize, region.blockSize);
 	if (region.backendRegion != null) {
-		tc.t.assertz(true, PmemMmapRegion.?(region.backendRegion));
+		tc.t.assertz(true, PmemRegion.?(region.backendRegion));
 	}
 	region.deallocate();
-	RegionFileIO.unlink(WRAPPER_PMEM_PATH);
+	BackingFile.unlink(WRAPPER_PMEM_PATH);
 }
 
-def test_wrapper_pw_block_device_region(tc: PWRegionWrapperTester) {
-	RegionFileIO.unlink(WRAPPER_FILE_PATH);
-	var region = X86_64PWBlockDeviceRegion.new(WRAPPER_FILE_PATH, 8u64, tc.emptyDescs(), true);
+def test_wrapper_pw_block_device_region(tc: AllocatorFactoryTester) {
+	BackingFile.unlink(WRAPPER_FILE_PATH);
+	var region = RegionAllocators.onMappedFile(WRAPPER_FILE_PATH, 8u64, tc.emptyDescs(), OpenMode.FORMAT);
 	tc.t.assertz(false, region.backendRegion == null);
-	tc.t.assertz(true, FileMmapRegion.?(region.backendRegion));
-	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+	tc.t.assertz(true, MappedFileRegion.?(region.backendRegion));
+	tc.t.assert_eq(RegionDefaults.BlockSize, region.blockSize);
 	tc.t.assertz(false, region.allocChunk(1u32).isNull());
 	region.deallocate();
-	RegionFileIO.unlink(WRAPPER_FILE_PATH);
+	BackingFile.unlink(WRAPPER_FILE_PATH);
 }
 
-def test_wrapper_immix_pw_mem_region(tc: PWRegionWrapperTester) {
-	var region = X86_64ImmixPWMemRegion.new(8u64, tc.lineDescs(), true);
+def test_wrapper_immix_pw_mem_region(tc: AllocatorFactoryTester) {
+	var region = RegionAllocators.immixInMemory(8u64, tc.lineDescs(), OpenMode.FORMAT);
 	tc.t.assertz(false, region.backendRegion == null);
 	tc.t.assertz(true, VolatileRegion.?(region.backendRegion));
-	tc.t.assert_eq(u64.!(ImmixPWRegions.DefaultImmixLineSize), region.lineSize);
+	tc.t.assert_eq(u64.!(ImmixLineMarks.DefaultImmixLineSize), region.lineSize);
 	tc.t.assertz(false, region.lineMarks.addr == 0);
 	region.deallocate();
 }
 
-def test_wrapper_immix_pw_nv_region(tc: PWRegionWrapperTester) {
-	RegionFileIO.unlink(WRAPPER_IMMIX_PMEM_PATH);
-	var region = X86_64ImmixPWNVRegion.new(
-		WRAPPER_IMMIX_PMEM_PATH, 8u64, tc.lineDescs(), true);
-	tc.t.assert_eq(MemRegions.BlockSize, region.blockSize);
+def test_wrapper_immix_pw_nv_region(tc: AllocatorFactoryTester) {
+	BackingFile.unlink(WRAPPER_IMMIX_PMEM_PATH);
+	var region = RegionAllocators.immixOnPmem(
+		WRAPPER_IMMIX_PMEM_PATH, 8u64, tc.lineDescs(), OpenMode.FORMAT);
+	tc.t.assert_eq(RegionDefaults.BlockSize, region.blockSize);
 	if (region.backendRegion == null) {
 		tc.t.assert_eq(0u64, region.lineMarks.addr);
 		tc.t.assert_eq(0u64, region.numLineMarks);
 	} else {
-		tc.t.assertz(true, PmemMmapRegion.?(region.backendRegion));
+		tc.t.assertz(true, PmemRegion.?(region.backendRegion));
 		tc.t.assertz(false, region.lineMarks.addr == 0);
 	}
 	region.deallocate();
-	RegionFileIO.unlink(WRAPPER_IMMIX_PMEM_PATH);
+	BackingFile.unlink(WRAPPER_IMMIX_PMEM_PATH);
 }
 
 
@@ -653,23 +649,22 @@ def test_wrapper_immix_pw_nv_region(tc: PWRegionWrapperTester) {
 // 64 = 192. A single allocChunk(2) split-path call buffers 16 distinct cache
 // writes in one WAL transaction; the resulting record (>= 448 B) can never
 // fit in a 192 B slot, so the commit must fail.
-def SRT = UnitTests.registerT("pwregion_overflow:", _, SmallRingPWRegionTester.new, _);
+def SRT = UnitTests.registerT("allocator_overflow:", _, SmallRingAllocatorTester.new, _);
 def SX = [
 	SRT("alloc_overflow_returns_blank", test_alloc_overflow_returns_blank),
 	()
 ];
 
-class SmallRingPWRegionTester(t: Tester) {
-	var region: PWRegion;
+class SmallRingAllocatorTester(t: Tester) {
+	var region: RegionAllocator;
 
 	new() {
-		region = PWRegion.new(
-			Backends.getVolatile(),
+		region = RegionAllocator.new(
+			Backends.volatile(),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			512u64,
-			true
-		);
+			OpenMode.FORMAT);
 	}
 
 	def allocSucceeded(chunk: ChunkHandle) -> bool {
@@ -681,7 +676,7 @@ class SmallRingPWRegionTester(t: Tester) {
 // buffered writes), which overflows slotBytes=192. The commit must fail,
 // allocChunk must return blankChunkHandle (not a chunk claiming success), and
 // the transaction must remain dirty (data retained, not lost).
-def test_alloc_overflow_returns_blank(tc: SmallRingPWRegionTester) {
+def test_alloc_overflow_returns_blank(tc: SmallRingAllocatorTester) {
 	tc.t.assertz(false, tc.region.txn.isDirty());
 	var chunk = tc.region.allocChunk(2u32);
 	tc.t.assertz(false, tc.allocSucceeded(chunk));
@@ -694,19 +689,19 @@ def test_alloc_overflow_returns_blank(tc: SmallRingPWRegionTester) {
 // Recovery-required propagation (injected persistence failure)
 // =============================================================================
 
-def PRT = UnitTests.registerT("pwregion_recovery:", _, RecoveryPWRegionTester.new, _);
+def PRT = UnitTests.registerT("allocator_recovery:", _, RecoveryAllocatorTester.new, _);
 def PRX = [
 	PRT("alloc_persist_failure_requires_recovery", test_alloc_persist_failure_requires_recovery),
 	PRT("free_persist_failure_requires_recovery", test_free_persist_failure_requires_recovery),
 	()
 ];
 
-class RecoveryPWRegionBackend extends TxnRegionBackend {
-	var region: RecoveryPWBackendRegion;
+class RecoveryAllocatorBackend extends StorageBackend {
+	var region: RecoveryAllocatorRegion;
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
 		def data = Array<byte>.new(int.!(size));
-		region = RecoveryPWBackendRegion.new(data[0 ..+ data.length]);
+		region = RecoveryAllocatorRegion.new(data[0 ..+ data.length]);
 		return region;
 	}
 
@@ -719,45 +714,44 @@ class RecoveryPWRegionBackend extends TxnRegionBackend {
 	}
 }
 
-class RecoveryPWBackendRegion extends BackendRegion {
-	var failNextPersistChanges = false;
-	var persistChangesCount = 0;
+class RecoveryAllocatorRegion extends StorageRegion {
+	var failNextDrain = false;
+	var drainCount = 0;
 
 	new(range: Range<byte>) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
+	def persist(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistChanges() -> bool {
-		persistChangesCount++;
-		if (failNextPersistChanges) {
-			failNextPersistChanges = false;
+	def drain() -> bool {
+		drainCount++;
+		if (failNextDrain) {
+			failNextDrain = false;
 			return false;
 		}
 		return true;
 	}
 }
 
-class RecoveryPWRegionTester(t: Tester) {
-	var backend: RecoveryPWRegionBackend;
-	var region: PWRegion;
+class RecoveryAllocatorTester(t: Tester) {
+	var backend: RecoveryAllocatorBackend;
+	var region: RegionAllocator;
 
 	new() {
-		backend = RecoveryPWRegionBackend.new();
-		region = PWRegion.new(
+		backend = RecoveryAllocatorBackend.new();
+		region = RegionAllocator.new(
 			backend,
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			true
-		);
+			OpenMode.FORMAT);
 	}
 
 	def allocSucceeded(chunk: ChunkHandle) -> bool {
@@ -766,24 +760,24 @@ class RecoveryPWRegionTester(t: Tester) {
 }
 
 // A failed allocator commit must remain distinguishable from exhaustion or
-// capacity rejection at the PWRegion API. The shared transaction stays dirty,
+// capacity rejection at the RegionAllocator API. The shared transaction stays dirty,
 // and the mounted allocator rejects later work without another boundary.
-def test_alloc_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
+def test_alloc_persist_failure_requires_recovery(tc: RecoveryAllocatorTester) {
 	tc.t.assertz(false, tc.region.requiresRecovery());
 	def committedChunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(committedChunk));
-	tc.backend.region.failNextPersistChanges = true;
+	tc.backend.region.failNextDrain = true;
 
 	def failedChunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(false, tc.allocSucceeded(failedChunk));
 	tc.t.assertz(true, tc.region.requiresRecovery());
 	tc.t.assertz(true, tc.region.txn.isDirty());
 
-	def persistChangesCount = tc.backend.region.persistChangesCount;
+	def drainCount = tc.backend.region.drainCount;
 	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
 	tc.t.assertz(false, tc.region.freeChunk(committedChunk));
-	tc.t.assertz(true, tc.region.chunkToBlockEntry(committedChunk).getUsed(tc.region.reader()));
-	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
+	tc.t.assertz(true, tc.region.chunkToBlockTableEntry(committedChunk).getUsedInRegion(tc.region.reader()));
+	tc.t.assert_eq(drainCount, tc.backend.region.drainCount);
 }
 
 // freeChunk() must propagate its own commit-point persistence failure rather
@@ -791,24 +785,24 @@ def test_alloc_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
 // through the shared transaction, but its after-images have not reached live
 // region memory; the latched mount rejects later allocator work without
 // issuing another persistence boundary.
-def test_free_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
+def test_free_persist_failure_requires_recovery(tc: RecoveryAllocatorTester) {
 	def chunk = tc.region.allocChunk(1u32);
-	def entry = tc.region.chunkToBlockEntry(chunk);
+	def entry = tc.region.chunkToBlockTableEntry(chunk);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
-	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
-	tc.backend.region.failNextPersistChanges = true;
+	tc.t.assertz(true, entry.getUsedInRegion(tc.region.reader()));
+	tc.backend.region.failNextDrain = true;
 
 	tc.t.assertz(false, tc.region.freeChunk(chunk));
 	tc.t.assertz(true, tc.region.requiresRecovery());
 	tc.t.assertz(true, tc.region.txn.isDirty());
-	tc.t.assertz(false, entry.getUsedCached(tc.region.txn));
-	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
+	tc.t.assertz(false, entry.getUsed(tc.region.txn));
+	tc.t.assertz(true, entry.getUsedInRegion(tc.region.reader()));
 
-	def persistChangesCount = tc.backend.region.persistChangesCount;
+	def drainCount = tc.backend.region.drainCount;
 	tc.t.assertz(false, tc.allocSucceeded(tc.region.allocChunk(1u32)));
 	tc.t.assertz(false, tc.region.freeChunk(chunk));
-	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
-	tc.t.assert_eq(persistChangesCount, tc.backend.region.persistChangesCount);
+	tc.t.assertz(true, entry.getUsedInRegion(tc.region.reader()));
+	tc.t.assert_eq(drainCount, tc.backend.region.drainCount);
 }
 
 
@@ -818,7 +812,7 @@ def test_free_persist_failure_requires_recovery(tc: RecoveryPWRegionTester) {
 
 def BACKEND_PATH = "/tmp/wiz_test_txn_backend_region";
 
-def MT = UnitTests.registerT("txn_backend:", _, FileMmapBackendTester.new, _);
+def MT = UnitTests.registerT("storage_backend:", _, MappedFileBackendTester.new, _);
 def MX = [
 	MT("fresh_truncates_and_zero_fills", test_fresh_truncates_and_zero_fills),
 	MT("exclusive_create_rejects_existing_file", test_exclusive_create_rejects_existing_file),
@@ -836,52 +830,52 @@ def MX = [
 	()
 ];
 
-class FileMmapBackendTester(t: Tester) {
-	var backend: FileMmapBackend;
-	var region1: BackendRegion;
-	var region2: BackendRegion;
+class MappedFileBackendTester(t: Tester) {
+	var backend: MappedFileBackend;
+	var region1: StorageRegion;
+	var region2: StorageRegion;
 
 	new() {
-		RegionFileIO.unlink(BACKEND_PATH);
-		backend = FileMmapBackend.new(BACKEND_PATH);
+		BackingFile.unlink(BACKEND_PATH);
+		backend = MappedFileBackend.new(BACKEND_PATH);
 	}
 
 	def cleanup() {
 		if (region1 != null) {
-			region1.destroy();
+			region1.close();
 			region1 = null;
 		}
 		if (region2 != null) {
-			region2.destroy();
+			region2.close();
 			region2 = null;
 		}
-		RegionFileIO.unlink(BACKEND_PATH);
+		BackingFile.unlink(BACKEND_PATH);
 	}
 }
 
 // Shared-machine integration runners reserve their generated path atomically.
 // A second reservation must fail rather than opening or truncating that file.
-def test_exclusive_create_rejects_existing_file(tc: FileMmapBackendTester) {
-	def first = RegionFileIO.createExclusive(BACKEND_PATH);
+def test_exclusive_create_rejects_existing_file(tc: MappedFileBackendTester) {
+	def first = BackingFile.createExclusive(BACKEND_PATH);
 	if (first < 0) {
 		tc.t.fail("initial exclusive file reservation failed");
 		tc.cleanup();
 		return;
 	}
 
-	def second = RegionFileIO.createExclusive(BACKEND_PATH);
+	def second = BackingFile.createExclusive(BACKEND_PATH);
 	tc.t.assertz(true, second < 0);
-	if (second >= 0) RegionFileIO.close(second);
-	RegionFileIO.close(first);
+	if (second >= 0) BackingFile.close(second);
+	BackingFile.close(first);
 	tc.cleanup();
 }
 
 // A fresh open must discard both stale contents and a stale larger extent.
 // Fill an 8 KiB backing file with nonzero bytes, then recreate it at 4 KiB and
 // verify the kernel-provided post-truncation extent is entirely zeroed.
-def test_fresh_truncates_and_zero_fills(tc: FileMmapBackendTester) {
+def test_fresh_truncates_and_zero_fills(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(8192u64, prot, false);
+	tc.region1 = tc.backend.open(8192u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("initial mapped file backend creation failed");
@@ -892,11 +886,11 @@ def test_fresh_truncates_and_zero_fills(tc: FileMmapBackendTester) {
 	for (i < tc.region1.range.length) {
 		Pointer.atElement(tc.region1.range, i).store<u8>(0xa5u8);
 	}
-	tc.t.assertz(true, tc.region1.persistRange(0u64, 8192u64));
-	tc.region1.destroy();
+	tc.t.assertz(true, tc.region1.persist(0u64, 8192u64));
+	tc.region1.close();
 	tc.region1 = null;
 
-	tc.region1 = tc.backend.create(4096u64, prot, true);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.FORMAT);
 	if (tc.region1 == null) {
 		tc.t.fail("fresh mapped file backend creation failed");
 		tc.cleanup();
@@ -910,13 +904,13 @@ def test_fresh_truncates_and_zero_fills(tc: FileMmapBackendTester) {
 	tc.t.assertz(true, allZero);
 	tc.t.assert_eq(4096, tc.region1.range.length);
 
-	def fd = RegionFileIO.open(BACKEND_PATH);
+	def fd = BackingFile.open(BACKEND_PATH);
 	if (fd < 0) {
 		tc.t.fail("fresh backing file could not be reopened");
 	} else {
 		def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
 		tc.t.assert_eq(4096u64, u64.view(size));
-		RegionFileIO.close(fd);
+		BackingFile.close(fd);
 	}
 
 	tc.cleanup();
@@ -924,9 +918,9 @@ def test_fresh_truncates_and_zero_fills(tc: FileMmapBackendTester) {
 
 // Mount intent on a missing path falls back to creating a fresh, zero-filled
 // backing file rather than failing or exposing unspecified bytes.
-def test_missing_attach_creates_zeroed_file(tc: FileMmapBackendTester) {
+def test_missing_attach_creates_zeroed_file(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("missing-file attach fallback failed");
@@ -941,25 +935,25 @@ def test_missing_attach_creates_zeroed_file(tc: FileMmapBackendTester) {
 	tc.t.assertz(true, allZero);
 	tc.t.assert_eq(4096, tc.region1.range.length);
 
-	def fd = RegionFileIO.open(BACKEND_PATH);
+	def fd = BackingFile.open(BACKEND_PATH);
 	tc.t.assertz(true, fd >= 0);
 	if (fd >= 0) {
 		def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
 		tc.t.assert_eq(4096u64, u64.view(size));
-		RegionFileIO.close(fd);
+		BackingFile.close(fd);
 	}
 
 	tc.cleanup();
 }
 
 // Attaching to a non-empty file of another size must leave it as it is.
-// FileMmapBackend and PmemMmapBackend size the file through the same helper
+// MappedFileBackend and PmemBackend size the file through the same helper
 // before mapping it, so the PMEM backend refuses here on any filesystem, DAX
 // or not; on tmpfs its MAP_SYNC mapping would fail only afterwards. Until
 // 2026-10-21 both truncated or extended the file to the requested size first.
-def test_attach_other_size_refused_unchanged(tc: FileMmapBackendTester) {
+def test_attach_other_size_refused_unchanged(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(8192u64, prot, true);
+	tc.region1 = tc.backend.open(8192u64, prot, OpenMode.FORMAT);
 	if (tc.region1 == null) {
 		tc.t.fail("initial mapped file backend creation failed");
 		tc.cleanup();
@@ -968,8 +962,8 @@ def test_attach_other_size_refused_unchanged(tc: FileMmapBackendTester) {
 	for (i < tc.region1.range.length) {
 		Pointer.atElement(tc.region1.range, i).store<u8>(u8.view(i * 7 + 1));
 	}
-	tc.t.assertz(true, tc.region1.persistRange(0u64, 8192u64));
-	tc.region1.destroy();
+	tc.t.assertz(true, tc.region1.persist(0u64, 8192u64));
+	tc.region1.close();
 	tc.region1 = null;
 	def before = System.fileLoad(BACKEND_PATH);
 	if (before == null) {
@@ -978,14 +972,14 @@ def test_attach_other_size_refused_unchanged(tc: FileMmapBackendTester) {
 		return;
 	}
 
-	def backends = Array<TxnRegionBackend>.new(2);
+	def backends = Array<StorageBackend>.new(2);
 	backends[0] = tc.backend;
-	backends[1] = PmemMmapBackend.new(BACKEND_PATH);
+	backends[1] = PmemBackend.new(BACKEND_PATH);
 	for (backend in backends) {
 		for (size in [4096u64, 16384u64]) {
-			def region = backend.create(size, prot, false);
+			def region = backend.open(size, prot, OpenMode.ATTACH);
 			tc.t.assertz(true, region == null);
-			if (region != null) region.destroy();
+			if (region != null) region.close();
 			def after = System.fileLoad(BACKEND_PATH);
 			if (after == null) {
 				tc.t.fail("backing file missing after the attach");
@@ -1001,10 +995,10 @@ def test_attach_other_size_refused_unchanged(tc: FileMmapBackendTester) {
 	tc.cleanup();
 }
 
-def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
+def test_mapped_file_region_owns_state(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
-	tc.region2 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
+	tc.region2 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null || tc.region2 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1012,8 +1006,8 @@ def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 		return;
 	}
 
-	var r1 = FileMmapRegion.!(tc.region1);
-	var r2 = FileMmapRegion.!(tc.region2);
+	var r1 = MappedFileRegion.!(tc.region1);
+	var r2 = MappedFileRegion.!(tc.region2);
 
 	tc.t.assertz(false, r1.mapping == r2.mapping);
 	tc.t.assertz(false, r1.mapping.range.start == r2.mapping.range.start);
@@ -1022,17 +1016,17 @@ def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 	tc.t.assertz(true, Pointer.atElement(r2.range, 0) == r2.mapping.range.start);
 	tc.t.assert_eq(int.!(r2.mapping.range.size()), r2.range.length);
 
-	tc.t.assertz(true, tc.region1.prepareChangedRange(128u64, 16u64));
-	tc.t.assertz(true, tc.region2.prepareChangedRange(256u64, 32u64));
+	tc.t.assertz(true, tc.region1.writeBack(128u64, 16u64));
+	tc.t.assertz(true, tc.region2.writeBack(256u64, 32u64));
 
 	tc.t.assertz(true, r1.hasDirtyChanges);
 	tc.t.assertz(true, r2.hasDirtyChanges);
 
-	tc.t.assertz(true, tc.region1.persistChanges());
+	tc.t.assertz(true, tc.region1.drain());
 	tc.t.assertz(false, r1.hasDirtyChanges);
 	tc.t.assertz(true, r2.hasDirtyChanges);
 
-	tc.region1.destroy();
+	tc.region1.close();
 	tc.region1 = null;
 
 	tc.t.assertz(true, r1.mapping == null);
@@ -1043,15 +1037,15 @@ def test_mapped_file_region_owns_state(tc: FileMmapBackendTester) {
 	Pointer.atElement(tc.region2.range, 0).store<u8>(0x42u8);
 	tc.t.assert_eq(0x42u8, Pointer.atElement(tc.region2.range, 0).load<u8>());
 
-	tc.t.assertz(true, tc.region2.persistChanges());
+	tc.t.assertz(true, tc.region2.drain());
 	tc.t.assertz(false, r2.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_changes_clears_dirty_flag(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_changes_clears_dirty_flag(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1059,21 +1053,21 @@ def test_mapped_file_persist_changes_clears_dirty_flag(tc: FileMmapBackendTester
 		return;
 	}
 
-	var r1 = FileMmapRegion.!(tc.region1);
+	var r1 = MappedFileRegion.!(tc.region1);
 	Pointer.atElement(tc.region1.range, 64).store<u8>(0x7au8);
-	tc.t.assertz(true, tc.region1.prepareChangedRange(64u64, 1u64));
+	tc.t.assertz(true, tc.region1.writeBack(64u64, 1u64));
 
 	tc.t.assertz(true, r1.hasDirtyChanges);
-	tc.t.assertz(true, tc.region1.persistChanges());
+	tc.t.assertz(true, tc.region1.drain());
 	tc.t.assertz(false, r1.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_changes_keeps_other_region_dirty(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_changes_keeps_other_region_dirty(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
-	tc.region2 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
+	tc.region2 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null || tc.region2 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1081,24 +1075,24 @@ def test_mapped_file_persist_changes_keeps_other_region_dirty(tc: FileMmapBacken
 		return;
 	}
 
-	var r1 = FileMmapRegion.!(tc.region1);
-	var r2 = FileMmapRegion.!(tc.region2);
+	var r1 = MappedFileRegion.!(tc.region1);
+	var r2 = MappedFileRegion.!(tc.region2);
 
 	Pointer.atElement(tc.region1.range, 128).store<u8>(0x11u8);
 	Pointer.atElement(tc.region2.range, 256).store<u8>(0x22u8);
-	tc.t.assertz(true, tc.region1.prepareChangedRange(128u64, 1u64));
-	tc.t.assertz(true, tc.region2.prepareChangedRange(256u64, 1u64));
+	tc.t.assertz(true, tc.region1.writeBack(128u64, 1u64));
+	tc.t.assertz(true, tc.region2.writeBack(256u64, 1u64));
 
-	tc.t.assertz(true, tc.region1.persistChanges());
+	tc.t.assertz(true, tc.region1.drain());
 	tc.t.assertz(false, r1.hasDirtyChanges);
 	tc.t.assertz(true, r2.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_changes_failure_keeps_dirty_flag(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_changes_failure_keeps_dirty_flag(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1106,19 +1100,19 @@ def test_mapped_file_persist_changes_failure_keeps_dirty_flag(tc: FileMmapBacken
 		return;
 	}
 
-	var r1 = FileMmapRegion.!(tc.region1);
-	tc.t.assertz(true, tc.region1.prepareChangedRange(96u64, 8u64));
-	RegionFileIO.close(r1.fd);
+	var r1 = MappedFileRegion.!(tc.region1);
+	tc.t.assertz(true, tc.region1.writeBack(96u64, 8u64));
+	BackingFile.close(r1.fd);
 
-	tc.t.assertz(false, tc.region1.persistChanges());
+	tc.t.assertz(false, tc.region1.drain());
 	tc.t.assertz(true, r1.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_persist_range_keeps_dirty_flag(tc: FileMmapBackendTester) {
+def test_mapped_file_persist_range_keeps_dirty_flag(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1126,20 +1120,20 @@ def test_mapped_file_persist_range_keeps_dirty_flag(tc: FileMmapBackendTester) {
 		return;
 	}
 
-	var r1 = FileMmapRegion.!(tc.region1);
+	var r1 = MappedFileRegion.!(tc.region1);
 	Pointer.atElement(tc.region1.range, 64).store<u8>(0x7au8);
 	Pointer.atElement(tc.region1.range, 512).store<u8>(0x33u8);
-	tc.t.assertz(true, tc.region1.prepareChangedRange(64u64, 1u64));
-	tc.t.assertz(true, tc.region1.persistRange(512u64, 1u64));
+	tc.t.assertz(true, tc.region1.writeBack(64u64, 1u64));
+	tc.t.assertz(true, tc.region1.persist(512u64, 1u64));
 
 	tc.t.assertz(true, r1.hasDirtyChanges);
 
 	tc.cleanup();
 }
 
-def test_mapped_file_invalid_ops_fail(tc: FileMmapBackendTester) {
+def test_mapped_file_invalid_ops_fail(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	tc.region1 = tc.backend.create(4096u64, prot, false);
+	tc.region1 = tc.backend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1147,24 +1141,24 @@ def test_mapped_file_invalid_ops_fail(tc: FileMmapBackendTester) {
 		return;
 	}
 
-	def volatileRegion = Backends.getVolatile().create(4096u64, prot, false);
-	tc.t.assertz(true, volatileRegion.prepareChangedRange(0u64, 1u64));
-	tc.t.assertz(true, volatileRegion.persistRange(0u64, 1u64));
-	tc.t.assertz(true, volatileRegion.persistChanges());
-	tc.t.assertz(false, tc.region1.prepareChangedRange(4096u64, 1u64));
-	tc.t.assertz(false, tc.region1.prepareChangedRange(4095u64, 2u64));
-	tc.t.assertz(true, tc.region1.prepareChangedRange(4096u64, 0u64));
-	tc.t.assertz(false, tc.region1.persistRange(4096u64, 1u64));
-	tc.t.assertz(false, tc.region1.persistRange(4095u64, 2u64));
-	tc.t.assertz(true, tc.region1.persistRange(4096u64, 0u64));
+	def volatileRegion = Backends.volatile().open(4096u64, prot, OpenMode.ATTACH);
+	tc.t.assertz(true, volatileRegion.writeBack(0u64, 1u64));
+	tc.t.assertz(true, volatileRegion.persist(0u64, 1u64));
+	tc.t.assertz(true, volatileRegion.drain());
+	tc.t.assertz(false, tc.region1.writeBack(4096u64, 1u64));
+	tc.t.assertz(false, tc.region1.writeBack(4095u64, 2u64));
+	tc.t.assertz(true, tc.region1.writeBack(4096u64, 0u64));
+	tc.t.assertz(false, tc.region1.persist(4096u64, 1u64));
+	tc.t.assertz(false, tc.region1.persist(4095u64, 2u64));
+	tc.t.assertz(true, tc.region1.persist(4096u64, 0u64));
 
 	tc.cleanup();
 }
 
-def test_mapped_file_region_destroy_owns_lifecycle(tc: FileMmapBackendTester) {
+def test_mapped_file_region_destroy_owns_lifecycle(tc: MappedFileBackendTester) {
 	def prot = BackendProt.READ.mask | BackendProt.WRITE.mask;
-	def otherBackend = FileMmapBackend.new(BACKEND_PATH);
-	tc.region1 = otherBackend.create(4096u64, prot, false);
+	def otherBackend = MappedFileBackend.new(BACKEND_PATH);
+	tc.region1 = otherBackend.open(4096u64, prot, OpenMode.ATTACH);
 
 	if (tc.region1 == null) {
 		tc.t.fail("mapped file backend creation failed");
@@ -1172,10 +1166,10 @@ def test_mapped_file_region_destroy_owns_lifecycle(tc: FileMmapBackendTester) {
 		return;
 	}
 
-	var fileRegion = FileMmapRegion.!(tc.region1);
-	tc.t.assertz(true, tc.region1.prepareChangedRange(64u64, 1u64));
+	var fileRegion = MappedFileRegion.!(tc.region1);
+	tc.t.assertz(true, tc.region1.writeBack(64u64, 1u64));
 
-	tc.region1.destroy();
+	tc.region1.close();
 	tc.region1 = null;
 	tc.t.assertz(true, fileRegion.mapping == null);
 	tc.t.assert_eq(-1, fileRegion.fd);
@@ -1184,39 +1178,39 @@ def test_mapped_file_region_destroy_owns_lifecycle(tc: FileMmapBackendTester) {
 	tc.cleanup();
 }
 
-def test_fdatasync_invalid_fd_fails(tc: FileMmapBackendTester) {
-	tc.t.assertz(false, RegionFileIO.fdatasync(-1));
+def test_fdatasync_invalid_fd_fails(tc: MappedFileBackendTester) {
+	tc.t.assertz(false, BackingFile.fdatasync(-1));
 	tc.cleanup();
 }
 
-def test_pmem_region_tracks_pending_writeback(tc: FileMmapBackendTester) {
-	def backend = PmemMmapBackend.new(BACKEND_PATH);
+def test_pmem_region_tracks_pending_writeback(tc: MappedFileBackendTester) {
+	def backend = PmemBackend.new(BACKEND_PATH);
 	def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
-	var region: BackendRegion = backend.makePersistentRegion(mapping, -1);
+	var region: StorageRegion = backend.makePmemRegion(mapping, -1);
 
 	if (region == null) {
 		tc.t.fail("pmem test mapping allocation failed");
 		return;
 	}
 
-	tc.t.assertz(true, FdMmapRegion.?(region));
-	tc.t.assertz(true, PmemMmapRegion.?(region));
-	tc.t.assertz(false, FileMmapRegion.?(region));
+	tc.t.assertz(true, FileBackedRegion.?(region));
+	tc.t.assertz(true, PmemRegion.?(region));
+	tc.t.assertz(false, MappedFileRegion.?(region));
 
-	def fdRegion = FdMmapRegion.!(region);
-	def pmemRegion = PmemMmapRegion.!(region);
+	def fdRegion = FileBackedRegion.!(region);
+	def pmemRegion = PmemRegion.!(region);
 	tc.t.assertz(true, Pointer.atElement(fdRegion.range, 0) == fdRegion.mapping.range.start);
 	tc.t.assert_eq(int.!(fdRegion.mapping.range.size()), fdRegion.range.length);
-	tc.t.assertz(true, region.prepareChangedRange(32u64, 8u64));
+	tc.t.assertz(true, region.writeBack(32u64, 8u64));
 	tc.t.assertz(true, pmemRegion.hasPendingWriteback);
-	tc.t.assertz(true, region.prepareChangedRange(4096u64, 0u64));
-	tc.t.assertz(false, region.prepareChangedRange(4096u64, 1u64));
-	tc.t.assertz(false, region.prepareChangedRange(4095u64, 2u64));
-	tc.t.assertz(true, region.persistRange(512u64, 1u64));
+	tc.t.assertz(true, region.writeBack(4096u64, 0u64));
+	tc.t.assertz(false, region.writeBack(4096u64, 1u64));
+	tc.t.assertz(false, region.writeBack(4095u64, 2u64));
+	tc.t.assertz(true, region.persist(512u64, 1u64));
 	tc.t.assertz(true, pmemRegion.hasPendingWriteback);
-	tc.t.assertz(true, region.persistChanges());
+	tc.t.assertz(true, region.drain());
 	tc.t.assertz(false, pmemRegion.hasPendingWriteback);
-	region.destroy();
+	region.close();
 	tc.t.assertz(true, fdRegion.mapping == null);
 	tc.t.assert_eq(-1, fdRegion.fd);
 }
@@ -1240,9 +1234,9 @@ component FilePersistenceTraceOp {
 }
 
 // Records prepared ranges and the completed syscalls behind both production
-// FileMmapRegion persistence seams. This keeps the real mapping and syscall
+// MappedFileRegion persistence seams. This keeps the real mapping and syscall
 // paths while making fdatasync/msync ordering and failures visible to tests.
-class FilePersistenceTraceRegion extends FileMmapRegion {
+class FilePersistenceTraceRegion extends MappedFileRegion {
 	var operations = Vector<int>.new();
 	var preparedOffsets = Vector<u64>.new();
 	var preparedSizes = Vector<u64>.new();
@@ -1263,7 +1257,7 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 
 	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
-	def onRangePrepared(offset: u64, size: u64) {
+	def onWriteBack(offset: u64, size: u64) {
 		operations.put(FilePersistenceTraceOp.PREPARE_RANGE);
 		preparedOffsets.put(offset);
 		preparedSizes.put(size);
@@ -1279,9 +1273,9 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 			failNextDataSync = false;
 			// Exercise the real syscall error path without invalidating the
 			// mapping's owned descriptor, which is still needed for clean teardown.
-			success = RegionFileIO.fdatasync(-1);
+			success = BackingFile.fdatasync(-1);
 		} else {
-			success = RegionFileIO.fdatasync(fd);
+			success = BackingFile.fdatasync(fd);
 		}
 		operations.put(if(
 			success,
@@ -1324,13 +1318,13 @@ class FilePersistenceTraceRegion extends FileMmapRegion {
 	}
 }
 
-class FilePersistenceTraceBackend extends FileMmapBackend {
+class FilePersistenceTraceBackend extends MappedFileBackend {
 	var tracedRegion: FilePersistenceTraceRegion;
 	var failFirstDataSync = false;
 
 	new(path: string) super(path) { }
 
-	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+	def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
 		if (newMapping == null) return null;
 		tracedRegion = FilePersistenceTraceRegion.new(newMapping, fd);
 		tracedRegion.failNextDataSync = failFirstDataSync;
@@ -1339,11 +1333,11 @@ class FilePersistenceTraceBackend extends FileMmapBackend {
 }
 
 // Test-only file backend that stops its process after the real fdatasync at a
-// WAL commit boundary, but before persistChanges() returns to DualTxnWal and
-// RegionTransaction can apply the allocator after-images. The parent can then
+// WAL commit boundary, but before drain() returns to TwoSlotWal and
+// TransactionCache can apply the allocator after-images. The parent can then
 // SIGKILL the stopped child to make this otherwise tiny protocol window fully
 // deterministic.
-class CommitBoundaryStopFileMmapRegion extends FileMmapRegion {
+class CommitBoundaryStopMappedFileRegion extends MappedFileRegion {
 	def stopAtDataSync: int;
 	var dataSyncCount = 0;
 
@@ -1351,7 +1345,7 @@ class CommitBoundaryStopFileMmapRegion extends FileMmapRegion {
 
 	def syncFileData() -> bool {
 		if (fd < 0) return false;
-		if (!RegionFileIO.fdatasync(fd)) return false;
+		if (!BackingFile.fdatasync(fd)) return false;
 		dataSyncCount++;
 
 		if (dataSyncCount == stopAtDataSync) {
@@ -1365,24 +1359,24 @@ class CommitBoundaryStopFileMmapRegion extends FileMmapRegion {
 	}
 }
 
-class CommitBoundaryStopFileMmapBackend extends FileMmapBackend {
+class CommitBoundaryStopMappedFileBackend extends MappedFileBackend {
 	def stopAtDataSync: int;
 
 	new(path: string, stopAtDataSync: int) super(path) { }
 
-	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+	def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
 		if (newMapping == null) return null;
-		return CommitBoundaryStopFileMmapRegion.new(newMapping, fd, stopAtDataSync);
+		return CommitBoundaryStopMappedFileRegion.new(newMapping, fd, stopAtDataSync);
 	}
 }
 
 // Stop after a real fdatasync completes while close() is reclaiming WAL slots.
-// close() first syncs the deferred data, then each slot scrub's persistRange()
+// close() first syncs the deferred data, then each slot scrub's persist()
 // is a fence of its own, so the first scrub is close()'s second sync. Killing
 // the child at that point exercises a durable prefix of the ordered slot scrubs
 // without allowing unmap, fd close, or later scrubs. Only syncs after the child
 // sets {closing} are counted.
-class SlotScrubBoundaryStopFileMmapRegion extends FileMmapRegion {
+class SlotScrubBoundaryStopMappedFileRegion extends MappedFileRegion {
 	def stopAtCloseSync: int;
 	var closing = false;
 	var closeSyncCount = 0;
@@ -1391,7 +1385,7 @@ class SlotScrubBoundaryStopFileMmapRegion extends FileMmapRegion {
 
 	def syncFileData() -> bool {
 		if (fd < 0) return false;
-		if (!RegionFileIO.fdatasync(fd)) return false;
+		if (!BackingFile.fdatasync(fd)) return false;
 		if (!closing) return true;
 		closeSyncCount++;
 
@@ -1403,18 +1397,18 @@ class SlotScrubBoundaryStopFileMmapRegion extends FileMmapRegion {
 	}
 }
 
-class SlotScrubBoundaryStopFileMmapBackend extends FileMmapBackend {
+class SlotScrubBoundaryStopMappedFileBackend extends MappedFileBackend {
 	def stopAtCloseSync: int;
 
 	new(path: string, stopAtCloseSync: int) super(path) { }
 
-	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+	def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
 		if (newMapping == null) return null;
-		return SlotScrubBoundaryStopFileMmapRegion.new(newMapping, fd, stopAtCloseSync);
+		return SlotScrubBoundaryStopMappedFileRegion.new(newMapping, fd, stopAtCloseSync);
 	}
 }
 
-def BT = UnitTests.registerT("pwregion_bd:", _, BlockDevicePWRegionTester.new, _);
+def BT = UnitTests.registerT("allocator_file:", _, MappedFileAllocatorTester.new, _);
 def BX = [
 	BT("format_magic",          test_bd_format_magic),
 	BT("initializes_file_size", test_bd_initializes_file_size),
@@ -1469,12 +1463,12 @@ def BX = [
 	()
 ];
 
-class BlockDevicePWRegionTester(t: Tester) {
-	var region: PWRegion;
-	var immixDescs: Array<Ref<MetaDataDesc>>;	// set: openRegion() opens an ImmixPWRegion
+class MappedFileAllocatorTester(t: Tester) {
+	var region: RegionAllocator;
+	var immixDescs: Array<Ref<MetadataDescriptor>>;	// set: openRegion() opens an ImmixRegionAllocator
 
 	new() {
-		RegionFileIO.unlink(BD_PATH);
+		BackingFile.unlink(BD_PATH);
 		region = openRegion(true);
 	}
 
@@ -1484,7 +1478,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 	def persistHeaderU64(offset: int, value: u64) -> bool {
 		Pointer.atElement(region.backendRegion.range, offset).store<u64>(value);
-		return region.backendRegion.persistRange(u64.view(offset), 8u64);
+		return region.backendRegion.persist(u64.view(offset), 8u64);
 	}
 
 	def cleanup() {
@@ -1492,15 +1486,15 @@ class BlockDevicePWRegionTester(t: Tester) {
 			region.deallocate();
 			region = null;
 		}
-		RegionFileIO.unlink(BD_PATH);
+		BackingFile.unlink(BD_PATH);
 	}
 
 	// Store {magic} in the formatted region's header, close it, and reopen it
 	// without forceFormat. The open must be refused as a geometry mismatch is
-	// (no transaction, no log chunk), and no byte of the backing file may
+	// (no transaction, no log block), and no byte of the backing file may
 	// change, in the mapping while it is open or in the file once it is closed.
 	def checkMagicRefused(magic: u64) {
-		checkReopenRefused(PWRegionHeader.magic.offset, magic);
+		checkReopenRefused(RegionHeader.magic.offset, magic);
 	}
 
 	// As checkMagicRefused, for {value} stored at any header {offset}. An
@@ -1520,10 +1514,10 @@ class BlockDevicePWRegionTester(t: Tester) {
 		t.assertz(true, refused.backendRegion != null);
 		if (refused.backendRegion == null) return;
 		t.assertz(true, refused.txn == null);
-		t.assertz(true, refused.logChunk.isNull());
+		t.assertz(true, refused.logBlock.isNull());
 		t.assert_eq(value, Pointer.atElement(refused.backendRegion.range, offset).load<u64>());
-		if (ImmixPWRegion.?(refused)) {
-			def immix = ImmixPWRegion.!(refused);
+		if (ImmixRegionAllocator.?(refused)) {
+			def immix = ImmixRegionAllocator.!(refused);
 			t.assert_eq(0u64, immix.lineMarks.addr);
 			t.assert_eq(0u64, immix.numLineMarks);
 			immix.resetAllLineMarks();
@@ -1576,7 +1570,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 	}
 
 	// Open a fresh region over existing files (mount, not format)
-	def remount() -> PWRegion {
+	def remount() -> RegionAllocator {
 		if (region != null) {
 			region.deallocate();
 		}
@@ -1585,7 +1579,7 @@ class BlockDevicePWRegionTester(t: Tester) {
 	}
 
 	// Start another generated history from a newly formatted backing file.
-	def reformat() -> PWRegion {
+	def reformat() -> RegionAllocator {
 		if (region != null) {
 			region.deallocate();
 		}
@@ -1593,22 +1587,22 @@ class BlockDevicePWRegionTester(t: Tester) {
 		return region;
 	}
 
-	private def isBlockTableEntry(candidate: PWRegion, entry: BlockEntryHandle) -> bool {
+	private def isBlockTableEntry(candidate: RegionAllocator, entry: BlockTableEntryHandle) -> bool {
 		if (entry.isNull()) return false;
 		if (entry.addr < candidate.blockTableHandle.addr) return false;
 		def delta = entry.addr - candidate.blockTableHandle.addr;
-		if (delta % u64.!(BlockEntry.size) != 0) return false;
-		return delta / u64.!(BlockEntry.size) <= candidate.numBlocks;
+		if (delta % u64.!(BlockTableEntry.size) != 0) return false;
+		return delta / u64.!(BlockTableEntry.size) <= candidate.numBlocks;
 	}
 
 	private def walkFreeList(
-		candidate: PWRegion,
-		sentinel: BlockEntryHandle,
-		kind: ListKind,
+		candidate: RegionAllocator,
+		sentinel: BlockTableEntryHandle,
+		kind: FreeListKind,
 		listed: Array<bool>) {
 
 		var previous = sentinel;
-		var current = sentinel.getListNext(candidate.reader());
+		var current = sentinel.getListNextInRegion(candidate.reader());
 		var steps = 0;
 		while (!current.isNull()) {
 			if (steps > int.!(candidate.numBlocks)) {
@@ -1626,12 +1620,12 @@ class BlockDevicePWRegionTester(t: Tester) {
 				return;
 			}
 			listed[index] = true;
-			t.assert_eq(kind.code, current.getListNum(candidate.reader()));
-			t.assertz(false, current.getUsed(candidate.reader()));
-			t.assert_eq(previous.addr, current.getListPrev(candidate.reader()).addr);
+			t.assert_eq(kind.code, current.getListNumInRegion(candidate.reader()));
+			t.assertz(false, current.getUsedInRegion(candidate.reader()));
+			t.assert_eq(previous.addr, current.getListPrevInRegion(candidate.reader()).addr);
 
 			previous = current;
-			current = current.getListNext(candidate.reader());
+			current = current.getListNextInRegion(candidate.reader());
 			steps++;
 		}
 	}
@@ -1639,12 +1633,12 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// Walk both allocator structures directly. The memory-order chain must be
 	// acyclic, ordered, and doubly linked; each free extent must be classified by
 	// its actual span and appear exactly once on the matching free list.
-	def assertAllocatorInvariants(candidate: PWRegion) {
+	def assertAllocatorInvariants(candidate: RegionAllocator) {
 		def entryCount = int.!(candidate.numBlocks + 1u64);
 		var memorySeen = Array<bool>.new(entryCount);
 		var freeByIndex = Array<bool>.new(entryCount);
 		var listed = Array<bool>.new(entryCount);
-		var previous = BlockEntryHandle(0u64);
+		var previous = BlockTableEntryHandle(0u64);
 		var current = candidate.blockTableHandle[0u64];
 		var reachedEnd = false;
 		var steps = 0;
@@ -1666,15 +1660,15 @@ class BlockDevicePWRegionTester(t: Tester) {
 				return;
 			}
 			memorySeen[arrayIndex] = true;
-			t.assert_eq(previous.addr, current.getPrev(candidate.reader()).addr);
+			t.assert_eq(previous.addr, current.getPrevInRegion(candidate.reader()).addr);
 
-			def next = current.getNext(candidate.reader());
+			def next = current.getNextInRegion(candidate.reader());
 			if (index == candidate.numBlocks) {
-				t.assertz(true, current.getUsed(candidate.reader()));
-				t.assert_eq(ListKind.NONE.code, current.getListNum(candidate.reader()));
+				t.assertz(true, current.getUsedInRegion(candidate.reader()));
+				t.assert_eq(FreeListKind.NONE.code, current.getListNumInRegion(candidate.reader()));
 				t.assertz(true, next.isNull());
-				t.assertz(true, current.getListPrev(candidate.reader()).isNull());
-				t.assertz(true, current.getListNext(candidate.reader()).isNull());
+				t.assertz(true, current.getListPrevInRegion(candidate.reader()).isNull());
+				t.assertz(true, current.getListNextInRegion(candidate.reader()).isNull());
 				reachedEnd = true;
 				break;
 			}
@@ -1688,21 +1682,21 @@ class BlockDevicePWRegionTester(t: Tester) {
 				t.fail("memory-order block indices are not increasing");
 				return;
 			}
-			t.assert_eq(current.addr, next.getPrev(candidate.reader()).addr);
+			t.assert_eq(current.addr, next.getPrevInRegion(candidate.reader()).addr);
 
-			if (current.getUsed(candidate.reader())) {
-				def kind = current.getListNum(candidate.reader());
-				t.assertz(true, kind == ListKind.NONE.code || kind == ListKind.METADATA.code);
-				t.assertz(true, current.getListPrev(candidate.reader()).isNull());
-				t.assertz(true, current.getListNext(candidate.reader()).isNull());
+			if (current.getUsedInRegion(candidate.reader())) {
+				def kind = current.getListNumInRegion(candidate.reader());
+				t.assertz(true, kind == FreeListKind.NONE.code || kind == FreeListKind.METADATA.code);
+				t.assertz(true, current.getListPrevInRegion(candidate.reader()).isNull());
+				t.assertz(true, current.getListNextInRegion(candidate.reader()).isNull());
 			} else {
 				def extentBlocks = nextIndex - index;
 				def expectedKind = if(
 					extentBlocks == 1u64,
-					ListKind.SMALL_FREE.code,
-					ListKind.LARGE_FREE.code);
-				t.assert_eq(expectedKind, current.getListNum(candidate.reader()));
-				if (!previous.isNull()) t.assertz(true, previous.getUsed(candidate.reader()));
+					FreeListKind.SMALL_FREE.code,
+					FreeListKind.LARGE_FREE.code);
+				t.assert_eq(expectedKind, current.getListNumInRegion(candidate.reader()));
+				if (!previous.isNull()) t.assertz(true, previous.getUsedInRegion(candidate.reader()));
 				freeByIndex[arrayIndex] = true;
 			}
 
@@ -1712,8 +1706,8 @@ class BlockDevicePWRegionTester(t: Tester) {
 		}
 
 		t.assertz(true, reachedEnd);
-		walkFreeList(candidate, candidate.smallSentinel, ListKind.SMALL_FREE, listed);
-		walkFreeList(candidate, candidate.largeSentinel, ListKind.LARGE_FREE, listed);
+		walkFreeList(candidate, candidate.smallSentinel, FreeListKind.SMALL_FREE, listed);
+		walkFreeList(candidate, candidate.largeSentinel, FreeListKind.LARGE_FREE, listed);
 		for (i < entryCount) {
 			t.assertz(freeByIndex[i], listed[i]);
 		}
@@ -1723,20 +1717,20 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 	// Cross-check the allocator against the generated history's compact model.
 	// Each nonzero element is an allocated extent beginning at that block index.
-	def assertTrackedAllocations(candidate: PWRegion, allocationSizes: Array<u32>) {
+	def assertTrackedAllocations(candidate: RegionAllocator, allocationSizes: Array<u32>) {
 		for (i = 2; i < 7; i++) {
 			def size = allocationSizes[i];
 			if (size == 0u32) continue;
 
 			def entry = candidate.blockTableHandle[u64.view(i)];
-			def next = entry.getNext(candidate.reader());
-			t.assertz(true, entry.getUsed(candidate.reader()));
-			t.assert_eq(ListKind.NONE.code, entry.getListNum(candidate.reader()));
+			def next = entry.getNextInRegion(candidate.reader());
+			t.assertz(true, entry.getUsedInRegion(candidate.reader()));
+			t.assert_eq(FreeListKind.NONE.code, entry.getListNumInRegion(candidate.reader()));
 			t.assert_eq(u64.view(i) + u64.view(size), candidate.blockIndexOf(next));
 
-			def chunk = candidate.blockEntryToChunk(entry);
-			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getLimit(candidate.reader()));
-			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getChunkLimit(candidate.reader()));
+			def chunk = candidate.blockTableEntryToChunk(entry);
+			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getLimitInRegion(candidate.reader()));
+			t.assert_eq(u64.view(size) * candidate.blockSize, chunk.getChunkLimitInRegion(candidate.reader()));
 		}
 
 		// The reverse check prevents an unexpected allocated extent from being
@@ -1750,15 +1744,15 @@ class BlockDevicePWRegionTester(t: Tester) {
 			}
 			def index = candidate.blockIndexOf(current);
 			if (index >= 2u64 && index < 7u64) {
-				t.assertz(current.getUsed(candidate.reader()), allocationSizes[int.!(index)] != 0u32);
+				t.assertz(current.getUsedInRegion(candidate.reader()), allocationSizes[int.!(index)] != 0u32);
 			}
-			current = current.getNext(candidate.reader());
+			current = current.getNextInRegion(candidate.reader());
 			steps++;
 		}
 	}
 
-	def writeCommittedWalUpdate(region: PWRegion, addr: u64, value: u64, width: u8) {
-		var wal = DualTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+	def writeCommittedWalUpdate(region: RegionAllocator, addr: u64, value: u64, width: u8) {
+		var wal = TwoSlotWal.new(region.regionStart, region.logBlock.addr, region.blockSize, region.backendRegion, OpenMode.ATTACH);
 		wal.append(addr - region.regionStart, value, width);
 		wal.commit();
 	}
@@ -1766,17 +1760,17 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// Run in a forked child. Return an exit status instead of asserting because
 	// the child's Tester state is private after fork. The caller terminates with
 	// exit_group immediately after this returns, deliberately skipping every
-	// PWRegion/DualTxnWal cleanup path.
+	// RegionAllocator/TwoSlotWal cleanup path.
 	def writeCommittedWalUpdateAbruptly() -> int {
 		region = openRegion(false);
 		if (region.backendRegion == null || region.txn == null) return 2;
 
 		def entry = region.blockTableHandle[2u64];
-		if (entry.getUsed(region.reader())) return 3;
+		if (entry.getUsedInRegion(region.reader())) return 3;
 
-		var wal = DualTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+		var wal = TwoSlotWal.new(region.regionStart, region.logBlock.addr, region.blockSize, region.backendRegion, OpenMode.ATTACH);
 		if (!wal.append(
-			entry.addr + u64.view(BlockEntry.used.offset) - region.regionStart,
+			entry.addr + u64.view(BlockTableEntry.used.offset) - region.regionStart,
 			1u64,
 			1u8)) return 4;
 		if (wal.commit() == 0u64) return 5;
@@ -1796,25 +1790,24 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (chunk.isNull()) return 3;
 		if (region.requiresRecovery()) return 4;
 		if (region.txn.isDirty()) return 5;
-		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 6;
-		if (!FileMmapRegion.?(region.backendRegion)) return 7;
-		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 8;
+		if (!region.blockTableHandle[2u64].getUsedInRegion(region.reader())) return 6;
+		if (!MappedFileRegion.?(region.backendRegion)) return 7;
+		if (!MappedFileRegion.!(region.backendRegion).hasDirtyChanges) return 8;
 		return 0;
 	}
 
-	// The custom backend stops inside persistChanges() after fdatasync has made
+	// The custom backend stops inside drain() after fdatasync has made
 	// the split transaction's WAL record durable. allocChunk() must not return:
 	// its multi-entry after-images have not yet been applied at this point.
 	def allocateSplitAtCommitBoundary() -> int {
-		region = PWRegion.new(
-			CommitBoundaryStopFileMmapBackend.new(BD_PATH, 1),
+		region = RegionAllocator.new(
+			CommitBoundaryStopMappedFileBackend.new(BD_PATH, 1),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			false
-		);
+			OpenMode.ATTACH);
 		if (region.backendRegion == null || region.txn == null) return 2;
-		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+		if (!CommitBoundaryStopMappedFileRegion.?(region.backendRegion)) return 3;
 
 		def chunk = region.allocChunk(1u32);
 		if (chunk.isNull()) return 4;
@@ -1827,15 +1820,14 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// This transaction removes the only free-list node instead of splitting it,
 	// so recovery must reconstruct a distinct multi-entry structural update.
 	def allocateExactFitAtCommitBoundary() -> int {
-		region = PWRegion.new(
-			CommitBoundaryStopFileMmapBackend.new(BD_PATH, 1),
+		region = RegionAllocator.new(
+			CommitBoundaryStopMappedFileBackend.new(BD_PATH, 1),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			false
-		);
+			OpenMode.ATTACH);
 		if (region.backendRegion == null || region.txn == null) return 2;
-		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+		if (!CommitBoundaryStopMappedFileRegion.?(region.backendRegion)) return 3;
 
 		def chunk = region.allocChunk(5u32);
 		if (chunk.isNull()) return 4;
@@ -1850,19 +1842,18 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// backend stops after that complete transaction's WAL record is durable but
 	// before freeChunk() can apply any of its structural after-images.
 	def coalesceFreeAtCommitBoundary() -> int {
-		region = PWRegion.new(
-			CommitBoundaryStopFileMmapBackend.new(BD_PATH, 1),
+		region = RegionAllocator.new(
+			CommitBoundaryStopMappedFileBackend.new(BD_PATH, 1),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			false
-		);
+			OpenMode.ATTACH);
 		if (region.backendRegion == null || region.txn == null) return 2;
-		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+		if (!CommitBoundaryStopMappedFileRegion.?(region.backendRegion)) return 3;
 
 		def allocatedRight = region.blockTableHandle[3u64];
-		if (!allocatedRight.getUsed(region.reader())) return 4;
-		if (!region.freeChunk(region.blockEntryToChunk(allocatedRight))) return 5;
+		if (!allocatedRight.getUsedInRegion(region.reader())) return 4;
+		if (!region.freeChunk(region.blockTableEntryToChunk(allocatedRight))) return 5;
 		// Reaching this return means the expected SIGSTOP did not hold the child
 		// at the commit boundary.
 		return 6;
@@ -1872,19 +1863,18 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// fdatasync. That one boundary must persist transaction 1's already-applied
 	// data together with transaction 2's record, before transaction 2 applies.
 	def allocateTwoAtSecondCommitBoundary() -> int {
-		region = PWRegion.new(
-			CommitBoundaryStopFileMmapBackend.new(BD_PATH, 2),
+		region = RegionAllocator.new(
+			CommitBoundaryStopMappedFileBackend.new(BD_PATH, 2),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			false
-		);
+			OpenMode.ATTACH);
 		if (region.backendRegion == null || region.txn == null) return 2;
-		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+		if (!CommitBoundaryStopMappedFileRegion.?(region.backendRegion)) return 3;
 
 		def first = region.allocChunk(1u32);
 		if (first.isNull()) return 4;
-		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 5;
+		if (!region.blockTableHandle[2u64].getUsedInRegion(region.reader())) return 5;
 		def second = region.allocChunk(1u32);
 		if (second.isNull()) return 6;
 		// Reaching this return means the expected second-boundary SIGSTOP did not
@@ -1895,19 +1885,18 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// Complete one split allocation, then stop after explicit flush's fdatasync
 	// has made its deferred after-images durable but before flush() returns.
 	def allocateAndFlushAtBoundary() -> int {
-		region = PWRegion.new(
-			CommitBoundaryStopFileMmapBackend.new(BD_PATH, 2),
+		region = RegionAllocator.new(
+			CommitBoundaryStopMappedFileBackend.new(BD_PATH, 2),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			false
-		);
+			OpenMode.ATTACH);
 		if (region.backendRegion == null || region.txn == null) return 2;
-		if (!CommitBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+		if (!CommitBoundaryStopMappedFileRegion.?(region.backendRegion)) return 3;
 
 		def chunk = region.allocChunk(1u32);
 		if (chunk.isNull()) return 4;
-		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 5;
+		if (!MappedFileRegion.!(region.backendRegion).hasDirtyChanges) return 5;
 		if (!region.txn.flush()) return 6;
 		// Reaching this return means the expected explicit-flush SIGSTOP did not
 		// hold the child at the second fdatasync boundary.
@@ -1919,24 +1908,23 @@ class BlockDevicePWRegionTester(t: Tester) {
 	// made both transactions' data durable; recovery must retain the newer record
 	// if the parent kills the child before the second scrub.
 	def allocateTwoAndCloseAtFirstSlotScrub() -> int {
-		region = PWRegion.new(
-			SlotScrubBoundaryStopFileMmapBackend.new(BD_PATH, 2),
+		region = RegionAllocator.new(
+			SlotScrubBoundaryStopMappedFileBackend.new(BD_PATH, 2),
 			8u64,
-			Array<Ref<MetaDataDesc>>.new(0),
+			Array<Ref<MetadataDescriptor>>.new(0),
 			4096u64,
-			false
-		);
+			OpenMode.ATTACH);
 		if (region.backendRegion == null || region.txn == null) return 2;
-		if (!SlotScrubBoundaryStopFileMmapRegion.?(region.backendRegion)) return 3;
+		if (!SlotScrubBoundaryStopMappedFileRegion.?(region.backendRegion)) return 3;
 
 		def first = region.allocChunk(1u32);
 		if (first.isNull()) return 4;
 		def second = region.allocChunk(1u32);
 		if (second.isNull()) return 5;
-		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 6;
-		if (!region.blockTableHandle[3u64].getUsed(region.reader())) return 7;
+		if (!region.blockTableHandle[2u64].getUsedInRegion(region.reader())) return 6;
+		if (!region.blockTableHandle[3u64].getUsedInRegion(region.reader())) return 7;
 
-		SlotScrubBoundaryStopFileMmapRegion.!(region.backendRegion).closing = true;
+		SlotScrubBoundaryStopMappedFileRegion.!(region.backendRegion).closing = true;
 		region.deallocate();
 		region = null;
 		// Reaching this return means the expected first-scrub SIGSTOP did not
@@ -1955,10 +1943,10 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (chunk.isNull()) return 3;
 		if (region.requiresRecovery()) return 4;
 		if (region.txn.isDirty()) return 5;
-		if (!region.blockTableHandle[2u64].getUsed(region.reader())) return 6;
-		if (!region.largeSentinel.getListNext(region.reader()).isNull()) return 7;
-		if (!FileMmapRegion.?(region.backendRegion)) return 8;
-		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 9;
+		if (!region.blockTableHandle[2u64].getUsedInRegion(region.reader())) return 6;
+		if (!region.largeSentinel.getListNextInRegion(region.reader()).isNull()) return 7;
+		if (!MappedFileRegion.?(region.backendRegion)) return 8;
+		if (!MappedFileRegion.!(region.backendRegion).hasDirtyChanges) return 9;
 		return 0;
 	}
 
@@ -1979,47 +1967,47 @@ class BlockDevicePWRegionTester(t: Tester) {
 		if (region.txn.isDirty()) return 8;
 
 		def coalesced = region.blockTableHandle[2u64];
-		if (coalesced.getUsed(region.reader())) return 9;
-		if (coalesced.getListNum(region.reader()) != ListKind.LARGE_FREE.code) return 10;
-		if (!FileMmapRegion.?(region.backendRegion)) return 11;
-		if (!FileMmapRegion.!(region.backendRegion).hasDirtyChanges) return 12;
+		if (coalesced.getUsedInRegion(region.reader())) return 9;
+		if (coalesced.getListNumInRegion(region.reader()) != FreeListKind.LARGE_FREE.code) return 10;
+		if (!MappedFileRegion.?(region.backendRegion)) return 11;
+		if (!MappedFileRegion.!(region.backendRegion).hasDirtyChanges) return 12;
 		return 0;
 	}
 
-	def assertRecoveredSplitAllocation(recovered: PWRegion) {
+	def assertRecoveredSplitAllocation(recovered: RegionAllocator) {
 		def logEntry = recovered.blockTableHandle[1u64];
 		def allocated = recovered.blockTableHandle[2u64];
 		def remainder = recovered.blockTableHandle[3u64];
 		def metadata = recovered.blockTableHandle[7u64];
-		def chunk = recovered.blockEntryToChunk(allocated);
+		def chunk = recovered.blockTableEntryToChunk(allocated);
 
 		// Memory-order chain: log block -> allocated block -> remainder -> metadata.
-		t.assertz(true, allocated.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.NONE.code, allocated.getListNum(recovered.reader()));
-		t.assert_eq(logEntry.addr, allocated.getPrev(recovered.reader()).addr);
-		t.assert_eq(remainder.addr, allocated.getNext(recovered.reader()).addr);
-		t.assertz(true, allocated.getListPrev(recovered.reader()).isNull());
-		t.assertz(true, allocated.getListNext(recovered.reader()).isNull());
+		t.assertz(true, allocated.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.NONE.code, allocated.getListNumInRegion(recovered.reader()));
+		t.assert_eq(logEntry.addr, allocated.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(remainder.addr, allocated.getNextInRegion(recovered.reader()).addr);
+		t.assertz(true, allocated.getListPrevInRegion(recovered.reader()).isNull());
+		t.assertz(true, allocated.getListNextInRegion(recovered.reader()).isNull());
 
-		t.assertz(false, remainder.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum(recovered.reader()));
-		t.assert_eq(allocated.addr, remainder.getPrev(recovered.reader()).addr);
-		t.assert_eq(metadata.addr, remainder.getNext(recovered.reader()).addr);
-		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev(recovered.reader()).addr);
-		t.assertz(true, remainder.getListNext(recovered.reader()).isNull());
-		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext(recovered.reader()).addr);
-		t.assert_eq(remainder.addr, metadata.getPrev(recovered.reader()).addr);
+		t.assertz(false, remainder.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.LARGE_FREE.code, remainder.getListNumInRegion(recovered.reader()));
+		t.assert_eq(allocated.addr, remainder.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, remainder.getNextInRegion(recovered.reader()).addr);
+		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrevInRegion(recovered.reader()).addr);
+		t.assertz(true, remainder.getListNextInRegion(recovered.reader()).isNull());
+		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNextInRegion(recovered.reader()).addr);
+		t.assert_eq(remainder.addr, metadata.getPrevInRegion(recovered.reader()).addr);
 
 		// The same transaction also initialized the allocated chunk header.
-		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset(recovered.reader()));
-		t.assert_eq(4096u64, chunk.getLimit(recovered.reader()));
-		t.assert_eq(4096u64, chunk.getChunkLimit(recovered.reader()));
-		t.assert_eq(0u64, chunk.getLinemarks(recovered.reader()));
+		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffsetInRegion(recovered.reader()));
+		t.assert_eq(4096u64, chunk.getLimitInRegion(recovered.reader()));
+		t.assert_eq(4096u64, chunk.getChunkLimitInRegion(recovered.reader()));
+		t.assert_eq(0u64, chunk.getLinemarksInRegion(recovered.reader()));
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
 
-	def assertRecoveredTwoSplitAllocations(recovered: PWRegion) {
+	def assertRecoveredTwoSplitAllocations(recovered: RegionAllocator) {
 		def logEntry = recovered.blockTableHandle[1u64];
 		def first = recovered.blockTableHandle[2u64];
 		def second = recovered.blockTableHandle[3u64];
@@ -2028,71 +2016,71 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 		// Memory-order chain: log -> first allocation -> second allocation ->
 		// three-block free remainder -> metadata.
-		t.assertz(true, first.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.NONE.code, first.getListNum(recovered.reader()));
-		t.assert_eq(logEntry.addr, first.getPrev(recovered.reader()).addr);
-		t.assert_eq(second.addr, first.getNext(recovered.reader()).addr);
-		t.assertz(true, second.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.NONE.code, second.getListNum(recovered.reader()));
-		t.assert_eq(first.addr, second.getPrev(recovered.reader()).addr);
-		t.assert_eq(remainder.addr, second.getNext(recovered.reader()).addr);
+		t.assertz(true, first.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.NONE.code, first.getListNumInRegion(recovered.reader()));
+		t.assert_eq(logEntry.addr, first.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(second.addr, first.getNextInRegion(recovered.reader()).addr);
+		t.assertz(true, second.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.NONE.code, second.getListNumInRegion(recovered.reader()));
+		t.assert_eq(first.addr, second.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(remainder.addr, second.getNextInRegion(recovered.reader()).addr);
 
-		t.assertz(false, remainder.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.LARGE_FREE.code, remainder.getListNum(recovered.reader()));
-		t.assert_eq(second.addr, remainder.getPrev(recovered.reader()).addr);
-		t.assert_eq(metadata.addr, remainder.getNext(recovered.reader()).addr);
-		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrev(recovered.reader()).addr);
-		t.assertz(true, remainder.getListNext(recovered.reader()).isNull());
-		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNext(recovered.reader()).addr);
+		t.assertz(false, remainder.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.LARGE_FREE.code, remainder.getListNumInRegion(recovered.reader()));
+		t.assert_eq(second.addr, remainder.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, remainder.getNextInRegion(recovered.reader()).addr);
+		t.assert_eq(recovered.largeSentinel.addr, remainder.getListPrevInRegion(recovered.reader()).addr);
+		t.assertz(true, remainder.getListNextInRegion(recovered.reader()).isNull());
+		t.assert_eq(remainder.addr, recovered.largeSentinel.getListNextInRegion(recovered.reader()).addr);
 
-		def firstChunk = recovered.blockEntryToChunk(first);
-		def secondChunk = recovered.blockEntryToChunk(second);
-		t.assert_eq(u64.!(ChunkHeader.size), firstChunk.getOffset(recovered.reader()));
-		t.assert_eq(4096u64, firstChunk.getLimit(recovered.reader()));
-		t.assert_eq(4096u64, firstChunk.getChunkLimit(recovered.reader()));
-		t.assert_eq(u64.!(ChunkHeader.size), secondChunk.getOffset(recovered.reader()));
-		t.assert_eq(4096u64, secondChunk.getLimit(recovered.reader()));
-		t.assert_eq(4096u64, secondChunk.getChunkLimit(recovered.reader()));
+		def firstChunk = recovered.blockTableEntryToChunk(first);
+		def secondChunk = recovered.blockTableEntryToChunk(second);
+		t.assert_eq(u64.!(ChunkHeader.size), firstChunk.getOffsetInRegion(recovered.reader()));
+		t.assert_eq(4096u64, firstChunk.getLimitInRegion(recovered.reader()));
+		t.assert_eq(4096u64, firstChunk.getChunkLimitInRegion(recovered.reader()));
+		t.assert_eq(u64.!(ChunkHeader.size), secondChunk.getOffsetInRegion(recovered.reader()));
+		t.assert_eq(4096u64, secondChunk.getLimitInRegion(recovered.reader()));
+		t.assert_eq(4096u64, secondChunk.getChunkLimitInRegion(recovered.reader()));
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
 
-	def assertRecoveredExactFitAllocation(recovered: PWRegion) {
+	def assertRecoveredExactFitAllocation(recovered: RegionAllocator) {
 		def logEntry = recovered.blockTableHandle[1u64];
 		def allocated = recovered.blockTableHandle[2u64];
 		def metadata = recovered.blockTableHandle[7u64];
 		def endMarker = recovered.blockTableHandle[8u64];
-		def chunk = recovered.blockEntryToChunk(allocated);
+		def chunk = recovered.blockTableEntryToChunk(allocated);
 
 		// Memory order skips the consumed extent's interior table entries.
-		t.assertz(true, allocated.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.NONE.code, allocated.getListNum(recovered.reader()));
-		t.assert_eq(allocated.addr, logEntry.getNext(recovered.reader()).addr);
-		t.assert_eq(logEntry.addr, allocated.getPrev(recovered.reader()).addr);
-		t.assert_eq(metadata.addr, allocated.getNext(recovered.reader()).addr);
-		t.assertz(true, metadata.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.METADATA.code, metadata.getListNum(recovered.reader()));
-		t.assert_eq(allocated.addr, metadata.getPrev(recovered.reader()).addr);
-		t.assert_eq(endMarker.addr, metadata.getNext(recovered.reader()).addr);
-		t.assertz(true, metadata.getListPrev(recovered.reader()).isNull());
-		t.assertz(true, metadata.getListNext(recovered.reader()).isNull());
-		t.assert_eq(metadata.addr, endMarker.getPrev(recovered.reader()).addr);
+		t.assertz(true, allocated.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.NONE.code, allocated.getListNumInRegion(recovered.reader()));
+		t.assert_eq(allocated.addr, logEntry.getNextInRegion(recovered.reader()).addr);
+		t.assert_eq(logEntry.addr, allocated.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, allocated.getNextInRegion(recovered.reader()).addr);
+		t.assertz(true, metadata.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.METADATA.code, metadata.getListNumInRegion(recovered.reader()));
+		t.assert_eq(allocated.addr, metadata.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(endMarker.addr, metadata.getNextInRegion(recovered.reader()).addr);
+		t.assertz(true, metadata.getListPrevInRegion(recovered.reader()).isNull());
+		t.assertz(true, metadata.getListNextInRegion(recovered.reader()).isNull());
+		t.assert_eq(metadata.addr, endMarker.getPrevInRegion(recovered.reader()).addr);
 
 		// Exact fit consumes the only free extent.
-		t.assertz(true, allocated.getListPrev(recovered.reader()).isNull());
-		t.assertz(true, allocated.getListNext(recovered.reader()).isNull());
-		t.assertz(true, recovered.smallSentinel.getListNext(recovered.reader()).isNull());
-		t.assertz(true, recovered.largeSentinel.getListNext(recovered.reader()).isNull());
+		t.assertz(true, allocated.getListPrevInRegion(recovered.reader()).isNull());
+		t.assertz(true, allocated.getListNextInRegion(recovered.reader()).isNull());
+		t.assertz(true, recovered.smallSentinel.getListNextInRegion(recovered.reader()).isNull());
+		t.assertz(true, recovered.largeSentinel.getListNextInRegion(recovered.reader()).isNull());
 
-		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffset(recovered.reader()));
-		t.assert_eq(5u64 * 4096u64, chunk.getLimit(recovered.reader()));
-		t.assert_eq(5u64 * 4096u64, chunk.getChunkLimit(recovered.reader()));
-		t.assert_eq(0u64, chunk.getLinemarks(recovered.reader()));
+		t.assert_eq(u64.!(ChunkHeader.size), chunk.getOffsetInRegion(recovered.reader()));
+		t.assert_eq(5u64 * 4096u64, chunk.getLimitInRegion(recovered.reader()));
+		t.assert_eq(5u64 * 4096u64, chunk.getChunkLimitInRegion(recovered.reader()));
+		t.assert_eq(0u64, chunk.getLinemarksInRegion(recovered.reader()));
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
 
-	def assertRecoveredCoalescingFree(recovered: PWRegion) {
+	def assertRecoveredCoalescingFree(recovered: RegionAllocator) {
 		def logEntry = recovered.blockTableHandle[1u64];
 		def coalesced = recovered.blockTableHandle[2u64];
 		def freedRight = recovered.blockTableHandle[3u64];
@@ -2102,78 +2090,77 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 		// Both neighbors were absorbed: the memory-order chain contains one
 		// five-block free extent between the log and metadata entries.
-		t.assert_eq(coalesced.addr, logEntry.getNext(recovered.reader()).addr);
-		t.assertz(false, coalesced.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.LARGE_FREE.code, coalesced.getListNum(recovered.reader()));
-		t.assert_eq(logEntry.addr, coalesced.getPrev(recovered.reader()).addr);
-		t.assert_eq(metadata.addr, coalesced.getNext(recovered.reader()).addr);
-		t.assert_eq(coalesced.addr, metadata.getPrev(recovered.reader()).addr);
-		t.assert_eq(endMarker.addr, metadata.getNext(recovered.reader()).addr);
-		t.assert_eq(metadata.addr, endMarker.getPrev(recovered.reader()).addr);
+		t.assert_eq(coalesced.addr, logEntry.getNextInRegion(recovered.reader()).addr);
+		t.assertz(false, coalesced.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.LARGE_FREE.code, coalesced.getListNumInRegion(recovered.reader()));
+		t.assert_eq(logEntry.addr, coalesced.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, coalesced.getNextInRegion(recovered.reader()).addr);
+		t.assert_eq(coalesced.addr, metadata.getPrevInRegion(recovered.reader()).addr);
+		t.assert_eq(endMarker.addr, metadata.getNextInRegion(recovered.reader()).addr);
+		t.assert_eq(metadata.addr, endMarker.getPrevInRegion(recovered.reader()).addr);
 
 		// The coalesced entry is the only free-list member. The freed-right and
 		// old-remainder entries are interior to its extent and no longer listed.
-		t.assertz(true, recovered.smallSentinel.getListNext(recovered.reader()).isNull());
-		t.assert_eq(coalesced.addr, recovered.largeSentinel.getListNext(recovered.reader()).addr);
-		t.assert_eq(recovered.largeSentinel.addr, coalesced.getListPrev(recovered.reader()).addr);
-		t.assertz(true, coalesced.getListNext(recovered.reader()).isNull());
-		t.assertz(false, freedRight.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.NONE.code, freedRight.getListNum(recovered.reader()));
-		t.assertz(true, freedRight.getListPrev(recovered.reader()).isNull());
-		t.assertz(true, freedRight.getListNext(recovered.reader()).isNull());
-		t.assertz(false, absorbedRemainder.getUsed(recovered.reader()));
-		t.assert_eq(ListKind.NONE.code, absorbedRemainder.getListNum(recovered.reader()));
-		t.assertz(true, absorbedRemainder.getListPrev(recovered.reader()).isNull());
-		t.assertz(true, absorbedRemainder.getListNext(recovered.reader()).isNull());
+		t.assertz(true, recovered.smallSentinel.getListNextInRegion(recovered.reader()).isNull());
+		t.assert_eq(coalesced.addr, recovered.largeSentinel.getListNextInRegion(recovered.reader()).addr);
+		t.assert_eq(recovered.largeSentinel.addr, coalesced.getListPrevInRegion(recovered.reader()).addr);
+		t.assertz(true, coalesced.getListNextInRegion(recovered.reader()).isNull());
+		t.assertz(false, freedRight.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.NONE.code, freedRight.getListNumInRegion(recovered.reader()));
+		t.assertz(true, freedRight.getListPrevInRegion(recovered.reader()).isNull());
+		t.assertz(true, freedRight.getListNextInRegion(recovered.reader()).isNull());
+		t.assertz(false, absorbedRemainder.getUsedInRegion(recovered.reader()));
+		t.assert_eq(FreeListKind.NONE.code, absorbedRemainder.getListNumInRegion(recovered.reader()));
+		t.assertz(true, absorbedRemainder.getListPrevInRegion(recovered.reader()).isNull());
+		t.assertz(true, absorbedRemainder.getListNextInRegion(recovered.reader()).isNull());
 		t.assertz(false, recovered.requiresRecovery());
 		t.assertz(false, recovered.txn.isDirty());
 	}
 
 	// Corrupt the record written by writeCommittedWalUpdate: its txnSeq 1
 	// parity-maps to slot 1.
-	def corruptFirstRecordChecksum(region: PWRegion) {
-		var wal = DualTxnWal.new(region.regionStart, region.logChunk.addr, region.blockSize, region.backendRegion, false);
+	def corruptFirstRecordChecksum(region: RegionAllocator) {
+		var wal = TwoSlotWal.new(region.regionStart, region.logBlock.addr, region.blockSize, region.backendRegion, OpenMode.ATTACH);
 		def recordAddr = wal.slotAddr(1);
-		def entryCount = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
-		def checksumAddr = recordAddr + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
-		def checksum = PWRegionUtils.pointerFromU64(checksumAddr).load<u64>();
-		PWRegionUtils.pointerFromU64(checksumAddr).store<u64>(checksum + 1u64);
-		region.backendRegion.persistRange(checksumAddr - region.regionStart, 8u64);
+		def entryCount = RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.entryCount.offset)).load<u32>();
+		def checksumAddr = recordAddr + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size) + u64.view(WalRecordTrailer.checksum.offset);
+		def checksum = RegionUtils.pointerFromU64(checksumAddr).load<u64>();
+		RegionUtils.pointerFromU64(checksumAddr).store<u64>(checksum + 1u64);
+		region.backendRegion.persist(checksumAddr - region.regionStart, 8u64);
 	}
 
 	// Reformat the file as an Immix region with the default line-mark
 	// descriptor, then mark every line with a value no reset produces and
 	// write the table back, so a reset that reaches the file shows in it.
-	def formatImmixMarked() -> ImmixPWRegion {
-		immixDescs = Array<Ref<MetaDataDesc>>.new(1);
-		immixDescs[0] = MemRegions.lineMarkDescRef;
-		def immix = ImmixPWRegion.!(reformat());
+	def formatImmixMarked() -> ImmixRegionAllocator {
+		immixDescs = Array<Ref<MetadataDescriptor>>.new(1);
+		immixDescs[0] = RegionDefaults.lineMarkDescRef;
+		def immix = ImmixRegionAllocator.!(reformat());
 		t.assertz(false, immix.txn == null);
 		t.assertz(true, immix.numLineMarks > 0u64);
-		for (i < immix.numLineMarks) immix.lineMarks[i].setMark(immix.lineMarkWriter(), 0xA5u8);
-		t.assertz(true, immix.backendRegion.persistRange(
+		for (i < immix.numLineMarks) immix.lineMarks[i].setMarkUnlogged(immix.lineMarkWriter(), 0xA5u8);
+		t.assertz(true, immix.backendRegion.persist(
 			immix.offsetInRegion(immix.lineMarks.addr), immix.numLineMarks * u64.!(LineMark.size)));
 		return immix;
 	}
 
-	private def openRegion(forceFormat: bool) -> PWRegion {
+	private def openRegion(forceFormat: bool) -> RegionAllocator {
 		return openBlocks(8u64, forceFormat);
 	}
 
 	// Open the file as a region of {numBlocks} 4 KiB blocks, as {region}. The
 	// caller has closed the previous one.
-	def openBlocks(numBlocks: u64, forceFormat: bool) -> PWRegion {
+	def openBlocks(numBlocks: u64, forceFormat: bool) -> RegionAllocator {
 		if (immixDescs != null) {
-			region = ImmixPWRegion.new(
-				X86_64Backends.getFileMapped(BD_PATH), numBlocks, immixDescs, 4096u64, forceFormat);
+			region = ImmixRegionAllocator.new(
+				X86_64Backends.mappedFile(BD_PATH), numBlocks, immixDescs, 4096u64, if(forceFormat, OpenMode.FORMAT, OpenMode.ATTACH));
 		} else {
-			region = PWRegion.new(
-				X86_64Backends.getFileMapped(BD_PATH),
+			region = RegionAllocator.new(
+				X86_64Backends.mappedFile(BD_PATH),
 				numBlocks,
-				Array<Ref<MetaDataDesc>>.new(0),
+				Array<Ref<MetadataDescriptor>>.new(0),
 				4096u64,
-				forceFormat
-			);
+				if(forceFormat, OpenMode.FORMAT, OpenMode.ATTACH));
 		}
 		return region;
 	}
@@ -2195,9 +2182,9 @@ class BlockDevicePWRegionTester(t: Tester) {
 			def refused = openBlocks(n, false);
 			t.assertz(true, refused.backendRegion == null);
 			t.assertz(true, refused.txn == null);
-			t.assertz(true, refused.logChunk.isNull());
-			if (ImmixPWRegion.?(refused)) {
-				def immix = ImmixPWRegion.!(refused);
+			t.assertz(true, refused.logBlock.isNull());
+			if (ImmixRegionAllocator.?(refused)) {
+				def immix = ImmixRegionAllocator.!(refused);
 				t.assert_eq(0u64, immix.lineMarks.addr);
 				t.assert_eq(0u64, immix.numLineMarks);
 				immix.resetAllLineMarks();
@@ -2216,52 +2203,52 @@ class BlockDevicePWRegionTester(t: Tester) {
 
 	// The length of the region file, or -1 if it cannot be opened.
 	def fileLength() -> i64 {
-		def fd = RegionFileIO.open(BD_PATH);
+		def fd = BackingFile.open(BD_PATH);
 		if (fd < 0) return -1;
 		def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
-		RegionFileIO.close(fd);
+		BackingFile.close(fd);
 		return size;
 	}
 }
 
 // After format(), the MAGIC constant must be stamped in the header.
-def test_bd_format_magic(tc: BlockDevicePWRegionTester) {
+def test_bd_format_magic(tc: MappedFileAllocatorTester) {
 	var hdr = tc.region.getHeader();
-	tc.t.assert_eq(PWRegions.MAGIC, hdr.magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, hdr.magic);
 	tc.cleanup();
 }
 
 // First-time initialization should size the backing file to the region.
-def test_bd_initializes_file_size(tc: BlockDevicePWRegionTester) {
-	def fd = RegionFileIO.open(BD_PATH);
+def test_bd_initializes_file_size(tc: MappedFileAllocatorTester) {
+	def fd = BackingFile.open(BD_PATH);
 	def size = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
-	RegionFileIO.close(fd);
+	BackingFile.close(fd);
 	tc.t.assert_eq(8u64 * 4096u64, u64.view(size));
 	tc.cleanup();
 }
 
 // Mount must reject a region whose persisted block size no longer matches the
 // constructor geometry, before constructing a transaction or WAL facade.
-def test_bd_stored_block_size_mismatch_rejected(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.blockSize.offset, 2048u64));
+def test_bd_stored_block_size_mismatch_rejected(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.blockSize.offset, 2048u64));
 
 	def region2 = tc.remount();
 	tc.t.assert_eq(2048u64, region2.getHeader().blockSize);
 	tc.t.assertz(true, region2.txn == null);
-	tc.t.assertz(true, region2.logChunk.isNull());
+	tc.t.assertz(true, region2.logBlock.isNull());
 
 	tc.cleanup();
 }
 
 // Mount performs the same early rejection when the persisted block count does
 // not match, even though the mapped byte extent still has the requested size.
-def test_bd_stored_num_blocks_mismatch_rejected(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.numBlocks.offset, 7u64));
+def test_bd_stored_num_blocks_mismatch_rejected(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.numBlocks.offset, 7u64));
 
 	def region2 = tc.remount();
 	tc.t.assert_eq(7u64, region2.getHeader().numBlocks);
 	tc.t.assertz(true, region2.txn == null);
-	tc.t.assertz(true, region2.logChunk.isNull());
+	tc.t.assertz(true, region2.logBlock.isNull());
 
 	tc.cleanup();
 }
@@ -2271,36 +2258,36 @@ def test_bd_stored_num_blocks_mismatch_rejected(tc: BlockDevicePWRegionTester) {
 // whose sentinels lie where userRoot is now. Its other fields still validate,
 // so the open must refuse it on the version alone, and must not format it:
 // that would erase its data.
-def test_bd_version_0_magic_refused_unchanged(tc: BlockDevicePWRegionTester) {
-	tc.checkMagicRefused(PWRegions.MAGIC_TAG);
+def test_bd_version_0_magic_refused_unchanged(tc: MappedFileAllocatorTester) {
+	tc.checkMagicRefused(RegionFormat.MAGIC_TAG);
 	tc.cleanup();
 }
 
 // A version this build does not know, newer than its own, is refused the same way.
-def test_bd_future_version_magic_refused_unchanged(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, PWRegions.isTagged(PWRegions.MAGIC));
-	tc.t.assert_eq(PWRegions.FORMAT_VERSION, PWRegions.versionOf(PWRegions.MAGIC));
-	tc.checkMagicRefused(PWRegions.MAGIC_TAG | ((u64.!(PWRegions.FORMAT_VERSION) + 1u64) << 56));
+def test_bd_future_version_magic_refused_unchanged(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, RegionFormat.isTagged(RegionFormat.MAGIC));
+	tc.t.assert_eq(RegionFormat.FORMAT_VERSION, RegionFormat.versionOf(RegionFormat.MAGIC));
+	tc.checkMagicRefused(RegionFormat.MAGIC_TAG | ((u64.!(RegionFormat.FORMAT_VERSION) + 1u64) << 56));
 	tc.cleanup();
 }
 
-// A header with no PWRegion magic -- zero, garbage, or the tag with byte 5 or 6
-// nonzero -- is not a PWRegion of any version, and is formatted as before:
+// A header with no RegionAllocator magic -- zero, garbage, or the tag with byte 5 or 6
+// nonzero -- is not a RegionAllocator of any version, and is formatted as before:
 // the reopened region has a transaction, the current magic, and no root.
-def test_bd_untagged_magic_reformatted(tc: BlockDevicePWRegionTester) {
+def test_bd_untagged_magic_reformatted(tc: MappedFileAllocatorTester) {
 	def magics = [0u64, 0xDEAD_BEEF_CAFE_F00Du64,
-		PWRegions.MAGIC_TAG | (1u64 << 40), PWRegions.MAGIC_TAG | (1u64 << 48)];
+		RegionFormat.MAGIC_TAG | (1u64 << 40), RegionFormat.MAGIC_TAG | (1u64 << 48)];
 	for (magic in magics) {
-		tc.t.assertz(false, PWRegions.isTagged(magic));
+		tc.t.assertz(false, RegionFormat.isTagged(magic));
 		def region = tc.reformat();
 		def chunk = region.allocChunk(1u32);
 		tc.t.assertz(true, tc.allocSucceeded(chunk));
 		tc.t.assertz(true, region.setUserRoot(region.offsetInRegion(chunk.addr)));
-		tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.magic.offset, magic));
+		tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.magic.offset, magic));
 
 		def region2 = tc.remount();
 		tc.t.assertz(false, region2.txn == null);
-		tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+		tc.t.assert_eq(RegionFormat.MAGIC, region2.getHeader().magic);
 		tc.t.assert_eq(0u64, region2.getUserRoot());
 	}
 	tc.cleanup();
@@ -2308,43 +2295,43 @@ def test_bd_untagged_magic_reformatted(tc: BlockDevicePWRegionTester) {
 
 // forceFormat still formats unconditionally, so it is how a refused region
 // is brought to the current version: there is no in-place upgrade.
-def test_bd_force_format_replaces_version_0(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.magic.offset, PWRegions.MAGIC_TAG));
+def test_bd_force_format_replaces_version_0(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.magic.offset, RegionFormat.MAGIC_TAG));
 	def region2 = tc.reformat();
 	tc.t.assertz(false, region2.txn == null);
-	tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, region2.getHeader().magic);
 	tc.cleanup();
 }
 
-// ImmixPWRegion rebuilds its line table from the region's descriptors after
+// ImmixRegionAllocator rebuilds its line table from the region's descriptors after
 // init(). A refused version-0 region must leave that table empty: otherwise
 // the refused object hands out the old region's line marks, and a GC cycle's
 // reset zeroes them in the file.
-def test_bd_immix_version_0_refused_unchanged(tc: BlockDevicePWRegionTester) {
+def test_bd_immix_version_0_refused_unchanged(tc: MappedFileAllocatorTester) {
 	tc.formatImmixMarked();
-	tc.checkMagicRefused(PWRegions.MAGIC_TAG);
+	tc.checkMagicRefused(RegionFormat.MAGIC_TAG);
 	tc.cleanup();
 }
 
 // Another version may lay its descriptors out differently. Here the
 // line-mark descriptor reads as a zero line size, which this build would
 // divide by; the refused open must not interpret the descriptor at all.
-def test_bd_immix_incompatible_descriptor_refused(tc: BlockDevicePWRegionTester) {
+def test_bd_immix_incompatible_descriptor_refused(tc: MappedFileAllocatorTester) {
 	def immix = tc.formatImmixMarked();
-	def desc = immix.getMetaDataDesc(0u64);
-	tc.t.assert_eq(ImmixPWRegions.ImmixLineMarkMetaKind, desc.kind);
+	def desc = immix.getMetadataDescriptor(0u64);
+	tc.t.assert_eq(ImmixLineMarks.ImmixLineMarkMetaKind, desc.kind);
 	desc.unitSize = 0u32;
-	def descOffset = immix.getHeader().metaDataDescs;
-	tc.t.assertz(true, immix.backendRegion.persistRange(descOffset, u64.!(MetaDataDesc.size)));
-	tc.checkMagicRefused(PWRegions.MAGIC_TAG | ((u64.!(PWRegions.FORMAT_VERSION) + 1u64) << 56));
+	def descOffset = immix.getHeader().metadataDescriptors;
+	tc.t.assertz(true, immix.backendRegion.persist(descOffset, u64.!(MetadataDescriptor.size)));
+	tc.checkMagicRefused(RegionFormat.MAGIC_TAG | ((u64.!(RegionFormat.FORMAT_VERSION) + 1u64) << 56));
 	tc.cleanup();
 }
 
 // The geometry refusals leave txn null the same way, and the Immix line table
 // stays empty for them too.
-def test_bd_immix_num_blocks_mismatch_refused_unchanged(tc: BlockDevicePWRegionTester) {
+def test_bd_immix_num_blocks_mismatch_refused_unchanged(tc: MappedFileAllocatorTester) {
 	tc.formatImmixMarked();
-	tc.checkReopenRefused(PWRegionHeader.numBlocks.offset, 7u64);
+	tc.checkReopenRefused(RegionHeader.numBlocks.offset, 7u64);
 	tc.cleanup();
 }
 
@@ -2354,7 +2341,7 @@ def test_bd_immix_num_blocks_mismatch_refused_unchanged(tc: BlockDevicePWRegionT
 // the requested size first, and mount() then refused the block count: a
 // reopen at four blocks cut this eight-block region in half. A reopen at the
 // file's own size still mounts it, root and all.
-def test_bd_current_version_other_size_refused_unchanged(tc: BlockDevicePWRegionTester) {
+def test_bd_current_version_other_size_refused_unchanged(tc: MappedFileAllocatorTester) {
 	def chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 	def root = tc.region.offsetInRegion(chunk.addr);
@@ -2369,29 +2356,29 @@ def test_bd_current_version_other_size_refused_unchanged(tc: BlockDevicePWRegion
 
 // The same for a region of another format version, which init() would
 // refuse in any case: the size check comes first and changes nothing.
-def test_bd_version_0_other_size_refused_unchanged(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.magic.offset, PWRegions.MAGIC_TAG));
+def test_bd_version_0_other_size_refused_unchanged(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.magic.offset, RegionFormat.MAGIC_TAG));
 	tc.checkOtherSizesRefused([4u64, 16u64]);
 	tc.cleanup();
 }
 
-// A non-empty file with no PWRegion magic is refused too when the size is
+// A non-empty file with no RegionAllocator magic is refused too when the size is
 // another: the backend sizes the file before anything reads its header, so
 // it cannot tell such a file from a region, and resizing it to format it
 // would destroy whatever it holds. At its own size it is formatted, as before.
-def test_bd_untagged_other_size_refused_unchanged(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.magic.offset, 0xDEAD_BEEF_CAFE_F00Du64));
+def test_bd_untagged_other_size_refused_unchanged(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.magic.offset, 0xDEAD_BEEF_CAFE_F00Du64));
 	tc.checkOtherSizesRefused([4u64, 16u64]);
 
 	def region2 = tc.openBlocks(8u64, false);
 	tc.t.assertz(false, region2.txn == null);
-	tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, region2.getHeader().magic);
 	tc.cleanup();
 }
 
 // A refused Immix region has an empty line table here as well, and its
 // reset writes nothing.
-def test_bd_immix_other_size_refused_unchanged(tc: BlockDevicePWRegionTester) {
+def test_bd_immix_other_size_refused_unchanged(tc: MappedFileAllocatorTester) {
 	tc.formatImmixMarked();
 	tc.checkOtherSizesRefused([4u64, 16u64]);
 	tc.cleanup();
@@ -2399,10 +2386,10 @@ def test_bd_immix_other_size_refused_unchanged(tc: BlockDevicePWRegionTester) {
 
 // A missing file and an empty one hold no region, so an open without
 // forceFormat still sizes each to the request and formats it.
-def test_bd_missing_and_empty_file_sized_and_formatted(tc: BlockDevicePWRegionTester) {
+def test_bd_missing_and_empty_file_sized_and_formatted(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
-	RegionFileIO.unlink(BD_PATH);
+	BackingFile.unlink(BD_PATH);
 	tc.t.assertz(true, tc.fileLength() < 0);
 	def fromMissing = tc.openBlocks(4u64, false);
 	if (fromMissing.txn == null) {
@@ -2410,15 +2397,15 @@ def test_bd_missing_and_empty_file_sized_and_formatted(tc: BlockDevicePWRegionTe
 		tc.cleanup();
 		return;
 	}
-	tc.t.assert_eq(PWRegions.MAGIC, fromMissing.getHeader().magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, fromMissing.getHeader().magic);
 	tc.t.assert_eq(4u64, fromMissing.getHeader().numBlocks);
 	tc.t.assert_eq(4u64 * 4096u64, u64.view(tc.fileLength()));
 
 	fromMissing.deallocate();
 	tc.region = null;
-	def fd = RegionFileIO.create(BD_PATH);
+	def fd = BackingFile.create(BD_PATH);
 	tc.t.assertz(true, fd >= 0);
-	if (fd >= 0) RegionFileIO.close(fd);
+	if (fd >= 0) BackingFile.close(fd);
 	tc.t.assert_eq(0u64, u64.view(tc.fileLength()));
 	def fromEmpty = tc.openBlocks(16u64, false);
 	if (fromEmpty.txn == null) {
@@ -2426,7 +2413,7 @@ def test_bd_missing_and_empty_file_sized_and_formatted(tc: BlockDevicePWRegionTe
 		tc.cleanup();
 		return;
 	}
-	tc.t.assert_eq(PWRegions.MAGIC, fromEmpty.getHeader().magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, fromEmpty.getHeader().magic);
 	tc.t.assert_eq(16u64, fromEmpty.getHeader().numBlocks);
 	tc.t.assert_eq(16u64 * 4096u64, u64.view(tc.fileLength()));
 	tc.cleanup();
@@ -2434,7 +2421,7 @@ def test_bd_missing_and_empty_file_sized_and_formatted(tc: BlockDevicePWRegionTe
 
 // forceFormat asks for the file to be replaced, so it may take any size: the
 // backend's O_TRUNC empties the file, which is then sized and formatted.
-def test_bd_force_format_other_size_resizes(tc: BlockDevicePWRegionTester) {
+def test_bd_force_format_other_size_resizes(tc: MappedFileAllocatorTester) {
 	def chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 	tc.t.assertz(true, tc.region.setUserRoot(tc.region.offsetInRegion(chunk.addr)));
@@ -2447,7 +2434,7 @@ def test_bd_force_format_other_size_resizes(tc: BlockDevicePWRegionTester) {
 			tc.cleanup();
 			return;
 		}
-		tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+		tc.t.assert_eq(RegionFormat.MAGIC, region2.getHeader().magic);
 		tc.t.assert_eq(n, region2.getHeader().numBlocks);
 		tc.t.assert_eq(0u64, region2.getUserRoot());
 		tc.t.assert_eq(n * 4096u64, u64.view(tc.fileLength()));
@@ -2457,44 +2444,44 @@ def test_bd_force_format_other_size_resizes(tc: BlockDevicePWRegionTester) {
 
 // Older formatted regions have no explicit WAL offset. A zero value must map
 // to block 1, produce a healthy transaction, and remain usable after mount.
-def test_bd_legacy_log_chunk_fallback(tc: BlockDevicePWRegionTester) {
-	tc.t.assertz(true, tc.persistHeaderU64(PWRegionHeader.logChunk.offset, 0u64));
+def test_bd_legacy_log_chunk_fallback(tc: MappedFileAllocatorTester) {
+	tc.t.assertz(true, tc.persistHeaderU64(RegionHeader.logBlock.offset, 0u64));
 
 	def region2 = tc.remount();
-	tc.t.assert_eq(0u64, region2.getHeader().logChunk);
+	tc.t.assert_eq(0u64, region2.getHeader().logBlock);
 	tc.t.assertz(false, region2.txn == null);
-	tc.t.assert_eq(4096u64, region2.offsetInRegion(region2.logChunk.addr));
+	tc.t.assert_eq(4096u64, region2.offsetInRegion(region2.logBlock.addr));
 	tc.t.assertz(true, tc.allocSucceeded(region2.allocChunk(1u32)));
 
 	tc.cleanup();
 }
 
 // allocChunk(1) must return a valid chunk on a fresh region.
-def test_bd_alloc_valid(tc: BlockDevicePWRegionTester) {
+def test_bd_alloc_valid(tc: MappedFileAllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 	tc.cleanup();
 }
 
 // After allocChunk(1), the block entry's used flag must be true.
-def test_bd_alloc_sets_used(tc: BlockDevicePWRegionTester) {
+def test_bd_alloc_sets_used(tc: MappedFileAllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
-	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
+	var entry = tc.region.chunkToBlockTableEntry(chunk);
+	tc.t.assertz(true, entry.getUsedInRegion(tc.region.reader()));
 	tc.cleanup();
 }
 
 // After alloc+free, the block entry must show used == false.
-def test_bd_free_clears_used(tc: BlockDevicePWRegionTester) {
+def test_bd_free_clears_used(tc: MappedFileAllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.region.freeChunk(chunk);
-	var entry = tc.region.chunkToBlockEntry(chunk);
-	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
+	var entry = tc.region.chunkToBlockTableEntry(chunk);
+	tc.t.assertz(false, entry.getUsedInRegion(tc.region.reader()));
 	tc.cleanup();
 }
 
 // Coalescing must work with block device backend.
-def test_bd_coalesce(tc: BlockDevicePWRegionTester) {
+def test_bd_coalesce(tc: MappedFileAllocatorTester) {
 	var chunk2 = tc.region.allocChunk(1u32);
 	var chunk3 = tc.region.allocChunk(1u32);
 
@@ -2508,16 +2495,16 @@ def test_bd_coalesce(tc: BlockDevicePWRegionTester) {
 }
 
 // After format + close + remount, the magic must be present.
-def test_bd_persist_and_remount(tc: BlockDevicePWRegionTester) {
+def test_bd_persist_and_remount(tc: MappedFileAllocatorTester) {
 	// Region was formatted in constructor. Remount it.
 	var region2 = tc.remount();
-	tc.t.assert_eq(PWRegions.MAGIC, region2.getHeader().magic);
+	tc.t.assert_eq(RegionFormat.MAGIC, region2.getHeader().magic);
 	tc.cleanup();
 }
 
 // After alloc + close + remount, allocation state must be preserved.
 // If 1 block was allocated (out of 5 free), remount should have 4 free.
-def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
+def test_bd_remount_alloc_state(tc: MappedFileAllocatorTester) {
 	// Allocate 1 block (leaves 4 free)
 	var chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
@@ -2536,7 +2523,7 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 	tc.cleanup();
 }
 
-// Format issues four persistRange() fences, each a fence of its own: the two
+// Format issues four persist() fences, each a fence of its own: the two
 // ordered WAL initialization ranges, both in block 1's single page, the
 // complete eight-block mapping before the magic is stored, and then the
 // magic's line alone, in block 0's page (since 2026-10-19; until then the
@@ -2544,16 +2531,15 @@ def test_bd_remount_alloc_state(tc: BlockDevicePWRegionTester) {
 // fdatasync, asked to make exactly the pages its writebacks marked durable --
 // the restriction of the PMEM model, not the page-aligned msync of the range
 // alone that the file backend issued until 2026-10-13.
-def test_bd_file_format_syncs_marked_pages(tc: BlockDevicePWRegionTester) {
+def test_bd_file_format_syncs_marked_pages(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		true
-	);
+		OpenMode.FORMAT);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2598,16 +2584,15 @@ def test_bd_file_format_syncs_marked_pages(tc: BlockDevicePWRegionTester) {
 // fdatasync commit boundary, and only then prepare the allocator after-images
 // whose durability is deferred to the next boundary. The trace is cleared
 // after mount so it contains exactly one allocator transaction.
-def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRegionTester) {
+def test_bd_file_commit_orders_fdatasync_before_after_images(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false
-	);
+		OpenMode.ATTACH);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2626,7 +2611,7 @@ def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRe
 	}
 
 	// The first prepared range is the complete checksummed record in block 1.
-	def logOffset = tc.region.offsetInRegion(tc.region.logChunk.addr);
+	def logOffset = tc.region.offsetInRegion(tc.region.logBlock.addr);
 	def logEnd = logOffset + tc.region.blockSize;
 	tc.t.assert_eq(FilePersistenceTraceOp.PREPARE_RANGE, traced.operations[0]);
 	tc.t.assertz(true, traced.preparedOffsets[0] >= logOffset);
@@ -2636,7 +2621,7 @@ def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRe
 	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_COMPLETE, traced.operations[1]);
 
 	// All remaining events are non-WAL allocator after-images. No second sync is
-	// issued, so FileMmapRegion retains them for the next piggybacked boundary.
+	// issued, so MappedFileRegion retains them for the next piggybacked boundary.
 	for (i = 2; i < traced.operations.length; i++) {
 		tc.t.assert_eq(FilePersistenceTraceOp.PREPARE_RANGE, traced.operations[i]);
 		def preparedIndex = i - 1;
@@ -2655,16 +2640,15 @@ def test_bd_file_commit_orders_fdatasync_before_after_images(tc: BlockDevicePWRe
 // must retain its dirty cache, reject all further persistence work, and require
 // reopen. A same-kernel remount can observe and replay the complete page-cache
 // record; this characterizes the indeterminate outcome, not power durability.
-def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false
-	);
+		OpenMode.ATTACH);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2693,8 +2677,8 @@ def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegio
 	tc.t.assert_eq(FilePersistenceTraceOp.FDATASYNC_FAILED, traced.operations[1]);
 	tc.t.assert_eq(1, traced.preparedOffsets.length);
 	def allocated = tc.region.blockTableHandle[2u64];
-	tc.t.assertz(false, allocated.getUsed(tc.region.reader()));
-	tc.t.assertz(true, allocated.getUsedCached(tc.region.txn));
+	tc.t.assertz(false, allocated.getUsedInRegion(tc.region.reader()));
+	tc.t.assertz(true, allocated.getUsed(tc.region.txn));
 
 	// The latch prevents both another allocator transaction and an explicit
 	// flush from reaching the backend on this mount.
@@ -2718,7 +2702,7 @@ def test_bd_file_commit_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegio
 // child leaves a complete split-allocation record without clean close; mount
 // replays it into the new mapping, then must latch when the recovery boundary
 // reports EBADF. A later mount replays the retained record again successfully.
-def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -2747,13 +2731,12 @@ def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: BlockDevicePWReg
 
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
 	backend.failFirstDataSync = true;
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false
-	);
+		OpenMode.ATTACH);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2764,7 +2747,7 @@ def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: BlockDevicePWReg
 
 	tc.t.assertz(true, tc.region.requiresRecovery());
 	tc.t.assertz(false, tc.region.txn.isDirty());
-	tc.t.assertz(true, tc.region.blockTableHandle[2u64].getUsed(tc.region.reader()));
+	tc.t.assertz(true, tc.region.blockTableHandle[2u64].getUsedInRegion(tc.region.reader()));
 	tc.t.assertz(true, traced.hasDirtyChanges);
 	tc.t.assert_eq(1, traced.dataSyncAttempts);
 	tc.t.assertz(true, traced.operations.length >= 2);
@@ -2797,16 +2780,15 @@ def test_bd_file_recovery_fdatasync_failure_requires_reopen(tc: BlockDevicePWReg
 // Fail the explicit idle-time fdatasync after a successful allocation has
 // applied its after-images. The WAL record remains the durable source of truth,
 // the current mount cannot retry, and reopening replays the allocation.
-def test_bd_file_flush_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+def test_bd_file_flush_fdatasync_failure_requires_reopen(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false
-	);
+		OpenMode.ATTACH);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2853,16 +2835,15 @@ def test_bd_file_flush_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegion
 // Fail close() at its final-data fdatasync, before either reclaimable WAL slot
 // is scrubbed. The close path must latch and stop, preserving the complete
 // record for the next mount to replay.
-def test_bd_file_close_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+def test_bd_file_close_fdatasync_failure_requires_reopen(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false
-	);
+		OpenMode.ATTACH);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2902,21 +2883,20 @@ def test_bd_file_close_fdatasync_failure_requires_reopen(tc: BlockDevicePWRegion
 }
 
 // Clean close first makes the deferred allocator after-images durable with
-// fdatasync, then scrubs its reclaimable WAL slot, whose persistRange() is a
+// fdatasync, then scrubs its reclaimable WAL slot, whose persist() is a
 // fence of its own: a second fdatasync, asked for the log page alone. Fail that
 // actual call: the old WAL instance must latch, while remount remains
 // structurally correct whether the idempotent record is still visible or its
 // live scrub is observed through the shared page cache.
-def test_bd_file_close_scrub_sync_failure_requires_reopen(tc: BlockDevicePWRegionTester) {
+def test_bd_file_close_scrub_sync_failure_requires_reopen(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	def backend = FilePersistenceTraceBackend.new(BD_PATH);
-	tc.region = PWRegion.new(
+	tc.region = RegionAllocator.new(
 		backend,
 		8u64,
-		Array<Ref<MetaDataDesc>>.new(0),
+		Array<Ref<MetadataDescriptor>>.new(0),
 		4096u64,
-		false
-	);
+		OpenMode.ATTACH);
 
 	def traced = backend.tracedRegion;
 	if (tc.region.backendRegion == null || tc.region.txn == null || traced == null) {
@@ -2965,7 +2945,7 @@ def test_bd_file_close_scrub_sync_failure_requires_reopen(tc: BlockDevicePWRegio
 // repeated clean remounts in one history. Unlike allocation-probe tests, the
 // invariant walker checks the complete memory-order and free-list structures
 // after every mutation and after every remount.
-def test_bd_mixed_sequence_preserves_invariants(tc: BlockDevicePWRegionTester) {
+def test_bd_mixed_sequence_preserves_invariants(tc: MappedFileAllocatorTester) {
 	tc.assertAllocatorInvariants(tc.region);
 
 	def twoBlocks = tc.region.allocChunk(2u32);
@@ -3001,14 +2981,14 @@ def test_bd_mixed_sequence_preserves_invariants(tc: BlockDevicePWRegionTester) {
 
 	// The old handles belonged to the unmapped address range. Rebuild handles
 	// from stable block-table indices before continuing the history.
-	def recoveredLeft = recovered.blockEntryToChunk(recovered.blockTableHandle[2u64]);
+	def recoveredLeft = recovered.blockTableEntryToChunk(recovered.blockTableHandle[2u64]);
 	tc.t.assertz(true, recovered.freeChunk(recoveredLeft));
 	tc.assertAllocatorInvariants(recovered);
 
 	recovered = tc.remount();
 	tc.assertAllocatorInvariants(recovered);
 
-	def recoveredRight = recovered.blockEntryToChunk(recovered.blockTableHandle[5u64]);
+	def recoveredRight = recovered.blockTableEntryToChunk(recovered.blockTableHandle[5u64]);
 	tc.t.assertz(true, recovered.freeChunk(recoveredRight));
 	tc.assertAllocatorInvariants(recovered);
 
@@ -3022,7 +3002,7 @@ def test_bd_mixed_sequence_preserves_invariants(tc: BlockDevicePWRegionTester) {
 // covering many more fragmentation and coalescing orders than the hand-written
 // history above. The model stores stable block indices because remount changes
 // every mapped address and invalidates the old ChunkHandles.
-def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTester) {
+def test_bd_seeded_mixed_histories_preserve_invariants(tc: MappedFileAllocatorTester) {
 	def seeds = [1, 0x5EED, 0xBEEF, 0xCAFE];
 	for (seedIndex < seeds.length) {
 		if (seedIndex > 0) tc.reformat();
@@ -3060,7 +3040,7 @@ def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTe
 					return;
 				}
 				def entry = tc.region.blockTableHandle[u64.view(selected)];
-				def freed = tc.region.freeChunk(tc.region.blockEntryToChunk(entry));
+				def freed = tc.region.freeChunk(tc.region.blockTableEntryToChunk(entry));
 				tc.t.assertz(true, freed);
 				if (!freed) {
 					tc.cleanup();
@@ -3077,7 +3057,7 @@ def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTe
 					tc.t.assertz(false, tc.region.requiresRecovery());
 					tc.t.assertz(false, tc.region.txn.isDirty());
 				} else {
-					def index = int.!(tc.region.blockIndexOf(tc.region.chunkToBlockEntry(chunk)));
+					def index = int.!(tc.region.blockIndexOf(tc.region.chunkToBlockTableEntry(chunk)));
 					def limit = index + int.!(request);
 					tc.t.assertz(true, index >= 2 && limit <= 7);
 					if (index < 2 || limit > 7) {
@@ -3109,7 +3089,7 @@ def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTe
 		for (i = 2; i < 7; i++) {
 			if (allocationSizes[i] == 0u32) continue;
 			def entry = tc.region.blockTableHandle[u64.view(i)];
-			def freed = tc.region.freeChunk(tc.region.blockEntryToChunk(entry));
+			def freed = tc.region.freeChunk(tc.region.blockTableEntryToChunk(entry));
 			tc.t.assertz(true, freed);
 			if (!freed) {
 				tc.cleanup();
@@ -3126,29 +3106,29 @@ def test_bd_seeded_mixed_histories_preserve_invariants(tc: BlockDevicePWRegionTe
 }
 
 // A committed WAL should replay on remount and then be cleared.
-def test_bd_recover_committed_wal(tc: BlockDevicePWRegionTester) {
+def test_bd_recover_committed_wal(tc: MappedFileAllocatorTester) {
 	var entry = tc.region.blockTableHandle[2u64];
-	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
+	tc.t.assertz(false, entry.getUsedInRegion(tc.region.reader()));
 
 	tc.writeCommittedWalUpdate(
 		tc.region,
-		entry.addr + u64.view(BlockEntry.used.offset),
+		entry.addr + u64.view(BlockTableEntry.used.offset),
 		1u64,
 		1u8);
 
 	var region2 = tc.remount();
-	tc.t.assertz(true, region2.blockTableHandle[2u64].getUsed(region2.reader()));
+	tc.t.assertz(true, region2.blockTableHandle[2u64].getUsedInRegion(region2.reader()));
 
 	tc.cleanup();
 }
 
 // The writer process exits immediately after the WAL commit boundary, without
-// applying the after-image and without deallocate()/DualTxnWal.close(). A
+// applying the after-image and without deallocate()/TwoSlotWal.close(). A
 // separate process must be able to mount the same file and replay the durable
 // record. This is process-crash consistency evidence for the real file backend;
 // it is not a host power-loss test because both processes share one kernel and
 // its page cache.
-def test_bd_abrupt_writer_recovers_committed_wal(tc: BlockDevicePWRegionTester) {
+def test_bd_abrupt_writer_recovers_committed_wal(tc: MappedFileAllocatorTester) {
 	// Finish the fresh format and remove the parent's mapping before forking so
 	// only the child writer has the region open at the simulated crash point.
 	tc.region.deallocate();
@@ -3178,7 +3158,7 @@ def test_bd_abrupt_writer_recovers_committed_wal(tc: BlockDevicePWRegionTester) 
 	}
 
 	def recovered = tc.remount();
-	tc.t.assertz(true, recovered.blockTableHandle[2u64].getUsed(recovered.reader()));
+	tc.t.assertz(true, recovered.blockTableHandle[2u64].getUsedInRegion(recovered.reader()));
 
 	tc.cleanup();
 }
@@ -3188,8 +3168,8 @@ def test_bd_abrupt_writer_recovers_committed_wal(tc: BlockDevicePWRegionTester) 
 // applied to the mapping, but those after-images have not ridden the next
 // commit boundary. Abrupt exit must leave a replayable multi-entry record, and
 // remount must reconstruct a structurally consistent split allocation without
-// relying on DualTxnWal.close().
-def test_bd_abrupt_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+// relying on TwoSlotWal.close().
+def test_bd_abrupt_split_alloc_recovers_transaction(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3226,7 +3206,7 @@ def test_bd_abrupt_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTeste
 // crash window. Unlike the split path, exact fit removes the only free-list
 // node and leaves no remainder; remount must recover that distinct structure
 // from the multi-entry WAL record without child cleanup.
-def test_bd_abrupt_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+def test_bd_abrupt_exact_fit_alloc_recovers_transaction(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3263,7 +3243,7 @@ def test_bd_abrupt_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegionT
 // left and right coalescing, but before those after-images ride a later commit
 // or clean-close boundary. Remount must replay the record and reconstruct the
 // original five-block free extent without child cleanup.
-def test_bd_abrupt_coalescing_free_recovers_transaction(tc: BlockDevicePWRegionTester) {
+def test_bd_abrupt_coalescing_free_recovers_transaction(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3297,10 +3277,10 @@ def test_bd_abrupt_coalescing_free_recovers_transaction(tc: BlockDevicePWRegionT
 }
 
 // Stop immediately after the split allocation's multi-entry WAL record reaches
-// fdatasync, then kill the child before persistChanges() returns and before any
+// fdatasync, then kill the child before drain() returns and before any
 // allocator after-image is applied. A fresh mapping must reconstruct the full
 // split allocation from that record, including links and the chunk header.
-def test_bd_sigkill_split_alloc_commit_boundary_recovers(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_split_alloc_commit_boundary_recovers(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3332,7 +3312,7 @@ def test_bd_sigkill_split_alloc_commit_boundary_recovers(tc: BlockDevicePWRegion
 // fdatasync, then kill the child before any allocator after-image is applied.
 // Recovery must remove the only free extent and restore the empty-list state
 // from the durable multi-entry record alone.
-def test_bd_sigkill_exact_fit_alloc_commit_boundary_recovers(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_exact_fit_alloc_commit_boundary_recovers(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3364,7 +3344,7 @@ def test_bd_sigkill_exact_fit_alloc_commit_boundary_recovers(tc: BlockDevicePWRe
 // stop immediately after that multi-entry WAL record reaches fdatasync. The
 // child is killed before any after-image is applied; recovery must rebuild the
 // original five-block extent using the record alone.
-def test_bd_sigkill_coalescing_free_commit_boundary_recovers(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_coalescing_free_commit_boundary_recovers(tc: MappedFileAllocatorTester) {
 	def first = tc.region.allocChunk(1u32);
 	def second = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, !first.isNull());
@@ -3374,8 +3354,8 @@ def test_bd_sigkill_coalescing_free_commit_boundary_recovers(tc: BlockDevicePWRe
 		return;
 	}
 	tc.t.assertz(true, tc.region.freeChunk(first));
-	if (tc.region.blockTableHandle[2u64].getUsed(tc.region.reader()) ||
-		!tc.region.blockTableHandle[3u64].getUsed(tc.region.reader())) {
+	if (tc.region.blockTableHandle[2u64].getUsedInRegion(tc.region.reader()) ||
+		!tc.region.blockTableHandle[3u64].getUsedInRegion(tc.region.reader())) {
 		tc.t.fail("coalescing-free setup failed");
 		tc.cleanup();
 		return;
@@ -3412,7 +3392,7 @@ def test_bd_sigkill_coalescing_free_commit_boundary_recovers(tc: BlockDevicePWRe
 // transactions. Transaction 1 has applied but remains dirty; transaction 2's
 // commit-point fdatasync persists those after-images with record 2. Kill before
 // transaction 2 applies, then require recovery to preserve both allocations.
-def test_bd_sigkill_second_commit_piggybacks_previous_data(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_second_commit_piggybacks_previous_data(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3443,7 +3423,7 @@ def test_bd_sigkill_second_commit_piggybacks_previous_data(tc: BlockDevicePWRegi
 // Stop after explicit flush's real fdatasync, then kill before it returns or
 // any close/scrub path runs. The allocation's deferred after-images and retained
 // idempotent WAL record must remount as one structurally valid allocation.
-def test_bd_sigkill_explicit_flush_boundary_recovers(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_explicit_flush_boundary_recovers(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3475,7 +3455,7 @@ def test_bd_sigkill_explicit_flush_boundary_recovers(tc: BlockDevicePWRegionTest
 // scrub's real fdatasync and kill the child: remount should see the newer surviving record,
 // never replay transaction 1 over transaction 2's already-durable allocator
 // state. This is process-crash consistency evidence under the same kernel.
-def test_bd_sigkill_close_first_slot_scrub_preserves_latest_state(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_close_first_slot_scrub_preserves_latest_state(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3507,7 +3487,7 @@ def test_bd_sigkill_close_first_slot_scrub_preserves_latest_state(tc: BlockDevic
 // death. The child stops itself only after the allocator transaction and its
 // structural checks complete; the parent observes that stop, sends SIGKILL,
 // and remounts without allowing any child cleanup code to run.
-def test_bd_sigkill_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_split_alloc_recovers_transaction(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3569,7 +3549,7 @@ def test_bd_sigkill_split_alloc_recovers_transaction(tc: BlockDevicePWRegionTest
 // exact-fit allocation. Unlike the split path, the transaction removes the
 // only free extent, so recovery must preserve the empty free lists and the
 // shortened memory-order chain after the parent kills the stopped child.
-def test_bd_sigkill_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_exact_fit_alloc_recovers_transaction(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3633,7 +3613,7 @@ def test_bd_sigkill_exact_fit_alloc_recovers_transaction(tc: BlockDevicePWRegion
 // neighboring extents, but those updates have not ridden another fdatasync.
 // Kill the stopped child without cleanup and require remount to replay the
 // retained WAL record into the original five-block free extent.
-def test_bd_sigkill_coalescing_free_recovers_transaction(tc: BlockDevicePWRegionTester) {
+def test_bd_sigkill_coalescing_free_recovers_transaction(tc: MappedFileAllocatorTester) {
 	tc.region.deallocate();
 	tc.region = null;
 
@@ -3693,20 +3673,20 @@ def test_bd_sigkill_coalescing_free_recovers_transaction(tc: BlockDevicePWRegion
 }
 
 // A corrupt committed WAL must not replay, and recovery must durably clear it.
-def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
+def test_bd_corrupt_wal_checksum(tc: MappedFileAllocatorTester) {
 	var entry = tc.region.blockTableHandle[2u64];
-	tc.t.assertz(false, entry.getUsed(tc.region.reader()));
+	tc.t.assertz(false, entry.getUsedInRegion(tc.region.reader()));
 
 	tc.writeCommittedWalUpdate(
 		tc.region,
-		entry.addr + u64.view(BlockEntry.used.offset),
+		entry.addr + u64.view(BlockTableEntry.used.offset),
 		1u64,
 		1u8);
 
 	tc.corruptFirstRecordChecksum(tc.region);
 
 	var region2 = tc.remount();
-	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsed(region2.reader()));
+	tc.t.assertz(false, region2.blockTableHandle[2u64].getUsedInRegion(region2.reader()));
 
 	tc.cleanup();
 }
@@ -3714,7 +3694,7 @@ def test_bd_corrupt_wal_checksum(tc: BlockDevicePWRegionTester) {
 // The point of the root: a program that stops and restarts finds its own data
 // again without hardcoding an offset. Publish an allocated chunk as the root,
 // close cleanly, remount, and reach the chunk through the header alone.
-def test_bd_user_root_survives_remount(tc: BlockDevicePWRegionTester) {
+def test_bd_user_root_survives_remount(tc: MappedFileAllocatorTester) {
 	var chunk = tc.region.allocChunk(2u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 	def offset = tc.region.offsetInRegion(chunk.addr);
@@ -3732,9 +3712,9 @@ def test_bd_user_root_survives_remount(tc: BlockDevicePWRegionTester) {
 	// Rebuild the handle from the durable root and check the allocator still
 	// agrees the extent is live.
 	def recovered = ChunkHandle(region2.regionStart + region2.getUserRoot());
-	def entry = region2.chunkToBlockEntry(recovered);
+	def entry = region2.chunkToBlockTableEntry(recovered);
 	tc.t.assertz(false, entry.isNull());
-	tc.t.assertz(true, entry.getUsed(tc.region.reader()));
+	tc.t.assertz(true, entry.getUsedInRegion(tc.region.reader()));
 	tc.t.assert_eq(0xFEED_FACE_u64,
 		region2.txn.readU64(recovered.addr + u64.!(ChunkHeader.size)));
 
@@ -3743,7 +3723,7 @@ def test_bd_user_root_survives_remount(tc: BlockDevicePWRegionTester) {
 
 // A reformat over an existing image must not leave the previous run's root
 // visible: the new region owns none of the old extents.
-def test_bd_user_root_cleared_by_reformat(tc: BlockDevicePWRegionTester) {
+def test_bd_user_root_cleared_by_reformat(tc: MappedFileAllocatorTester) {
 	var chunk = tc.region.allocChunk(1u32);
 	tc.t.assertz(true, tc.allocSucceeded(chunk));
 	tc.t.assertz(true, tc.region.setUserRoot(tc.region.offsetInRegion(chunk.addr)));

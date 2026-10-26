@@ -4,13 +4,13 @@
 //
 // This is Jaaru's constraint refinement (Gorjiara, Xu and Demsky, ASPLOS'21:
 // §3.1, §4, Figs. 9-11) over the line classes of the reduced search
-// (X86_64PersistentExplorer.v3), by re-execution rather than by fork. At a cut,
+// (X86_64CrashExplorer.v3), by re-execution rather than by fork. At a cut,
 // each line the trace wrote can hold any of its distinct contents
-// (PersistentLineClasses), independently of the other lines, so the cut's
+// (CrashLineClasses), independently of the other lines, so the cut's
 // images are the product of the per-line class sets. An execution starts with
 // every line's set S_i holding all of its classes and the crash image's
 // mapping holding the lazy image (class 0 everywhere). When the code under test
-// is about to load bytes of a line with |S_i| > 1 (PersistentLoadObserver, the
+// is about to load bytes of a line with |S_i| > 1 (LoadObserver, the
 // load seam of Stage B), the search looks at the loaded bytes that this
 // execution has not stored itself and on which the classes in S_i differ. If
 // there are none, the load cannot tell the classes apart and nothing happens.
@@ -36,13 +36,13 @@
 // images: the groups at a decision partition S_i, two leaves differ at their
 // first differing decision, and depth-first search takes every group. The
 // proviso is the load seam's: a load that escapes the observer would read the
-// least class there in every image. The tests in PersistentLazyExplorerTest.v3
+// least class there in every image. The tests in ReadDrivenExplorerTest.v3
 // check each step executably (docs/pmem-crash-model.md, "The lazy search").
 //
 // A property must be lazy-safe to run here, which is why it is its own type
-// (PersistentLazyProperty) and not a PersistentImageProperty: it mounts images
+// (ReadDrivenProperty) and not a CrashImageProperty: it mounts images
 // only through the mounter it is handed, and it reads a frozen copy only with
-// PersistentImageView.read(), sameBytes() or firstDifference(), which decide
+// CrashImageView.read(), sameBytes() or firstDifference(), which decide
 // what they read. A mount's snapshot() keeps the bytes the run neither stored
 // nor loaded as marks that stand for the crash image's byte at the same offset;
 // two such marks at one offset are the same byte, so comparing two snapshots
@@ -53,16 +53,16 @@
 // read. {groupOf} gives each class's group, -1 for a class already ruled out.
 // Groups are numbered by their least class, so group 0 holds the least class
 // still possible. {choice} is the group the execution took.
-class PersistentLazyDecision(line: int, groupOf: Array<int>, groups: int) {
+class ReadDrivenDecision(line: int, groupOf: Array<int>, groups: int) {
 	var choice = 0;
 
-	def copy() -> PersistentLazyDecision {
-		def d = PersistentLazyDecision.new(line, groupOf, groups);
+	def copy() -> ReadDrivenDecision {
+		def d = ReadDrivenDecision.new(line, groupOf, groups);
 		d.choice = choice;
 		return d;
 	}
 
-	def sameSplit(that: PersistentLazyDecision) -> bool {
+	def sameSplit(that: ReadDrivenDecision) -> bool {
 		return line == that.line && groups == that.groups && Arrays.equal(groupOf, that.groupOf);
 	}
 }
@@ -74,8 +74,8 @@ class PersistentLazyDecision(line: int, groupOf: Array<int>, groups: int) {
 // sets[i], for every i, makes the same loads and stores as this execution and
 // gets the same verdict. {logs} holds each mount's stores and loads when the
 // search was asked to record them, else it is empty.
-class PersistentLazyLeaf(index: int, decisions: Array<PersistentLazyDecision>,
-	sets: Array<Array<int>>, detail: string, logs: Array<PersistentMountLog>) {
+class ReadDrivenLeaf(index: int, decisions: Array<ReadDrivenDecision>,
+	sets: Array<Array<int>>, detail: string, logs: Array<CrashMountLog>) {
 
 	// Whether the image whose line i holds class choice[i] is one of this
 	// leaf's.
@@ -104,16 +104,16 @@ class PersistentLazyLeaf(index: int, decisions: Array<PersistentLazyDecision>,
 	}
 
 	// The distinct images the leaf stands for, saturating at
-	// PersistentExplorer.COUNT_LIMIT.
+	// CrashExplorer.COUNT_LIMIT.
 	def represented() -> long {
 		var p = 1L;
-		for (s in sets) p = PersistentExplorer.multiplyCount(p, s.length);
+		for (s in sets) p = CrashExplorer.multiplyCount(p, s.length);
 		return p;
 	}
 
 	// The decisions as "line O took group g of n", and the lines whose class
 	// is still open as "line O {k, ...} of n".
-	def render(buf: StringBuilder, classes: Array<PersistentLineClasses>) -> StringBuilder {
+	def render(buf: StringBuilder, classes: Array<CrashLineClasses>) -> StringBuilder {
 		buf.put1("leaf %d; decisions:", index);
 		if (decisions.length == 0) buf.puts(" none");
 		for (i < decisions.length) {
@@ -141,41 +141,41 @@ class PersistentLazyLeaf(index: int, decisions: Array<PersistentLazyDecision>,
 }
 
 // A property the lazy search can run: {check} mounts images only through the
-// mounter it is handed and reads frozen copies only through PersistentImageView
+// mounter it is handed and reads frozen copies only through CrashImageView
 // (see the header comment). The same function, given a durable image and the
 // eager mounter, is the property's eager form, which the search's
 // counterexamples are confirmed against and which the agreement tests compare
 // with, so the two paths run one body of code.
-class PersistentLazyProperty(name: string, windowOffset: u64, windowLength: int,
-	check: (PersistentImageView, PersistentImageMounter) -> string) {
+class ReadDrivenProperty(name: string, windowOffset: u64, windowLength: int,
+	check: (CrashImageView, CrashImageMounter) -> string) {
 
-	def checkEagerly(image: PersistentDurableImage) -> string {
-		return check(image, PersistentImageMounters.EAGER);
+	def checkEagerly(image: CrashImage) -> string {
+		return check(image, CrashImageMounters.EAGER);
 	}
 
-	def eager() -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, windowOffset, windowLength, checkEagerly);
+	def eager() -> CrashImageProperty {
+		return CrashImageProperty.new(name, windowOffset, windowLength, checkEagerly);
 	}
 }
 
 // Outcome of a lazy check over one cut or a range of cuts. {leaves} counts
 // executions; {represented} the distinct images those leaves stand for, which
 // equals {classProduct} when no cut was truncated; {classProduct} and {product}
-// are the cuts' distinct images and prefix vectors, as in PersistentCheckResult.
+// are the cuts' distinct images and prefix vectors, as in CrashCheckResult.
 // All four are summed over the cuts reached and saturate at
-// PersistentExplorer.COUNT_LIMIT. {nondeterminism} is set when an execution did
+// CrashExplorer.COUNT_LIMIT. {nondeterminism} is set when an execution did
 // not replay its decision prefix, which voids the search. {confirmed} says
 // whether the eager property, run over the counterexample's image, gave the
 // same detail as the lazy leaf.
-class PersistentLazyCheckResult(trace: PersistentTrace, crashAfter: int,
-	counterexample: PersistentCounterexample, confirmed: bool, nondeterminism: string,
+class ReadDrivenCheckResult(trace: PersistenceTrace, crashAfter: int,
+	counterexample: CrashCounterexample, confirmed: bool, nondeterminism: string,
 	leaves: long, represented: long, classProduct: long, product: long, truncated: bool) {
 
 	def ok() -> bool {
 		return counterexample == null && nondeterminism == null;
 	}
 
-	// As PersistentCheckResult.exhaustive(): the property held in every leaf
+	// As CrashCheckResult.exhaustive(): the property held in every leaf
 	// and no cut ran out of budget, so the leaves cover every distinct image.
 	def exhaustive() -> bool {
 		return ok() && !truncated;
@@ -192,10 +192,10 @@ class PersistentLazyCheckResult(trace: PersistentTrace, crashAfter: int,
 
 	// One line: "L leaves cover R of Y distinct images (Z prefix states)".
 	def renderCoverage(buf: StringBuilder) -> StringBuilder {
-		PersistentExplorer.putCount(buf, leaves).puts(" leaves cover ");
-		PersistentExplorer.putCount(buf, represented).puts(" of ");
-		PersistentExplorer.putCount(buf, classProduct).puts(" distinct images (");
-		PersistentExplorer.putCount(buf, product).puts(" prefix states)");
+		CrashExplorer.putCount(buf, leaves).puts(" leaves cover ");
+		CrashExplorer.putCount(buf, represented).puts(" of ");
+		CrashExplorer.putCount(buf, classProduct).puts(" distinct images (");
+		CrashExplorer.putCount(buf, product).puts(" prefix states)");
 		if (truncated) buf.puts(", truncated");
 		return buf.ln();
 	}
@@ -207,12 +207,12 @@ class PersistentLazyCheckResult(trace: PersistentTrace, crashAfter: int,
 
 // A lazy search's mounts are PMEM regions over mappings the search owns and
 // reuses from one execution to the next, so closing a mount must not unmap
-// them; PersistentLazySearch.close() does.
-class PersistentLazyRegion extends PmemMmapRegion {
+// them; ReadDrivenSearch.close() does.
+class ReadDrivenRegion extends PmemRegion {
 	new(mapping: Mapping) super(mapping, -1) { }
 
-	def destroy() {
-		cleanupBeforeDestroy();
+	def close() {
+		cleanupBeforeClose();
 	}
 }
 
@@ -220,8 +220,8 @@ class PersistentLazyRegion extends PmemMmapRegion {
 // a recorder over the mount's range that performs them, and every byte a store
 // covers is marked in {written}, which is how the search knows which loads
 // read the execution's own stores.
-class PersistentLazyOperations extends PersistentOperations {
-	def inner: RecordingPersistentOperations;
+class ReadDrivenProvider extends PersistenceProvider {
+	def inner: RecordingProvider;
 	def written: Array<bool> = Array<bool>.new(inner.range.length);
 
 	new(inner) { }
@@ -246,12 +246,12 @@ class PersistentLazyOperations extends PersistentOperations {
 		mark(offset, 8);
 	}
 
-	def clwb(cacheLine: u64) {
-		inner.clwb(cacheLine);
+	def writeBackLine(lineOffset: u64) {
+		inner.writeBackLine(lineOffset);
 	}
 
-	def sfence() {
-		inner.sfence();
+	def fence() {
+		inner.fence();
 	}
 
 	private def mark(offset: u64, width: int) {
@@ -261,8 +261,8 @@ class PersistentLazyOperations extends PersistentOperations {
 }
 
 // The observer on the crash image's own mount.
-class PersistentLazyRootObserver(search: PersistentLazySearch) extends PersistentLoadObserver {
-	def observe(offset: u64, length: u64) {
+class ReadDrivenRootObserver(search: ReadDrivenSearch) extends LoadObserver {
+	def beforeLoad(offset: u64, length: u64) {
 		search.observeRoot(offset, length);
 	}
 }
@@ -270,10 +270,10 @@ class PersistentLazyRootObserver(search: PersistentLazySearch) extends Persisten
 // The observer on a mount of a lazy view other than the fresh crash image: a
 // snapshot, or the crash image mounted a second time. It fills the bytes the
 // view does not know from the crash image when they are first loaded.
-class PersistentLazyCopyObserver(search: PersistentLazySearch, mount: PersistentLazyMount)
-	extends PersistentLoadObserver {
+class ReadDrivenCopyObserver(search: ReadDrivenSearch, mount: ReadDrivenMount)
+	extends LoadObserver {
 
-	def observe(offset: u64, length: u64) {
+	def beforeLoad(offset: u64, length: u64) {
 		search.observeCopy(mount, offset, length);
 	}
 }
@@ -281,31 +281,31 @@ class PersistentLazyCopyObserver(search: PersistentLazySearch, mount: Persistent
 // One mount made by a lazy search. {pending} is null for the crash image's own
 // mount; for any other it marks the bytes the mounted view did not know, which
 // the mount fills from the crash image when they are first loaded.
-class PersistentLazyMount extends PersistentImageMount {
-	def search: PersistentLazySearch;
-	def ops: PersistentLazyOperations;
+class ReadDrivenMount extends CrashImageMount {
+	def search: ReadDrivenSearch;
+	def ops: ReadDrivenProvider;
 	def pending: Array<bool>;
 	def generation: int;
 
-	new(region: BackendRegion, search, ops, pending, generation) super(region, null) { }
+	new(region: StorageRegion, search, ops, pending, generation) super(region, null) { }
 
 	// A snapshot that decides nothing: bytes the run neither stored nor
 	// loaded, and the crash image has not yet decided, stay marks.
-	def snapshot() -> PersistentImageView {
+	def snapshot() -> CrashImageView {
 		return search.snapshotOf(this);
 	}
 
 	// Every byte, decided: correct for any caller, but it branches on every
 	// byte that is still open, so lazy-safe properties use snapshot().
-	def freeze() -> PersistentDurableImage {
+	def freeze() -> CrashImage {
 		return search.materialize(search.snapshotOf(this));
 	}
 }
 
 // A view whose marked bytes stand for the crash image's bytes at the same
 // offsets in one execution of {search}.
-class PersistentLazyView extends PersistentImageView {
-	def search: PersistentLazySearch;
+class ReadDrivenView extends CrashImageView {
+	def search: ReadDrivenSearch;
 	def generation: int;
 
 	new(search, generation) { }
@@ -316,7 +316,7 @@ class PersistentLazyView extends PersistentImageView {
 	// Byte {i} as the view holds it; meaningful only where it is not marked.
 	def held(i: int) -> byte;
 
-	def origin() -> PersistentLazySearch {
+	def origin() -> ReadDrivenSearch {
 		return search;
 	}
 
@@ -341,7 +341,7 @@ class PersistentLazyView extends PersistentImageView {
 		live();
 		def size = u64.!(size());
 		if (width < 0 || offset > size || u64.!(width) > size - offset) {
-			System.error("PersistentImageError", "durable read leaves the image");
+			System.error("CrashImageError", "durable read leaves the image");
 		}
 		def start = int.!(offset), end = start + width;
 		// Decide the marked bytes, a run at a time, so a read splits on the
@@ -369,14 +369,14 @@ class PersistentLazyView extends PersistentImageView {
 
 	private def live() {
 		if (generation != search.generation) {
-			System.error("PersistentLazyError", "a lazy view was read after its execution ended");
+			System.error("ReadDrivenError", "a lazy view was read after its execution ended");
 		}
 	}
 }
 
 // The crash image itself: every byte is the crash image's.
-class PersistentLazyImage extends PersistentLazyView {
-	new(search: PersistentLazySearch, generation: int) super(search, generation) { }
+class ReadDrivenImage extends ReadDrivenView {
+	new(search: ReadDrivenSearch, generation: int) super(search, generation) { }
 
 	def marked(i: int) -> bool {
 		return true;
@@ -389,11 +389,11 @@ class PersistentLazyImage extends PersistentLazyView {
 
 // A mount's bytes after the run, with the bytes it neither stored nor loaded,
 // and the crash image had not decided, kept as marks.
-class PersistentLazySnapshot extends PersistentLazyView {
+class ReadDrivenSnapshot extends ReadDrivenView {
 	def bytes: Array<byte>;
 	def marks: Array<bool>;
 
-	new(search: PersistentLazySearch, generation: int, bytes, marks) super(search, generation) { }
+	new(search: ReadDrivenSearch, generation: int, bytes, marks) super(search, generation) { }
 
 	def marked(i: int) -> bool {
 		return marks[i];
@@ -405,8 +405,8 @@ class PersistentLazySnapshot extends PersistentLazyView {
 }
 
 // What a property mounts through inside the lazy search.
-class PersistentLazyMounter(search: PersistentLazySearch) extends PersistentImageMounter {
-	def mount(image: PersistentImageView) -> PersistentImageMount {
+class ReadDrivenMounter(search: ReadDrivenSearch) extends CrashImageMounter {
+	def mount(image: CrashImageView) -> CrashImageMount {
 		return search.mount(image);
 	}
 }
@@ -416,14 +416,14 @@ class PersistentLazyMounter(search: PersistentLazySearch) extends PersistentImag
 // or null when every group has been taken, the budget of leaves is spent with
 // alternatives left ({truncated}), or an execution did not replay its prefix
 // ({nondeterminism}). close() releases the mappings.
-class PersistentLazySearch {
-	def trace: PersistentTrace;
+class ReadDrivenSearch {
+	def trace: PersistenceTrace;
 	def initial: Array<byte>;
 	def var cut: int;
 	def budget: int;
-	def property: PersistentLazyProperty;
+	def property: ReadDrivenProperty;
 	def record: bool;
-	def var classes: Array<PersistentLineClasses>;
+	def var classes: Array<CrashLineClasses>;
 	def var floorBytes: Array<byte>;	// the lazy image: every line at class 0
 	def var product: long;
 	def var classProduct: long;
@@ -435,35 +435,35 @@ class PersistentLazySearch {
 	var generation = 0;		// one per execution; a view outlives its own
 
 	private var finished = false;
-	private def trail = Vector<PersistentLazyDecision>.new();
+	private def trail = Vector<ReadDrivenDecision>.new();
 	private var nextDecision = 0;
 	private var lineIndex: Array<int>;	// region line number to class line, -1 if the trace never wrote it
 	private var everyClass: Array<Array<int>>;
 	private var varyingAll: Array<Array<bool>>;	// bytes on which a line's classes are not all equal
 	private var members: Array<Array<int>>;		// S_i: the classes line i may still hold, ascending
 	private var varying: Array<Array<bool>>;	// bytes on which the classes in S_i are not all equal
-	private def positions = Array<int>.new(int.!(MmapRegionUtils.CACHE_LINE_SIZE));
+	private def positions = Array<int>.new(int.!(CacheLines.CACHE_LINE_SIZE));
 	private var rootMapping: Mapping;
 	private var rootRange: Range<byte>;
-	private var rootOps: PersistentLazyOperations;
+	private var rootOps: ReadDrivenProvider;
 	private var rootMounted = false;
 	private def pool = Vector<Mapping>.new();
 	private var poolUsed = 0;
-	private def logs = Vector<PersistentMountLog>.new();
-	private var image: PersistentLazyImage;
-	private var mounter: PersistentLazyMounter;
+	private def logs = Vector<CrashMountLog>.new();
+	private var image: ReadDrivenImage;
+	private var mounter: ReadDrivenMounter;
 
 	new(trace, initial, crashAfter: int, budget, property, record) {
-		mounter = PersistentLazyMounter.new(this);
+		mounter = ReadDrivenMounter.new(this);
 		var c = crashAfter;
 		if (c < 0) c = 0;
 		if (c > trace.length()) c = trace.length();
 		cut = c;
-		floorBytes = PersistentImages.lazyCrash(trace, initial, cut).bytes;
-		classes = PersistentExplorer.lineClasses(trace, initial, cut);
-		product = PersistentExplorer.prefixProduct(classes);
-		classProduct = PersistentExplorer.classProduct(classes);
-		def lineSize = int.!(MmapRegionUtils.CACHE_LINE_SIZE);
+		floorBytes = CrashImages.lazyCrash(trace, initial, cut).bytes;
+		classes = CrashExplorer.lineClasses(trace, initial, cut);
+		product = CrashExplorer.prefixProduct(classes);
+		classProduct = CrashExplorer.classProduct(classes);
+		def lineSize = int.!(CacheLines.CACHE_LINE_SIZE);
 		lineIndex = Array<int>.new((floorBytes.length + lineSize - 1) / lineSize);
 		for (i < lineIndex.length) lineIndex[i] = -1;
 		everyClass = Array<Array<int>>.new(classes.length);
@@ -492,7 +492,7 @@ class PersistentLazySearch {
 	}
 
 	// Run the next execution and return its leaf; see the class comment.
-	def next() -> PersistentLazyLeaf {
+	def next() -> ReadDrivenLeaf {
 		if (finished) return null;
 		if (leaves > 0) {
 			var j = trail.length - 1;
@@ -512,7 +512,7 @@ class PersistentLazySearch {
 		if (rootMapping == null) {
 			rootMapping = Mmap.reserve(u64.!(floorBytes.length), Mmap.PROT_READ | Mmap.PROT_WRITE);
 			if (rootMapping == null) {
-				System.error("PersistentLazyError", "could not map a region for the crash image");
+				System.error("ReadDrivenError", "could not map a region for the crash image");
 			}
 			rootRange = CiRuntime.forgeRange<byte>(rootMapping.range.start, floorBytes.length);
 		}
@@ -529,11 +529,11 @@ class PersistentLazySearch {
 		}
 		def sets = Array<Array<int>>.new(members.length);
 		for (l < sets.length) sets[l] = members[l];
-		def decisions = Array<PersistentLazyDecision>.new(trail.length);
+		def decisions = Array<ReadDrivenDecision>.new(trail.length);
 		for (i < decisions.length) decisions[i] = trail[i].copy();
-		def leaf = PersistentLazyLeaf.new(leaves, decisions, sets, detail, logs.copy());
+		def leaf = ReadDrivenLeaf.new(leaves, decisions, sets, detail, logs.copy());
 		leaves++;
-		represented = PersistentExplorer.addCounts(represented, leaf.represented());
+		represented = CrashExplorer.addCounts(represented, leaf.represented());
 		return leaf;
 	}
 
@@ -551,8 +551,8 @@ class PersistentLazySearch {
 	// The image whose line i holds class {choice[i]}, built by the crash
 	// machine: replayed to the cut, then every line written back to its
 	// class's least prefix.
-	def imageOf(choice: Array<int>) -> PersistentDurableImage {
-		def m = PersistentCrashMachine.new(trace, initial);
+	def imageOf(choice: Array<int>) -> CrashImage {
+		def m = CrashModel.new(trace, initial);
 		m.runTo(cut);
 		for (l < classes.length) m.writebackAt(l, classes[l].prefixes[choice[l]]);
 		return m.crash();
@@ -581,22 +581,22 @@ class PersistentLazySearch {
 		poolUsed = 0;
 		logs.resize(0);
 		nextDecision = 0;
-		image = PersistentLazyImage.new(this, generation);
+		image = ReadDrivenImage.new(this, generation);
 	}
 
-	def mount(view: PersistentImageView) -> PersistentImageMount {
-		if (PersistentDurableImage.?(view)) {
+	def mount(view: CrashImageView) -> CrashImageMount {
+		if (CrashImage.?(view)) {
 			// A concrete image decides nothing; mount it as the eager mounter does.
-			def m = PersistentImageMounts.openMapped(PersistentDurableImage.!(view), record);
-			if (m != null && record) logs.put(PersistentMountLog.new(m.recorder, m.recorder.recordLoads()));
+			def m = CrashImageMounts.openMapped(CrashImage.!(view), record);
+			if (m != null && record) logs.put(CrashMountLog.new(m.recorder, m.recorder.recordLoads()));
 			return m;
 		}
-		if (!PersistentLazyView.?(view)) {
-			System.error("PersistentLazyError", "a lazy search can mount only durable images and its own views");
+		if (!ReadDrivenView.?(view)) {
+			System.error("ReadDrivenError", "a lazy search can mount only durable images and its own views");
 		}
-		def v = PersistentLazyView.!(view);
+		def v = ReadDrivenView.!(view);
 		if (v.search != this || v.generation != generation) {
-			System.error("PersistentLazyError", "a lazy view was mounted outside the execution that made it");
+			System.error("ReadDrivenError", "a lazy view was mounted outside the execution that made it");
 		}
 		if (v == image && !rootMounted) return mountRoot();
 		return mountCopy(v);
@@ -604,25 +604,25 @@ class PersistentLazySearch {
 
 	// The crash image's own mount, in the mapping that holds the lazy image
 	// with every decision so far written into it.
-	private def mountRoot() -> PersistentImageMount {
+	private def mountRoot() -> CrashImageMount {
 		rootMounted = true;
-		def region = PersistentLazyRegion.new(rootMapping);
-		def ops = PersistentLazyOperations.new(RecordingPersistentOperations.new(region.range));
-		region.setPersistentOperations(ops);
+		def region = ReadDrivenRegion.new(rootMapping);
+		def ops = ReadDrivenProvider.new(RecordingProvider.new(region.range));
+		region.setProvider(ops);
 		rootOps = ops;
-		install(ops, PersistentLazyRootObserver.new(this));
-		return PersistentLazyMount.new(region, this, ops, null, generation);
+		install(ops, ReadDrivenRootObserver.new(this));
+		return ReadDrivenMount.new(region, this, ops, null, generation);
 	}
 
 	// A mount of a view in a mapping of its own: the view's known bytes, and
 	// the bytes it does not know filled from the crash image when loaded.
-	private def mountCopy(v: PersistentLazyView) -> PersistentImageMount {
+	private def mountCopy(v: ReadDrivenView) -> CrashImageMount {
 		if (poolUsed == pool.length) {
 			def m = Mmap.reserve(u64.!(floorBytes.length), Mmap.PROT_READ | Mmap.PROT_WRITE);
 			if (m == null) return null;
 			pool.put(m);
 		}
-		def region = PersistentLazyRegion.new(pool[poolUsed++]);
+		def region = ReadDrivenRegion.new(pool[poolUsed++]);
 		def n = floorBytes.length;
 		def pending = Array<bool>.new(n);
 		for (i < n) {
@@ -634,21 +634,21 @@ class PersistentLazySearch {
 				pending[i] = true;
 			}
 		}
-		def ops = PersistentLazyOperations.new(RecordingPersistentOperations.new(region.range));
-		region.setPersistentOperations(ops);
-		def mount = PersistentLazyMount.new(region, this, ops, pending, generation);
-		install(ops, PersistentLazyCopyObserver.new(this, mount));
+		def ops = ReadDrivenProvider.new(RecordingProvider.new(region.range));
+		region.setProvider(ops);
+		def mount = ReadDrivenMount.new(region, this, ops, pending, generation);
+		install(ops, ReadDrivenCopyObserver.new(this, mount));
 		return mount;
 	}
 
-	private def install(ops: PersistentLazyOperations, observer: PersistentLoadObserver) {
+	private def install(ops: ReadDrivenProvider, observer: LoadObserver) {
 		if (!record) {
 			ops.loadObserver = observer;
 			return;
 		}
 		def loads = RecordingLoadObserver.new(ops.inner.range, observer, ops.inner);
 		ops.loadObserver = loads;
-		logs.put(PersistentMountLog.new(ops.inner, loads));
+		logs.put(CrashMountLog.new(ops.inner, loads));
 	}
 
 	// --- The observers ---
@@ -667,7 +667,7 @@ class PersistentLazySearch {
 
 	// A load from a copy mount: fill the bytes its view did not know and it
 	// has not stored since, deciding them in the crash image first.
-	def observeCopy(mount: PersistentLazyMount, offset: u64, length: u64) {
+	def observeCopy(mount: ReadDrivenMount, offset: u64, length: u64) {
 		def n = floorBytes.length;
 		if (length == 0 || offset >= u64.!(n)) return;
 		var end = n;
@@ -690,9 +690,9 @@ class PersistentLazySearch {
 		}
 	}
 
-	def snapshotOf(mount: PersistentLazyMount) -> PersistentLazySnapshot {
+	def snapshotOf(mount: ReadDrivenMount) -> ReadDrivenSnapshot {
 		if (mount.generation != generation) {
-			System.error("PersistentLazyError", "a lazy mount was frozen after its execution ended");
+			System.error("ReadDrivenError", "a lazy mount was frozen after its execution ended");
 		}
 		def range = mount.region.range;
 		def n = range.length;
@@ -708,11 +708,11 @@ class PersistentLazySearch {
 				bytes[i] = crashByte(i);
 			}
 		}
-		return PersistentLazySnapshot.new(this, generation, bytes, marks);
+		return ReadDrivenSnapshot.new(this, generation, bytes, marks);
 	}
 
 	// Every byte of {view}, decided.
-	def materialize(view: PersistentLazyView) -> PersistentDurableImage {
+	def materialize(view: ReadDrivenView) -> CrashImage {
 		def n = view.size();
 		var i = 0;
 		while (i < n) {
@@ -727,7 +727,7 @@ class PersistentLazySearch {
 		}
 		def out = Array<byte>.new(n);
 		for (k < n) out[k] = u8.view(view.knownByte(k));
-		return PersistentDurableImage.new(out);
+		return CrashImage.new(out);
 	}
 
 	// --- The crash image ---
@@ -757,7 +757,7 @@ class PersistentLazySearch {
 		if (length == 0 || offset >= n) return;
 		var end = n;
 		if (length < n - offset) end = offset + length;
-		def lineSize = MmapRegionUtils.CACHE_LINE_SIZE;
+		def lineSize = CacheLines.CACHE_LINE_SIZE;
 		var line = offset - offset % lineSize;
 		while (line < end) {
 			def l = lineIndex[int.!(line / lineSize)];
@@ -820,7 +820,7 @@ class PersistentLazySearch {
 	// what was recorded when it was first taken, or 0 at a new decision.
 	private def take(l: int, groupOf: Array<int>, groups: int) -> int {
 		def j = nextDecision++;
-		def here = PersistentLazyDecision.new(l, groupOf, groups);
+		def here = ReadDrivenDecision.new(l, groupOf, groups);
 		if (j < trail.length) {
 			def d = trail[j];
 			if (d.sameSplit(here)) return d.choice;
@@ -869,26 +869,26 @@ class PersistentLazySearch {
 	}
 }
 
-// Entry points. Each takes a PersistentLazyProperty, so a property that is not
+// Entry points. Each takes a ReadDrivenProperty, so a property that is not
 // lazy-safe cannot be run here by mistake; budgets count leaves per cut.
-component PersistentLazyExplorer {
+component ReadDrivenExplorer {
 	// The search over one cut, for callers that want its leaves. With
 	// {record} set, each leaf carries every mount's stores and loads. The
 	// caller must close() it.
-	def search(trace: PersistentTrace, initial: Array<byte>, crashAfter: int, budget: int,
-		property: PersistentLazyProperty, record: bool) -> PersistentLazySearch {
+	def search(trace: PersistenceTrace, initial: Array<byte>, crashAfter: int, budget: int,
+		property: ReadDrivenProperty, record: bool) -> ReadDrivenSearch {
 
-		return PersistentLazySearch.new(trace, initial, crashAfter, budgetOf(budget), property, record);
+		return ReadDrivenSearch.new(trace, initial, crashAfter, budgetOf(budget), property, record);
 	}
 
 	// Run {property} lazily over every image the cut admits, and stop at the
 	// first failing leaf. Its counterexample is the leaf's least image,
 	// re-checked with the property's eager form.
-	def checkImagesLazily(trace: PersistentTrace, initial: Array<byte>, crashAfter: int,
-		budget: int, property: PersistentLazyProperty) -> PersistentLazyCheckResult {
+	def checkImagesLazily(trace: PersistenceTrace, initial: Array<byte>, crashAfter: int,
+		budget: int, property: ReadDrivenProperty) -> ReadDrivenCheckResult {
 
 		def s = search(trace, initial, crashAfter, budget, property, false);
-		var cx: PersistentCounterexample;
+		var cx: CrashCounterexample;
 		var confirmed = false;
 		while (true) {
 			def leaf = s.next();
@@ -901,37 +901,37 @@ component PersistentLazyExplorer {
 			}
 		}
 		s.close();
-		return PersistentLazyCheckResult.new(trace, s.cut, cx, confirmed, s.nondeterminism,
+		return ReadDrivenCheckResult.new(trace, s.cut, cx, confirmed, s.nondeterminism,
 			s.leaves, s.represented, s.classProduct, s.product, s.truncated);
 	}
 
 	// The same over the cuts in [{fromCut}, {toCut}], earliest first, as
-	// PersistentExplorer.checkCutRange() clamps them.
-	def checkCutRangeLazily(trace: PersistentTrace, initial: Array<byte>, fromCut: int,
-		toCut: int, budget: int, property: PersistentLazyProperty) -> PersistentLazyCheckResult {
+	// CrashExplorer.checkCutRange() clamps them.
+	def checkCutRangeLazily(trace: PersistenceTrace, initial: Array<byte>, fromCut: int,
+		toCut: int, budget: int, property: ReadDrivenProperty) -> ReadDrivenCheckResult {
 
 		def end = clampCut(trace, toCut);
 		var first = clampCut(trace, fromCut);
 		if (first > end) first = end;
 		var leaves = 0L, represented = 0L, classes = 0L, product = 0L;
 		var truncated = false;
-		var last: PersistentLazyCheckResult;
+		var last: ReadDrivenCheckResult;
 		for (cut = first; cut <= end; cut++) {
 			def r = checkImagesLazily(trace, initial, cut, budget, property);
-			leaves = PersistentExplorer.addCounts(leaves, r.leaves);
-			represented = PersistentExplorer.addCounts(represented, r.represented);
-			classes = PersistentExplorer.addCounts(classes, r.classProduct);
-			product = PersistentExplorer.addCounts(product, r.product);
+			leaves = CrashExplorer.addCounts(leaves, r.leaves);
+			represented = CrashExplorer.addCounts(represented, r.represented);
+			classes = CrashExplorer.addCounts(classes, r.classProduct);
+			product = CrashExplorer.addCounts(product, r.product);
 			if (r.truncated) truncated = true;
 			last = r;
 			if (!r.ok()) break;
 		}
-		return PersistentLazyCheckResult.new(trace, last.crashAfter, last.counterexample,
+		return ReadDrivenCheckResult.new(trace, last.crashAfter, last.counterexample,
 			last.confirmed, last.nondeterminism, leaves, represented, classes, product, truncated);
 	}
 
-	def checkAllCutsLazily(trace: PersistentTrace, initial: Array<byte>, budget: int,
-		property: PersistentLazyProperty) -> PersistentLazyCheckResult {
+	def checkAllCutsLazily(trace: PersistenceTrace, initial: Array<byte>, budget: int,
+		property: ReadDrivenProperty) -> ReadDrivenCheckResult {
 
 		return checkCutRangeLazily(trace, initial, 0, trace.length(), budget, property);
 	}
@@ -939,7 +939,7 @@ component PersistentLazyExplorer {
 	// A failing leaf's counterexample: its least image, built by the crash
 	// machine, with the decisions and the classes still possible as its
 	// selection, and whether the eager property gives the same detail there.
-	def counterexample(s: PersistentLazySearch, leaf: PersistentLazyLeaf) -> (PersistentCounterexample, bool) {
+	def counterexample(s: ReadDrivenSearch, leaf: ReadDrivenLeaf) -> (CrashCounterexample, bool) {
 		def image = s.imageOf(leaf.low());
 		def eager = s.property.checkEagerly(image);
 		def confirmed = eager != null && Strings.equal(eager, leaf.detail);
@@ -948,17 +948,17 @@ component PersistentLazyExplorer {
 		leaf.render(note, s.classes);
 		if (confirmed) note.puts("; eager re-check: same detail");
 		else note.put1("; eager re-check DISAGREES: %s", if(eager == null, "the property holds", eager));
-		def cx = PersistentCounterexample.new(s.trace.name, s.property.name, leaf.detail, s.trace, s.cut)
+		def cx = CrashCounterexample.new(s.trace.name, s.property.name, leaf.detail, s.trace, s.cut)
 			.withImage(image, s.property.windowOffset, s.property.windowLength)
 			.withSelection(note.toString());
 		return (cx, confirmed);
 	}
 
 	private def budgetOf(budget: int) -> int {
-		return if(budget > 0, budget, PersistentExplorer.DEFAULT_BUDGET);
+		return if(budget > 0, budget, CrashExplorer.DEFAULT_BUDGET);
 	}
 
-	private def clampCut(trace: PersistentTrace, crashAfter: int) -> int {
+	private def clampCut(trace: PersistenceTrace, crashAfter: int) -> int {
 		if (crashAfter < 0) return 0;
 		if (crashAfter > trace.length()) return trace.length();
 		return crashAfter;

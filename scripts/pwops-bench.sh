@@ -5,7 +5,7 @@
 # the same chunks, an empty commit, the mount of a cleanly closed 1 MiB and
 # 64 MiB region, and the recovery of a 1 MiB region whose log holds one
 # committed, unapplied transaction of 8 or 24 entries. Every operation goes
-# through the production PWRegion, RegionTransaction and DualTxnWal, and the
+# through the production RegionAllocator, TransactionCache and TwoSlotWal, and the
 # benchmark fails a run in which any operation does other persistence work than
 # it should. A commit of k entries is pwbench's (scripts/pmem-experiments.sh,
 # scripts/clwb-eviction.sh) and is not measured here.
@@ -28,7 +28,7 @@
 #                    same block storage (PWOB_BLOCK_DIR)
 #   file-dax-legacy, file-block-legacy
 #                    file-dax and file-block with the file backend's boundary
-#                    before 2026-10-13 (a flag and fdatasync, persistRange an msync
+#                    before 2026-10-13 (a flag and fdatasync, persist() an msync
 #                    of its own pages), for the old-against-new comparison only
 #
 # There is no direct configuration without writeback: on the direct backend a

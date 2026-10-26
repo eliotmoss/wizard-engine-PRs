@@ -1,8 +1,9 @@
-// Dual-Transaction Redo WAL (two-slot log, phase B: piggybacked persistence
-// boundary, one boundary per commit in steady state)
+// Two-slot redo WAL (TwoSlotWal; phase B: piggybacked persistence boundary,
+// one boundary per commit in steady state). Its record layout is in
+// X86_64WalRecord.v3.
 //
-// Replaces the ring/superblock machinery of MultiTxnWal with two fixed record
-// slots in the block-1 log chunk, selected by transaction-sequence parity
+// Replaces the ring/superblock machinery of RingWal with two fixed record
+// slots in the block-1 log block, selected by transaction-sequence parity
 // (txnSeq % 2). Redo entries are idempotent absolute after-images, so recovery
 // simply validates both slots and replays the valid records in ascending
 // txnSeq -- no durableAppliedSeq replay floor, superblocks, epoch fencing, or
@@ -13,11 +14,11 @@
 //
 // Commit (phase B) = write record into slot txnSeq % 2 -> one persistence
 // boundary (the commit point) that covers the record TOGETHER with the
-// previous transaction's applied after-images, via prepareChangedRange(record)
-// + persistChanges(). The committing transaction's own after-images are
+// previous transaction's applied after-images, via writeBack(record)
+// + drain(). The committing transaction's own after-images are
 // applied to the region afterwards and ride the NEXT commit's boundary, an
-// explicit persistAppliedData(), or close(). They are stored with
-// storeUpdate() and prepared together by prepareApplied(), one preparation per
+// explicit persistAfterImages(), or close(). They are stored with
+// storeAfterImage() and prepared together by writeBackAfterImages(), one preparation per
 // cache line rather than one per after-image; every boundary that advances
 // dataDurableSeq first prepares whatever is still outstanding, so no stored
 // after-image can miss the boundary that claims it. Correctness by induction: a
@@ -26,12 +27,12 @@
 // the latest acknowledged state. Recovery = validate both slots -> replay
 // valid records in seq order -> persist data -> nextTxnSeq = max + 1.
 //
-// Record slots reuse the TxnRecordHeader/TxnCommitTrailer/LogEntry layouts
-// from MultiTxnWal; the logEpoch fields are reserved here and must be zero.
-// Distinct magic values guarantee stale MultiTxnWal ring bytes in a reused
-// log chunk can never validate as dual-slot records.
+// Record slots reuse the WalRecordHeader/WalRecordTrailer/WalEntry layouts
+// from RingWal; the logEpoch fields are reserved here and must be zero.
+// Distinct magic values guarantee stale RingWal ring bytes in a reused
+// log block can never validate as dual-slot records.
 
-layout DualWalHeader {
+layout WalHeader {
         +0      magic:          u64;    // Constant signature identifying this as a dual-slot WAL header
         +8      version:        u32;    // Persistent format version. Used to reject incompatible layouts
         +16     headerSize:     u64;    // Size of this header layout in bytes
@@ -42,7 +43,7 @@ layout DualWalHeader {
         =64;
 }
 
-component DualTxnWalConstants {
+component WalLayout {
         def HEADER_MAGIC = 0x4457_414c_4845_4144_u64;   // "DWALHEAD"
         def RECORD_MAGIC = 0x4457_414c_5458_4844_u64;   // "DWALTXHD"
         def TRAILER_MAGIC = 0x4457_414c_5458_434d_u64;  // "DWALTXCM"
@@ -57,20 +58,20 @@ component DualTxnWalConstants {
 // With {skipRecordChecksum} set, validateSlot() accepts a record whose stored
 // checksum does not match its bytes, so recovery replays a torn record whose
 // header, trailer and entries happen to be well formed.
-// persistent_sieve:unchecked_record_checksum_is_caught shows the crash-image
+// sieve_crash:unchecked_record_checksum_is_caught shows the crash-image
 // explorer rejecting that recovery.
 // With {recordLastLineUnflushed} set, a commit prepares its record minus the
 // record's last 64-byte line before the commit-point fence, an ordering bug: the
 // commit is acknowledged while the trailer's tail may still be volatile.
-// persistent_lazy:unflushed_record_line_is_caught records a commit with it set.
-component DualTxnWalMutants {
+// read_driven:unflushed_record_line_is_caught records a commit with it set.
+component WalFaultInjection {
         var skipRecordChecksum = false;
         var recordLastLineUnflushed = false;
 }
 
-// Outcome of DualTxnWal.recover(). Distinguishes nothing to replay, a
+// Outcome of TwoSlotWal.recover(). Distinguishes nothing to replay, a
 // successful replay, an unusable log, and a replay whose data persist failed.
-enum DualWalRecovery {
+enum WalRecovery {
         CLEAN,          // no valid records; nothing was replayed
         REPLAYED,       // valid records were replayed and their data persisted
         CORRUPT,        // WAL header invalid; log contents were ignored
@@ -79,18 +80,18 @@ enum DualWalRecovery {
                         // available for recovery by the next instance
 }
 
-class DualTxnWal {
+class TwoSlotWal {
         def regionStart: u64;
-        def logChunkAddr: u64;
-        def var logChunkSize: u64;
-        def backendRegion: BackendRegion;
-        private var persistentOperations: PersistentOperations;
+        def logBlockAddr: u64;
+        def var logBlockSize: u64;
+        def backendRegion: StorageRegion;
+        private var provider: PersistenceProvider;
         // Every load this WAL makes from the region -- header and slot
         // validation, the replay, the checksums, and the transaction's cache
         // misses -- goes through this reader, which shares the provider.
-        private var reader: DirectRegionReader;
+        private var reader: RegionReader;
 
-        def var logChunkOffset: u64;
+        def var logBlockOffset: u64;
         def var slotBytes: u64;
         def var nextTxnSeq: u64 = 1;            // Next transaction sequence number
         def var lastCommittedSeq: u64 = 0;      // Highest seq whose record reached its commit point (boundary 1)
@@ -98,7 +99,7 @@ class DualTxnWal {
         def var slotSeqs = Array<u64>.new(2);   // txnSeq of the valid record in each slot (0 = empty/unknown)
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
-        // [start, end) of after-images stored by storeUpdate() and not yet
+        // [start, end) of after-images stored by storeAfterImage() and not yet
         // prepared, as parallel arrays grown by doubling: no allocation per
         // commit and no call per element (a Vector's accessors are not inlined,
         // and on Magpie that per-entry overhead cost ~0.7 us at 24 entries).
@@ -109,28 +110,28 @@ class DualTxnWal {
         private var recoveryRequired = false;   // Persistence work left this mount unable to continue safely
         def var openOk = false;
 
-        new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
-                logChunkSize = blockSize;
-                logChunkOffset = logChunkAddr - regionStart;
-                slotBytes = alignDown((blockSize - u64.!(DualWalHeader.size)) / 2u64, DualTxnWalConstants.ALIGNMENT);
+        new(regionStart, logBlockAddr, blockSize: u64, backendRegion, mode: OpenMode) {
+                logBlockSize = blockSize;
+                logBlockOffset = logBlockAddr - regionStart;
+                slotBytes = alignDown((blockSize - u64.!(WalHeader.size)) / 2u64, WalLayout.ALIGNMENT);
                 slotSeqs[0] = 0u64;
                 slotSeqs[1] = 0u64;
                 if (backendRegion == null) {
-                        Trace.OUT.puts("dual-transaction WAL requires a backend region").ln();
+                        Trace.OUT.puts("two-slot WAL requires a backend region").ln();
                         return;
                 }
-                persistentOperations = X86_64PersistentOps.ensureFor(backendRegion);
-                reader = DirectRegionReader.new(persistentOperations, regionStart);
+                provider = NativeProviders.installIfAbsent(backendRegion);
+                reader = RegionReader.new(provider, regionStart);
                 if (slotBytes < alignedRecordLen(0u32)) {
-                        Trace.OUT.put1("log chunk too small for dual-transaction WAL slots (%d bytes)", blockSize).ln();
+                        Trace.OUT.put1("log block too small for two-slot WAL slots (%d bytes)", blockSize).ln();
                         return;
                 }
-                if (initializeFresh) {
+                if (mode == OpenMode.FORMAT) {
                         initializeHeader();
                 } else {
                         openOk = validateHeader();
                         if (!openOk) {
-                                Trace.OUT.puts("corrupt dual-transaction WAL header").ln();
+                                Trace.OUT.puts("corrupt two-slot WAL header").ln();
                                 return;
                         }
                         scanSlots();
@@ -163,7 +164,7 @@ class DualTxnWal {
         // sentinel is unambiguous.
         //
         // CONTRACT: the caller must apply a committed transaction's entries
-        // (storeUpdate, then prepareApplied; or applyUpdate) before committing
+        // (storeAfterImage, then writeBackAfterImages; or applyAfterImage) before committing
         // the next transaction; the boundary here only covers after-images that
         // have already been applied.
         def commit() -> u64 {
@@ -191,11 +192,11 @@ class DualTxnWal {
         // Apply one acknowledged after-image and prepare its range for the next
         // boundary. If range preparation fails, the durable slot remains the
         // source of truth and only a new WAL instance may replay it.
-        def applyUpdate(offset: u64, value: u64, width: u8) -> bool {
+        def applyAfterImage(offset: u64, value: u64, width: u8) -> bool {
                 if (recoveryRequired) return false;
                 if (!validEntryFields(offset, width)) return false;
                 writeAfterImage(offset, value, width);
-                if (!backendRegion.prepareChangedRange(offset, u64.view(width))) {
+                if (!backendRegion.writeBack(offset, u64.view(width))) {
                         recoveryRequired = true;
                         return false;
                 }
@@ -203,15 +204,15 @@ class DualTxnWal {
         }
 
         // Apply one acknowledged after-image without preparing its range; the
-        // range is recorded for prepareApplied(). A transaction's after-images
+        // range is recorded for writeBackAfterImages(). A transaction's after-images
         // are stored first and prepared together because on PMEM a preparation
         // is a CLWB, which on Cascade Lake evicts the line: preparing each one
         // as it is stored made the next store into the same line miss to the
         // medium -- about 95 % of the per-entry cost of the writebacks, as
         // measured on Magpie (docs/persistent-backends.md, "CLWB evicts on
         // Cascade Lake"). The durable slot remains the source of truth until
-        // the next boundary, exactly as with applyUpdate().
-        def storeUpdate(offset: u64, value: u64, width: u8) -> bool {
+        // the next boundary, exactly as with applyAfterImage().
+        def storeAfterImage(offset: u64, value: u64, width: u8) -> bool {
                 if (recoveryRequired) return false;
                 if (!validEntryFields(offset, width)) return false;
                 writeAfterImage(offset, value, width);
@@ -231,7 +232,7 @@ class DualTxnWal {
                 extentCount = n + 1;
         }
 
-        // Prepare every range stored by storeUpdate() since the last call, each
+        // Prepare every range stored by storeAfterImage() since the last call, each
         // cache line once: ranges are sorted by start and merged while the next
         // begins in, or immediately after, the current run's last line, so each
         // merged range covers exactly the lines that were written. Called by
@@ -239,7 +240,7 @@ class DualTxnWal {
         // construction ahead of the fence and of the next store to these lines
         // -- and by every boundary that advances dataDurableSeq, which makes
         // the obligation structural rather than the caller's.
-        def prepareApplied() -> bool {
+        def writeBackAfterImages() -> bool {
                 if (recoveryRequired) return false;
                 def n = extentCount;
                 if (n == 0) return true;
@@ -248,7 +249,7 @@ class DualTxnWal {
                 var start = starts[0], end = ends[0];
                 for (i = 1; i < n; i++) {
                         def next = starts[i];
-                        // Lines are DualTxnWalConstants.ALIGNMENT (64) bytes. Shifts,
+                        // Lines are WalLayout.ALIGNMENT (64) bytes. Shifts,
                         // not "/ 64": on a u64 the compiler cannot prove
                         // non-negative, that division is a 64-bit divq.
                         if ((next >> 6) <= ((end - 1u64) >> 6) + 1u64) {
@@ -266,7 +267,7 @@ class DualTxnWal {
         }
 
         private def prepareAppliedRange(start: u64, end: u64) -> bool {
-                if (!backendRegion.prepareChangedRange(start, end - start)) {
+                if (!backendRegion.writeBack(start, end - start)) {
                         recoveryRequired = true;
                         return false;
                 }
@@ -300,10 +301,10 @@ class DualTxnWal {
         // unreclaimable. As with every indeterminate persistence result, the
         // current instance cannot safely retry: explicit flush and close
         // callers must reopen and recover.
-        def persistAppliedData() -> bool {
+        def persistAfterImages() -> bool {
                 if (recoveryRequired) return false;
-                if (!prepareApplied()) return false;
-                if (!backendRegion.persistChanges()) {
+                if (!writeBackAfterImages()) return false;
+                if (!backendRegion.drain()) {
                         recoveryRequired = true;
                         return false;
                 }
@@ -327,7 +328,7 @@ class DualTxnWal {
                 // without recover()), the persist cannot cover it and the commit
                 // must fail until recover() runs.
                 if (slotSeqs[slot] != 0u64 && slotSeqs[slot] > dataDurableSeq) {
-                        if (!persistAppliedData()) return 0u64;
+                        if (!persistAfterImages()) return 0u64;
                         if (slotSeqs[slot] > dataDurableSeq) return 0u64;
                 }
 
@@ -335,50 +336,50 @@ class DualTxnWal {
                 slotSeqs[slot] = 0u64;  // the previous record is destroyed from here on
                 zeroBytes(absStart, recordLen64);
 
-                recordStoreU64(absStart, TxnRecordHeader.magic.offset, DualTxnWalConstants.RECORD_MAGIC);
-                recordStoreU16(absStart, TxnRecordHeader.version.offset, DualTxnWalConstants.RECORD_VERSION);
-                recordStoreU16(absStart, TxnRecordHeader.headerSize.offset, u16.!(TxnRecordHeader.size));
-                recordStoreU16(absStart, TxnRecordHeader.entrySize.offset, u16.!(LogEntry.size));
-                recordStoreU32(absStart, TxnRecordHeader.recordLen.offset, u32.!(recordLen64));
-                recordStoreU32(absStart, TxnRecordHeader.entryCount.offset, entryCount);
-                recordStoreU64(absStart, TxnRecordHeader.logEpoch.offset, 0u64);        // reserved
-                recordStoreU64(absStart, TxnRecordHeader.txnSeq.offset, txnSeq);
+                recordStoreU64(absStart, WalRecordHeader.magic.offset, WalLayout.RECORD_MAGIC);
+                recordStoreU16(absStart, WalRecordHeader.version.offset, WalLayout.RECORD_VERSION);
+                recordStoreU16(absStart, WalRecordHeader.headerSize.offset, u16.!(WalRecordHeader.size));
+                recordStoreU16(absStart, WalRecordHeader.entrySize.offset, u16.!(WalEntry.size));
+                recordStoreU32(absStart, WalRecordHeader.recordLen.offset, u32.!(recordLen64));
+                recordStoreU32(absStart, WalRecordHeader.entryCount.offset, entryCount);
+                recordStoreU64(absStart, WalRecordHeader.logEpoch.offset, 0u64);        // reserved
+                recordStoreU64(absStart, WalRecordHeader.txnSeq.offset, txnSeq);
 
-                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                var entryAddr = absStart + u64.!(WalRecordHeader.size);
                 for (i < entries.length) {
                         def e = entries[i];
-                        recordStoreU64(entryAddr, LogEntry.offset.offset, e.offset);
-                        recordStoreU64(entryAddr, LogEntry.value.offset, e.value);
-                        recordStoreU8(entryAddr, LogEntry.width.offset, e.width);
-                        entryAddr += u64.!(LogEntry.size);
+                        recordStoreU64(entryAddr, WalEntry.offset.offset, e.offset);
+                        recordStoreU64(entryAddr, WalEntry.value.offset, e.value);
+                        recordStoreU8(entryAddr, WalEntry.width.offset, e.width);
+                        entryAddr += u64.!(WalEntry.size);
                 }
 
-                def trailerAddr = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.magic.offset, DualTxnWalConstants.TRAILER_MAGIC);
-                recordStoreU32(trailerAddr, TxnCommitTrailer.recordLen.offset, u32.!(recordLen64));
-                recordStoreU32(trailerAddr, TxnCommitTrailer.entryCount.offset, entryCount);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.logEpoch.offset, 0u64);    // reserved
-                recordStoreU64(trailerAddr, TxnCommitTrailer.txnSeq.offset, txnSeq);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, 0u64);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, computeRecordChecksum(absStart, recordLen64));
+                def trailerAddr = absStart + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size);
+                recordStoreU64(trailerAddr, WalRecordTrailer.magic.offset, WalLayout.TRAILER_MAGIC);
+                recordStoreU32(trailerAddr, WalRecordTrailer.recordLen.offset, u32.!(recordLen64));
+                recordStoreU32(trailerAddr, WalRecordTrailer.entryCount.offset, entryCount);
+                recordStoreU64(trailerAddr, WalRecordTrailer.logEpoch.offset, 0u64);    // reserved
+                recordStoreU64(trailerAddr, WalRecordTrailer.txnSeq.offset, txnSeq);
+                recordStoreU64(trailerAddr, WalRecordTrailer.checksum.offset, 0u64);
+                recordStoreU64(trailerAddr, WalRecordTrailer.checksum.offset, computeRecordChecksum(absStart, recordLen64));
 
                 // The transaction commit point: one boundary persists the new
                 // record together with the previous transaction's applied
-                // after-images (their ranges were prepared by prepareApplied or
-                // applyUpdate; any still outstanding are prepared here). On
+                // after-images (their ranges were prepared by writeBackAfterImages or
+                // applyAfterImage; any still outstanding are prepared here). On
                 // PMEM that is one SFENCE over all flushed lines; on a file
                 // backend one fdatasync subsumes both. The sequence is
                 // deliberately not burned on failure. A failed persistence
                 // result is unacknowledged, so this instance is latched until
                 // the durable image is reopened and recovered.
-                if (!prepareApplied()) return 0u64;
+                if (!writeBackAfterImages()) return 0u64;
                 var preparedLen = recordLen64;
-                if (DualTxnWalMutants.recordLastLineUnflushed) preparedLen = recordLen64 - DualTxnWalConstants.ALIGNMENT;
-                if (!backendRegion.prepareChangedRange(absStart - regionStart, preparedLen)) {
+                if (WalFaultInjection.recordLastLineUnflushed) preparedLen = recordLen64 - WalLayout.ALIGNMENT;
+                if (!backendRegion.writeBack(absStart - regionStart, preparedLen)) {
                         recoveryRequired = true;
                         return 0u64;
                 }
-                if (!backendRegion.persistChanges()) {
+                if (!backendRegion.drain()) {
                         recoveryRequired = true;
                         return 0u64;
                 }
@@ -414,9 +415,9 @@ class DualTxnWal {
         // order. Records are idempotent after-images, so re-replaying an
         // already-durable record on a later mount is harmless -- no replay
         // floor is tracked.
-        def recover() -> DualWalRecovery {
-                if (recoveryRequired) return DualWalRecovery.PERSIST_FAILED;
-                if (!openOk) return DualWalRecovery.CORRUPT;
+        def recover() -> WalRecovery {
+                if (recoveryRequired) return WalRecovery.PERSIST_FAILED;
+                if (!openOk) return WalRecovery.CORRUPT;
                 slotSeqs[0] = validateSlot(0);
                 slotSeqs[1] = validateSlot(1);
                 def maxSeq = if(slotSeqs[0] > slotSeqs[1], slotSeqs[0], slotSeqs[1]);
@@ -424,38 +425,38 @@ class DualTxnWal {
                         nextTxnSeq = 1u64;
                         lastCommittedSeq = 0u64;
                         dataDurableSeq = 0u64;
-                        return DualWalRecovery.CLEAN;
+                        return WalRecovery.CLEAN;
                 }
                 for (slot < 2) {
                         if (slotSeqs[slot] != 0u64 && slotSeqs[slot] < maxSeq && !redoSlot(slot)) {
-                                return DualWalRecovery.PERSIST_FAILED;
+                                return WalRecovery.PERSIST_FAILED;
                         }
                 }
-                if (!redoSlot(slotIndexOf(maxSeq))) return DualWalRecovery.PERSIST_FAILED;
+                if (!redoSlot(slotIndexOf(maxSeq))) return WalRecovery.PERSIST_FAILED;
                 lastCommittedSeq = maxSeq;
                 nextTxnSeq = maxSeq + 1u64;
                 // The replay is published only once the redone data is durable.
                 // On failure the slots stay valid and the overwrite guard keeps
                 // them from being destroyed, so a later mount replays them again.
-                if (!prepareApplied()) return DualWalRecovery.PERSIST_FAILED;
-                if (!backendRegion.persistChanges()) {
+                if (!writeBackAfterImages()) return WalRecovery.PERSIST_FAILED;
+                if (!backendRegion.drain()) {
                         recoveryRequired = true;
-                        return DualWalRecovery.PERSIST_FAILED;
+                        return WalRecovery.PERSIST_FAILED;
                 }
                 dataDurableSeq = maxSeq;
-                return DualWalRecovery.REPLAYED;
+                return WalRecovery.REPLAYED;
         }
 
         private def redoSlot(slot: int) -> bool {
                 def absStart = slotAddr(slot);
-                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
-                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                def entryCount = recordLoadU32(absStart, WalRecordHeader.entryCount.offset);
+                var entryAddr = absStart + u64.!(WalRecordHeader.size);
                 for (i < entryCount) {
-                        if (!applyUpdate(
-                                recordLoadU64(entryAddr, LogEntry.offset.offset),
-                                recordLoadU64(entryAddr, LogEntry.value.offset),
-                                recordLoadU8(entryAddr, LogEntry.width.offset))) return false;
-                        entryAddr += u64.!(LogEntry.size);
+                        if (!applyAfterImage(
+                                recordLoadU64(entryAddr, WalEntry.offset.offset),
+                                recordLoadU64(entryAddr, WalEntry.value.offset),
+                                recordLoadU8(entryAddr, WalEntry.width.offset))) return false;
+                        entryAddr += u64.!(WalEntry.size);
                 }
                 return true;
         }
@@ -475,7 +476,7 @@ class DualTxnWal {
                 clear();
                 if (recoveryRequired) return;
                 if (!openOk) return;
-                if (!persistAppliedData()) return;
+                if (!persistAfterImages()) return;
                 // Reclaim oldest-first. If a crash or indeterminate persist
                 // interrupts the two scrubs, the surviving records must form a
                 // newest suffix. Reclaiming by slot index can erase seq N+1
@@ -492,8 +493,8 @@ class DualTxnWal {
 
         private def scrubDurableSlot(slot: int) -> bool {
                 if (slotSeqs[slot] == 0u64 || slotSeqs[slot] > dataDurableSeq) return true;
-                zeroBytes(slotAddr(slot), u64.!(TxnRecordHeader.size));
-                if (!backendRegion.persistRange(slotAddr(slot) - regionStart, u64.!(TxnRecordHeader.size))) {
+                zeroBytes(slotAddr(slot), u64.!(WalRecordHeader.size));
+                if (!backendRegion.persist(slotAddr(slot) - regionStart, u64.!(WalRecordHeader.size))) {
                         recoveryRequired = true;
                         return false;
                 }
@@ -505,30 +506,30 @@ class DualTxnWal {
                 nextTxnSeq = 1u64;
                 lastCommittedSeq = 0u64;
                 dataDurableSeq = 0u64;
-                zeroBytes(logChunkAddr, u64.!(DualWalHeader.size));
-                headerStoreU64(DualWalHeader.magic.offset, DualTxnWalConstants.HEADER_MAGIC);
-                headerStoreU32(DualWalHeader.version.offset, DualTxnWalConstants.VERSION);
-                headerStoreU64(DualWalHeader.headerSize.offset, u64.!(DualWalHeader.size));
-                headerStoreU64(DualWalHeader.slotBytes.offset, slotBytes);
-                headerStoreU32(DualWalHeader.slotCount.offset, DualTxnWalConstants.SLOT_COUNT);
-                headerStoreU64(DualWalHeader.reserved.offset, 0u64);
-                headerStoreU64(DualWalHeader.checksum.offset, computeHeaderChecksum());
+                zeroBytes(logBlockAddr, u64.!(WalHeader.size));
+                headerStoreU64(WalHeader.magic.offset, WalLayout.HEADER_MAGIC);
+                headerStoreU32(WalHeader.version.offset, WalLayout.VERSION);
+                headerStoreU64(WalHeader.headerSize.offset, u64.!(WalHeader.size));
+                headerStoreU64(WalHeader.slotBytes.offset, slotBytes);
+                headerStoreU32(WalHeader.slotCount.offset, WalLayout.SLOT_COUNT);
+                headerStoreU64(WalHeader.reserved.offset, 0u64);
+                headerStoreU64(WalHeader.checksum.offset, computeHeaderChecksum());
                 // Invalidate stale record bytes in the slots: a re-format can run
                 // over a region that previously held WAL contents.
-                zeroBytes(slotAddr(0), u64.!(TxnRecordHeader.size));
-                zeroBytes(slotAddr(1), u64.!(TxnRecordHeader.size));
+                zeroBytes(slotAddr(0), u64.!(WalRecordHeader.size));
+                zeroBytes(slotAddr(1), u64.!(WalRecordHeader.size));
                 // Header and slot 0's scrubbed header prefix are contiguous.
                 // Stop at the first failed ordered write: the result is
                 // indeterminate, so this instance cannot safely continue.
-                if (!backendRegion.persistRange(
-                                logChunkOffset,
-                                u64.!(DualWalHeader.size) + u64.!(TxnRecordHeader.size))) {
+                if (!backendRegion.persist(
+                                logBlockOffset,
+                                u64.!(WalHeader.size) + u64.!(WalRecordHeader.size))) {
                         recoveryRequired = true;
                         return;
                 }
-                if (!backendRegion.persistRange(
+                if (!backendRegion.persist(
                                 slotAddr(1) - regionStart,
-                                u64.!(TxnRecordHeader.size))) {
+                                u64.!(WalRecordHeader.size))) {
                         recoveryRequired = true;
                         return;
                 }
@@ -536,13 +537,13 @@ class DualTxnWal {
         }
 
         def validateHeader() -> bool {
-                if (headerLoadU64(DualWalHeader.magic.offset) != DualTxnWalConstants.HEADER_MAGIC) return false;
-                if (headerLoadU32(DualWalHeader.version.offset) != DualTxnWalConstants.VERSION) return false;
-                if (headerLoadU64(DualWalHeader.headerSize.offset) != u64.!(DualWalHeader.size)) return false;
-                if (headerLoadU64(DualWalHeader.slotBytes.offset) != slotBytes) return false;
-                if (headerLoadU32(DualWalHeader.slotCount.offset) != DualTxnWalConstants.SLOT_COUNT) return false;
-                if (headerLoadU64(DualWalHeader.reserved.offset) != 0u64) return false;
-                return headerLoadU64(DualWalHeader.checksum.offset) == computeHeaderChecksum();
+                if (headerLoadU64(WalHeader.magic.offset) != WalLayout.HEADER_MAGIC) return false;
+                if (headerLoadU32(WalHeader.version.offset) != WalLayout.VERSION) return false;
+                if (headerLoadU64(WalHeader.headerSize.offset) != u64.!(WalHeader.size)) return false;
+                if (headerLoadU64(WalHeader.slotBytes.offset) != slotBytes) return false;
+                if (headerLoadU32(WalHeader.slotCount.offset) != WalLayout.SLOT_COUNT) return false;
+                if (headerLoadU64(WalHeader.reserved.offset) != 0u64) return false;
+                return headerLoadU64(WalHeader.checksum.offset) == computeHeaderChecksum();
         }
 
         // Derive the sequence state from the slot contents. Only nextTxnSeq is
@@ -559,36 +560,36 @@ class DualTxnWal {
         // does not hold a complete, well-formed record of this slot's parity.
         def validateSlot(slot: int) -> u64 {
                 def absStart = slotAddr(slot);
-                def recordLen = recordLoadU32(absStart, TxnRecordHeader.recordLen.offset);
-                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
-                def txnSeq = recordLoadU64(absStart, TxnRecordHeader.txnSeq.offset);
-                if (recordLoadU64(absStart, TxnRecordHeader.magic.offset) != DualTxnWalConstants.RECORD_MAGIC) return 0u64;
-                if (recordLoadU16(absStart, TxnRecordHeader.version.offset) != DualTxnWalConstants.RECORD_VERSION) return 0u64;
-                if (recordLoadU16(absStart, TxnRecordHeader.headerSize.offset) != u16.!(TxnRecordHeader.size)) return 0u64;
-                if (recordLoadU16(absStart, TxnRecordHeader.entrySize.offset) != u16.!(LogEntry.size)) return 0u64;
-                if (recordLoadU64(absStart, TxnRecordHeader.logEpoch.offset) != 0u64) return 0u64;      // reserved
+                def recordLen = recordLoadU32(absStart, WalRecordHeader.recordLen.offset);
+                def entryCount = recordLoadU32(absStart, WalRecordHeader.entryCount.offset);
+                def txnSeq = recordLoadU64(absStart, WalRecordHeader.txnSeq.offset);
+                if (recordLoadU64(absStart, WalRecordHeader.magic.offset) != WalLayout.RECORD_MAGIC) return 0u64;
+                if (recordLoadU16(absStart, WalRecordHeader.version.offset) != WalLayout.RECORD_VERSION) return 0u64;
+                if (recordLoadU16(absStart, WalRecordHeader.headerSize.offset) != u16.!(WalRecordHeader.size)) return 0u64;
+                if (recordLoadU16(absStart, WalRecordHeader.entrySize.offset) != u16.!(WalEntry.size)) return 0u64;
+                if (recordLoadU64(absStart, WalRecordHeader.logEpoch.offset) != 0u64) return 0u64;      // reserved
                 if (txnSeq == 0u64) return 0u64;
                 if (slotIndexOf(txnSeq) != slot) return 0u64;
-                if (recordLen < u32.!(TxnRecordHeader.size + TxnCommitTrailer.size)) return 0u64;
-                if (u64.view(recordLen) % DualTxnWalConstants.ALIGNMENT != 0u64) return 0u64;
+                if (recordLen < u32.!(WalRecordHeader.size + WalRecordTrailer.size)) return 0u64;
+                if (u64.view(recordLen) % WalLayout.ALIGNMENT != 0u64) return 0u64;
                 if (u64.view(recordLen) > slotBytes) return 0u64;
 
-                def trailerAddr = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
-                if (trailerAddr + u64.!(TxnCommitTrailer.size) > absStart + u64.view(recordLen)) return 0u64;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.magic.offset) != DualTxnWalConstants.TRAILER_MAGIC) return 0u64;
-                if (recordLoadU32(trailerAddr, TxnCommitTrailer.recordLen.offset) != recordLen) return 0u64;
-                if (recordLoadU32(trailerAddr, TxnCommitTrailer.entryCount.offset) != entryCount) return 0u64;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.logEpoch.offset) != 0u64) return 0u64;  // reserved
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.txnSeq.offset) != txnSeq) return 0u64;
-                if (!DualTxnWalMutants.skipRecordChecksum &&
-                        recordLoadU64(trailerAddr, TxnCommitTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return 0u64;
+                def trailerAddr = absStart + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size);
+                if (trailerAddr + u64.!(WalRecordTrailer.size) > absStart + u64.view(recordLen)) return 0u64;
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.magic.offset) != WalLayout.TRAILER_MAGIC) return 0u64;
+                if (recordLoadU32(trailerAddr, WalRecordTrailer.recordLen.offset) != recordLen) return 0u64;
+                if (recordLoadU32(trailerAddr, WalRecordTrailer.entryCount.offset) != entryCount) return 0u64;
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.logEpoch.offset) != 0u64) return 0u64;  // reserved
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.txnSeq.offset) != txnSeq) return 0u64;
+                if (!WalFaultInjection.skipRecordChecksum &&
+                        recordLoadU64(trailerAddr, WalRecordTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return 0u64;
 
-                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                var entryAddr = absStart + u64.!(WalRecordHeader.size);
                 for (i < entryCount) {
                         if (!validEntryFields(
-                                recordLoadU64(entryAddr, LogEntry.offset.offset),
-                                recordLoadU8(entryAddr, LogEntry.width.offset))) return 0u64;
-                        entryAddr += u64.!(LogEntry.size);
+                                recordLoadU64(entryAddr, WalEntry.offset.offset),
+                                recordLoadU8(entryAddr, WalEntry.width.offset))) return 0u64;
+                        entryAddr += u64.!(WalEntry.size);
                 }
                 return txnSeq;
         }
@@ -600,12 +601,12 @@ class DualTxnWal {
         }
 
         def slotAddr(slot: int) -> u64 {
-                return logChunkAddr + u64.!(DualWalHeader.size) + u64.view(slot) * slotBytes;
+                return logBlockAddr + u64.!(WalHeader.size) + u64.view(slot) * slotBytes;
         }
 
         private def alignedRecordLen(entryCount: u32) -> u64 {
-                def raw = u64.!(TxnRecordHeader.size + TxnCommitTrailer.size) + u64.view(entryCount) * u64.!(LogEntry.size);
-                return alignUp(raw, DualTxnWalConstants.ALIGNMENT);
+                def raw = u64.!(WalRecordHeader.size + WalRecordTrailer.size) + u64.view(entryCount) * u64.!(WalEntry.size);
+                return alignUp(raw, WalLayout.ALIGNMENT);
         }
 
         private def alignUp(n: u64, alignment: u64) -> u64 {
@@ -629,34 +630,34 @@ class DualTxnWal {
                 def end = offset + size;
                 // Natural alignment makes this impossible for 1/2/4/8-byte stores in
                 // the 64-byte-line model, but keep the supported contract explicit.
-                // Lines are DualTxnWalConstants.ALIGNMENT (64) bytes. Shifts, not
+                // Lines are WalLayout.ALIGNMENT (64) bytes. Shifts, not
                 // "/ 64": on a u64 the compiler cannot prove non-negative, that
                 // division is a 64-bit divq.
                 if ((offset >> 6) != ((end - 1u64) >> 6)) return false;
-                def walStart = logChunkOffset;
-                def walEnd = logChunkOffset + logChunkSize;
+                def walStart = logBlockOffset;
+                def walEnd = logBlockOffset + logBlockSize;
                 if (offset < walEnd && walStart < end) return false;
                 return true;
         }
 
         private def writeAfterImage(offset: u64, value: u64, width: u8) {
                 match (width) {
-                        1 => persistentOperations.storeU8(offset, u8.view(value));
-                        2 => persistentOperations.storeU16(offset, u16.view(value));
-                        4 => persistentOperations.storeU32(offset, u32.view(value));
-                        8 => persistentOperations.storeU64(offset, value);
+                        1 => provider.storeU8(offset, u8.view(value));
+                        2 => provider.storeU16(offset, u16.view(value));
+                        4 => provider.storeU32(offset, u32.view(value));
+                        8 => provider.storeU64(offset, value);
                         _ => ;
                 }
         }
 
         private def computeHeaderChecksum() -> u64 {
-                def skip = logChunkAddr + u64.view(DualWalHeader.checksum.offset);
-                return checksumBytes(logChunkAddr, u64.!(DualWalHeader.size), skip, 8u64);
+                def skip = logBlockAddr + u64.view(WalHeader.checksum.offset);
+                return checksumBytes(logBlockAddr, u64.!(WalHeader.size), skip, 8u64);
         }
 
         private def computeRecordChecksum(absStart: u64, recordLen: u64) -> u64 {
-                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
-                def skip = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+                def entryCount = recordLoadU32(absStart, WalRecordHeader.entryCount.offset);
+                def skip = absStart + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size) + u64.view(WalRecordTrailer.checksum.offset);
                 return checksumBytes(absStart, recordLen, skip, 8u64);
         }
 
@@ -669,12 +670,12 @@ class DualTxnWal {
                 // field, and nothing else: observe those two ranges first.
                 def lo = if(skipStart < start, start, if(skipStart > end, end, skipStart));
                 def hi = if(skipEnd < lo, lo, if(skipEnd > end, end, skipEnd));
-                reader.observe(start, lo - start);
-                reader.observe(hi, end - hi);
+                reader.beforeLoad(start, lo - start);
+                reader.beforeLoad(hi, end - hi);
                 while (ptr < end) {
                         var b: u64 = 0u64;
                         if (!(ptr >= skipStart && ptr < skipEnd)) {
-                                b = u64.view(PWRegionUtils.pointerFromU64(ptr).load<u8>());
+                                b = u64.view(RegionUtils.pointerFromU64(ptr).load<u8>());
                         }
                         h = (h << 7) | (h >> 57);
                         h = (h ^ b) * 0x1000_0000_01B3_u64;
@@ -687,41 +688,41 @@ class DualTxnWal {
                 var ptr = start;
                 def end = start + len;
                 while (ptr < end) {
-                        persistentOperations.storeU8(ptr - regionStart, 0u8);
+                        provider.storeU8(ptr - regionStart, 0u8);
                         ptr++;
                 }
         }
 
-        def headerAt() -> Ref<DualWalHeader> {
-                return reader.forgeDualWalHeader(logChunkAddr);
+        def headerAt() -> Ref<WalHeader> {
+                return reader.forgeWalHeader(logBlockAddr);
         }
 
-        def recordHeaderAt(addr: u64) -> Ref<TxnRecordHeader> {
+        def recordHeaderAt(addr: u64) -> Ref<WalRecordHeader> {
                 return reader.forgeRecordHeader(addr);
         }
 
-        def commitTrailerAt(addr: u64) -> Ref<TxnCommitTrailer> {
-                return reader.forgeCommitTrailer(addr);
+        def recordTrailerAt(addr: u64) -> Ref<WalRecordTrailer> {
+                return reader.forgeRecordTrailer(addr);
         }
 
-        def logEntryAt(addr: u64) -> Ref<LogEntry> {
-                return reader.forgeLogEntry(addr);
+        def walEntryAt(addr: u64) -> Ref<WalEntry> {
+                return reader.forgeWalEntry(addr);
         }
 
         private def headerLoadU64(offset: int) -> u64 {
-                return reader.loadU64(logChunkAddr + u64.view(offset));
+                return reader.loadU64(logBlockAddr + u64.view(offset));
         }
 
         private def headerLoadU32(offset: int) -> u32 {
-                return reader.loadU32(logChunkAddr + u64.view(offset));
+                return reader.loadU32(logBlockAddr + u64.view(offset));
         }
 
         private def headerStoreU64(offset: int, value: u64) {
-                persistentOperations.storeU64(logChunkOffset + u64.view(offset), value);
+                provider.storeU64(logBlockOffset + u64.view(offset), value);
         }
 
         private def headerStoreU32(offset: int, value: u32) {
-                persistentOperations.storeU32(logChunkOffset + u64.view(offset), value);
+                provider.storeU32(logBlockOffset + u64.view(offset), value);
         }
 
         private def recordLoadU64(addr: u64, offset: int) -> u64 {
@@ -741,18 +742,18 @@ class DualTxnWal {
         }
 
         private def recordStoreU64(addr: u64, offset: int, value: u64) {
-                persistentOperations.storeU64(addr - regionStart + u64.view(offset), value);
+                provider.storeU64(addr - regionStart + u64.view(offset), value);
         }
 
         private def recordStoreU32(addr: u64, offset: int, value: u32) {
-                persistentOperations.storeU32(addr - regionStart + u64.view(offset), value);
+                provider.storeU32(addr - regionStart + u64.view(offset), value);
         }
 
         private def recordStoreU16(addr: u64, offset: int, value: u16) {
-                persistentOperations.storeU16(addr - regionStart + u64.view(offset), value);
+                provider.storeU16(addr - regionStart + u64.view(offset), value);
         }
 
         private def recordStoreU8(addr: u64, offset: int, value: u8) {
-                persistentOperations.storeU8(addr - regionStart + u64.view(offset), value);
+                provider.storeU8(addr - regionStart + u64.view(offset), value);
         }
 }

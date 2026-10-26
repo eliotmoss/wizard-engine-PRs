@@ -5,7 +5,7 @@
 // agrees with the full one at every cut, and that its line classes give exactly
 // the distinct images the per-line prefix vectors give.
 
-def PET = UnitTests.registerT("persistent_explore:", _, PersistentExplorerTester.new, _);
+def PET = UnitTests.registerT("crash_explorer:", _, CrashExplorerTester.new, _);
 def PETX = [
 	PET("single_store_has_two_images", test_explore_single_store_has_two_images),
 	PET("fence_forces_one_image", test_explore_fence_forces_one_image),
@@ -30,15 +30,15 @@ def PETX = [
 // the bytes of {lines}, the trace's touched lines: a function of the image, so
 // equal images share a bucket, and cheaper than digest() over the region,
 // since the images of one cut differ only there.
-class PersistentExplorerImageSet(lines: Array<u64>) {
-	def buckets = HashMap<u64, Vector<PersistentDurableImage>>.new(imageSetKey, u64.==);
+class CrashExplorerImageSet(lines: Array<u64>) {
+	def buckets = HashMap<u64, Vector<CrashImage>>.new(imageSetKey, u64.==);
 	var count = 0;
 
 	def length() -> int {
 		return count;
 	}
 
-	def contains(image: PersistentDurableImage) -> bool {
+	def contains(image: CrashImage) -> bool {
 		def bucket = buckets[key(image)];
 		if (bucket == null) return false;
 		for (i < bucket.length) if (bucket[i].sameBytes(image)) return true;
@@ -46,11 +46,11 @@ class PersistentExplorerImageSet(lines: Array<u64>) {
 	}
 
 	// True when {image} was not already present.
-	def add(image: PersistentDurableImage) -> bool {
+	def add(image: CrashImage) -> bool {
 		def k = key(image);
 		var bucket = buckets[k];
 		if (bucket == null) {
-			bucket = Vector<PersistentDurableImage>.new();
+			bucket = Vector<CrashImage>.new();
 			buckets[k] = bucket;
 		}
 		for (i < bucket.length) if (bucket[i].sameBytes(image)) return false;
@@ -59,11 +59,11 @@ class PersistentExplorerImageSet(lines: Array<u64>) {
 		return true;
 	}
 
-	private def key(image: PersistentDurableImage) -> u64 {
+	private def key(image: CrashImage) -> u64 {
 		def bytes = image.bytes;
 		var h = 0x9E37_79B9_7F4A_7C15_u64;
 		for (line in lines) {
-			var end = int.!(line) + int.!(MmapRegionUtils.CACHE_LINE_SIZE);
+			var end = int.!(line) + int.!(CacheLines.CACHE_LINE_SIZE);
 			if (end > bytes.length) end = bytes.length;
 			for (j = int.!(line); j < end; j++) {
 				def r = (h << 7) | (h >> 57);
@@ -78,27 +78,27 @@ def imageSetKey(key: u64) -> int {
 	return i32.view(key ^ (key >> 32));
 }
 
-class PersistentExplorerTester(t: Tester) {
+class CrashExplorerTester(t: Tester) {
 	def A = 0x1111_2222_3333_4444_u64;
 	def B = 0x5555_6666_7777_8888_u64;
 	def C = 0x9999_AAAA_BBBB_CCCC_u64;
 	// A budget no test trace reaches, so a search under it is complete.
 	def EXHAUSTIVE = 1 << 30;
 
-	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistentTraceEvent {
-		return PersistentTraceEvent(seq, PersistentEventKind.STORE, offset, width, value);
+	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistenceEvent {
+		return PersistenceEvent(seq, PersistenceEventKind.STORE, offset, width, value);
 	}
 
-	def clwb(seq: u64, cacheLine: u64) -> PersistentTraceEvent {
-		return PersistentTraceEvent(seq, PersistentEventKind.CLWB, cacheLine, 0u8, 0u64);
+	def clwb(seq: u64, cacheLine: u64) -> PersistenceEvent {
+		return PersistenceEvent(seq, PersistenceEventKind.CLWB, cacheLine, 0u8, 0u64);
 	}
 
-	def fence(seq: u64) -> PersistentTraceEvent {
-		return PersistentTraceEvent(seq, PersistentEventKind.SFENCE, 0u64, 0u8, 0u64);
+	def fence(seq: u64) -> PersistenceEvent {
+		return PersistenceEvent(seq, PersistenceEventKind.SFENCE, 0u64, 0u8, 0u64);
 	}
 
-	def trace(name: string, events: Array<PersistentTraceEvent>) -> PersistentTrace {
-		def result = PersistentTrace.new(name, 256u64, events);
+	def trace(name: string, events: Array<PersistenceEvent>) -> PersistenceTrace {
+		def result = PersistenceTrace.new(name, 256u64, events);
 		def check = result.validate();
 		if (!check.ok()) {
 			t.fail(check.render(StringBuilder.new().puts("test trace is not modelable: ")).toString());
@@ -106,25 +106,25 @@ class PersistentExplorerTester(t: Tester) {
 		return result;
 	}
 
-	def explore(tr: PersistentTrace, cut: int) -> PersistentExploration {
-		return PersistentExplorer.crashImages(tr, null, cut, 0);
+	def explore(tr: PersistenceTrace, cut: int) -> CrashExploration {
+		return CrashExplorer.crashImages(tr, null, cut, 0);
 	}
 
-	def reduced(tr: PersistentTrace, cut: int) -> PersistentExploration {
-		return PersistentExplorer.reducedCrashImages(tr, null, cut, 0);
+	def reduced(tr: PersistenceTrace, cut: int) -> CrashExploration {
+		return CrashExplorer.reducedCrashImages(tr, null, cut, 0);
 	}
 
 	// Same set of durable images, regardless of the order they were found in.
 	// Both searches keep each image once, byte for byte, so equal counts and
 	// containment make the sets equal.
-	def assertSameImages(expected: PersistentExploration, got: PersistentExploration) {
+	def assertSameImages(expected: CrashExploration, got: CrashExploration) {
 		t.asserti(expected.imageCount(), got.imageCount());
 		for (i < expected.images.length) t.assertz(true, got.containsImage(expected.images[i]));
 	}
 
 	// The traces the reduction is checked on, ending with one whose stores
 	// often rewrite the bytes a line already holds.
-	def reductionTraces() -> Array<PersistentTrace> {
+	def reductionTraces() -> Array<PersistenceTrace> {
 		return [
 			trace("r_one_line", [
 				store(1u64, 0u64, 8u8, A),
@@ -153,7 +153,7 @@ class PersistentExplorerTester(t: Tester) {
 	}
 
 	// Every small trace this file's tests explore, as they define them.
-	def smallTraces() -> Array<PersistentTrace> {
+	def smallTraces() -> Array<PersistenceTrace> {
 		def others = [
 			trace("one_store", [store(1u64, 8u64, 8u8, A)]),
 			trace("fenced", [store(1u64, 8u64, 8u8, A), clwb(2u64, 0u64), fence(3u64)]),
@@ -202,7 +202,7 @@ class PersistentExplorerTester(t: Tester) {
 	// Stores that rewrite a line's bytes: a zero over zero, a value stored,
 	// cleared and stored again, a fenced value rewritten, and a line whose only
 	// store changes nothing. Most of its prefix vectors repeat an image.
-	def repeatsTrace() -> PersistentTrace {
+	def repeatsTrace() -> PersistenceTrace {
 		return trace("repeats", [
 			store(1u64, 0u64, 8u8, 0u64),
 			store(2u64, 8u64, 8u8, A),
@@ -226,17 +226,17 @@ class PersistentExplorerTester(t: Tester) {
 	// lowest line's next store with writebackAt(), the machine's own forward
 	// transition, which reaches the same state. Returns the distinct images and
 	// the number of prefix vectors.
-	def prefixOdometer(tr: PersistentTrace, initial: Array<byte>,
-		cut: int) -> (PersistentExplorerImageSet, int) {
+	def prefixOdometer(tr: PersistenceTrace, initial: Array<byte>,
+		cut: int) -> (CrashExplorerImageSet, int) {
 
-		def m = PersistentCrashMachine.new(tr, initial);
+		def m = CrashModel.new(tr, initial);
 		m.runTo(cut);
 		def floor = m.snapshot();
 		def lines = m.lineCount();
 		def counts = Arrays.dup(floor.durableCounts);
 		def limits = Array<int>.new(lines);
 		for (i < lines) limits[i] = m.storesInLine(i);
-		def distinct = PersistentExplorerImageSet.new(tr.touchedLines());
+		def distinct = CrashExplorerImageSet.new(tr.touchedLines());
 		var states = 0;
 		var more = true;
 		while (more) {
@@ -248,7 +248,7 @@ class PersistentExplorerTester(t: Tester) {
 					counts[i]++;
 					more = true;
 					if (i == 0) m.writebackAt(0, counts[0]);
-					else m.restore(PersistentMachineState.new(floor.pos, Arrays.dup(counts), floor.requiredCounts));
+					else m.restore(CrashModelState.new(floor.pos, Arrays.dup(counts), floor.requiredCounts));
 					break;
 				}
 				counts[i] = floor.durableCounts[i];
@@ -264,8 +264,8 @@ class PersistentExplorerTester(t: Tester) {
 	// prefixes and every other line at its floor: the distinct contents in
 	// order of first appearance, each at its least prefix. Returns the old
 	// odometer's prefix vectors and distinct images.
-	def assertClassesMatchOdometer(tr: PersistentTrace, initial: Array<byte>, cut: int) -> (int, int) {
-		def got = PersistentExplorer.reducedCrashImages(tr, initial, cut, EXHAUSTIVE);
+	def assertClassesMatchOdometer(tr: PersistenceTrace, initial: Array<byte>, cut: int) -> (int, int) {
+		def got = CrashExplorer.reducedCrashImages(tr, initial, cut, EXHAUSTIVE);
 		def expected = prefixOdometer(tr, initial, cut);
 		def old = expected.0, states = expected.1;
 		t.assertz(false, got.truncated);
@@ -273,16 +273,16 @@ class PersistentExplorerTester(t: Tester) {
 		t.asserti(got.imageCount(), got.statesVisited);
 		t.assert_eq(long.!(old.length()), got.classProduct);
 		t.assert_eq(long.!(states), got.product);
-		def mine = PersistentExplorerImageSet.new(tr.touchedLines());
+		def mine = CrashExplorerImageSet.new(tr.touchedLines());
 		for (i < got.images.length) {
 			t.assertz(true, old.contains(got.images[i]));
 			t.assertz(true, mine.add(got.images[i]));
 		}
-		def lazy = PersistentImages.lazyCrash(tr, initial, cut);
+		def lazy = CrashImages.lazyCrash(tr, initial, cut);
 		t.assertz(true, got.imageCount() > 0 && got.images[0].sameBytes(lazy));
 
-		def classes = PersistentExplorer.lineClasses(tr, initial, cut);
-		def m = PersistentCrashMachine.new(tr, initial);
+		def classes = CrashExplorer.lineClasses(tr, initial, cut);
+		def m = CrashModel.new(tr, initial);
 		m.runTo(cut);
 		def floor = m.snapshot();
 		t.asserti(m.lineCount(), classes.length);
@@ -292,14 +292,14 @@ class PersistentExplorerTester(t: Tester) {
 			t.asserti(floor.durableCounts[i], c.floor);
 			t.asserti(m.storesInLine(i), c.last);
 			def start = int.!(c.line);
-			var end = start + int.!(MmapRegionUtils.CACHE_LINE_SIZE);
+			var end = start + int.!(CacheLines.CACHE_LINE_SIZE);
 			if (end > lazy.size()) end = lazy.size();
 			def prefixes = Vector<int>.new();
 			def contents = Vector<Array<byte>>.new();
 			for (p = c.floor; p <= c.last; p++) {
 				def counts = Arrays.dup(floor.durableCounts);
 				counts[i] = p;
-				m.restore(PersistentMachineState.new(floor.pos, counts, floor.requiredCounts));
+				m.restore(CrashModelState.new(floor.pos, counts, floor.requiredCounts));
 				def bytes = Arrays.range(m.crash().bytes, start, end);
 				var seen = false;
 				for (k < contents.length) if (Arrays.equal(contents[k], bytes)) seen = true;
@@ -319,8 +319,8 @@ class PersistentExplorerTester(t: Tester) {
 
 	// Four lines, each holding three stores of different values and nothing
 	// fenced, so each line has four contents and the cut 4^4 = 256 images.
-	def fourLinesTrace() -> PersistentTrace {
-		def events = Vector<PersistentTraceEvent>.new();
+	def fourLinesTrace() -> PersistenceTrace {
+		def events = Vector<PersistenceEvent>.new();
 		var seq = 1u64;
 		for (k < 3) {
 			for (line < 4) {
@@ -334,40 +334,40 @@ class PersistentExplorerTester(t: Tester) {
 
 	// The image whose line i holds the class {choice[i]} of {classes}, built by
 	// the machine: every line drained to that class's least prefix.
-	def imageOf(tr: PersistentTrace, cut: int, classes: Array<PersistentLineClasses>,
-		choice: Array<int>) -> PersistentDurableImage {
+	def imageOf(tr: PersistenceTrace, cut: int, classes: Array<CrashLineClasses>,
+		choice: Array<int>) -> CrashImage {
 
-		def m = PersistentCrashMachine.new(tr, null);
+		def m = CrashModel.new(tr, null);
 		m.runTo(cut);
 		def floor = m.snapshot();
 		def counts = Array<int>.new(classes.length);
 		for (i < counts.length) counts[i] = classes[i].prefixes[choice[i]];
-		m.restore(PersistentMachineState.new(floor.pos, counts, floor.requiredCounts));
+		m.restore(CrashModelState.new(floor.pos, counts, floor.requiredCounts));
 		return m.crash();
 	}
 
-	def sameSequence(a: PersistentExploration, b: PersistentExploration) -> bool {
+	def sameSequence(a: CrashExploration, b: CrashExploration) -> bool {
 		if (a.images.length != b.images.length) return false;
 		for (i < a.images.length) if (!a.images[i].sameBytes(b.images[i])) return false;
 		return true;
 	}
 
 	// Record one real commit -- append and commit, no apply -- through the
-	// production WAL, as persistent_recovery: does, and the bytes that were
+	// production WAL, as crash_recovery: does, and the bytes that were
 	// durable before it: the WAL header the constructor persisted.
-	def recordOneCommit() -> (PersistentTrace, Array<byte>) {
+	def recordOneCommit() -> (PersistenceTrace, Array<byte>) {
 		def region = makePmemRegion();
 		if (region == null) return (null, null);
-		def recorder = RecordingPersistentOperations.!(region.persistentOperations());
+		def recorder = RecordingProvider.!(region.provider());
 		def base = u64.view(Pointer.atElement(region.range, 0));
-		def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+		def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 		def mounted = Array<byte>.new(region.range.length);
 		for (i < mounted.length) mounted[i] = region.range[i];
 		recorder.clear();
 		var ok = wal.append(200u64, 0x8877_6655_4433_2211_u64, 8u8);
 		ok = ok && wal.commit() == 1u64;
 		def tr = recorder.snapshot("dual_wal_commit");
-		region.destroy();
+		region.close();
 		if (!ok || !tr.validate().ok()) return (null, null);
 		return (tr, mounted);
 	}
@@ -385,7 +385,7 @@ class PersistentExplorerTester(t: Tester) {
 
 	// Program order within a line: the second store can only be durable if the
 	// first one is. Holds on every image the model produces.
-	def orderedProperty(image: PersistentDurableImage) -> string {
+	def orderedProperty(image: CrashImage) -> string {
 		if (image.read(8u64, 8) != 0u64 && image.read(0u64, 8) != A) {
 			return "second store durable without the first";
 		}
@@ -393,30 +393,30 @@ class PersistentExplorerTester(t: Tester) {
 	}
 
 	// Fails on any image whose line 192 holds the last value stored there.
-	def lastValueAbsent(image: PersistentDurableImage) -> string {
+	def lastValueAbsent(image: CrashImage) -> string {
 		if (image.read(208u64, 8) == u64.!(1 + 16 * 3 + 2)) return "line 192 holds its last value";
 		return null;
 	}
 
 	// Deliberately too strong: an unflushed store is not durable on every
 	// schedule, so this fails on exactly the images that dropped it.
-	def durableProperty(image: PersistentDurableImage) -> string {
+	def durableProperty(image: CrashImage) -> string {
 		if (image.read(0u64, 8) != A) return "first store absent";
 		return null;
 	}
 
-	def makePmemRegion() -> PmemMmapRegion {
+	def makePmemRegion() -> PmemRegion {
 		def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
-		def region = PmemMmapRegion.new(mapping, -1);
-		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		def region = PmemRegion.new(mapping, -1);
+		region.setProvider(RecordingProvider.new(region.range));
 		return region;
 	}
 }
 
 // One unflushed store is one bit of freedom: the crash either caught the
 // eviction or it did not.
-def test_explore_single_store_has_two_images(tc: PersistentExplorerTester) {
+def test_explore_single_store_has_two_images(tc: CrashExplorerTester) {
 	def tr = tc.trace("one_store", [tc.store(1u64, 8u64, 8u8, tc.A)]);
 
 	def before = tc.explore(tr, 0);
@@ -425,8 +425,8 @@ def test_explore_single_store_has_two_images(tc: PersistentExplorerTester) {
 
 	def after = tc.explore(tr, 1);
 	tc.t.asserti(2, after.imageCount());
-	tc.t.assertz(true, after.containsImage(PersistentImages.lazyCrash(tr, null, 1)));
-	tc.t.assertz(true, after.containsImage(PersistentImages.eagerCrash(tr, null, 1)));
+	tc.t.assertz(true, after.containsImage(CrashImages.lazyCrash(tr, null, 1)));
+	tc.t.assertz(true, after.containsImage(CrashImages.eagerCrash(tr, null, 1)));
 	// Three states: nothing done, the store executed, the store written back.
 	tc.t.asserti(3, after.statesVisited);
 }
@@ -434,7 +434,7 @@ def test_explore_single_store_has_two_images(tc: PersistentExplorerTester) {
 // A completed fence removes the freedom it covers: after it, the store is
 // durable on every schedule, so the cut has exactly one image. This is what
 // makes the WAL's commit point a commit point.
-def test_explore_fence_forces_one_image(tc: PersistentExplorerTester) {
+def test_explore_fence_forces_one_image(tc: CrashExplorerTester) {
 	def tr = tc.trace("fenced", [
 		tc.store(1u64, 8u64, 8u8, tc.A),
 		tc.clwb(2u64, 0u64),
@@ -451,7 +451,7 @@ def test_explore_fence_forces_one_image(tc: PersistentExplorerTester) {
 
 // Different cache lines are independent, so their freedom multiplies rather
 // than being decided together by one all-or-nothing flush.
-def test_explore_independent_lines_multiply(tc: PersistentExplorerTester) {
+def test_explore_independent_lines_multiply(tc: CrashExplorerTester) {
 	def tr = tc.trace("two_lines", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 128u64, 8u8, tc.B)
@@ -474,7 +474,7 @@ def test_explore_independent_lines_multiply(tc: PersistentExplorerTester) {
 // A line's writeback may stop after any of its stores, so three stores on one
 // line give four images -- the partially constructed WAL record states the
 // model must not collapse away.
-def test_explore_torn_prefixes_enumerated(tc: PersistentExplorerTester) {
+def test_explore_torn_prefixes_enumerated(tc: CrashExplorerTester) {
 	def tr = tc.trace("one_line_three_stores", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 8u64, 8u8, tc.B),
@@ -494,7 +494,7 @@ def test_explore_torn_prefixes_enumerated(tc: PersistentExplorerTester) {
 
 // A fence sets a floor, not a ceiling: stores made after the CLWB on the same
 // line stay free, so the cut keeps exactly the freedom the protocol left open.
-def test_explore_fence_floor_limits_later_stores(tc: PersistentExplorerTester) {
+def test_explore_fence_floor_limits_later_stores(tc: CrashExplorerTester) {
 	def tr = tc.trace("floor", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.clwb(2u64, 0u64),
@@ -505,14 +505,14 @@ def test_explore_fence_floor_limits_later_stores(tc: PersistentExplorerTester) {
 	def all = tc.explore(tr, 4);
 	tc.t.asserti(2, all.imageCount());
 	for (i < all.images.length) tc.t.assert_eq(tc.A, all.images[i].read(0u64, 8));
-	tc.t.assertz(true, all.containsImage(PersistentImages.lazyCrash(tr, null, 4)));
-	tc.t.assertz(true, all.containsImage(PersistentImages.eagerCrash(tr, null, 4)));
+	tc.t.assertz(true, all.containsImage(CrashImages.lazyCrash(tr, null, 4)));
+	tc.t.assertz(true, all.containsImage(CrashImages.eagerCrash(tr, null, 4)));
 }
 
 // The two canonical schedules are the extremes of the search, so an exploration
 // that lost either of them has lost the weakest and strongest images recovery
 // must cope with.
-def test_explore_brackets_lazy_and_eager(tc: PersistentExplorerTester) {
+def test_explore_brackets_lazy_and_eager(tc: CrashExplorerTester) {
 	def tr = tc.trace("mixed", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.clwb(2u64, 0u64),
@@ -524,15 +524,15 @@ def test_explore_brackets_lazy_and_eager(tc: PersistentExplorerTester) {
 	for (cut < tr.length() + 1) {
 		def all = tc.explore(tr, cut);
 		tc.t.assertz(false, all.truncated);
-		tc.t.assertz(true, all.containsImage(PersistentImages.lazyCrash(tr, null, cut)));
-		tc.t.assertz(true, all.containsImage(PersistentImages.eagerCrash(tr, null, cut)));
+		tc.t.assertz(true, all.containsImage(CrashImages.lazyCrash(tr, null, cut)));
+		tc.t.assertz(true, all.containsImage(CrashImages.eagerCrash(tr, null, cut)));
 	}
 }
 
 // The reduction claim, checked rather than argued: replaying with no voluntary
 // writeback and then enumerating per-line prefixes above the fence-forced floor
 // reaches exactly the images the full branching search reaches.
-def test_explore_reduction_agrees_with_full_search(tc: PersistentExplorerTester) {
+def test_explore_reduction_agrees_with_full_search(tc: CrashExplorerTester) {
 	def traces = tc.reductionTraces();
 	for (i < traces.length) {
 		def tr = traces[i];
@@ -550,7 +550,7 @@ def test_explore_reduction_agrees_with_full_search(tc: PersistentExplorerTester)
 
 // A search that ran out of budget must say so: a truncated exploration is not
 // evidence that no other image exists.
-def test_explore_budget_truncates_and_reports(tc: PersistentExplorerTester) {
+def test_explore_budget_truncates_and_reports(tc: CrashExplorerTester) {
 	def tr = tc.trace("budgeted", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 8u64, 8u8, tc.B),
@@ -563,11 +563,11 @@ def test_explore_budget_truncates_and_reports(tc: PersistentExplorerTester) {
 	// Three lines, one holding two stores: 3 * 2 * 2 prefix combinations.
 	tc.t.asserti(12, complete.imageCount());
 
-	def capped = PersistentExplorer.crashImages(tr, null, 4, 4);
+	def capped = CrashExplorer.crashImages(tr, null, 4, 4);
 	tc.t.assertz(true, capped.truncated);
 	tc.t.assertz(true, capped.imageCount() <= complete.imageCount());
 
-	def cappedReduced = PersistentExplorer.reducedCrashImages(tr, null, 4, 2);
+	def cappedReduced = CrashExplorer.reducedCrashImages(tr, null, 4, 2);
 	tc.t.assertz(true, cappedReduced.truncated);
 	tc.t.asserti(2, cappedReduced.imageCount());
 
@@ -585,36 +585,36 @@ def test_explore_budget_truncates_and_reports(tc: PersistentExplorerTester) {
 // record is durable on every schedule while the after-image has not been
 // written yet, and once the scenario has flushed and fenced every line it
 // touched the cut has exactly one image.
-def test_explore_real_wal_images_at_boundaries(tc: PersistentExplorerTester) {
+def test_explore_real_wal_images_at_boundaries(tc: CrashExplorerTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("trace mapping allocation failed");
 		return;
 	}
-	def recorder = RecordingPersistentOperations.!(region.persistentOperations());
+	def recorder = RecordingProvider.!(region.provider());
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 
 	def value = 0x8877_6655_4433_2211_u64;
 	recorder.clear();
 	tc.t.assertz(true, wal.append(200u64, value, 8u8));
 	tc.t.assert_eq(1u64, wal.commit());
-	tc.t.assertz(true, wal.applyUpdate(200u64, value, 8u8));
-	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assertz(true, wal.applyAfterImage(200u64, value, 8u8));
+	tc.t.assertz(true, wal.persistAfterImages());
 	def tr = recorder.snapshot("dual_wal_commit_apply_flush");
 	tc.t.assertz(true, tr.validate().ok());
 
 	// Everything touched has been flushed and fenced, so no freedom is left.
-	def atEnd = PersistentExplorer.reducedCrashImages(tr, null, tr.length(), 0);
+	def atEnd = CrashExplorer.reducedCrashImages(tr, null, tr.length(), 0);
 	tc.t.assertz(false, atEnd.truncated);
 	tc.t.asserti(1, atEnd.imageCount());
 	tc.t.assert_eq(value, atEnd.images[0].read(200u64, 8));
-	tc.t.assertz(true, atEnd.containsImage(PersistentImages.lazyCrash(tr, null, tr.length())));
+	tc.t.assertz(true, atEnd.containsImage(CrashImages.lazyCrash(tr, null, tr.length())));
 
 	// At the commit point the record is durable on every schedule; the
 	// after-image has not been stored yet, so no image can contain it.
 	def commitFence = tr.length() - 3;
-	def atCommit = PersistentExplorer.reducedCrashImages(tr, null, commitFence, 0);
+	def atCommit = CrashExplorer.reducedCrashImages(tr, null, commitFence, 0);
 	tc.t.assertz(false, atCommit.truncated);
 	tc.t.asserti(1, atCommit.imageCount());
 	tc.t.assertz(false, 0u64 == atCommit.images[0].read(1536u64, 8));
@@ -622,29 +622,29 @@ def test_explore_real_wal_images_at_boundaries(tc: PersistentExplorerTester) {
 
 	// One event later the after-image exists but is unflushed: two images, and
 	// the record survives in both.
-	def applied = PersistentExplorer.reducedCrashImages(tr, null, commitFence + 1, 0);
+	def applied = CrashExplorer.reducedCrashImages(tr, null, commitFence + 1, 0);
 	tc.t.asserti(2, applied.imageCount());
 	for (i < applied.images.length) {
 		tc.t.assertz(false, 0u64 == applied.images[i].read(1536u64, 8));
 	}
-	tc.t.assertz(true, applied.containsImage(PersistentImages.lazyCrash(tr, null, commitFence + 1)));
-	tc.t.assertz(true, applied.containsImage(PersistentImages.eagerCrash(tr, null, commitFence + 1)));
-	region.destroy();
+	tc.t.assertz(true, applied.containsImage(CrashImages.lazyCrash(tr, null, commitFence + 1)));
+	tc.t.assertz(true, applied.containsImage(CrashImages.eagerCrash(tr, null, commitFence + 1)));
+	region.close();
 }
 
 
 // A property that holds is reported as holding over every image the cut permits
 // -- and only counts as evidence when the search that produced them was
 // complete.
-def test_explore_property_holds_over_every_image(tc: PersistentExplorerTester) {
+def test_explore_property_holds_over_every_image(tc: CrashExplorerTester) {
 	def tr = tc.trace("ordered", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 8u64, 8u8, tc.B)
 	]);
-	def property = PersistentImageProperty.new("same-line stores persist in order",
+	def property = CrashImageProperty.new("same-line stores persist in order",
 		0u64, 16, tc.orderedProperty);
 
-	def result = PersistentExplorer.checkImages(tr, null, 2, 0, property);
+	def result = CrashExplorer.checkImages(tr, null, 2, 0, property);
 	tc.t.assertz(true, result.ok());
 	tc.t.assertz(true, result.exhaustive());
 	tc.t.asserti(3, result.imagesChecked);
@@ -652,7 +652,7 @@ def test_explore_property_holds_over_every_image(tc: PersistentExplorerTester) {
 	// With no counterexample the artifact is the exploration summary.
 	tc.t.asserti(1, tc.countOf(result.toArtifact(), "truncated=false"));
 
-	def sweep = PersistentExplorer.checkAllCuts(tr, null, 0, property);
+	def sweep = CrashExplorer.checkAllCuts(tr, null, 0, property);
 	tc.t.assertz(true, sweep.exhaustive());
 	// Cuts 0, 1 and 2 permit 1, 2 and 3 images.
 	tc.t.asserti(6, sweep.imagesChecked);
@@ -661,12 +661,12 @@ def test_explore_property_holds_over_every_image(tc: PersistentExplorerTester) {
 // A failing property becomes a stored counterexample: the failing durable
 // bytes, the schedule prefix that produced them, and a window of the region
 // worth reading.
-def test_explore_property_failure_becomes_counterexample(tc: PersistentExplorerTester) {
+def test_explore_property_failure_becomes_counterexample(tc: CrashExplorerTester) {
 	def tr = tc.trace("unflushed", [tc.store(1u64, 0u64, 8u8, tc.A)]);
-	def property = PersistentImageProperty.new("first store survives", 0u64, 16,
+	def property = CrashImageProperty.new("first store survives", 0u64, 16,
 		tc.durableProperty);
 
-	def result = PersistentExplorer.checkImages(tr, null, 1, 0, property);
+	def result = CrashExplorer.checkImages(tr, null, 1, 0, property);
 	tc.t.assertz(false, result.ok());
 	tc.t.assertz(false, result.exhaustive());
 	tc.t.assertz(false, result.truncated);
@@ -677,8 +677,8 @@ def test_explore_property_failure_becomes_counterexample(tc: PersistentExplorerT
 	tc.t.assert_string("first store absent", cx.detail);
 	tc.t.asserti(1, cx.crashAfter);
 	// The image it carries is the one that dropped the store: the lazy schedule.
-	tc.t.assert_eq(PersistentImages.lazyCrash(tr, null, 1).digest(), cx.durableImage().digest());
-	tc.t.assertz(false, PersistentImages.eagerCrash(tr, null, 1).digest() == cx.durableImage().digest());
+	tc.t.assert_eq(CrashImages.lazyCrash(tr, null, 1).digest(), cx.durableImage().digest());
+	tc.t.assertz(false, CrashImages.eagerCrash(tr, null, 1).digest() == cx.durableImage().digest());
 
 	def artifact = cx.toArtifact();
 	tc.t.asserti(1, tc.countOf(artifact, "detail: first store absent"));
@@ -690,17 +690,17 @@ def test_explore_property_failure_becomes_counterexample(tc: PersistentExplorerT
 
 // Sweeping every cut reports the earliest one at which the property can fail,
 // which is the cut worth reading: later failures are usually the same hole.
-def test_explore_all_cuts_reports_earliest_failure(tc: PersistentExplorerTester) {
+def test_explore_all_cuts_reports_earliest_failure(tc: CrashExplorerTester) {
 	def tr = tc.trace("late_failure", [
 		tc.store(1u64, 64u64, 8u8, tc.B),
 		tc.store(2u64, 0u64, 8u8, tc.A),
 		tc.clwb(3u64, 0u64),
 		tc.fence(4u64)
 	]);
-	def property = PersistentImageProperty.new("first store survives", 0u64, 8,
+	def property = CrashImageProperty.new("first store survives", 0u64, 8,
 		tc.durableProperty);
 
-	def sweep = PersistentExplorer.checkAllCuts(tr, null, 0, property);
+	def sweep = CrashExplorer.checkAllCuts(tr, null, 0, property);
 	tc.t.assertz(false, sweep.ok());
 	// Cuts 0 and 1 have no store at offset 0 at all, so they fail first.
 	tc.t.asserti(0, sweep.counterexample.crashAfter);
@@ -708,29 +708,29 @@ def test_explore_all_cuts_reports_earliest_failure(tc: PersistentExplorerTester)
 
 	// Once the fence has completed, the store is durable on every schedule, so
 	// the same property holds at that cut.
-	def atFence = PersistentExplorer.checkImages(tr, null, 4, 0, property);
+	def atFence = CrashExplorer.checkImages(tr, null, 4, 0, property);
 	tc.t.assertz(true, atFence.exhaustive());
 	tc.t.asserti(2, atFence.exploration.imageCount());
 }
 
 // A budget that stopped the search is not a proof: the result says so even when
 // every image it did check passed.
-def test_explore_truncated_search_is_not_evidence(tc: PersistentExplorerTester) {
+def test_explore_truncated_search_is_not_evidence(tc: CrashExplorerTester) {
 	def tr = tc.trace("budgeted_check", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 8u64, 8u8, tc.B),
 		tc.store(3u64, 64u64, 8u8, tc.C)
 	]);
-	def property = PersistentImageProperty.new("same-line stores persist in order",
+	def property = CrashImageProperty.new("same-line stores persist in order",
 		0u64, 16, tc.orderedProperty);
 
-	def capped = PersistentExplorer.checkImages(tr, null, 3, 2, property);
+	def capped = CrashExplorer.checkImages(tr, null, 3, 2, property);
 	tc.t.assertz(true, capped.ok());
 	tc.t.assertz(true, capped.truncated);
 	tc.t.assertz(false, capped.exhaustive());
 	tc.t.asserti(2, capped.imagesChecked);
 
-	def complete = PersistentExplorer.checkImages(tr, null, 3, 0, property);
+	def complete = CrashExplorer.checkImages(tr, null, 3, 0, property);
 	tc.t.assertz(true, complete.exhaustive());
 	tc.t.asserti(6, complete.imagesChecked);
 }
@@ -740,40 +740,40 @@ def test_explore_truncated_search_is_not_evidence(tc: PersistentExplorerTester) 
 // range must check the cuts it was given and no others: the property that fails
 // at the start of this trace holds from the fence on, and asking for that
 // suffix must not drag the earlier cuts back in. Ends outside the trace clamp.
-def test_explore_cut_range_checks_only_its_cuts(tc: PersistentExplorerTester) {
+def test_explore_cut_range_checks_only_its_cuts(tc: CrashExplorerTester) {
 	def tr = tc.trace("late_failure", [
 		tc.store(1u64, 64u64, 8u8, tc.B),
 		tc.store(2u64, 0u64, 8u8, tc.A),
 		tc.clwb(3u64, 0u64),
 		tc.fence(4u64)
 	]);
-	def property = PersistentImageProperty.new("first store survives", 0u64, 8,
+	def property = CrashImageProperty.new("first store survives", 0u64, 8,
 		tc.durableProperty);
 
 	// From the fence onward the store is durable on every schedule.
-	def suffix = PersistentExplorer.checkCutRange(tr, null, 4, 99, 0, property);
+	def suffix = CrashExplorer.checkCutRange(tr, null, 4, 99, 0, property);
 	tc.t.assertz(true, suffix.exhaustive());
 
 	// A range that reaches back before the fence fails at its own earliest cut,
 	// not at the trace's.
-	def wider = PersistentExplorer.checkCutRange(tr, null, 2, 4, 0, property);
+	def wider = CrashExplorer.checkCutRange(tr, null, 2, 4, 0, property);
 	tc.t.assertz(false, wider.ok());
 	tc.t.asserti(2, wider.counterexample.crashAfter);
 
 	// The whole trace is the range 0..length, and delegating to it must not
 	// change what the sweep reports.
-	def all = PersistentExplorer.checkAllCuts(tr, null, 0, property);
-	def same = PersistentExplorer.checkCutRange(tr, null, 0, tr.length(), 0, property);
+	def all = CrashExplorer.checkAllCuts(tr, null, 0, property);
+	def same = CrashExplorer.checkCutRange(tr, null, 0, tr.length(), 0, property);
 	tc.t.asserti(all.counterexample.crashAfter, same.counterexample.crashAfter);
 	tc.t.asserti(all.imagesChecked, same.imagesChecked);
 }
 
 // The line classes, checked against the enumeration they replace. At every cut
-// of this file's traces, and at sampled cuts of a recorded one-commit DualTxnWal
+// of this file's traces, and at sampled cuts of a recorded one-commit TwoSlotWal
 // trace, the reduced search's images are exactly the distinct images of the old
 // prefix odometer, each once; its count is that odometer's number of distinct
 // images and its {product} that odometer's number of prefix vectors.
-def test_explore_line_classes_equal_distinct_images(tc: PersistentExplorerTester) {
+def test_explore_line_classes_equal_distinct_images(tc: CrashExplorerTester) {
 	def traces = tc.smallTraces();
 	for (i < traces.length) {
 		def tr = traces[i];
@@ -783,7 +783,7 @@ def test_explore_line_classes_equal_distinct_images(tc: PersistentExplorerTester
 	// The repeats trace at its last cut: five prefixes of line 0 give two
 	// contents, three of line 64 give two, and two of line 128 give one.
 	def repeats = tc.repeatsTrace();
-	def end = PersistentExplorer.reducedCrashImages(repeats, null, repeats.length(), 0);
+	def end = CrashExplorer.reducedCrashImages(repeats, null, repeats.length(), 0);
 	tc.t.assert_eq(30L, end.product);
 	tc.t.assert_eq(4L, end.classProduct);
 	tc.t.asserti(4, end.imageCount());
@@ -821,22 +821,22 @@ def test_explore_line_classes_equal_distinct_images(tc: PersistentExplorerTester
 // rest at theirs; then to images drawn at random with a seed derived from the
 // trace and the cut. The selection holds only images the cut admits, each once,
 // and the same seed gives the same images in the same order.
-def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: PersistentExplorerTester) {
+def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: CrashExplorerTester) {
 	def tr = tc.fourLinesTrace();
 	def cut = tr.length();
-	def all = PersistentExplorer.reducedCrashImages(tr, null, cut, tc.EXHAUSTIVE);
+	def all = CrashExplorer.reducedCrashImages(tr, null, cut, tc.EXHAUSTIVE);
 	tc.t.assertz(false, all.truncated);
 	tc.t.asserti(256, all.imageCount());
-	def classes = PersistentExplorer.lineClasses(tr, null, cut);
+	def classes = CrashExplorer.lineClasses(tr, null, cut);
 	tc.t.asserti(4, classes.length);
 	for (c in classes) tc.t.asserti(4, c.count());
 
-	def got = PersistentExplorer.reducedCrashImages(tr, null, cut, 16);
+	def got = CrashExplorer.reducedCrashImages(tr, null, cut, 16);
 	tc.t.assertz(true, got.truncated);
 	tc.t.asserti(16, got.imageCount());
 	tc.t.assert_eq(256L, got.classProduct);
-	tc.t.assert_eq(PersistentExplorer.selectionSeed(tr, cut), got.seed);
-	def seen = PersistentExplorerImageSet.new(tr.touchedLines());
+	tc.t.assert_eq(CrashExplorer.selectionSeed(tr, cut), got.seed);
+	def seen = CrashExplorerImageSet.new(tr.touchedLines());
 	for (i < got.images.length) {
 		tc.t.assertz(true, all.containsImage(got.images[i]));
 		tc.t.assertz(true, seen.add(got.images[i]));
@@ -844,8 +844,8 @@ def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: Per
 
 	// The extremes, in order: lazy, eager, then each line alone at its last
 	// content, then each line one below its last with the rest at theirs.
-	tc.t.assertz(true, got.images[0].sameBytes(PersistentImages.lazyCrash(tr, null, cut)));
-	tc.t.assertz(true, got.images[1].sameBytes(PersistentImages.eagerCrash(tr, null, cut)));
+	tc.t.assertz(true, got.images[0].sameBytes(CrashImages.lazyCrash(tr, null, cut)));
+	tc.t.assertz(true, got.images[1].sameBytes(CrashImages.eagerCrash(tr, null, cut)));
 	for (i < 4) {
 		def alone = Array<int>.new(4);
 		alone[i] = 3;
@@ -858,10 +858,10 @@ def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: Per
 	// Reproducible: the derived seed replays through selectCrashImages(), a
 	// second run gives the same sequence, and another seed keeps the extremes
 	// but draws a different random tail.
-	def replay = PersistentExplorer.selectCrashImages(tr, null, cut, 16, got.seed);
+	def replay = CrashExplorer.selectCrashImages(tr, null, cut, 16, got.seed);
 	tc.t.assertz(true, tc.sameSequence(got, replay));
-	tc.t.assertz(true, tc.sameSequence(got, PersistentExplorer.reducedCrashImages(tr, null, cut, 16)));
-	def other = PersistentExplorer.selectCrashImages(tr, null, cut, 16, got.seed + 1u64);
+	tc.t.assertz(true, tc.sameSequence(got, CrashExplorer.reducedCrashImages(tr, null, cut, 16)));
+	def other = CrashExplorer.selectCrashImages(tr, null, cut, 16, got.seed + 1u64);
 	tc.t.asserti(16, other.imageCount());
 	for (i < 10) tc.t.assertz(true, other.images[i].sameBytes(got.images[i]));
 	var differ = false;
@@ -870,13 +870,13 @@ def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: Per
 
 	// A budget below the extremes' count stops them in order, and a budget of
 	// every image but one still draws distinct images to the end.
-	def three = PersistentExplorer.reducedCrashImages(tr, null, cut, 3);
+	def three = CrashExplorer.reducedCrashImages(tr, null, cut, 3);
 	tc.t.asserti(3, three.imageCount());
 	for (i < 3) tc.t.assertz(true, three.images[i].sameBytes(got.images[i]));
-	def most = PersistentExplorer.reducedCrashImages(tr, null, cut, 255);
+	def most = CrashExplorer.reducedCrashImages(tr, null, cut, 255);
 	tc.t.assertz(true, most.truncated);
 	tc.t.asserti(255, most.imageCount());
-	def mostSeen = PersistentExplorerImageSet.new(tr.touchedLines());
+	def mostSeen = CrashExplorerImageSet.new(tr.touchedLines());
 	for (i < most.images.length) {
 		tc.t.assertz(true, all.containsImage(most.images[i]));
 		tc.t.assertz(true, mostSeen.add(most.images[i]));
@@ -884,9 +884,9 @@ def test_explore_over_budget_selection_takes_extremes_then_seeded_random(tc: Per
 
 	// A sweep's counterexample names the failing image's place in the
 	// selection and the seed, so the same search finds it again.
-	def property = PersistentImageProperty.new("line 192 never holds its last value", 192u64, 8,
+	def property = CrashImageProperty.new("line 192 never holds its last value", 192u64, 8,
 		tc.lastValueAbsent);
-	def result = PersistentExplorer.checkImages(tr, null, cut, 4, property);
+	def result = CrashExplorer.checkImages(tr, null, cut, 4, property);
 	tc.t.assertz(false, result.ok());
 	// The eager image is the second one taken.
 	tc.t.asserti(2, result.imagesChecked);

@@ -15,7 +15,7 @@ def DIO_WUNTRACED = 2;
 def DIO_RW = BackendProt.READ.mask | BackendProt.WRITE.mask;
 def DIO_UNIT = 4096u64;
 def DIO_RAW_UNITS = 8u64;              // raw-region tests: 8 units, 32 KiB
-def DIO_BLOCKS = 8u64;                 // PWRegion tests: 8 blocks
+def DIO_BLOCKS = 8u64;                 // RegionAllocator tests: 8 blocks
 
 def DT = UnitTests.registerT("direct_io:", _, DirectIoTester.new, _);
 def DX = [
@@ -59,10 +59,10 @@ component DirectIoTestPaths {
                 probed = true;
                 for (d in CANDIDATES) {
                         def p = join(d, "wiz_test_direct_probe");
-                        RegionFileIO.unlink(p);
-                        def region = DirectIoBackend.new(p, DirectIoTarget.FILE).create(DIO_UNIT, DIO_RW, true);
-                        if (region != null) region.destroy();
-                        RegionFileIO.unlink(p);
+                        BackingFile.unlink(p);
+                        def region = DirectIoBackend.new(p, DirectIoTarget.FILE).open(DIO_UNIT, DIO_RW, OpenMode.FORMAT);
+                        if (region != null) region.close();
+                        BackingFile.unlink(p);
                         if (region != null) {
                                 chosen = d;
                                 break;
@@ -92,7 +92,7 @@ class ProbeDirectRegion extends DirectIoRegion {
         var failNextWrite = false;
         var failNextSync = false;
         var stopAfterSyncs = 0;
-        var recorder: RecordingPersistentOperations;
+        var recorder: RecordingProvider;
         def snapshotCuts = Vector<int>.new();
         def snapshotFiles = Vector<Array<byte>>.new();
 
@@ -141,8 +141,8 @@ class ProbeDirectBackend extends DirectIoBackend {
         def makeDirectRegion(mapping: Mapping, fd: int, blockDevice: bool) -> DirectIoRegion {
                 def region = ProbeDirectRegion.new(mapping, fd, blockDevice, path);
                 if (record) {
-                        region.recorder = RecordingPersistentOperations.new(region.range);
-                        region.wrapProvider(region.recorder);
+                        region.recorder = RecordingProvider.new(region.range);
+                        region.setInnerProvider(region.recorder);
                 }
                 last = region;
                 return region;
@@ -152,9 +152,9 @@ class ProbeDirectBackend extends DirectIoBackend {
 class DirectIoTester(t: Tester) {
         def path = DirectIoTestPaths.path("wiz_test_direct_region");
         def contrastPath = DirectIoTestPaths.path("wiz_test_direct_contrast");
-        var raw: BackendRegion;
-        var other: BackendRegion;
-        var pw: PWRegion;
+        var raw: StorageRegion;
+        var other: StorageRegion;
+        var pw: RegionAllocator;
 
         new() {
                 unlinkAll();
@@ -179,13 +179,13 @@ class DirectIoTester(t: Tester) {
         // A raw region of DIO_RAW_UNITS units with observable seams.
         def openProbe(fresh: bool) -> ProbeDirectRegion {
                 def backend = probeBackend();
-                raw = backend.create(DIO_RAW_UNITS * DIO_UNIT, DIO_RW, fresh);
+                raw = backend.open(DIO_RAW_UNITS * DIO_UNIT, DIO_RW, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
                 if (raw == null) t.fail1("could not create a direct region: %s", backend.lastError);
                 return backend.last;
         }
 
-        def openPW(backend: TxnRegionBackend, blockSize: u64, fresh: bool) -> PWRegion {
-                pw = PWRegion.new(backend, DIO_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), blockSize, fresh);
+        def openPW(backend: StorageBackend, blockSize: u64, fresh: bool) -> RegionAllocator {
+                pw = RegionAllocator.new(backend, DIO_BLOCKS, Array<Ref<MetadataDescriptor>>.new(0), blockSize, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
                 return pw;
         }
 
@@ -202,11 +202,11 @@ class DirectIoTester(t: Tester) {
 
         def cleanup() {
                 if (raw != null) {
-                        raw.destroy();
+                        raw.close();
                         raw = null;
                 }
                 if (other != null) {
-                        other.destroy();
+                        other.close();
                         other = null;
                 }
                 dropPW();
@@ -214,8 +214,8 @@ class DirectIoTester(t: Tester) {
         }
 
         private def unlinkAll() {
-                if (path != null) RegionFileIO.unlink(path);
-                if (contrastPath != null) RegionFileIO.unlink(contrastPath);
+                if (path != null) BackingFile.unlink(path);
+                if (contrastPath != null) BackingFile.unlink(contrastPath);
         }
 
         // Fork a child that runs {body} and exits with its status. The parent
@@ -234,7 +234,7 @@ class DirectIoTester(t: Tester) {
         }
 
         // Wait for a child to stop itself, then SIGKILL it so that no cleanup
-        // code runs (as TxnPWRegionTest's killStoppedChild()).
+        // code runs (as RegionAllocatorTest's killStoppedChild()).
         def killStoppedChild(pid: i64) -> bool {
                 var waitStatus = Array<int>.new(1);
                 def waitedForStop = Linux.syscall(LinuxConst.SYS_wait4,
@@ -288,11 +288,11 @@ def test_fresh_region_is_zero_and_sized(tc: DirectIoTester) {
         tc.t.assert_eq(0, nonzero);
         def file = tc.fileBytes();
         tc.t.assert(file != null && file.length == region.range.length, "file not sized to the region");
-        tc.t.assert(DirectIoOperations.?(region.persistentOperations()), "region did not install its dirty-marking provider");
+        tc.t.assert(MarkingProvider.?(region.provider()), "region did not install its dirty-marking provider");
         tc.cleanup();
 }
 
-// Attaching to a path with no file behaves like FileMmapBackend: a fresh, zeroed
+// Attaching to a path with no file behaves like MappedFileBackend: a fresh, zeroed
 // file rather than a failure.
 def test_missing_file_attach_creates_fresh(tc: DirectIoTester) {
         if (!tc.ready()) return;
@@ -307,10 +307,10 @@ def test_rejects_unaligned_or_empty_size(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def backend = tc.productionBackend();
         for (size in [0u64, 100u64, 4095u64, 4097u64, 12289u64]) {
-                def region = backend.create(size, DIO_RW, true);
+                def region = backend.open(size, DIO_RW, OpenMode.FORMAT);
                 if (region != null) {
                         tc.t.fail1("accepted a region of %d bytes", size);
-                        region.destroy();
+                        region.close();
                 }
                 tc.t.assert(backend.lastError != null, "a rejection gave no reason");
         }
@@ -322,11 +322,11 @@ def test_rejects_unaligned_or_empty_size(tc: DirectIoTester) {
 def test_rejects_char_device(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def asFile = DirectIoBackend.new("/dev/null", DirectIoTarget.FILE);
-        tc.t.assert(asFile.create(DIO_UNIT, DIO_RW, false) == null, "/dev/null accepted as a file");
+        tc.t.assert(asFile.open(DIO_UNIT, DIO_RW, OpenMode.ATTACH) == null, "/dev/null accepted as a file");
         def asDevice = DirectIoBackend.new("/dev/null", DirectIoTarget.BLOCK_DEVICE);
-        tc.t.assert(asDevice.create(DIO_UNIT, DIO_RW, false) == null, "/dev/null accepted as a block device");
+        tc.t.assert(asDevice.open(DIO_UNIT, DIO_RW, OpenMode.ATTACH) == null, "/dev/null accepted as a block device");
         def missing = DirectIoBackend.new(tc.path, DirectIoTarget.BLOCK_DEVICE);
-        tc.t.assert(missing.create(DIO_UNIT, DIO_RW, true) == null, "a missing path accepted as a block device");
+        tc.t.assert(missing.open(DIO_UNIT, DIO_RW, OpenMode.FORMAT) == null, "a missing path accepted as a block device");
         tc.t.assert(tc.fileBytes() == null, "a block-device target created a file");
         tc.cleanup();
 }
@@ -336,8 +336,8 @@ def test_prepare_marks_without_writing(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def region = tc.openProbe(true);
         if (region == null) return tc.cleanup();
-        region.persistentOperations().storeU64(8200u64, 0x1122334455667788u64);
-        tc.t.assert(region.prepareChangedRange(8200u64, 8u64), "prepare failed");
+        region.provider().storeU64(8200u64, 0x1122334455667788u64);
+        tc.t.assert(region.writeBack(8200u64, 8u64), "prepare failed");
         tc.t.assert(region.dirty.isMarked(2u64), "unit 2 not marked");
         tc.t.assert_eq(1u64, region.dirty.markedCount());
         tc.t.assert(region.hasPendingWriteback, "pending flag not set");
@@ -354,9 +354,9 @@ def test_persist_writes_only_marked_units(tc: DirectIoTester) {
         def region = tc.openProbe(true);
         if (region == null) return tc.cleanup();
         Pointer.atElement(region.range, 20480).store<u64>(0xDEADu64);
-        region.persistentOperations().storeU64(8192u64, 0xBEEFu64);
-        region.prepareChangedRange(8192u64, 8u64);
-        tc.t.assert(region.persistChanges(), "persistChanges failed");
+        region.provider().storeU64(8192u64, 0xBEEFu64);
+        region.writeBack(8192u64, 8u64);
+        tc.t.assert(region.drain(), "drain failed");
         def file = tc.fileBytes();
         tc.t.assert_eq(0xBEEFu64, dioReadU64(file, 8192));
         tc.t.assert_eq(0u64, dioReadU64(file, 20480));
@@ -377,10 +377,10 @@ def test_adjacent_units_coalesce(tc: DirectIoTester) {
         if (region == null) return tc.cleanup();
         for (unit in [2u64, 3u64, 4u64, 7u64]) {
                 def offset = unit * DIO_UNIT + 64u64;
-                region.persistentOperations().storeU64(offset, unit);
-                region.prepareChangedRange(offset, 8u64);
+                region.provider().storeU64(offset, unit);
+                region.writeBack(offset, 8u64);
         }
-        tc.t.assert(region.persistChanges(), "persistChanges failed");
+        tc.t.assert(region.drain(), "drain failed");
         tc.t.assert_eq(2, region.writes.length);
         if (region.writes.length == 2) {
                 tc.t.assert_eq(2u64 * DIO_UNIT, region.writes[0].0);
@@ -396,16 +396,16 @@ def test_adjacent_units_coalesce(tc: DirectIoTester) {
         tc.cleanup();
 }
 
-// persistRange() makes earlier prepared ranges durable too, as the fence ending
-// a PMEM persistRange() completes every outstanding CLWB.
+// persist() makes earlier prepared ranges durable too, as the fence ending
+// a PMEM persist() completes every outstanding CLWB.
 def test_persist_range_drains_pending(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def region = tc.openProbe(true);
         if (region == null) return tc.cleanup();
-        region.persistentOperations().storeU64(4096u64, 11u64);
-        region.prepareChangedRange(4096u64, 8u64);
-        region.persistentOperations().storeU64(24576u64, 66u64);
-        tc.t.assert(region.persistRange(24576u64, 8u64), "persistRange failed");
+        region.provider().storeU64(4096u64, 11u64);
+        region.writeBack(4096u64, 8u64);
+        region.provider().storeU64(24576u64, 66u64);
+        tc.t.assert(region.persist(24576u64, 8u64), "persist failed");
         tc.t.assert_eq(2, region.writes.length);
         tc.t.assert_eq(1, region.syncs);
         def file = tc.fileBytes();
@@ -418,22 +418,22 @@ def test_persist_without_pending_is_noop(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def region = tc.openProbe(true);
         if (region == null) return tc.cleanup();
-        tc.t.assert(region.persistChanges(), "an empty boundary failed");
-        tc.t.assert(region.persistRange(0u64, 0u64), "an empty range failed");
+        tc.t.assert(region.drain(), "an empty boundary failed");
+        tc.t.assert(region.persist(0u64, 0u64), "an empty range failed");
         tc.t.assert_eq(0, region.writes.length);
         tc.t.assert_eq(0, region.syncs);
         tc.cleanup();
 }
 
-// The staging buffer is loaded from the file on attach: PWRegion reads its
-// header straight out of the range once create() returns.
+// The staging buffer is loaded from the file on attach: RegionAllocator reads its
+// header straight out of the range once open() returns.
 def test_attach_reads_existing_image(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def first = tc.openProbe(true);
         if (first == null) return tc.cleanup();
-        first.persistentOperations().storeU64(12296u64, 0xC0FFEEu64);
-        first.persistRange(12296u64, 8u64);
-        tc.raw.destroy();
+        first.provider().storeU64(12296u64, 0xC0FFEEu64);
+        first.persist(12296u64, 8u64);
+        tc.raw.close();
         tc.raw = null;
         def second = tc.openProbe(false);
         if (second == null) return tc.cleanup();
@@ -442,9 +442,9 @@ def test_attach_reads_existing_image(tc: DirectIoTester) {
 }
 
 // A non-empty region file of another size is refused before it is resized,
-// read or switched to O_DIRECT, by the backend and so by PWRegion, and the
+// read or switched to O_DIRECT, by the backend and so by RegionAllocator, and the
 // file keeps its length and every byte. The file target shares
-// FileMmapBackend's sizing helper, which until 2026-10-21 truncated or
+// MappedFileBackend's sizing helper, which until 2026-10-21 truncated or
 // extended the file first. forceFormat still replaces it at any size.
 def test_attach_other_size_refused_unchanged(tc: DirectIoTester) {
         if (!tc.ready()) return;
@@ -462,12 +462,12 @@ def test_attach_other_size_refused_unchanged(tc: DirectIoTester) {
         }
         for (n in [DIO_BLOCKS / 2u64, DIO_BLOCKS * 2u64]) {
                 def backend = tc.productionBackend();
-                def raw = backend.create(n * DIO_UNIT, DIO_RW, false);
+                def raw = backend.open(n * DIO_UNIT, DIO_RW, OpenMode.ATTACH);
                 tc.t.assert(raw == null, "a region file of another size was attached");
-                if (raw != null) raw.destroy();
+                if (raw != null) raw.close();
                 tc.t.assert(backend.lastError != null, "the refusal gave no reason");
-                tc.pw = PWRegion.new(tc.productionBackend(), n, Array<Ref<MetaDataDesc>>.new(0), DIO_UNIT, false);
-                tc.t.assert(tc.pw.backendRegion == null && tc.pw.txn == null && tc.pw.logChunk.isNull(),
+                tc.pw = RegionAllocator.new(tc.productionBackend(), n, Array<Ref<MetadataDescriptor>>.new(0), DIO_UNIT, OpenMode.ATTACH);
+                tc.t.assert(tc.pw.backendRegion == null && tc.pw.txn == null && tc.pw.logBlock.isNull(),
                         "a region file of another size was opened");
                 tc.dropPW();
                 def after = tc.fileBytes();
@@ -483,9 +483,9 @@ def test_attach_other_size_refused_unchanged(tc: DirectIoTester) {
                 tc.t.fail("the region did not mount at its own size");
                 return tc.cleanup();
         }
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the allocation did not survive the refused opens");
+        tc.t.assert(again.blockTableHandle[2u64].getUsedInRegion(again.reader()), "the allocation did not survive the refused opens");
         tc.dropPW();
-        tc.pw = PWRegion.new(tc.productionBackend(), DIO_BLOCKS * 2u64, Array<Ref<MetaDataDesc>>.new(0), DIO_UNIT, true);
+        tc.pw = RegionAllocator.new(tc.productionBackend(), DIO_BLOCKS * 2u64, Array<Ref<MetadataDescriptor>>.new(0), DIO_UNIT, OpenMode.FORMAT);
         tc.t.assert(tc.pw.txn != null, "forceFormat did not format at another size");
         def file = tc.fileBytes();
         tc.t.assert(file != null && file.length == int.!(DIO_BLOCKS * 2u64 * DIO_UNIT), "forceFormat did not resize the file");
@@ -496,10 +496,10 @@ def test_write_failure_reported(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def region = tc.openProbe(true);
         if (region == null) return tc.cleanup();
-        region.persistentOperations().storeU64(8192u64, 1u64);
-        region.prepareChangedRange(8192u64, 8u64);
+        region.provider().storeU64(8192u64, 1u64);
+        region.writeBack(8192u64, 8u64);
         region.failNextWrite = true;
-        tc.t.assert(!region.persistChanges(), "a failed write was reported as durable");
+        tc.t.assert(!region.drain(), "a failed write was reported as durable");
         tc.t.assert_eq(0, region.syncs);
         tc.t.assert(region.hasPendingWriteback, "a failed boundary cleared the pending flag");
         tc.cleanup();
@@ -509,31 +509,31 @@ def test_sync_failure_reported(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def region = tc.openProbe(true);
         if (region == null) return tc.cleanup();
-        region.persistentOperations().storeU64(8192u64, 1u64);
-        region.prepareChangedRange(8192u64, 8u64);
+        region.provider().storeU64(8192u64, 1u64);
+        region.writeBack(8192u64, 8u64);
         region.failNextSync = true;
-        tc.t.assert(!region.persistChanges(), "a failed sync was reported as durable");
+        tc.t.assert(!region.drain(), "a failed sync was reported as durable");
         tc.t.assert_eq(1, region.writes.length);
         tc.t.assert(!region.dirty.isEmpty(), "a failed sync cleared the dirty set");
         tc.cleanup();
 }
 
-// The mutant: a provider whose clwb() does nothing marks nothing, so a boundary
+// The mutant: a provider whose writeBackLine() does nothing marks nothing, so a boundary
 // that reports success writes nothing back.
 def test_elided_provider_writes_nothing(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def probe = tc.probeBackend();
-        tc.raw = ElidedWritebackBackend.new(probe).create(DIO_RAW_UNITS * DIO_UNIT, DIO_RW, true);
+        tc.raw = ElidedWriteBackBackend.new(probe).open(DIO_RAW_UNITS * DIO_UNIT, DIO_RW, OpenMode.FORMAT);
         if (tc.raw == null) {
                 tc.t.fail("could not create the elided region");
                 return tc.cleanup();
         }
         def region = probe.last;
-        tc.t.assert(ElidedWritebackOperations.?(region.persistentOperations()), "mutant provider not installed");
-        region.persistentOperations().storeU64(8192u64, 0xBADu64);
-        region.prepareChangedRange(8192u64, 8u64);
-        tc.t.assert(region.persistChanges(), "the mutant's boundary failed");
-        tc.t.assert(region.persistRange(8192u64, 8u64), "the mutant's persistRange failed");
+        tc.t.assert(ElidedWriteBackProvider.?(region.provider()), "mutant provider not installed");
+        region.provider().storeU64(8192u64, 0xBADu64);
+        region.writeBack(8192u64, 8u64);
+        tc.t.assert(region.drain(), "the mutant's boundary failed");
+        tc.t.assert(region.persist(8192u64, 8u64), "the mutant's persist failed");
         tc.t.assert_eq(0, region.writes.length);
         tc.t.assert_eq(0u64, dioReadU64(tc.fileBytes(), 8192));
         tc.cleanup();
@@ -557,16 +557,16 @@ def test_pwregion_format_mount_roundtrip(tc: DirectIoTester) {
                 tc.t.fail("could not remount");
                 return tc.cleanup();
         }
-        tc.t.assert(again.lastRecovery == DualWalRecovery.CLEAN, "a clean close did not remount clean");
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the allocation did not survive remount");
-        def err = PersistentAllocatorInvariants.check(again);
+        tc.t.assert(again.lastRecovery == WalRecovery.CLEAN, "a clean close did not remount clean");
+        tc.t.assert(again.blockTableHandle[2u64].getUsedInRegion(again.reader()), "the allocation did not survive remount");
+        def err = AllocatorInvariants.check(again);
         if (err != null) tc.t.fail1("allocator invariants: %s", err);
         tc.cleanup();
 }
 
 // A failed commit boundary latches the mount, and because the record's write
 // did reach the file, a fresh mount replays it: the unacknowledged-record
-// contract of DualTxnWal, now over real O_DIRECT writes.
+// contract of TwoSlotWal, now over real O_DIRECT writes.
 def test_commit_sync_failure_latches_and_remount_replays(tc: DirectIoTester) {
         if (!tc.ready()) return;
         tc.openPW(tc.productionBackend(), 4096u64, true);
@@ -586,9 +586,9 @@ def test_commit_sync_failure_latches_and_remount_replays(tc: DirectIoTester) {
                 tc.t.fail("could not remount");
                 return tc.cleanup();
         }
-        tc.t.assert(again.lastRecovery == DualWalRecovery.REPLAYED, "the written record was not replayed");
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the replayed allocation is missing");
-        def err = PersistentAllocatorInvariants.check(again);
+        tc.t.assert(again.lastRecovery == WalRecovery.REPLAYED, "the written record was not replayed");
+        tc.t.assert(again.blockTableHandle[2u64].getUsedInRegion(again.reader()), "the replayed allocation is missing");
+        def err = AllocatorInvariants.check(again);
         if (err != null) tc.t.fail1("allocator invariants: %s", err);
         tc.cleanup();
 }
@@ -601,7 +601,7 @@ def test_sigkill_after_commit_boundary_recovers(tc: DirectIoTester) {
         tc.dropPW();
         def pid = tc.forkChild(fun () -> int {
                 def probe = ProbeDirectBackend.new(tc.path);
-                def region = PWRegion.new(probe, DIO_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), 4096u64, false);
+                def region = RegionAllocator.new(probe, DIO_BLOCKS, Array<Ref<MetadataDescriptor>>.new(0), 4096u64, OpenMode.ATTACH);
                 if (region.backendRegion == null || region.txn == null) return 2;
                 probe.last.stopAfterSyncs = 1;
                 region.allocChunk(1u32);
@@ -613,9 +613,9 @@ def test_sigkill_after_commit_boundary_recovers(tc: DirectIoTester) {
                 tc.t.fail("could not remount after the kill");
                 return tc.cleanup();
         }
-        tc.t.assert(again.lastRecovery == DualWalRecovery.REPLAYED, "the killed child's record was not replayed");
-        tc.t.assert(again.blockTableHandle[2u64].getUsed(again.reader()), "the committed allocation is missing");
-        def err = PersistentAllocatorInvariants.check(again);
+        tc.t.assert(again.lastRecovery == WalRecovery.REPLAYED, "the killed child's record was not replayed");
+        tc.t.assert(again.blockTableHandle[2u64].getUsedInRegion(again.reader()), "the committed allocation is missing");
+        def err = AllocatorInvariants.check(again);
         if (err != null) tc.t.fail1("allocator invariants: %s", err);
         tc.cleanup();
 }
@@ -628,17 +628,17 @@ def test_sigkill_loses_unpersisted_staging(tc: DirectIoTester) {
         if (!tc.ready()) return;
         def size = DIO_RAW_UNITS * DIO_UNIT;
         def pid = tc.forkChild(fun () -> int {
-                def region = DirectIoBackend.new(tc.path, DirectIoTarget.FILE).create(size, DIO_RW, true);
+                def region = DirectIoBackend.new(tc.path, DirectIoTarget.FILE).open(size, DIO_RW, OpenMode.FORMAT);
                 if (region == null) return 2;
-                region.persistentOperations().storeU64(8192u64, 0xAAAAu64);
-                if (!region.persistRange(8192u64, 8u64)) return 3;
-                region.persistentOperations().storeU64(16384u64, 0xBBBBu64);
-                if (!region.prepareChangedRange(16384u64, 8u64)) return 4;
+                region.provider().storeU64(8192u64, 0xAAAAu64);
+                if (!region.persist(8192u64, 8u64)) return 3;
+                region.provider().storeU64(16384u64, 0xBBBBu64);
+                if (!region.writeBack(16384u64, 8u64)) return 4;
 
-                def file = FileMmapBackend.new(tc.contrastPath).create(size, DIO_RW, true);
+                def file = MappedFileBackend.new(tc.contrastPath).open(size, DIO_RW, OpenMode.FORMAT);
                 if (file == null) return 5;
-                file.persistentOperations().storeU64(16384u64, 0xCCCCu64);
-                if (!file.prepareChangedRange(16384u64, 8u64)) return 6;
+                file.provider().storeU64(16384u64, 0xCCCCu64);
+                if (!file.writeBack(16384u64, 8u64)) return 6;
                 dioSelfStop();
                 return 7;
         });
@@ -664,11 +664,11 @@ def test_mutant_loses_acknowledged_commit_on_sigkill(tc: DirectIoTester) {
                 tc.openPW(tc.productionBackend(), 4096u64, true);
                 tc.dropPW();
                 def pid = tc.forkChild(fun () -> int {
-                        var backend: TxnRegionBackend = DirectIoBackend.new(tc.path, DirectIoTarget.FILE);
-                        if (elide) backend = ElidedWritebackBackend.new(backend);
-                        def region = PWRegion.new(backend, DIO_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), 4096u64, false);
+                        var backend: StorageBackend = DirectIoBackend.new(tc.path, DirectIoTarget.FILE);
+                        if (elide) backend = ElidedWriteBackBackend.new(backend);
+                        def region = RegionAllocator.new(backend, DIO_BLOCKS, Array<Ref<MetadataDescriptor>>.new(0), 4096u64, OpenMode.ATTACH);
                         if (region.backendRegion == null || region.txn == null) return 2;
-                        if (ElidedWritebackOperations.?(region.backendRegion.persistentOperations()) != elide) return 3;
+                        if (ElidedWriteBackProvider.?(region.backendRegion.provider()) != elide) return 3;
                         if (region.allocChunk(1u32).isNull()) return 4;
                         if (region.requiresRecovery()) return 5;
                         dioSelfStop();
@@ -680,10 +680,10 @@ def test_mutant_loses_acknowledged_commit_on_sigkill(tc: DirectIoTester) {
                         tc.t.fail("could not remount after the kill");
                         return tc.cleanup();
                 }
-                def survived = again.blockTableHandle[2u64].getUsed(again.reader());
+                def survived = again.blockTableHandle[2u64].getUsedInRegion(again.reader());
                 if (elide && survived) tc.t.fail("the mutant's acknowledged allocation survived its death");
                 if (!elide && !survived) tc.t.fail("the production allocation did not survive");
-                def err = PersistentAllocatorInvariants.check(again);
+                def err = AllocatorInvariants.check(again);
                 if (err != null) tc.t.fail1("allocator invariants: %s", err);
                 tc.dropPW();
         }
@@ -697,7 +697,7 @@ def test_mutant_loses_acknowledged_commit_on_sigkill(tc: DirectIoTester) {
 // Format, two allocations, a free and a clean close: every boundary kind the
 // allocator and the WAL issue, including the header initialisation inside
 // format and the slot scrubs inside close.
-def dioScenario(region: PWRegion) -> bool {
+def dioScenario(region: RegionAllocator) -> bool {
         if (region.backendRegion == null || region.txn == null) return false;
         def a = region.allocChunk(1u32);
         if (a.isNull()) return false;
@@ -710,10 +710,10 @@ def dioScenario(region: PWRegion) -> bool {
 // Record the scenario over the direct backend with a recording provider
 // beneath the dirty-marking one; the region is left in {tc.pw} as deallocated.
 def dioRecordDirect(tc: DirectIoTester, blockSize: u64) -> ProbeDirectRegion {
-        RegionFileIO.unlink(tc.path);
+        BackingFile.unlink(tc.path);
         def probe = tc.probeBackend();
         probe.record = true;
-        def region = PWRegion.new(probe, DIO_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
+        def region = RegionAllocator.new(probe, DIO_BLOCKS, Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.FORMAT);
         if (!dioScenario(region)) {
                 tc.t.fail1("the direct scenario failed at block size %d", blockSize);
                 return null;
@@ -727,12 +727,12 @@ def dioRecordDirect(tc: DirectIoTester, blockSize: u64) -> ProbeDirectRegion {
 def test_trace_matches_pmem_region(tc: DirectIoTester) {
         if (!tc.ready()) return;
         for (blockSize in [2048u64, 4096u64]) {
-                def pmem = PWRegion.new(RecordingPmemBackend.new(), DIO_BLOCKS, Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
+                def pmem = RegionAllocator.new(RecordingPmemBackend.new(), DIO_BLOCKS, Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.FORMAT);
                 if (pmem.backendRegion == null) {
                         tc.t.fail("could not create the recording PMEM region");
                         return tc.cleanup();
                 }
-                def pmemRecorder = RecordingPersistentOperations.!(pmem.backendRegion.persistentOperations());
+                def pmemRecorder = RecordingProvider.!(pmem.backendRegion.provider());
                 if (!dioScenario(pmem)) {
                         tc.t.fail("the PMEM scenario failed");
                         return tc.cleanup();
@@ -751,9 +751,9 @@ def test_trace_matches_pmem_region(tc: DirectIoTester) {
 // line the trace touched must hold some prefix of its stores at or above the
 // fence-forced floor, and every other byte its initial (zero) value. Lines are
 // independent in the model, so this is exact: no enumeration and no budget.
-def dioAdmittedAt(trace: PersistentTrace, cut: int, file: Array<byte>) -> string {
+def dioAdmittedAt(trace: PersistenceTrace, cut: int, file: Array<byte>) -> string {
         if (file == null || file.length != int.!(trace.regionBytes)) return "the file is not region-sized";
-        def m = PersistentCrashMachine.new(trace, null);
+        def m = CrashModel.new(trace, null);
         m.runTo(cut);
         def touched = Array<bool>.new((file.length + 63) / 64);
         for (i < m.lineCount()) touched[int.!(m.lineAt(i) / 64u64)] = true;
@@ -787,7 +787,7 @@ def dioSameBytes(a: Array<byte>, b: Array<byte>) -> bool {
         return true;
 }
 
-// The image check, for FileMmapRegionTest.v3, whose backend makes the same
+// The image check, for MappedFileRegionTest.v3, whose backend makes the same
 // claim; top-level functions are private to their file.
 component DioRefinement {
         def admittedAt = dioAdmittedAt;
@@ -828,7 +828,7 @@ def test_boundary_images_are_model_images(tc: DirectIoTester) {
                                 tc.t.fail3("block size %d, boundary %d: the new file is not admitted before the fence: %s", blockSize, k, err);
                                 break;
                         }
-                        if (!dioSameBytes(file, PersistentImages.lazyCrash(trace, null, cut).bytes)) differsFromLazy = true;
+                        if (!dioSameBytes(file, CrashImages.lazyCrash(trace, null, cut).bytes)) differsFromLazy = true;
                         previous = file;
                 }
                 // The check must be able to fail: a flipped byte of the WAL
@@ -852,7 +852,7 @@ def test_boundary_images_are_model_images(tc: DirectIoTester) {
 }
 
 // A pinned layout fact the thesis quotes: at 4 KiB blocks the WAL header and
-// both record slots share the log chunk's single 4 KiB unit, so every commit
+// both record slots share the log block's single 4 KiB unit, so every commit
 // rewrites all three together. Two-slot independence therefore rests on the
 // device never leaving that unit unreadable, not only on 64-byte atomicity.
 def test_record_write_rewrites_whole_log_unit(tc: DirectIoTester) {

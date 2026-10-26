@@ -1,6 +1,6 @@
 # PMEM Emulation for Development and Validation
 
-This document assesses how to exercise Wizard's `PmemMmapBackend` on a
+This document assesses how to exercise Wizard's `PmemBackend` on a
 machine without physical persistent memory. The recommended development
 environment is an x86-64 Linux guest with a QEMU-emulated NVDIMM backed by a
 host file. Reserving DRAM as PMEM with the Linux `memmap` kernel parameter is
@@ -17,7 +17,7 @@ plan is specified in [PMEM Crash Model](pmem-crash-model.md).
 
 ## What the project requires
 
-`PmemMmapBackend.create()`:
+`PmemBackend.open()`:
 
 1. opens or creates a path as a regular file;
 2. checks its length: it sizes an empty file with `ftruncate()` and refuses,
@@ -35,7 +35,7 @@ QEMU file-backed NVDIMM
   → guest /dev/pmem0 block device
     → ext4 or XFS mounted with filesystem DAX
       → regular file such as /mnt/pmem/wizard-region
-        → PmemMmapBackend
+        → PmemBackend
 ```
 
 Do not pass `/dev/pmem0` directly to the current backend. An fsdax namespace's
@@ -296,9 +296,9 @@ sudo touch /mnt/pmem/wizard-region
 ```
 
 Use the regular-file path `/mnt/pmem/wizard-region` with
-`X86_64PWNVRegion`, `X86_64ImmixPWNVRegion`, or
-`X86_64Backends.getPersistent()`. A successful
-`PmemMmapBackend.create()` is the definitive project-level check that the
+`RegionAllocators.onPmem()`, `RegionAllocators.immixOnPmem()`, or
+`X86_64Backends.pmem()`. A successful
+`PmemBackend.open()` is the definitive project-level check that the
 file accepts `MAP_SYNC`.
 
 ## Available real-PMEM host: magpie
@@ -333,8 +333,8 @@ administrator-privileged DIMM health query of 2026-09-01 is:
 | DIMM identity | 2026-10-26, without privileges (Sean, as `u7599095`, who has no `sudo`; `thesis-reviews/2026-10-26/magpie-dimm-probe.txt`): twelve modules, `nmem0`-`nmem11`, with NFIT vendor `0x8089`, device `0x5605`, subsystem device `0x7a09` and subsystem revision `0x2000` (`nmem0`), and IDs `8089-a2-2002-...`; the EDAC listing gives twelve slots of 131,072 MiB beside twelve of 32,768 MiB, and the sixteen whose type it reached (it was cut at 40 lines) say `Non-volatile-RAM` for the first size and `Unbuffered-DDR4` for the second; `region0` and `region1` are 756.00 GiB each | Twelve 128 GiB Intel persistent-memory modules, six per socket. The part number is not observed: it is in the SMBIOS table (`/sys/firmware/dmi/tables/DMI`, mode 0400) and in the modules' own firmware (`/dev/nmem*`, mode 0600), both root-only. *Inference:* the Xeon Gold 6252N, a second-generation Xeon Scalable (Cascade Lake) processor, takes only the first generation of Optane persistent memory, the 100 series |
 | `MAP_SYNC` on an assigned test file | `pmem_dax:backend_accepts_map_sync` passed under `/mnt/pmem0.0/sean` | Production fsdax path confirmed |
 | Emitted `CLWB`/`SFENCE` instructions | Exact encoding and native production-path smoke tests passed on Magpie before the DAX run | Physical-target execution confirmed; power-loss persistence remains untested |
-| `MAP_SYNC` under a resumable workload | `make pwsieve-pmem` mapped `/mnt/pmem0.0/sean` and asserted a `PmemMmapRegion`, not its `FileMmapRegion` sibling | No silent fallback to an ordinary shared mapping |
-| WAL protocol under abrupt termination on DAX media | 13 `SIGKILL` restarts, every one reporting `DualWalRecovery.REPLAYED`; workload invariants held after each; 376,256 primes below 5,429,504 matched an independent sieve | Software crash consistency on physical PMEM |
+| `MAP_SYNC` under a resumable workload | `make pwsieve-pmem` mapped `/mnt/pmem0.0/sean` and asserted a `PmemRegion`, not its `MappedFileRegion` sibling | No silent fallback to an ordinary shared mapping |
+| WAL protocol under abrupt termination on DAX media | 13 `SIGKILL` restarts, every one reporting `WalRecovery.REPLAYED`; workload invariants held after each; 376,256 primes below 5,429,504 matched an independent sieve | Software crash consistency on physical PMEM |
 | Correct *placement* of `CLWB`/`SFENCE` | Not discriminated by any run to date — see the note below | Requires Stage 3 power interruption |
 
 ### What the 2026-09-01 crash loop does and does not discriminate
@@ -371,7 +371,7 @@ executes against real PMEM without corrupting anything, and that the WAL
 protocol and the workload's invariants survive abrupt process termination on
 physical DAX media. It does not establish that the flushes are correctly placed.
 
-That sensitivity is what layer 1b supplies instead: `PersistentExplorer`
+That sensitivity is what layer 1b supplies instead: `CrashExplorer`
 enumerates the durable images a crash permits *given* the recorded
 `STORE`/`CLWB`/`SFENCE` order, so a missing or misplaced flush shows up there as
 an enumerated image that production recovery cannot repair. The model is
@@ -383,13 +383,13 @@ Stage 3.
 
 The layering claim above — that the hardware run cannot discriminate flush
 placement and the layer-1b explorer can — is measured with an elided-writeback
-mutant: a `PersistentOperations` provider whose `clwb()` does nothing, with
+mutant: a `PersistenceProvider` provider whose `writeBackLine()` does nothing, with
 stores and `SFENCE` untouched, so a commit still returns success and the
 transaction is still acknowledged. It is installed by wrapping the real backend
-(`ElidedWritebackBackend`, `test/unittest/x86-64-linux/ElidedWritebackOps.v3`),
-so the production `PmemMmapBackend` still opens the real file and takes the real
+(`ElidedWriteBackBackend`, `test/unittest/x86-64-linux/ElidedWriteBackProvider.v3`),
+so the production `PmemBackend` still opens the real file and takes the real
 `MAP_SYNC` mapping and only the provider differs. The swap happens inside
-`create()` because `PWRegion` and `DualTxnWal` each resolve their provider once
+`open()` because `RegionAllocator` and `TwoSlotWal` each resolve their provider once
 at construction; installing it later would elide the data-range writebacks and
 leave the log's intact.
 
@@ -416,12 +416,12 @@ below 5,429,504, bit-identical to the ordinary run and to the file backend at th
 same geometry. The two builds are indistinguishable at layer 3 and separated at
 layer 1b, which is the claim this document used to assert and now measures.
 
-**Model half — done.** The four `persistent_control:` unit tests record the same
-sieve `step()` as `persistent_sieve:step_images_satisfy_sieve`, under one
+**Model half — done.** The four `crash_control:` unit tests record the same
+sieve `step()` as `sieve_crash:step_images_satisfy_sieve`, under one
 provider or both. Two check the traces (`mutant_trace_is_still_modelable`,
 `mutant_records_no_writeback`, the only one that records both); the other two
 (`ordinary_writeback_holds`, `elided_writeback_is_caught`) sweep the step at 64
-images per cut with the same `PersistentSieveProperty`, changing only the
+images per cut with the same `SieveProperty`, changing only the
 provider. (Until 2026-10-26 this said that all four record and sweep.) The mutant trace
 is still modelable (it validates against the baseline), carries zero `CLWB`
 events while its `STORE` and `SFENCE` counts match the ordinary recording
@@ -503,13 +503,13 @@ falsify the layering claim. See the reproduction note in
 bare-metal reserved-DRAM host and an operator; its runbook is
 [Stage 2c Hand-off](stage2c-handoff.md).
 
-Until 2026-10-13 the mutant was vacuous on the file backend: `FileMmapRegion`
-never called `clwb()`, since its persist path was `msync`/`fdatasync`, so a
+Until 2026-10-13 the mutant was vacuous on the file backend: `MappedFileRegion`
+never called `writeBackLine()`, since its persist path was `msync`/`fdatasync`, so a
 file-backed mutant run exercised the wiring and nothing else. Since then its
-`prepareChangedRange` calls `clwb()` for each line through a marking provider,
-the direct backend's `DirectIoOperations`, which marks the line's 4 KiB page,
-and a fence syncs only when a page is marked. The mutant's `clwb()` marks
-nothing, so its fences sync nothing (`file_mmap:elided_provider_syncs_nothing`).
+`writeBack` calls `writeBackLine()` for each line through a marking provider,
+the direct backend's `MarkingProvider`, which marks the line's 4 KiB page,
+and a fence syncs only when a page is marked. The mutant's `writeBackLine()` marks
+nothing, so its fences sync nothing (`mapped_file:elided_provider_syncs_nothing`).
 The mutation is therefore meaningful on the file backend too. Process death
 still leaves the page cache, so the file backend's kill loop cannot separate
 the builds (both `OK`, 2026-10-13), while a kernel reset does (`SURVIVED`
@@ -608,11 +608,11 @@ The complete layer definitions and their evidence boundaries are documented in
 
 #### Stage 0a — abstract persistence-boundary model
 
-The direct active-`DualTxnWal` tests now use a test-only shadow durable-memory
+The direct active-`TwoSlotWal` tests now use a test-only shadow durable-memory
 backend. It keeps separate live and durable byte arrays, makes
-`persistRange`/`persistChanges` copy into the durable shadow, restores live
+`persist`/`drain` copy into the durable shadow, restores live
 bytes from that shadow on simulated crash, and injects fail-before-copy,
-copy-then-fail and partial-copy outcomes. The `DualTxnWal` commit and recovery
+copy-then-fail and partial-copy outcomes. The `TwoSlotWal` commit and recovery
 paths now latch persistence failures, reject further same-instance work, and
 require a fresh instance to recover. Fresh initialization, after-image
 preparation, flush, close, transaction-facade, and allocator propagation are
@@ -623,7 +623,7 @@ file-sync seam cover those transactions instead; exact-fit allocation is
 covered only by `SIGKILL` (see
 [Persistent Backends](persistent-backends.md#shadow-durable-memory-test-backend)).
 
-Stage 0a answers whether the WAL is correct under the abstract `BackendRegion`
+Stage 0a answers whether the WAL is correct under the abstract `StorageRegion`
 persistence contract. It is fast, deterministic and suitable for the default
 unit suite. It cannot establish that `MAP_SYNC`, cache-line write-back
 instructions, Linux, QEMU or physical media implement that contract; those are
@@ -639,18 +639,18 @@ to survive before a fence, and an `SFENCE` to complete the earlier writebacks
 on which the protocol relies.
 
 That model is now built. Every persistent store on the active path —
-`PWRegion.format()`, `DirectRegionWriter` and `DualTxnWal` — goes through a
-per-region `PersistentOperations` provider, so a recording provider captures
+`RegionAllocator.format()`, `UnloggedWriter` and `TwoSlotWal` — goes through a
+per-region `PersistenceProvider` provider, so a recording provider captures
 the production order of `STORE`, `CLWB` and `SFENCE` (crash-model milestone 2
-and the store audit). A recording is frozen as a `PersistentTrace` with crash
-cuts (milestone 3). `PersistentCrashMachine` replays it with asynchronous,
+and the store audit). A recording is frozen as a `PersistenceTrace` with crash
+cuts (milestone 3). `CrashModel` replays it with asynchronous,
 non-snapshot writeback, fence obligations and background eviction, and
-materializes durable images (milestone 4). `PersistentExplorer` enumerates the
+materializes durable images (milestone 4). `CrashExplorer` enumerates the
 images a cut admits, by full branching search or by the fence-forced floor plus
 one of each line's distinct contents above it (a per-line prefix product until
 2026-10-19), which are checked against each other at every cut of four
-hand-written traces (5, 7, 4 and 10 events on one to three lines). Each image goes to production `DualTxnWal` recovery or a
-production `PWRegion` mount, which must satisfy the acknowledgement contract and
+hand-written traces (5, 7, 4 and 10 events on one to three lines). Each image goes to production `TwoSlotWal` recovery or a
+production `RegionAllocator` mount, which must satisfy the acknowledgement contract and
 the allocator's structural invariants (milestones 5–6). Crash during recovery
 and failed recovery boundaries run under the bounded two-crash profile
 (milestone 7). An ordinary file or byte array is sufficient because the
@@ -680,8 +680,8 @@ interface and the current backend are connected correctly:
 
 - the host exposes an fsdax block device;
 - a file on the mounted filesystem accepts `MAP_SYNC`;
-- `PmemMmapBackend.create()` formats and maps the requested region;
-- allocation and transaction commits work through `X86_64PWNVRegion`; and
+- `PmemBackend.open()` formats and maps the requested region;
+- allocation and transaction commits work through `RegionAllocators.onPmem()`; and
 - a clean close and remount preserve allocator state; and
 - a controlled reopen with a committed record exercises WAL replay.
 
@@ -730,11 +730,11 @@ collision suffix to its name, and removes only that file after a normal run.
 An interrupted runner may leave a clearly named `wizard-pmem-*.region` artifact
 for later manual cleanup, but a subsequent run will not overwrite it. A
 directory on an ordinary filesystem is expected to fail at
-`PmemMmapBackend.create()` because the backend has no non-`MAP_SYNC` fallback.
+`PmemBackend.open()` because the backend has no non-`MAP_SYNC` fallback.
 
-The existing `txn_backend:pmem_region_tracks_pending_writeback` unit test does
+The existing `storage_backend:pmem_region_tracks_pending_writeback` unit test does
 not provide this coverage. It wraps an anonymous `Mmap.reserve()` mapping
-directly in `PmemMmapRegion`, bypassing `PmemMmapBackend.create()`,
+directly in `PmemRegion`, bypassing `PmemBackend.open()`,
 `MAP_SYNC`, filesystem DAX, and `/dev/pmem0`.
 
 The successful Magpie run establishes functional DAX mapping, execution of the
@@ -756,15 +756,15 @@ parent then remounts from a fresh mapping, runs production WAL recovery, lets
 `PWSieve` reattach through the durable root, and checks its cross-object
 invariants and that progress never went backwards. The backend is named
 explicitly rather than inferred from the path, an unrecognised mode is rejected
-instead of defaulted, and the run asserts it received a `PmemMmapRegion` and not
-its `FileMmapRegion` sibling before doing any work — so a silent fallback to an
+instead of defaulted, and the run asserts it received a `PmemRegion` and not
+its `MappedFileRegion` sibling before doing any work — so a silent fallback to an
 ordinary shared mapping cannot be reported as a PMEM result. Because
-`PmemMmapBackend.create()` has no non-`MAP_SYNC` mapping mode, a run that starts
+`PmemBackend.open()` has no non-`MAP_SYNC` mapping mode, a run that starts
 at all is a run on filesystem DAX.
 
 This command passed on Magpie on 2026-09-01: 13 iterations at 512 x 4096 = 2 MiB
 before the sieve's 167-segment descriptor table filled, every restart reporting
-`DualWalRecovery.REPLAYED`, invariants holding after each recovery, three leaked
+`WalRecovery.REPLAYED`, invariants holding after each recovery, three leaked
 chunks reclaimed at mount, and 376,256 primes below 5,429,504 matching an
 independent in-process sieve. See the discrimination note in the Magpie section
 above: this establishes software crash consistency on physical media and clean
@@ -897,7 +897,7 @@ runbook and how to read each verdict are in
 
 Final durability validation requires a machine with real persistent memory,
 an fsdax namespace, and controlled crash or power-interruption experiments.
-`MmapRegionUtils.flushCacheLine()` and `storeFence()` now emit the required
+`X86_64CacheControl.writeBackLine()` and `fence()` now emit the required
 CPUID-selected cache writeback and `SFENCE` instructions, so the remaining work
 is to validate that production path and the persistence protocol on the
 physical target.
@@ -948,7 +948,7 @@ excluded failure class and is not evidence about the WAL in either direction.
 | Approach | Why it is not the primary workflow |
 |---|---|
 | Ordinary file or tmpfs | No filesystem DAX; `MAP_SYNC` should fail with `EOPNOTSUPP` |
-| QEMU virtio-pmem | Persists through `fsync()`/`msync()` but explicitly does not support `MAP_SYNC`; it matches file-backend semantics, not `PmemMmapBackend` |
+| QEMU virtio-pmem | Persists through `fsync()`/`msync()` but explicitly does not support `MAP_SYNC`; it matches file-backend semantics, not `PmemBackend` |
 | `/dev/daxX.Y` | Direct DAX mapping is possible, but the current backend's regular-file sizing and alignment assumptions do not fit |
 | Kernel `nfit_test` | A libnvdimm/ACPI NFIT unit-test module, not a stable application development environment |
 | Native `memmap` | Valid alternative, but invasive and less reproducible than a disposable VM |

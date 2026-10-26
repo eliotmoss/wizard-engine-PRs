@@ -1,0 +1,399 @@
+// The providers: the implementations of PersistenceProvider (StorageRegion.v3).
+//   NativeProvider     stores, CLWB and SFENCE on the machine (PmemRegion)
+//   RecordingProvider  the same stores, and a trace of STORE/CLWB/SFENCE events
+//                      in one monotonically sequenced stream, without executing
+//                      CLWB or SFENCE
+//   MarkingProvider    passes every call to an inner provider and marks the
+//                      write unit of each line written back (DirectIoRegion,
+//                      MappedFileRegion)
+//   StoreOnlyProvider  the inner provider a running engine gives MarkingProvider
+// The native and recording providers mutate the same live byte image with
+// ordinary Pointer.store operations. Loads are observed rather than performed
+// by the provider (LoadObserver, RegionReader); the recorder can keep them
+// too, in a list of their own (recordLoads()).
+
+// The x86-64 cache-control instructions the native provider issues.
+component X86_64CacheControl {
+	private def WRITEBACK_UNSELECTED = 0;
+	private def WRITEBACK_CLWB = 1;
+	private def WRITEBACK_CLFLUSHOPT = 2;
+	private def WRITEBACK_CLFLUSH = 3;
+	private def WRITEBACK_UNSUPPORTED = -1;
+	private var selectedWriteback = WRITEBACK_UNSELECTED;
+
+	// Write one cache line back. CLWB is preferred because the architecture
+	// allows it to leave the line cached, which CLFLUSHOPT and CLFLUSH do not;
+	// whether it does is the core's choice. Measured (docs/persistent-backends.md):
+	// on Cascade Lake it evicts exactly as CLFLUSHOPT does, and on Raptor Lake a
+	// re-load after it costs ~12-14 ns against ~53 ns after CLFLUSHOPT. So a
+	// store into a line just written back may miss either way, which is why a
+	// transaction's after-images are all stored before any line is written back.
+	// Falls back to CLFLUSHOPT, then CLFLUSH, on processors without CLWB.
+	def writeBackLine(addr: Pointer) {
+		def rawAddr = addr - Pointer.NULL;
+		def instruction = writebackInstruction();
+		if (instruction == WRITEBACK_CLWB) {
+			Target.clwb(rawAddr);
+		} else if (instruction == WRITEBACK_CLFLUSHOPT) {
+			Target.clflushOpt(rawAddr);
+		} else if (instruction == WRITEBACK_CLFLUSH) {
+			Target.clflush(rawAddr);
+		} else {
+			System.error("PersistenceProviderError", "no supported cache-line writeback instruction");
+		}
+	}
+
+	// CPU features cannot change while the process is running. Cache the choice
+	// so a large range does not execute CPUID once per cache line.
+	private def writebackInstruction() -> int {
+		if (selectedWriteback != WRITEBACK_UNSELECTED) return selectedWriteback;
+		if (Target.supportsClwb()) {
+			selectedWriteback = WRITEBACK_CLWB;
+		} else if (Target.supportsClflushOpt()) {
+			selectedWriteback = WRITEBACK_CLFLUSHOPT;
+		} else if (Target.supportsClflush()) {
+			selectedWriteback = WRITEBACK_CLFLUSH;
+		} else {
+			selectedWriteback = WRITEBACK_UNSUPPORTED;
+		}
+		return selectedWriteback;
+	}
+
+	// The store fence, SFENCE, which completes every outstanding CLWB.
+	def fence() {
+		Target.sfence();
+	}
+}
+
+enum PersistenceEventKind {
+	STORE,
+	CLWB,
+	SFENCE
+}
+
+type PersistenceEvent(seq: u64, kind: PersistenceEventKind,
+	offset: u64, width: u8, value: u64) #unboxed {
+	def render(buf: StringBuilder) -> StringBuilder {
+		match (kind) {
+			STORE => buf.put3("STORE(seq=%d, offset=%d, width=%d, value=0x",
+				seq, offset, u64.view(width)).putx(value).puts(")");
+			CLWB => buf.put2("CLWB(seq=%d, cacheLine=%d)", seq, offset);
+			SFENCE => buf.put1("SFENCE(seq=%d)", seq);
+		}
+		return buf;
+	}
+}
+
+class NativeProvider extends PersistenceProvider {
+	def range: Range<byte>;
+
+	new(range) { }
+
+	def storeU8(offset: u64, value: u8) {
+		checkedPointer(offset, 1u64).store<u8>(value);
+	}
+
+	def storeU16(offset: u64, value: u16) {
+		checkedPointer(offset, 2u64).store<u16>(value);
+	}
+
+	def storeU32(offset: u64, value: u32) {
+		checkedPointer(offset, 4u64).store<u32>(value);
+	}
+
+	def storeU64(offset: u64, value: u64) {
+		checkedPointer(offset, 8u64).store<u64>(value);
+	}
+
+	def writeBackLine(lineOffset: u64) {
+		if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+			lineOffset >= u64.!(range.length)) {
+			System.error("PersistenceProviderError", "invalid cache-line writeback offset");
+		}
+		X86_64CacheControl.writeBackLine(Pointer.atElement(range, int.!(lineOffset)));
+	}
+
+	def fence() {
+		X86_64CacheControl.fence();
+	}
+
+	def checkedPointer(offset: u64, width: u64) -> Pointer {
+		def size = u64.!(range.length);
+		if (offset % width != 0u64 || offset > size || width > size - offset) {
+			System.error("PersistenceProviderError", "unaligned or out-of-range persistent scalar store");
+		}
+		return Pointer.atElement(range, int.!(offset));
+	}
+}
+
+class RecordingProvider extends NativeProvider {
+	def events = Vector<PersistenceEvent>.new();
+	private var nextSeq = 1u64;
+	private var loadRecorder: RecordingLoadObserver;
+
+	new(range: Range<byte>) super(range) { }
+
+	def storeU8(offset: u64, value: u8) {
+		checkedPointer(offset, 1u64).store<u8>(value);
+		recordStore(offset, 1u8, u64.view(value) & 0xFF_u64);
+	}
+
+	def storeU16(offset: u64, value: u16) {
+		checkedPointer(offset, 2u64).store<u16>(value);
+		recordStore(offset, 2u8, u64.view(value) & 0xFFFF_u64);
+	}
+
+	def storeU32(offset: u64, value: u32) {
+		checkedPointer(offset, 4u64).store<u32>(value);
+		recordStore(offset, 4u8, u64.view(value) & 0xFFFF_FFFF_u64);
+	}
+
+	def storeU64(offset: u64, value: u64) {
+		checkedPointer(offset, 8u64).store<u64>(value);
+		recordStore(offset, 8u8, value);
+	}
+
+	def writeBackLine(lineOffset: u64) {
+		// Reuse the native provider's validation, but recording must not issue
+		// a native instruction: the trace itself is the deterministic result.
+		if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+			lineOffset >= u64.!(range.length)) {
+			System.error("PersistenceProviderError", "invalid cache-line writeback offset");
+		}
+		events.put(PersistenceEvent(nextSeq++, PersistenceEventKind.CLWB,
+			lineOffset, 0u8, 0u64));
+	}
+
+	def fence() {
+		events.put(PersistenceEvent(nextSeq++, PersistenceEventKind.SFENCE,
+			0u64, 0u8, 0u64));
+	}
+
+	// Freeze the events recorded so far into an immutable, named artifact. The
+	// recorder may keep running afterwards; the snapshot does not change.
+	def snapshot(name: string) -> PersistenceTrace {
+		return PersistenceTrace.new(name, u64.!(range.length), events.copy());
+	}
+
+	// Clears the loads recorded by recordLoads() too, so the two lists keep
+	// describing the same stretch of execution.
+	def clear() {
+		events.clear();
+		nextSeq = 1u64;
+		if (loadRecorder != null) loadRecorder.clear();
+	}
+
+	def reset() {
+		clear();
+	}
+
+	// Record this region's loads as well as its stores: install a
+	// RecordingLoadObserver in front of whatever observer is installed (it is
+	// called first and may rewrite the bytes), and return it. Loads are kept
+	// in the observer's own list and never become PersistenceEvents, so
+	// {events}, and every trace snapshot() freezes from it, stays
+	// STORE/CLWB/SFENCE only: validate(), digest(), render(), the crash
+	// machine and the explorer never see a load. Each load records how many
+	// events preceded it, which places it in the same total order.
+	def recordLoads() -> RecordingLoadObserver {
+		if (loadRecorder == null) {
+			loadRecorder = RecordingLoadObserver.new(range, loadObserver, this);
+			loadObserver = loadRecorder;
+		}
+		return loadRecorder;
+	}
+
+	private def recordStore(offset: u64, width: u8, value: u64) {
+		events.put(PersistenceEvent(nextSeq++, PersistenceEventKind.STORE,
+			offset, width, value));
+	}
+}
+
+// One observed load: the region-relative bytes [offset, offset + length) as
+// the code was about to load them, after the observer behind the recorder, if
+// any, had rewritten them. {afterEvents} is the number of STORE/CLWB/SFENCE events
+// the region's recorder held when the load was observed, so the load falls
+// between events[afterEvents - 1] and events[afterEvents]. {bytes} is null for
+// a load that does not lie inside the region.
+class LoadEvent(afterEvents: int, offset: u64, length: u64, bytes: Array<byte>) {
+	// The first min(length, 8) bytes, little-endian, as a typed load reads them.
+	def value() -> u64 {
+		if (bytes == null) return 0u64;
+		var v = 0u64;
+		def n = if(bytes.length < 8, bytes.length, 8);
+		for (i < n) v |= u64.view(bytes[i]) << u6.view(8 * i);
+		return v;
+	}
+
+	def same(that: LoadEvent) -> bool {
+		if (afterEvents != that.afterEvents || offset != that.offset || length != that.length) return false;
+		if (bytes == null || that.bytes == null) return bytes == that.bytes;
+		for (i < bytes.length) if (bytes[i] != that.bytes[i]) return false;
+		return true;
+	}
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		buf.put3("LOAD(after=%d, offset=%d, length=%d, value=0x", afterEvents, offset, length);
+		return buf.putx(value()).puts(")");
+	}
+}
+
+// A load observer that records every load, for audits. It calls {inner}
+// first, so it records what the code will actually load, and it can sit in
+// front of an observer that materialises bytes.
+class RecordingLoadObserver extends LoadObserver {
+	def range: Range<byte>;
+	def inner: LoadObserver;
+	def stores: RecordingProvider;	// may be null: no position
+	def loads = Vector<LoadEvent>.new();
+
+	new(range, inner, stores) { }
+
+	def beforeLoad(offset: u64, length: u64) {
+		if (inner != null) inner.beforeLoad(offset, length);
+		def at = if(stores == null, 0, stores.events.length);
+		def size = u64.!(range.length);
+		if (offset > size || length > size - offset) {
+			loads.put(LoadEvent.new(at, offset, length, null));
+			return;
+		}
+		def copy = Array<byte>.new(int.!(length));
+		def base = int.!(offset);
+		for (i < copy.length) copy[i] = range[base + i];
+		loads.put(LoadEvent.new(at, offset, length, copy));
+	}
+
+	// Loads that fell outside the region. A correct reader never makes one.
+	def outside() -> int {
+		var n = 0;
+		for (i < loads.length) if (loads[i].bytes == null) n++;
+		return n;
+	}
+
+	// Every byte some recorded load covered.
+	def coverage() -> Array<bool> {
+		def covered = Array<bool>.new(range.length);
+		for (i < loads.length) {
+			def e = loads[i];
+			if (e.bytes == null) continue;
+			for (b < e.bytes.length) covered[int.!(e.offset) + b] = true;
+		}
+		return covered;
+	}
+
+	def clear() {
+		loads.clear();
+	}
+}
+
+component NativeProviders {
+	// Resolve a region's provider, installing the native one on first use.
+	// Every writer to a region must share ONE provider object: PmemRegion's
+	// writeback/fence path reads back through StorageRegion.provider(),
+	// so a second, uninstalled provider would yield a trace that is interleaved
+	// but not totally ordered with the CLWB/SFENCE stream. VolatileRegion cannot
+	// install one itself -- it lives in the all-targets src/engine/, which cannot
+	// name this x86-64-only implementation.
+	def installIfAbsent(region: StorageRegion) -> PersistenceProvider {
+		if (region == null) return null;
+		var ops = region.provider();
+		if (ops == null) {
+			ops = NativeProvider.new(region.range);
+			region.setProvider(ops);
+		}
+		return ops;
+	}
+}
+
+// The write units a fence must write back, as a bitmap with the bounds of the
+// marked span so a fence scans only what it touched. MarkingProvider marks
+// them; DirectIoRegion and MappedFileRegion write them back.
+class DirtyUnits(unitBytes: u64, unitCount: u64) {
+	def bits = Array<u64>.new(int.!((unitCount + 63u64) / 64u64));
+	def var lo: u64 = unitCount;    // first marked unit; unitCount when empty
+	def var hi: u64 = 0u64;         // one past the last marked unit
+
+	def markLine(line: u64) {
+		def unit = line / unitBytes;
+		if (unit >= unitCount) return;
+		bits[int.!(unit >> 6)] |= 1u64 << u6.view(unit & 63u64);
+		if (unit < lo) lo = unit;
+		if (unit + 1u64 > hi) hi = unit + 1u64;
+	}
+
+	def isMarked(unit: u64) -> bool {
+		if (unit >= unitCount) return false;
+		return (bits[int.!(unit >> 6)] & (1u64 << u6.view(unit & 63u64))) != 0u64;
+	}
+
+	def isEmpty() -> bool {
+		return lo >= hi;
+	}
+
+	def markedCount() -> u64 {
+		var n = 0u64;
+		for (u = lo; u < hi; u++) if (isMarked(u)) n++;
+		return n;
+	}
+
+	def clear() {
+		if (lo < hi) {
+			def last = int.!((hi - 1u64) >> 6);
+			for (w = int.!(lo >> 6); w <= last; w++) bits[w] = 0u64;
+		}
+		lo = unitCount;
+		hi = 0u64;
+	}
+}
+
+// The native provider beneath MarkingProvider: stores only. Stores go natively
+// into the region (the direct backend's staging buffer, or the mapped file). A
+// line write-back only validates its line: the staging buffer is ordinary DRAM,
+// so a CLWB would buy nothing. A fence does nothing either; the region performs
+// the write-back itself, so that an I/O failure reaches the WAL as a failed
+// drain or persist. MappedFileRegion installs it too, beneath the same marking
+// provider: there the kernel's sync writes each marked page back (on DAX, line
+// by line), so a CLWB would only do part of that work early.
+class StoreOnlyProvider extends NativeProvider {
+	new(range: Range<byte>) super(range) { }
+
+	def writeBackLine(lineOffset: u64) {
+		if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+			lineOffset >= u64.!(range.length)) {
+			System.error("PersistenceProviderError", "invalid cache-line writeback offset");
+		}
+	}
+
+	def fence() { }
+}
+
+// The provider DirectIoRegion and MappedFileRegion install: every operation
+// goes to {inner}, and a line write-back also marks its line's unit dirty. A
+// running engine passes StoreOnlyProvider; tests pass a RecordingProvider, so
+// the recorded trace and the dirty set come from the same calls.
+class MarkingProvider(inner: PersistenceProvider, dirty: DirtyUnits) extends PersistenceProvider {
+	def storeU8(offset: u64, value: u8) {
+		inner.storeU8(offset, value);
+	}
+
+	def storeU16(offset: u64, value: u16) {
+		inner.storeU16(offset, value);
+	}
+
+	def storeU32(offset: u64, value: u32) {
+		inner.storeU32(offset, value);
+	}
+
+	def storeU64(offset: u64, value: u64) {
+		inner.storeU64(offset, value);
+	}
+
+	def writeBackLine(lineOffset: u64) {
+		inner.writeBackLine(lineOffset);
+		dirty.markLine(lineOffset);
+	}
+
+	def fence() {
+		inner.fence();
+	}
+}

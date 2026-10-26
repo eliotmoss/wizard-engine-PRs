@@ -78,11 +78,11 @@ prior work.
 **1. A persistence seam spanning byte-addressable and block-backed media, with
 a measured account of what it does not unify.**
 
-The seam is `BackendRegion` / `TxnRegionBackend` plus the per-region
-`PersistentOperations` provider (`src/engine/TxnBackend.v3`,
-`src/engine/x86-64/X86_64PersistentOperations.v3`), carrying one allocator
-(`PWRegion`) and one log (`DualTxnWal`) over `VolatileRegion`,
-`FileMmapRegion`, `PmemMmapRegion` and `DirectIoRegion` (explicit `pwrite` +
+The seam is `StorageRegion` / `StorageBackend` plus the per-region
+`PersistenceProvider` provider (`src/engine/StorageRegion.v3`,
+`src/engine/x86-64/X86_64Providers.v3`), carrying one allocator
+(`RegionAllocator`) and one log (`TwoSlotWal`) over `VolatileRegion`,
+`MappedFileRegion`, `PmemRegion` and `DirectIoRegion` (explicit `pwrite` +
 `O_DIRECT` from a private staging buffer, to a file or a raw block device,
 added 2026-09-24) without conditionals in the layers above. The direct backend
 emits the PMEM backend's `STORE`/`CLWB`/`SFENCE` trace for the same history,
@@ -115,7 +115,7 @@ written down. Four axes, in increasing order of how much they hurt.
 
 PMEM persists a 64-byte cache line via `CLWB` and orders with `SFENCE`. The
 file backend persists a page-aligned range via `msync`, or the whole file via
-`fdatasync`. `prepareChangedRange` / `persistChanges` present one interface over
+`fdatasync`. `writeBack` / `drain` present one interface over
 a granularity difference of roughly two to three orders of magnitude.
 
 ### Failure atomicity
@@ -131,7 +131,7 @@ less precisely specifiable side.
 
 ### Boundary cost
 
-Phase B of `DualTxnWal` exists to reduce the protocol to one persistence
+Phase B of `TwoSlotWal` exists to reduce the protocol to one persistence
 boundary per commit in steady state. **Measured on Magpie, 2026-09-18**, the
 same design decision is worth 95–99 % of a commit on a file over DAX, 52–86 % on
 a file over block storage (falling as the transaction grows), and 3.4 % on PMEM
@@ -419,8 +419,8 @@ point, line by line, still rests on the explorer alone.
 
 The thesis is framed around testing, so the testing needs one picture rather
 than fifteen test files and five harness binaries. The picture has two axes. One
-is the software stack under test: the sieve workload, `PWRegion`,
-`RegionTransaction`, `DualTxnWal`, the seam and the backends. The other is a
+is the software stack under test: the sieve workload, `RegionAllocator`,
+`TransactionCache`, `TwoSlotWal`, the seam and the backends. The other is a
 ladder of *evidence layers*, and each layer produces the bytes that exist after
 a crash in a different way. The explorer is the hub. Every other layer feeds it,
 discharges one of its assumptions, or samples part of what it enumerates. The
@@ -456,24 +456,24 @@ different numbering, and the text should never call them layers 1–4.
 
 The properties are not a ladder. The WAL's acknowledgement contract checks
 that acknowledged after-images survive; the allocator's structural invariants
-(`PersistentAllocatorInvariants.check()`, the whole of
-`PersistentAllocatorProperty`) check structure and take no acknowledged value,
+(`AllocatorInvariants.check()`, the whole of
+`AllocatorProperty`) check structure and take no acknowledged value,
 so neither contains the other. The workloads' properties contain the
-allocator's: `PersistentSieveProperty` runs the allocator walk and then
+allocator's: `SieveProperty` runs the allocator walk and then
 `PWSieve.checkInvariants()`, and the B+-tree's property runs the same walk
 before the tree's invariants and its comparison with the reference
-(`PersistentBTreeTest.v3`, `checkMounted()`). (Until 2026-10-26 this said
+(`BTreeCrashTest.v3`, `checkMounted()`). (Until 2026-10-26 this said
 "Only the sieve's cross-object invariants contain another property".) The sieve's containment is strict, and shown rather than
-assumed: `persistent_sieve:` corrupts two bytes of a durable bitmap, which the
+assumed: `sieve_crash:` corrupts two bytes of a durable bitmap, which the
 allocator walk accepts and the sieve property rejects. What the allocator
 finished is checked by count, not by the sweeps: the lazy image at the end of
 each allocation scenario must hold one more used chunk per finished
-allocation (`PersistentAllocatorTest.v3`). (Corrected 2026-10-19: this
+allocation (`AllocatorCrashTest.v3`). (Corrected 2026-10-19: this
 paragraph called the three a ladder, each strictly stronger than the one
 before, which the code does not bear out.)
 
 The layers share the code of their oracles, not only the properties.
-`checkInvariants()` runs in `PWSieveTest`, in `PersistentSieveProperty`, after
+`checkInvariants()` runs in `PWSieveTest`, in `SieveProperty`, after
 every restart of the `pwsieve` kill loop, in `pwreboot`'s verify step, and after
 every `pwsievebench` round. The allocator walk runs in unit tests, in the
 explorer, and in the direct backend's `SIGKILL` cases. The layers therefore
@@ -532,14 +532,14 @@ test at another layer:
 
 | The explorer assumes | Discharged by |
 |---|---|
-| The trace contains every persistent store | The `persistent_ops:` store audit: every field `format()` writes in the header, sentinels and block table, with the header's padding hole asserted as a hole, and a store in the log block (corrected 2026-10-25 from "complete byte coverage of `format()`", which is broader than `pwregion_format_trace` checks), and allocator after-images strictly after the commit boundary. The Immix line marks, the one stated exception until 2026-10-19, now cross the seam too, as stores with no writeback or fence of their own (`persistent_ops:immix_line_marks_cross_the_seam`) |
-| The trace is inside the model's domain | `validate()` on every explored trace; `persistent_trace:` pins the seven defects it rejects, each at the right event |
-| The provider's `clwb`/`sfence` are `CLWB`/`SFENCE` | `persistent_ops:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
-| The search finds every admitted image | The reduced search equals the full branching search at every cut of four hand-written traces (5, 7, 4 and 10 events on one to three lines), byte for byte; its per-line content classes give exactly the distinct images of every prefix vector at every cut of the small traces and at sampled cuts of a recorded commit (`persistent_explore:line_classes_equal_distinct_images`, 2026-10-19); an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
-| A lazy leaf's verdict holds for every image it stands for (since 2026-10-20) | `persistent_lazy:`: every distinct image lies in exactly one leaf (small traces and the one-commit trace, every cut); each image's eager verdict equals its leaf's (the one-commit trace, and the overwrite guard's 597,079 images); each leaf's least and greatest image, run eagerly, make the lazy run's stores and loads byte for byte; a nondeterministic property is reported. Only for the scenarios these tests run |
-| Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, `file_mmap:boundary_images_are_model_images` (since 2026-10-13: the mapped file after every sync, both as the page cache holds it and as the marked pages alone leave it), and Stage 2c's ordinary image. These are the only places where real bytes are compared with the model. (Corrected 2026-10-25: this row named only the direct check and Stage 2c.) |
-| One exploration covers more than one backend | Trace identity with the PMEM backend at 2 KiB and 4 KiB blocks: the direct backend's and, since 2026-10-13, the mapped file's (`file_mmap:trace_matches_pmem_region`). Both share the explorer's results by restriction ([PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)): the file backend on fsdax under the baseline profile and the kernel's `fsync` contract, on block storage only under B2–B5, of which nothing guarantees B2. (Corrected 2026-10-25: this row said the file backend had a stated model and no explorer.) |
-| "Recovery" means production recovery | Images are mounted through the production mount path (`runDualWal()`, `PersistentImageBackend`), never through a reimplementation |
+| The trace contains every persistent store | The `provider:` store audit: every field `format()` writes in the header, sentinels and block table, with the header's padding hole asserted as a hole, and a store in the log block (corrected 2026-10-25 from "complete byte coverage of `format()`", which is broader than `pwregion_format_trace` checks), and allocator after-images strictly after the commit boundary. The Immix line marks, the one stated exception until 2026-10-19, now cross the seam too, as stores with no writeback or fence of their own (`provider:immix_line_marks_cross_the_seam`) |
+| The trace is inside the model's domain | `validate()` on every explored trace; `persistence_trace:` pins the seven defects it rejects, each at the right event |
+| The provider's `writeBackLine`/`fence` are `CLWB`/`SFENCE` | `provider:native_instruction_encodings` and the native smoke path (layer 2); the `MAP_SYNC` integration on Magpie |
+| The search finds every admitted image | The reduced search equals the full branching search at every cut of four hand-written traces (5, 7, 4 and 10 events on one to three lines), byte for byte; its per-line content classes give exactly the distinct images of every prefix vector at every cut of the small traces and at sampled cuts of a recorded commit (`crash_explorer:line_classes_equal_distinct_images`, 2026-10-19); an exhausted budget is reported, and `exhaustive()` is true only when the search completed |
+| A lazy leaf's verdict holds for every image it stands for (since 2026-10-20) | `read_driven:`: every distinct image lies in exactly one leaf (small traces and the one-commit trace, every cut); each image's eager verdict equals its leaf's (the one-commit trace, and the overwrite guard's 597,079 images); each leaf's least and greatest image, run eagerly, make the lazy run's stores and loads byte for byte; a nondeterministic property is reported. Only for the scenarios these tests run |
+| Real systems leave only admitted images | `direct_io:boundary_images_are_model_images`, `mapped_file:boundary_images_are_model_images` (since 2026-10-13: the mapped file after every sync, both as the page cache holds it and as the marked pages alone leave it), and Stage 2c's ordinary image. These are the only places where real bytes are compared with the model. (Corrected 2026-10-25: this row named only the direct check and Stage 2c.) |
+| One exploration covers more than one backend | Trace identity with the PMEM backend at 2 KiB and 4 KiB blocks: the direct backend's and, since 2026-10-13, the mapped file's (`mapped_file:trace_matches_pmem_region`). Both share the explorer's results by restriction ([PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally)): the file backend on fsdax under the baseline profile and the kernel's `fsync` contract, on block storage only under B2–B5, of which nothing guarantees B2. (Corrected 2026-10-25: this row said the file backend had a stated model and no explorer.) |
+| "Recovery" means production recovery | Images are mounted through the production mount path (`runTwoSlotWal()`, `CrashImageBackend`), never through a reimplementation |
 
 The bridge runs the other way too. The explorer's scenarios are one sieve step,
 one B+-tree put of 7 or 6 commits (since 2026-10-15), or at most three
@@ -576,13 +576,13 @@ does. These are permanent tests:
 These were one-off mutation runs:
 
 - the batched apply's four mutants (an unprepared merged range, no commit drain,
-  no `persistAppliedData()` drain, and the facade skipping the prepare) each
+  no `persistAfterImages()` drain, and the facade skipping the prepare) each
   failed at least one test;
 - a deliberately broken direct write-back was rejected at the fifth boundary;
   and
-- the `MultiTxnWal` regression tests were verified to fail before their fixes.
+- the `RingWal` regression tests were verified to fail before their fixes.
 
-`persistent_control:` stays in the default suite for this reason. If the
+`crash_control:` stays in the default suite for this reason. If the
 explorer ever stopped catching the mutant, every result that leans on it would
 be worth less, and the suite would say so.
 
@@ -633,8 +633,8 @@ Chapter 6 should state coverage in these terms and no stronger:
   601,294 and 14,058 for the batched apply's 393,342; on sean-tan-PC the
   three-commit and batched sweeps take 0.33 s and 0.72 s against 15.9 s and
   10.5 s. A leaf's verdict stands for its images only as far as the load seam
-  is complete, which `persistent_lazy:` checks for the scenarios it runs. The
-  `persistent_recovery:` sweeps still run eagerly; nothing outside the WAL
+  is complete, which `read_driven:` checks for the scenarios it runs. The
+  `crash_recovery:` sweeps still run eagerly; nothing outside the WAL
   properties is lazy yet.
 - **Long histories, at the two ends only.** The kill loops sample the eager
   image (layer 3a) and the lazy image rounded up to 4 KiB (the direct backend)
@@ -754,14 +754,14 @@ Each gets one sentence in future work, no more.
   host module, so there is currently no runtime story. Wizard is motivation and
   context, not a contribution — **Eliot should be told this explicitly now**
   rather than discovering it in the draft.
-- ~~Closing the `ImmixPWRegion` line-mark hole in the seam.~~ Closed
+- ~~Closing the `ImmixRegionAllocator` line-mark hole in the seam.~~ Closed
   2026-10-19: the marks' stores cross the seam, still transient, with no
   writeback or fence of their own
-  (`persistent_ops:immix_line_marks_cross_the_seam`), so the active path has no
+  (`provider:immix_line_marks_cross_the_seam`), so the active path has no
   acknowledged exception left to state.
 - Crash-model milestones 8–9 (regular/seeded test tiers, emitted-instruction
   validation).
-- Any further `MultiTxnWal` or `SingleTxnWal` work; they appear in Chapter 3 as
+- Any further `RingWal` or `SingleTxnWal` work; they appear in Chapter 3 as
   design comparison only.
 - Hardware-only backend integration facts (non-granule alignment, large
   regions, `MAP_SYNC`-refusal control). Cheap, but low intellectual yield per
@@ -825,13 +825,13 @@ together with the layout assumption it exposes: at 4 KiB blocks the WAL header
 and both slots share one 4 KiB write unit.
 
 Since 2026-10-13 the file backend is a restriction of the PMEM model as well.
-Its provider is the direct backend's `DirectIoOperations`, which marks each
+Its provider is the direct backend's `MarkingProvider`, which marks each
 written-back line's 4 KiB page, so it emits the PMEM backend's trace for the
-same history (`file_mmap:trace_matches_pmem_region`), and each fence is one
+same history (`mapped_file:trace_matches_pmem_region`), and each fence is one
 `fdatasync` when a page is marked. Every image it can leave is one the PMEM
 model admits for that trace: on fsdax under the baseline profile and the
 kernel's `fsync` contract, on block storage only under B2–B5, of which nothing
-guarantees B2. `file_mmap:boundary_images_are_model_images` compares the file
+guarantees B2. `mapped_file:boundary_images_are_model_images` compares the file
 after every sync with the model. The explorer's results therefore carry over
 to the file backend, and a file-backed explorer is not needed. What the
 bullets above say about the file backend's own image set stays true; the
@@ -866,7 +866,7 @@ enumeration work:
   Not Created Equal" (OSDI '14); Crotty, Leis and Pavlo, "Are You Sure You Want
   to Use MMAP in Your DBMS?" (CIDR '22), the mmap-versus-buffer-pool argument
   this backend demonstrates within one seam; Rebello et al., "Can Applications
-  Recover from fsync Failures?" (ATC '20), against which `DualTxnWal`'s
+  Recover from fsync Failures?" (ATC '20), against which `TwoSlotWal`'s
   latch-and-reopen contract should be positioned.
 
 ### Differentiators
@@ -901,7 +901,7 @@ Witcher, Vinter and Mumak", rather than presenting it as a contribution.
 2. **The oracle knows what was acknowledged.** At each cut the recovered state
    is checked against the acknowledgement contract, the allocator's structural
    walk and, for the sieve, cross-object invariants
-   (`PersistentSieveProperty`). Jaaru and Mumak count only crashes and failed
+   (`SieveProperty`). Jaaru and Mumak count only crashes and failed
    assertions or a recovery that reports failure; Witcher compares outputs
    with crash-free runs; Vinter compares recovered POSIX states for atomicity.
    In Stage 2c the elided-writeback mutant lost every acknowledged step while
@@ -988,8 +988,8 @@ complete draft passes.
 
 Seven, and they need real hours budgeted.
 
-1. Layer stack — `PWRegion` → `RegionTransaction` → `DualTxnWal` →
-   `BackendRegion` → the four backends (volatile, mmap file, PMEM, direct I/O).
+1. Layer stack — `RegionAllocator` → `TransactionCache` → `TwoSlotWal` →
+   `StorageRegion` → the four backends (volatile, mmap file, PMEM, direct I/O).
 2. On-region layout.
 3. Phase B commit timeline, showing the piggybacked boundary.
 4. **One trace cut fanning out into its permitted durable images.** The

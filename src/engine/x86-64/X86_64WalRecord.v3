@@ -1,0 +1,38 @@
+// The on-media layout of a write-ahead log record, shared by TwoSlotWal and
+// RingWal: a header, the redo entries (one after-image each) and a trailer
+// that carries the record's checksum. SingleTxnWal uses WalEntry too.
+
+layout WalRecordHeader {
+        +0      magic:          u64;    // Constant signature identifying the start of a transaction record
+        +8      version:        u16;    // Transaction-record format version. Used to reject incompatible record layouts
+        +16     headerSize:     u16;    // Size of this header in bytes
+        +24     entrySize:      u16;    // Size of each redo entry. Expected to match WalEntry.size
+        +32     recordLen:      u32;    // Total aligned record length: header + entries + commit trailer + padding
+        +40     entryCount:     u32;    // Number of redo entries immediately following this trailer
+        +48     logEpoch:       u64;    // WAL epoch this record belongs to. Must match the current superblock epoch
+        +56     txnSeq:         u64;    // Transaction sequence number. Defines commit order and recovery replay order
+        =64;
+}
+
+layout WalEntry {
+        +0      offset:         u64;    // Relative offset of first changed byte, from the start of the Region
+        +8      value:          u64;    // The data to be written
+        +16     width:          u8;     // number of bytes being changed (1, 2, 4, 8)
+        =32;
+}
+
+layout WalRecordTrailer {
+        +0      magic:          u64;    // Constant signature identifying the commit trailer
+        +8      recordLen:      u32;    // Must match WalRecordHeader.recordLen
+        +16     entryCount:     u32;    // Must match WalRecordHeader.entryCount
+        +24     logEpoch:       u64;    // Must match both the record header and current superblock epoch
+        +32     txnSeq:         u64;    // Must match the record header
+        +40     checksum:       u64;    // Checksum for the complete transaction record.
+                                        // Computed over header, entries, trailer fields except this checksum
+        =48;
+}
+
+// An after-image held in memory until it is written into a record.
+type WalPendingEntry(offset: u64, value: u64, width: u8) #unboxed { }
+
+type WalEntryHandle(addr: u64) { }

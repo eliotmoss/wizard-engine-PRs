@@ -1,0 +1,198 @@
+// The storage interface the region allocator and its write-ahead log use.
+// A StorageBackend opens a StorageRegion: a range of bytes plus three
+// persistence calls (writeBack, drain, persist). The region owns one
+// PersistenceProvider, through which every store, line write-back and fence
+// passes. Implementations:
+//
+// 1. VolatileBackend:    in-memory storage (Array-backed), here
+// 2. PmemBackend:        a MAP_SYNC mapping of a DAX file (x86-64)
+// 3. MappedFileBackend:  a shared mapping of a regular file (x86-64)
+// 4. DirectIoBackend:    a DRAM staging buffer written back with O_DIRECT (x86-64)
+//
+// The backend opens regions and reports capabilities. A region owns its own
+// lifecycle and persistence behaviour.
+
+// Relative cost class of a checkpoint() on a backend, used to tune the WAL's
+// checkpoint thresholds. Checkpoint cost is strongly backend-asymmetric:
+//   FREE      volatile  -- reclaim only, no syncs
+//   CHEAP     PMEM      -- a couple of store fences
+//   EXPENSIVE file      -- fdatasync of region data + superblock msync
+enum CheckpointCost {
+	FREE,
+	CHEAP,
+	EXPENSIVE
+}
+
+// Watches the loads code makes from a persistent region. Loads do not go
+// through PersistenceProvider as stores do: a production load stays a plain
+// Pointer.load, and the region's readers (RegionReader) call beforeLoad()
+// first, only when an observer is installed on the region's provider.
+//
+// The contract:
+//   - offset and length are region-relative, like a store's offset;
+//   - beforeLoad() is called BEFORE the bytes [offset, offset + length) are
+//     loaded, and before any field of a Ref forged over them is read, so the
+//     observer may rewrite those bytes in the region's mapping and the code
+//     will load what it wrote (a lazy crash search materialises its chosen
+//     image there);
+//   - one call may cover a whole layout or a byte loop's range, so the
+//     reader may load the covered bytes later, and more than once, without
+//     another call;
+//   - reads of bytes the running code itself stored are observed like any
+//     other: telling them apart is the observer's business, not the reader's.
+// The default observes nothing.
+class LoadObserver {
+	def beforeLoad(offset: u64, length: u64) { }
+}
+
+// The provider: the narrow seam for persistent scalar stores and PMEM ordering
+// operations.
+// Offsets are always relative to the beginning of the owning StorageRegion.
+// Implementations must preserve naturally aligned little-endian 1/2/4/8-byte
+// stores. A StorageRegion owns one provider so stores, cache-line writebacks,
+// and fences can be observed in one total order without global tracing state.
+//
+// {loadObserver} is null in production. Installing one makes every reader of
+// this region (RegionReader) report its loads to it first.
+class PersistenceProvider {
+	var loadObserver: LoadObserver;
+
+	def storeU8(offset: u64, value: u8);
+	def storeU16(offset: u64, value: u16);
+	def storeU32(offset: u64, value: u32);
+	def storeU64(offset: u64, value: u64);
+	def writeBackLine(lineOffset: u64);
+	def fence();
+}
+
+// How a backend opens a region's backing store. FORMAT starts from a store that
+// is zero-initialised; ATTACH keeps an existing store (backends may fall back
+// to a fresh store if none exists).
+enum OpenMode {
+	ATTACH,
+	FORMAT
+}
+
+// A region of storage a backend opened
+class StorageRegion {
+	def range: Range<byte>;  // The actual bytes of the region
+	private var currentProvider: PersistenceProvider;
+
+	new(range) { }
+
+	def provider() -> PersistenceProvider {
+		return currentProvider;
+	}
+
+	def setProvider(provider: PersistenceProvider) {
+		currentProvider = provider;
+	}
+
+	// Close this region and release any resources it owns. Nothing is made
+	// durable here: the WAL's close() is the clean path.
+	def close();
+
+	// Relative cost of a checkpoint() on this backend. The WAL uses it to choose
+	// how aggressively to checkpoint: a free backend can checkpoint on nearly
+	// every commit, while an expensive backend checkpoints lazily. Conservative
+	// default for unknown backends is EXPENSIVE.
+	def checkpointCost() -> CheckpointCost {
+		return CheckpointCost.EXPENSIVE;
+	}
+
+	// Ordinary data bytes have already changed: start writing them back, one
+	// write-back per 64-byte line through the provider. They are durable after
+	// the next drain().
+	def writeBack(offset: u64, size: u64) -> bool;
+
+	// Complete every write-back started since the last drain(): one fence, and
+	// on a file backend the sync the fence stands for.
+	def drain() -> bool;
+
+	// Write back a range and fence: the range, and every earlier write-back, is
+	// durable when this returns true. For ordered WAL log and header writes.
+	def persist(offset: u64, size: u64) -> bool;
+}
+
+// Backend interface that all storage implementations must provide
+class StorageBackend {
+	// Open a region of the given size with the given access (BackendProt
+	// masks). FORMAT: the backing store must be zero-initialised. ATTACH: keep
+	// an existing store (backends may fall back to a fresh store if none
+	// exists). An attach must not change an existing store's size: the file
+	// backends size an empty file, and refuse (null) a non-empty one of any
+	// other size without changing it.
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion;
+	
+	// Check if this backend provides persistence
+	def isPersistent() -> bool;
+	
+	// Get the name of this backend (for debugging)
+	def name() -> string;
+}
+
+// Protection flags (mirror Linux mmap flags)
+enum BackendProt(mask: int) {
+	NONE(0),
+	READ(1),
+	WRITE(2),
+	EXEC(4)
+}
+
+class VolatileRegion extends StorageRegion {
+	new(range: Range<byte>) super(range) { }
+
+	def close() {
+		// Array storage is garbage collected automatically.
+	}
+
+	def checkpointCost() -> CheckpointCost {
+		return CheckpointCost.FREE;
+	}
+
+	def writeBack(offset: u64, size: u64) -> bool {
+		return true;
+	}
+
+	def drain() -> bool {
+		return true;
+	}
+
+	def persist(offset: u64, size: u64) -> bool {
+		return true;
+	}
+}
+
+// Platform-independent volatile memory backend using simple Array allocation
+class VolatileBackend extends StorageBackend {
+	
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		// A byte array-backed region. {mode} is ignored: a newly-allocated
+		// Array<byte> is zero-initialised by construction, satisfying both modes.
+		var data = Array<byte>.new(int.!(size));
+		var range = data[0 ..+ data.length];
+		return VolatileRegion.new(range);
+	}
+	
+	def isPersistent() -> bool {
+		return false;
+	}
+	
+	def name() -> string {
+		return "volatile";
+	}
+}
+
+// Global instances of platform-independent backends
+component Backends {
+	private var volatileBackend: VolatileBackend;
+	
+	def volatile() -> StorageBackend {
+		if (volatileBackend == null) {
+			volatileBackend = VolatileBackend.new();
+		}
+		return volatileBackend;
+	}
+	
+	def getMmap() -> StorageBackend;
+}

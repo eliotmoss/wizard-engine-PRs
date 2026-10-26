@@ -2,7 +2,7 @@
 //
 // Milestone 5 of docs/pmem-crash-model.md. The explorer produces the byte
 // images a crash can leave; this layer mounts one and runs the real
-// DualTxnWal recovery path over it, so a property is checked against the
+// TwoSlotWal recovery path over it, so a property is checked against the
 // program rather than against a second model of it. Reimplementing recovery
 // inside the checker could only prove that a correct model of an incorrect
 // program agrees with itself.
@@ -12,7 +12,7 @@
 // format), recover() runs, and the resulting bytes are frozen back into an
 // image before the region is released.
 //
-// Mounting an image is done through PersistentImageMounts, which offers the two
+// Mounting an image is done through CrashImageMounts, which offers the two
 // containers deliberately rather than by accident:
 //
 //   - openArray() is a plain region in an anonymous mapping (AnonMappedRegion).
@@ -24,7 +24,7 @@
 //     AnonMappedRegion); a mapping costs an mmap and a munmap per image.
 //     openFailing() is the same container with boundaries that fail once, at
 //     a chosen call (InjectedFailureRegion).
-//   - openMapped() is a PmemMmapRegion, so its boundaries translate into
+//   - openMapped() is a PmemRegion, so its boundaries translate into
 //     cache-line writebacks and fences on the region's provider. With a
 //     recording provider installed, recovery's own stores, CLWBs and fences are
 //     captured as a trace, which is the input to a bounded second crash DURING
@@ -35,15 +35,15 @@
 // What production recovery did with one durable image, and the bytes it left.
 // {left} is those bytes as the mount's snapshot() gave them: a durable image
 // when the mount held concrete bytes, and a lazy snapshot when it was one of a
-// lazy search's mounts (X86_64PersistentLazyExplorer.v3), whose bytes recovery
+// lazy search's mounts (X86_64ReadDrivenExplorer.v3), whose bytes recovery
 // neither stored nor loaded may still stand for undecided crash-image bytes.
 // {recovered} is the same bytes as a durable image, and null for a lazy run.
-class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
+class CrashRecoveryRun(recovery: WalRecovery, requiresRecovery: bool,
 	nextTxnSeq: u64, lastCommittedSeq: u64, dataDurableSeq: u64,
-	left: PersistentImageView) {
+	left: CrashImageView) {
 
-	def recovered: PersistentDurableImage = if(PersistentDurableImage.?(left),
-		PersistentDurableImage.!(left), null);
+	def recovered: CrashImage = if(CrashImage.?(left),
+		CrashImage.!(left), null);
 
 	def render(buf: StringBuilder) -> StringBuilder {
 		buf.put1("recovery=%s", recovery.name);
@@ -56,24 +56,24 @@ class PersistentRecoveryRun(recovery: DualWalRecovery, requiresRecovery: bool,
 
 // One durable image, mounted as a region. {recorder} is non-null only for a
 // mount that records what the code under test does to it.
-class PersistentImageMount(region: BackendRegion, recorder: RecordingPersistentOperations) {
+class CrashImageMount(region: StorageRegion, recorder: RecordingProvider) {
 
 	// The bytes as they stand now, frozen into an image. A raw copy, outside
 	// the load seam on purpose: it runs after the code under test has
 	// finished, and properties read the frozen copy, so it is not a load
 	// recovery makes and no load observer should see it. The same holds for
 	// the copies taken after an allocator check below.
-	def freeze() -> PersistentDurableImage {
+	def freeze() -> CrashImage {
 		def after = Array<byte>.new(region.range.length);
 		for (i < after.length) after[i] = region.range[i];
-		return PersistentDurableImage.new(after);
+		return CrashImage.new(after);
 	}
 
 	// The bytes as a property may read them afterwards. Here the frozen copy;
 	// a lazy search's mount returns a snapshot that keeps the bytes the code
 	// under test neither stored nor loaded as marks, so that freezing a mount
-	// decides nothing (PersistentLazyMount).
-	def snapshot() -> PersistentImageView {
+	// decides nothing (ReadDrivenMount).
+	def snapshot() -> CrashImageView {
 		return freeze();
 	}
 
@@ -82,48 +82,48 @@ class PersistentImageMount(region: BackendRegion, recorder: RecordingPersistentO
 	}
 
 	def close() {
-		region.destroy();
+		region.close();
 	}
 }
 
 // How a property mounts the images it is handed. A property written against a
-// mounter, rather than against PersistentImageMounts directly, runs unchanged
-// in an eager check, where every image is a PersistentDurableImage mounted in a
+// mounter, rather than against CrashImageMounts directly, runs unchanged
+// in an eager check, where every image is a CrashImage mounted in a
 // fresh mapping, and in the lazy search, whose mounter hands out mounts of the
-// crash image it is materialising (PersistentLazySearch). Returns null if the
+// crash image it is materialising (ReadDrivenSearch). Returns null if the
 // host refused a mapping.
-class PersistentImageMounter {
-	def mount(image: PersistentImageView) -> PersistentImageMount;
+class CrashImageMounter {
+	def mount(image: CrashImageView) -> CrashImageMount;
 }
 
-// The eager mounter: a mapped PMEM container per image, as runDualWal() has
+// The eager mounter: a mapped PMEM container per image, as runTwoSlotWal() has
 // always mounted one. With {record} set every mount records its stores,
 // writebacks, fences and loads, kept in {logs} in mount order, so a run can be
 // compared with another run of the same code.
-class PersistentEagerMounter(record: bool) extends PersistentImageMounter {
-	def logs = Vector<PersistentMountLog>.new();
+class CrashEagerMounter(record: bool) extends CrashImageMounter {
+	def logs = Vector<CrashMountLog>.new();
 
-	def mount(image: PersistentImageView) -> PersistentImageMount {
-		if (!PersistentDurableImage.?(image)) {
-			System.error("PersistentMountError", "an eager mount needs a durable image, not a lazy view");
+	def mount(image: CrashImageView) -> CrashImageMount {
+		if (!CrashImage.?(image)) {
+			System.error("CrashMountError", "an eager mount needs a durable image, not a lazy view");
 		}
-		def m = PersistentImageMounts.openMapped(PersistentDurableImage.!(image), record);
-		if (m != null && record) logs.put(PersistentMountLog.new(m.recorder, m.recorder.recordLoads()));
+		def m = CrashImageMounts.openMapped(CrashImage.!(image), record);
+		if (m != null && record) logs.put(CrashMountLog.new(m.recorder, m.recorder.recordLoads()));
 		return m;
 	}
 }
 
-component PersistentImageMounters {
+component CrashImageMounters {
 	// What every eager property check mounts through.
-	def EAGER = PersistentEagerMounter.new(false);
+	def EAGER = CrashEagerMounter.new(false);
 }
 
 // What one recorded mount did: its stores, writebacks and fences, and its
 // loads, in their recorded order.
-class PersistentMountLog(stores: RecordingPersistentOperations, loads: RecordingLoadObserver) {
+class CrashMountLog(stores: RecordingProvider, loads: RecordingLoadObserver) {
 
 	// The first way {that} differs from this mount, or null.
-	def difference(that: PersistentMountLog) -> string {
+	def difference(that: CrashMountLog) -> string {
 		def x = stores.events, y = that.stores.events;
 		if (x.length != y.length) {
 			return Strings.format2("%d persistent operations against %d", x.length, y.length);
@@ -151,12 +151,12 @@ class PersistentMountLog(stores: RecordingPersistentOperations, loads: Recording
 // A region in an anonymous mapping whose persistence boundaries succeed
 // without reaching the writeback/fence hooks, as VolatileRegion's do. A byte
 // array on Virgil's heap would not do: the semispace collector moves it, and
-// PWRegion and DualTxnWal keep the region's start as a raw address and forge
+// RegionAllocator and TwoSlotWal keep the region's start as a raw address and forge
 // every handle from it, so after a collection they read the old copy while
 // their stores, which go through the region's range, reach the moved one, and
 // the next collection reuses the old copy's memory. A mapping does not move.
 // The region holds the Mapping, so the mapping's finalizer cannot unmap it
-// while the region is in use; destroy() unmaps it.
+// while the region is in use; close() unmaps it.
 class AnonMappedRegion extends VolatileRegion {
 	var mapping: Mapping;
 
@@ -164,7 +164,7 @@ class AnonMappedRegion extends VolatileRegion {
 		mapping = m;
 	}
 
-	def destroy() {
+	def close() {
 		if (mapping != null) {
 			mapping.range.unmap();
 			mapping = null;
@@ -172,45 +172,45 @@ class AnonMappedRegion extends VolatileRegion {
 	}
 }
 
-component PersistentImageMounts {
+component CrashImageMounts {
 	// Plain container (AnonMappedRegion): persistence boundaries succeed
 	// without reaching the writeback/fence hooks. Use this when only the effect
 	// of the mounted code on the bytes matters. Named for the heap byte array
 	// it used until 2026-10-19. Returns null if the host refused a mapping.
-	def openArray(image: PersistentDurableImage) -> PersistentImageMount {
+	def openArray(image: CrashImage) -> CrashImageMount {
 		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
 		def region = AnonMappedRegion.new(mapping);
 		for (i < image.size()) region.range[i] = image.bytes[i];
-		return PersistentImageMount.new(region, null);
+		return CrashImageMount.new(region, null);
 	}
 
 	// The plain container with persistence boundaries that fail once, at call
 	// {failAtBoundary} (InjectedFailureRegion). Returns null if the host
 	// refused a mapping.
-	def openFailing(image: PersistentDurableImage, failAtBoundary: int) -> PersistentImageMount {
+	def openFailing(image: CrashImage, failAtBoundary: int) -> CrashImageMount {
 		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
 		def region = InjectedFailureRegion.new(mapping, failAtBoundary);
 		for (i < image.size()) region.range[i] = image.bytes[i];
-		return PersistentImageMount.new(region, null);
+		return CrashImageMount.new(region, null);
 	}
 
 	// Mapped PMEM container, whose boundaries translate into writebacks and
 	// fences on the region's provider. With {record} set, those -- and every
 	// persistent store -- are captured, so the mounted run can itself be
 	// explored for a further crash. Returns null if the host refused a mapping.
-	def openMapped(image: PersistentDurableImage, record: bool) -> PersistentImageMount {
+	def openMapped(image: CrashImage, record: bool) -> CrashImageMount {
 		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
-		def region = PmemMmapRegion.new(mapping, -1);
+		def region = PmemRegion.new(mapping, -1);
 		for (i < image.size()) region.range[i] = image.bytes[i];
-		var recorder: RecordingPersistentOperations;
+		var recorder: RecordingProvider;
 		if (record) {
-			recorder = RecordingPersistentOperations.new(region.range);
-			region.setPersistentOperations(recorder);
+			recorder = RecordingProvider.new(region.range);
+			region.setProvider(recorder);
 		}
-		return PersistentImageMount.new(region, recorder);
+		return CrashImageMount.new(region, recorder);
 	}
 }
 
@@ -225,11 +225,11 @@ class InjectedFailureRegion extends AnonMappedRegion {
 
 	new(mapping: Mapping, failAtBoundary) super(mapping) { }
 
-	def persistRange(offset: u64, size: u64) -> bool {
+	def persist(offset: u64, size: u64) -> bool {
 		return boundary();
 	}
 
-	def persistChanges() -> bool {
+	def drain() -> bool {
 		return boundary();
 	}
 
@@ -239,11 +239,11 @@ class InjectedFailureRegion extends AnonMappedRegion {
 	}
 }
 
-// A backend that hands out one already-prepared region, so a PWRegion can be
+// A backend that hands out one already-prepared region, so a RegionAllocator can be
 // mounted over a container the caller chose -- a recording one, or one that
 // injects a persistence failure.
-class PreparedRegionBackend(prepared: BackendRegion) extends TxnRegionBackend {
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+class PreparedStorageBackend(prepared: StorageRegion) extends StorageBackend {
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
 		if (prepared == null || u64.!(prepared.range.length) < size) return null;
 		return prepared;
 	}
@@ -260,30 +260,30 @@ class PreparedRegionBackend(prepared: BackendRegion) extends TxnRegionBackend {
 // A recovery run together with the trace of what recovery itself made durable.
 // The trace's starting durable image is the image recovery was handed, so
 // exploring it is exploring a second crash during recovery.
-class PersistentRecoveryRecording(run: PersistentRecoveryRun, trace: PersistentTrace) { }
+class CrashRecoveryRecording(run: CrashRecoveryRun, trace: PersistenceTrace) { }
 
 // The same for an allocator mount: what the mount produced, plus the trace of
 // what it made durable.
-class PersistentRegionRecording(run: PersistentRegionRun, trace: PersistentTrace) { }
+class CrashAllocatorRecording(run: CrashAllocatorRun, trace: PersistenceTrace) { }
 
-component PersistentRecoveries {
+component CrashRecoveries {
 	// Mount {image} and run the production two-slot WAL recovery over it.
 	// Returns null only when the host could not provide a region.
-	def runDualWal(image: PersistentDurableImage, logChunkOffset: u64,
-		logChunkSize: u64) -> PersistentRecoveryRun {
+	def runTwoSlotWal(image: CrashImage, logBlockOffset: u64,
+		logBlockSize: u64) -> CrashRecoveryRun {
 
-		return runDualWalOn(PersistentImageMounters.EAGER, image, logChunkOffset, logChunkSize);
+		return runTwoSlotWalOn(CrashImageMounters.EAGER, image, logBlockOffset, logBlockSize);
 	}
 
 	// The same run over a mount {mounter} provides: the eager mounter's fresh
 	// mapping, or the lazy search's mapping of the crash image it is deciding.
 	// The run's {left} is the mount's snapshot().
-	def runDualWalOn(mounter: PersistentImageMounter, image: PersistentImageView,
-		logChunkOffset: u64, logChunkSize: u64) -> PersistentRecoveryRun {
+	def runTwoSlotWalOn(mounter: CrashImageMounter, image: CrashImageView,
+		logBlockOffset: u64, logBlockSize: u64) -> CrashRecoveryRun {
 
 		def mount = mounter.mount(image);
 		if (mount == null) return null;
-		def run = recoverOn(mount, logChunkOffset, logChunkSize);
+		def run = recoverOn(mount, logBlockOffset, logBlockSize);
 		mount.close();
 		return run;
 	}
@@ -291,24 +291,24 @@ component PersistentRecoveries {
 	// The same run, recorded: every store, cache-line writeback and fence
 	// recovery performs is captured, so a crash DURING recovery can be explored
 	// with the same machinery as a crash during normal operation.
-	def recordDualWalRecovery(image: PersistentDurableImage, logChunkOffset: u64,
-		logChunkSize: u64, name: string) -> PersistentRecoveryRecording {
+	def recordWalRecovery(image: CrashImage, logBlockOffset: u64,
+		logBlockSize: u64, name: string) -> CrashRecoveryRecording {
 
-		def mount = PersistentImageMounts.openMapped(image, true);
+		def mount = CrashImageMounts.openMapped(image, true);
 		if (mount == null) return null;
-		def run = recoverOn(mount, logChunkOffset, logChunkSize);
+		def run = recoverOn(mount, logBlockOffset, logBlockSize);
 		def trace = mount.recorder.snapshot(name);
 		mount.close();
-		return PersistentRecoveryRecording.new(run, trace);
+		return CrashRecoveryRecording.new(run, trace);
 	}
 
-	private def recoverOn(mount: PersistentImageMount, logChunkOffset: u64,
-		logChunkSize: u64) -> PersistentRecoveryRun {
+	private def recoverOn(mount: CrashImageMount, logBlockOffset: u64,
+		logBlockSize: u64) -> CrashRecoveryRun {
 
 		def base = mount.regionStart();
-		def wal = DualTxnWal.new(base, base + logChunkOffset, logChunkSize, mount.region, false);
+		def wal = TwoSlotWal.new(base, base + logBlockOffset, logBlockSize, mount.region, OpenMode.ATTACH);
 		def result = wal.recover();
-		return PersistentRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
+		return CrashRecoveryRun.new(result, wal.requiresRecovery(), wal.nextTxnSeq,
 			wal.lastCommittedSeq, wal.dataDurableSeq, mount.snapshot());
 	}
 
@@ -316,12 +316,12 @@ component PersistentRecoveries {
 	// latch rather than claim a durability it did not reach, and the bytes left
 	// behind must still be recoverable by a later mount. Returns null only when
 	// the host could not provide a region.
-	def runDualWalWithFailure(image: PersistentDurableImage, logChunkOffset: u64,
-		logChunkSize: u64, failAtBoundary: int) -> PersistentRecoveryRun {
+	def runTwoSlotWalWithFailure(image: CrashImage, logBlockOffset: u64,
+		logBlockSize: u64, failAtBoundary: int) -> CrashRecoveryRun {
 
-		def mount = PersistentImageMounts.openFailing(image, failAtBoundary);
+		def mount = CrashImageMounts.openFailing(image, failAtBoundary);
 		if (mount == null) return null;
-		def run = recoverOn(mount, logChunkOffset, logChunkSize);
+		def run = recoverOn(mount, logBlockOffset, logBlockSize);
 		mount.close();
 		return run;
 	}
@@ -329,43 +329,43 @@ component PersistentRecoveries {
 	// Mount {image} as an allocator through a recording container, so the whole
 	// mount -- WAL recovery plus whatever the allocator publishes -- is captured
 	// as a trace that a second crash can be explored over.
-	def recordPWRegionRecovery(image: PersistentDurableImage, numBlocks: u64,
-		blockSize: u64, name: string) -> PersistentRegionRecording {
+	def recordAllocatorRecovery(image: CrashImage, numBlocks: u64,
+		blockSize: u64, name: string) -> CrashAllocatorRecording {
 
-		def mount = PersistentImageMounts.openMapped(image, true);
+		def mount = CrashImageMounts.openMapped(image, true);
 		if (mount == null) return null;
-		def region = PWRegion.new(PreparedRegionBackend.new(mount.region), numBlocks,
-			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		def region = RegionAllocator.new(PreparedStorageBackend.new(mount.region), numBlocks,
+			Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.ATTACH);
 		if (region.backendRegion == null) {
 			mount.close();
 			return null;
 		}
-		def violation = PersistentAllocatorInvariants.check(region);
-		def run = PersistentRegionRun.new(true, region.requiresRecovery(), violation, mount.freeze());
+		def violation = AllocatorInvariants.check(region);
+		def run = CrashAllocatorRun.new(true, region.requiresRecovery(), violation, mount.freeze());
 		def trace = mount.recorder.snapshot(name);
 		region.deallocate();
-		return PersistentRegionRecording.new(run, trace);
+		return CrashAllocatorRecording.new(run, trace);
 	}
 
 	// Mount {image} as an allocator with one persistence boundary failed.
-	def runPWRegionWithFailure(image: PersistentDurableImage, numBlocks: u64,
-		blockSize: u64, failAtBoundary: int) -> PersistentRegionRun {
+	def runAllocatorWithFailure(image: CrashImage, numBlocks: u64,
+		blockSize: u64, failAtBoundary: int) -> CrashAllocatorRun {
 
-		def mount = PersistentImageMounts.openFailing(image, failAtBoundary);
+		def mount = CrashImageMounts.openFailing(image, failAtBoundary);
 		if (mount == null) {
-			return PersistentRegionRun.new(false, false, "could not map a region for the durable image", null);
+			return CrashAllocatorRun.new(false, false, "could not map a region for the durable image", null);
 		}
-		def region = PWRegion.new(PreparedRegionBackend.new(mount.region), numBlocks,
-			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		def region = RegionAllocator.new(PreparedStorageBackend.new(mount.region), numBlocks,
+			Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.ATTACH);
 		if (region.backendRegion == null) {
 			mount.close();
-			return PersistentRegionRun.new(false, false, "region did not mount", null);
+			return CrashAllocatorRun.new(false, false, "region did not mount", null);
 		}
-		def violation = PersistentAllocatorInvariants.checkStructure(region);
+		def violation = AllocatorInvariants.checkStructure(region);
 		def after = Array<byte>.new(region.rng.length);
 		for (i < after.length) after[i] = region.rng[i];
-		def run = PersistentRegionRun.new(true, region.requiresRecovery(), violation,
-			PersistentDurableImage.new(after));
+		def run = CrashAllocatorRun.new(true, region.requiresRecovery(), violation,
+			CrashImage.new(after));
 		region.deallocate();
 		return run;
 	}
@@ -375,12 +375,12 @@ component PersistentRecoveries {
 	// and replay is idempotent, so a remount must reach the same state.
 	// Bounded to two crashes in total, matching the recovery profile in
 	// docs/pmem-crash-model.md.
-	def checkCrashDuringRecovery(image: PersistentDurableImage, logChunkOffset: u64,
-		logChunkSize: u64, budget: int, property: PersistentImageProperty) -> PersistentCheckResult {
+	def checkCrashDuringRecovery(image: CrashImage, logBlockOffset: u64,
+		logBlockSize: u64, budget: int, property: CrashImageProperty) -> CrashCheckResult {
 
-		def recording = recordDualWalRecovery(image, logChunkOffset, logChunkSize, "dual_wal_recovery");
+		def recording = recordWalRecovery(image, logBlockOffset, logBlockSize, "dual_wal_recovery");
 		if (recording == null) return null;
-		return PersistentExplorer.checkAllCuts(recording.trace, image.bytes, budget, property);
+		return CrashExplorer.checkAllCuts(recording.trace, image.bytes, budget, property);
 	}
 }
 
@@ -399,31 +399,31 @@ component PersistentRecoveries {
 //     complete valid record reached durability -- but it must never produce a
 //     value that was never committed, which is what a torn record replayed as
 //     valid would look like.
-class PersistentWalRecoveryProperty(logChunkOffset: u64, logChunkSize: u64,
+class WalRecoveryProperty(logBlockOffset: u64, logBlockSize: u64,
 	offset: u64, width: int, value: u64, mustSurvive: bool) {
 
 	// One entry is a history of length one, so the contract has a single
 	// implementation rather than two that must be kept saying the same thing.
-	private def history = PersistentWalHistoryProperty.new(logChunkOffset, logChunkSize,
-		[PersistentWalAfterImage.new(offset, width, value, mustSurvive)]);
+	private def history = WalHistoryProperty.new(logBlockOffset, logBlockSize,
+		[WalAfterImage.new(offset, width, value, mustSurvive)]);
 
-	def check(image: PersistentDurableImage) -> string {
+	def check(image: CrashImage) -> string {
 		return history.check(image);
 	}
 
-	def property(name: string) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, offset, 16, check);
+	def property(name: string) -> CrashImageProperty {
+		return CrashImageProperty.new(name, offset, 16, check);
 	}
 
-	// The same check for the lazy search (PersistentLazyExplorer).
-	def lazy(name: string) -> PersistentLazyProperty {
+	// The same check for the lazy search (ReadDrivenExplorer).
+	def lazy(name: string) -> ReadDrivenProperty {
 		return history.lazy(name, offset, 16);
 	}
 }
 
 // One after-image a recorded scenario wrote, and whether the transaction
 // carrying it was already acknowledged at the crash cut being checked.
-class PersistentWalAfterImage(offset: u64, width: int, value: u64, mustSurvive: bool) { }
+class WalAfterImage(offset: u64, width: int, value: u64, mustSurvive: bool) { }
 
 // The same contract over a history of transactions rather than a single one.
 //
@@ -438,11 +438,11 @@ class PersistentWalAfterImage(offset: u64, width: int, value: u64, mustSurvive: 
 // One mount checks them all: a sweep already mounts every image the cut permits
 // and a per-after-image property would multiply that by the length of the
 // history.
-class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
-	afterImages: Array<PersistentWalAfterImage>) {
+class WalHistoryProperty(logBlockOffset: u64, logBlockSize: u64,
+	afterImages: Array<WalAfterImage>) {
 
-	def check(image: PersistentDurableImage) -> string {
-		return checkOn(image, PersistentImageMounters.EAGER);
+	def check(image: CrashImage) -> string {
+		return checkOn(image, CrashImageMounters.EAGER);
 	}
 
 	// The contract itself, over whatever {mounter} mounts: the eager check
@@ -451,10 +451,10 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 	// region's reader or read from a run's {left} with read(), which decides
 	// the bytes it reads, and the idempotence run mounts {left} through the
 	// same mounter.
-	def checkOn(image: PersistentImageView, mounter: PersistentImageMounter) -> string {
-		def run = PersistentRecoveries.runDualWalOn(mounter, image, logChunkOffset, logChunkSize);
+	def checkOn(image: CrashImageView, mounter: CrashImageMounter) -> string {
+		def run = CrashRecoveries.runTwoSlotWalOn(mounter, image, logBlockOffset, logBlockSize);
 		if (run == null) return "could not map a region for the durable image";
-		if (run.recovery == DualWalRecovery.PERSIST_FAILED) {
+		if (run.recovery == WalRecovery.PERSIST_FAILED) {
 			return detail("recovery reported PERSIST_FAILED", run, null);
 		}
 		if (run.requiresRecovery) {
@@ -475,9 +475,9 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 
 		// Recovery is idempotent: replaying the image recovery just produced
 		// must not change any after-image or fail.
-		def again = PersistentRecoveries.runDualWalOn(mounter, run.left, logChunkOffset, logChunkSize);
+		def again = CrashRecoveries.runTwoSlotWalOn(mounter, run.left, logBlockOffset, logBlockSize);
 		if (again == null) return "could not map a region for the recovered image";
-		if (again.recovery == DualWalRecovery.PERSIST_FAILED || again.requiresRecovery) {
+		if (again.recovery == WalRecovery.PERSIST_FAILED || again.requiresRecovery) {
 			return detail("second recovery over the recovered image failed", again, null);
 		}
 		for (i < afterImages.length) {
@@ -489,17 +489,17 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 		return null;
 	}
 
-	def property(name: string, windowOffset: u64, windowLength: int) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, windowOffset, windowLength, check);
+	def property(name: string, windowOffset: u64, windowLength: int) -> CrashImageProperty {
+		return CrashImageProperty.new(name, windowOffset, windowLength, check);
 	}
 
-	// The same contract for the lazy search (PersistentLazyExplorer).
-	def lazy(name: string, windowOffset: u64, windowLength: int) -> PersistentLazyProperty {
-		return PersistentLazyProperty.new(name, windowOffset, windowLength, checkOn);
+	// The same contract for the lazy search (ReadDrivenExplorer).
+	def lazy(name: string, windowOffset: u64, windowLength: int) -> ReadDrivenProperty {
+		return ReadDrivenProperty.new(name, windowOffset, windowLength, checkOn);
 	}
 
-	private def detail(text: string, run: PersistentRecoveryRun,
-		a: PersistentWalAfterImage) -> string {
+	private def detail(text: string, run: CrashRecoveryRun,
+		a: WalAfterImage) -> string {
 
 		def buf = StringBuilder.new().put1("%s: ", text);
 		run.render(buf);
@@ -517,40 +517,40 @@ class PersistentWalHistoryProperty(logChunkOffset: u64, logChunkSize: u64,
 // be recoverable by a later mount. A recovery that reclaimed or scrubbed a
 // record it had not durably replayed would fail this even though its own
 // return value looked honest.
-class PersistentRecoveryFailureProperty(logChunkOffset: u64, logChunkSize: u64,
+class CrashRecoveryFailureProperty(logBlockOffset: u64, logBlockSize: u64,
 	offset: u64, width: int, value: u64, mustSurvive: bool, failAtBoundary: int) {
 
-	def check(image: PersistentDurableImage) -> string {
-		def failed = PersistentRecoveries.runDualWalWithFailure(image, logChunkOffset,
-			logChunkSize, failAtBoundary);
+	def check(image: CrashImage) -> string {
+		def failed = CrashRecoveries.runTwoSlotWalWithFailure(image, logBlockOffset,
+			logBlockSize, failAtBoundary);
 		if (failed == null) return "could not mount the durable image";
-		if (failed.recovery == DualWalRecovery.PERSIST_FAILED && !failed.requiresRecovery) {
+		if (failed.recovery == WalRecovery.PERSIST_FAILED && !failed.requiresRecovery) {
 			return "recovery reported PERSIST_FAILED without latching the mount";
 		}
-		if (failed.requiresRecovery && failed.recovery != DualWalRecovery.PERSIST_FAILED) {
+		if (failed.requiresRecovery && failed.recovery != WalRecovery.PERSIST_FAILED) {
 			return "recovery latched the mount without reporting PERSIST_FAILED";
 		}
-		return PersistentWalRecoveryProperty.new(logChunkOffset, logChunkSize, offset,
+		return WalRecoveryProperty.new(logBlockOffset, logBlockSize, offset,
 			width, value, mustSurvive).check(failed.recovered);
 	}
 
-	def property(name: string) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, offset, 16, check);
+	def property(name: string) -> CrashImageProperty {
+		return CrashImageProperty.new(name, offset, 16, check);
 	}
 }
 
-// A backend that hands a PWRegion one durable image to mount. `fresh` is
+// A backend that hands a RegionAllocator one durable image to mount. {mode} is
 // ignored: the point of this backend is that the bytes are the crash image, not
 // a fresh format.
-class PersistentImageBackend(image: PersistentDurableImage) extends TxnRegionBackend {
+class CrashImageBackend(image: CrashImage) extends StorageBackend {
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
 		if (u64.!(image.size()) < size) return null;
 		// The plain container: a sweep mounts thousands of images and only the
-		// bytes recovery leaves behind are examined. See PersistentImageMounts.
-		// Null if the host refused a mapping, which PWRegion reports as a
+		// bytes recovery leaves behind are examined. See CrashImageMounts.
+		// Null if the host refused a mapping, which RegionAllocator reports as a
 		// region that did not mount.
-		def mount = PersistentImageMounts.openArray(image);
+		def mount = CrashImageMounts.openArray(image);
 		if (mount == null) return null;
 		return mount.region;
 	}
@@ -565,8 +565,8 @@ class PersistentImageBackend(image: PersistentDurableImage) extends TxnRegionBac
 }
 
 // What mounting one durable image as an allocator produced.
-class PersistentRegionRun(mounted: bool, requiresRecovery: bool, violation: string,
-	recovered: PersistentDurableImage) { }
+class CrashAllocatorRun(mounted: bool, requiresRecovery: bool, violation: string,
+	recovered: CrashImage) { }
 
 // Structural check of a mounted allocator, as a first-violation string rather
 // than as assertions, so the same walk serves a unit test and a crash-model
@@ -575,10 +575,10 @@ class PersistentRegionRun(mounted: bool, requiresRecovery: bool, violation: stri
 // marker; a free extent is classified by its actual span and appears exactly
 // once on the matching free list; free extents are never adjacent; and a used
 // entry is on no list at all.
-component PersistentAllocatorInvariants {
+component AllocatorInvariants {
 	// Structure plus mount state. This is what a mount that completed its
 	// recovery must satisfy.
-	def check(region: PWRegion) -> string {
+	def check(region: RegionAllocator) -> string {
 		def bad = checkStructure(region);
 		if (bad != null) return bad;
 		if (region.requiresRecovery()) return "mount is recovery-required after recovery";
@@ -589,7 +589,7 @@ component PersistentAllocatorInvariants {
 	// Structure alone. A mount whose persistence failed is *expected* to be
 	// recovery-required, but its on-region structure must still be walkable --
 	// a latched mount is not a licence to leave a broken chain behind.
-	def checkStructure(region: PWRegion) -> string {
+	def checkStructure(region: RegionAllocator) -> string {
 		if (region == null || region.backendRegion == null) return "region did not mount";
 		// Every load goes through the region's reader, so a load observer
 		// sees the entries this walk visits.
@@ -599,7 +599,7 @@ component PersistentAllocatorInvariants {
 		def freeByIndex = Array<bool>.new(entryCount);
 		def listed = Array<bool>.new(entryCount);
 
-		var previous = BlockEntryHandle(0u64);
+		var previous = BlockTableEntryHandle(0u64);
 		var current = region.blockTableHandle[0u64];
 		var reachedEnd = false;
 		var steps = 0;
@@ -611,13 +611,13 @@ component PersistentAllocatorInvariants {
 			def arrayIndex = int.!(index);
 			if (memorySeen[arrayIndex]) return at("block appears twice in memory order", index);
 			memorySeen[arrayIndex] = true;
-			if (previous.addr != current.getPrev(r).addr) return at("memory-order back link is wrong", index);
+			if (previous.addr != current.getPrevInRegion(r).addr) return at("memory-order back link is wrong", index);
 
-			def next = current.getNext(r);
+			def next = current.getNextInRegion(r);
 			if (index == region.numBlocks) {
-				if (!current.getUsed(r)) return "region marker is not marked used";
-				if (current.getListNum(r) != ListKind.NONE.code) return "region marker is on a free list";
-				if (!next.isNull() || !current.getListPrev(r).isNull() || !current.getListNext(r).isNull()) {
+				if (!current.getUsedInRegion(r)) return "region marker is not marked used";
+				if (current.getListNumInRegion(r) != FreeListKind.NONE.code) return "region marker is on a free list";
+				if (!next.isNull() || !current.getListPrevInRegion(r).isNull() || !current.getListNextInRegion(r).isNull()) {
 					return "region marker has non-null links";
 				}
 				reachedEnd = true;
@@ -627,21 +627,21 @@ component PersistentAllocatorInvariants {
 
 			def nextIndex = region.blockIndexOf(next);
 			if (nextIndex <= index) return at("memory-order block indices are not increasing", index);
-			if (current.addr != next.getPrev(r).addr) return at("memory-order forward link is not mirrored", index);
+			if (current.addr != next.getPrevInRegion(r).addr) return at("memory-order forward link is not mirrored", index);
 
-			if (current.getUsed(r)) {
-				def kind = current.getListNum(r);
-				if (kind != ListKind.NONE.code && kind != ListKind.METADATA.code) {
+			if (current.getUsedInRegion(r)) {
+				def kind = current.getListNumInRegion(r);
+				if (kind != FreeListKind.NONE.code && kind != FreeListKind.METADATA.code) {
 					return at("used block carries a free-list kind", index);
 				}
-				if (!current.getListPrev(r).isNull() || !current.getListNext(r).isNull()) {
+				if (!current.getListPrevInRegion(r).isNull() || !current.getListNextInRegion(r).isNull()) {
 					return at("used block is linked into a free list", index);
 				}
 			} else {
 				def extentBlocks = nextIndex - index;
-				def expected = if(extentBlocks == 1u64, ListKind.SMALL_FREE.code, ListKind.LARGE_FREE.code);
-				if (current.getListNum(r) != expected) return at("free block is on the wrong free list", index);
-				if (!previous.isNull() && !previous.getUsed(r)) {
+				def expected = if(extentBlocks == 1u64, FreeListKind.SMALL_FREE.code, FreeListKind.LARGE_FREE.code);
+				if (current.getListNumInRegion(r) != expected) return at("free block is on the wrong free list", index);
+				if (!previous.isNull() && !previous.getUsedInRegion(r)) {
 					return at("adjacent free extents were not coalesced", index);
 				}
 				freeByIndex[arrayIndex] = true;
@@ -653,9 +653,9 @@ component PersistentAllocatorInvariants {
 		}
 		if (!reachedEnd) return "memory-order chain does not reach the region marker";
 
-		var bad = walkFreeList(region, region.smallSentinel, ListKind.SMALL_FREE, listed);
+		var bad = walkFreeList(region, region.smallSentinel, FreeListKind.SMALL_FREE, listed);
 		if (bad != null) return bad;
-		bad = walkFreeList(region, region.largeSentinel, ListKind.LARGE_FREE, listed);
+		bad = walkFreeList(region, region.largeSentinel, FreeListKind.LARGE_FREE, listed);
 		if (bad != null) return bad;
 		for (i < entryCount) {
 			if (freeByIndex[i] != listed[i]) {
@@ -666,12 +666,12 @@ component PersistentAllocatorInvariants {
 		return null;
 	}
 
-	private def walkFreeList(region: PWRegion, sentinel: BlockEntryHandle, kind: ListKind,
+	private def walkFreeList(region: RegionAllocator, sentinel: BlockTableEntryHandle, kind: FreeListKind,
 		listed: Array<bool>) -> string {
 
 		def r = region.reader();
 		var previous = sentinel;
-		var current = sentinel.getListNext(r);
+		var current = sentinel.getListNextInRegion(r);
 		var steps = 0;
 		while (!current.isNull()) {
 			if (steps > int.!(region.numBlocks)) return "free-list cycle detected";
@@ -681,23 +681,23 @@ component PersistentAllocatorInvariants {
 			def arrayIndex = int.!(index);
 			if (listed[arrayIndex]) return at("block appears more than once on the free lists", index);
 			listed[arrayIndex] = true;
-			if (current.getListNum(r) != kind.code) return at("free block is on the wrong list", index);
-			if (current.getUsed(r)) return at("used block appears on a free list", index);
-			if (previous.addr != current.getListPrev(r).addr) return at("free-list back link is wrong", index);
+			if (current.getListNumInRegion(r) != kind.code) return at("free block is on the wrong list", index);
+			if (current.getUsedInRegion(r)) return at("used block appears on a free list", index);
+			if (previous.addr != current.getListPrevInRegion(r).addr) return at("free-list back link is wrong", index);
 
 			previous = current;
-			current = current.getListNext(r);
+			current = current.getListNextInRegion(r);
 			steps++;
 		}
 		return null;
 	}
 
-	private def isBlockTableEntry(region: PWRegion, entry: BlockEntryHandle) -> bool {
+	private def isBlockTableEntry(region: RegionAllocator, entry: BlockTableEntryHandle) -> bool {
 		if (entry.isNull()) return false;
 		if (entry.addr < region.blockTableHandle.addr) return false;
 		def delta = entry.addr - region.blockTableHandle.addr;
-		if (delta % u64.!(BlockEntry.size) != 0) return false;
-		return delta / u64.!(BlockEntry.size) <= region.numBlocks;
+		if (delta % u64.!(BlockTableEntry.size) != 0) return false;
+		return delta / u64.!(BlockTableEntry.size) <= region.numBlocks;
 	}
 
 	private def at(text: string, index: u64) -> string {
@@ -710,10 +710,10 @@ component PersistentAllocatorInvariants {
 // leaves behind must mount cleanly and consistently afterwards. A mount that
 // half-applied a replayed transaction and then failed its boundary would break
 // the second half even though refusing further work looks correct.
-class PersistentAllocatorFailureProperty(numBlocks: u64, blockSize: u64, failAtBoundary: int) {
+class AllocatorFailureProperty(numBlocks: u64, blockSize: u64, failAtBoundary: int) {
 
-	def check(image: PersistentDurableImage) -> string {
-		def failed = PersistentRecoveries.runPWRegionWithFailure(image, numBlocks, blockSize,
+	def check(image: CrashImage) -> string {
+		def failed = CrashRecoveries.runAllocatorWithFailure(image, numBlocks, blockSize,
 			failAtBoundary);
 		if (!failed.mounted) return "durable image did not mount as an allocator";
 		if (failed.violation != null) {
@@ -722,11 +722,11 @@ class PersistentAllocatorFailureProperty(numBlocks: u64, blockSize: u64, failAtB
 		}
 		// Reopen without injection: the surviving bytes must be a consistent
 		// allocator, whether or not the failed attempt got as far as replaying.
-		return PersistentAllocatorProperty.new(numBlocks, blockSize).check(failed.recovered);
+		return AllocatorProperty.new(numBlocks, blockSize).check(failed.recovered);
 	}
 
-	def property(name: string) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, 0u64, 0, check);
+	def property(name: string) -> CrashImageProperty {
+		return CrashImageProperty.new(name, 0u64, 0, check);
 	}
 }
 
@@ -734,30 +734,30 @@ class PersistentAllocatorFailureProperty(numBlocks: u64, blockSize: u64, failAtB
 // behind. Every image a crash can produce must mount into an internally
 // consistent allocator: checking only whether a later allocation succeeds is too
 // weak, since a broken chain can still satisfy one request.
-class PersistentAllocatorProperty(numBlocks: u64, blockSize: u64) {
+class AllocatorProperty(numBlocks: u64, blockSize: u64) {
 
-	def run(image: PersistentDurableImage) -> PersistentRegionRun {
-		def backend = PersistentImageBackend.new(image);
-		def region = PWRegion.new(backend, numBlocks, Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+	def run(image: CrashImage) -> CrashAllocatorRun {
+		def backend = CrashImageBackend.new(image);
+		def region = RegionAllocator.new(backend, numBlocks, Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.ATTACH);
 		if (region.backendRegion == null) {
-			return PersistentRegionRun.new(false, false, "region did not mount", null);
+			return CrashAllocatorRun.new(false, false, "region did not mount", null);
 		}
-		def violation = PersistentAllocatorInvariants.check(region);
+		def violation = AllocatorInvariants.check(region);
 		def after = Array<byte>.new(region.rng.length);
 		for (i < after.length) after[i] = region.rng[i];
-		def run = PersistentRegionRun.new(true, region.requiresRecovery(), violation,
-			PersistentDurableImage.new(after));
+		def run = CrashAllocatorRun.new(true, region.requiresRecovery(), violation,
+			CrashImage.new(after));
 		region.deallocate();
 		return run;
 	}
 
-	def check(image: PersistentDurableImage) -> string {
+	def check(image: CrashImage) -> string {
 		def result = run(image);
 		if (!result.mounted) return "durable image did not mount as an allocator";
 		return result.violation;
 	}
 
-	def property(name: string, windowOffset: u64, windowLength: int) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, windowOffset, windowLength, check);
+	def property(name: string, windowOffset: u64, windowLength: int) -> CrashImageProperty {
+		return CrashImageProperty.new(name, windowOffset, windowLength, check);
 	}
 }

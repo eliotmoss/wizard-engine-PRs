@@ -24,7 +24,7 @@
 #                    same block storage (PWSB_BLOCK_DIR)
 #   file-dax-legacy, file-block-legacy
 #                    file-dax and file-block with the file backend's boundary
-#                    before 2026-10-13 (a flag and fdatasync, persistRange an msync
+#                    before 2026-10-13 (a flag and fdatasync, persist() an msync
 #                    of its own pages), for the old-against-new comparison only
 #   file-dax-msync, file-block-msync
 #                    the same with one msync(MS_SYNC) per run of marked pages

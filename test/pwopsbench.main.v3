@@ -6,14 +6,14 @@
 // pwbench measures one commit shape the harness chooses, and pwsievebench a
 // program's whole step; neither gives one operation's cost, and nothing
 // measured a mount or a recovery. Each operation here is the call a program
-// makes, through PWRegion, RegionTransaction and DualTxnWal:
+// makes, through RegionAllocator, TransactionCache and TwoSlotWal:
 //
 //   alloc-<n>     allocChunk(n), n = 1, 8 and 64 blocks: one committed transaction
 //   free-<n>      freeChunk() of that chunk: one committed transaction
-//   commit-empty  RegionTransaction.commit() with nothing buffered
-//   mount-1mib    PWRegion.new() over a cleanly closed 1 MiB region
+//   commit-empty  TransactionCache.commit() with nothing buffered
+//   mount-1mib    RegionAllocator.new() over a cleanly closed 1 MiB region
 //   mount-64mib   the same at 64 MiB
-//   recover-<k>   PWRegion.new() over a 1 MiB region whose log holds one
+//   recover-<k>   RegionAllocator.new() over a 1 MiB region whose log holds one
 //                 committed, unapplied transaction of k u64 entries, k = 8, 24
 //   timer         two back-to-back reads of the timer (rdtscOrdered): the floor
 //                 under every figure, and the empty commit's comparison
@@ -41,7 +41,7 @@
 //
 // Mounts are far dearer on the direct backend, which reads the whole region, so
 // they have their own, smaller counts. Each recovery's starting state is made,
-// untimed, by PWOps.commitUnapplied() and the region's destroy() without
+// untimed, by PWOps.commitUnapplied() and the region's close() without
 // close(); every mount is followed, untimed, by a clean deallocate(). The
 // 1 MiB clean mount and the recoveries alternate sample by sample, so the
 // difference between them is the replay.
@@ -56,10 +56,10 @@
 // of an eADR platform, where the caches are in the persistence domain; it is
 // not one, and the region is NOT durable.
 //
-// boundary= (file only) chooses the file backend's fence (FileBoundary), for
+// boundary= (file only) chooses the file backend's fence (MappedFileSync), for
 // the old-against-new comparison: fdatasync (the default, and the production
 // path) or legacy (the boundary before 2026-10-13: a flag and fdatasync,
-// persistRange an msync of its own pages). msync is refused: the work check
+// persist an msync of its own pages). msync is refused: the work check
 // expects one boundary per fence, and msync issues one sync per run of marked
 // pages.
 //
@@ -91,7 +91,7 @@ component OpsBenchConfig {
         def var path: string;
         def var backend = OpsBenchBackend.FILE;
         def var writeback = OpsBenchWriteback.AUTO;
-        def var boundary = FileBoundary.FDATASYNC;      // file backend only
+        def var boundary = MappedFileSync.FDATASYNC_ONCE;      // file backend only
         def var ops = 50000;           // Corundum's count
         def var warmup = 2000;
         def var mounts = 200;
@@ -115,9 +115,9 @@ component OpsBenchConfig {
                                 .putd(attempt)
                                 .puts(".region")
                                 .toString();
-                        def fd = RegionFileIO.createExclusive(path);
+                        def fd = BackingFile.createExclusive(path);
                         if (fd >= 0) {
-                                RegionFileIO.close(fd);
+                                BackingFile.close(fd);
                                 return true;
                         }
                         if (fd != -LinuxConst.EEXIST) {
@@ -133,10 +133,10 @@ component OpsBenchConfig {
         // and the direct and file backends' staging providers receive the same
         // ones. The file backend's legacy boundary makes none.
         def countsLines() -> bool {
-                return backend != OpsBenchBackend.FILE || boundary != FileBoundary.LEGACY;
+                return backend != OpsBenchBackend.FILE || boundary != MappedFileSync.LEGACY_RANGE_MSYNC;
         }
 
-        // prepareChangedRange() calls, which only the file and direct regions
+        // writeBack() calls, which only the file and direct regions
         // report.
         def countsPrepares() -> bool {
                 return backend != OpsBenchBackend.PMEM;
@@ -202,7 +202,7 @@ type OpCounts(boundaries: int, prepares: int, lines: int) #unboxed {
 // whether or not it falls in an operation, so each operation is a difference.
 class OpCounter {
         var boundaries = 0;     // SFENCE / fdatasync / msync / direct write-back
-        var prepares = 0;       // file and direct prepareChangedRange() calls
+        var prepares = 0;       // file and direct writeBack() calls
         var lines = 0;          // writeback requests (pmem, direct, and file unless legacy)
 
         def notePersist() {
@@ -224,42 +224,42 @@ class OpCounter {
 
 // -------------------------------------------------- PMEM instrumentation
 
-// pwsievebench's CountingPersistentOperations, less CLWB and CLFLUSHOPT: the
+// pwsievebench's CountingProvider, less CLWB and CLFLUSHOPT: the
 // production bodies, the writeback selectable, each fence and line counted.
-class CountingPersistentOperations extends X86_64PersistentOperations {
+class CountingProvider extends NativeProvider {
         def counter: OpCounter;
 
         new(range: Range<byte>, counter: OpCounter) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 match (OpsBenchConfig.writeback) {
-                        AUTO => MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+                        AUTO => X86_64CacheControl.writeBackLine(Pointer.atElement(range, int.!(lineOffset)));
                         NONE => ;       // still counted, so lines per operation stays checkable
                 }
                 counter.noteLine();
         }
 
-        def sfence() {
-                MmapRegionUtils.storeFence();
+        def fence() {
+                X86_64CacheControl.fence();
                 counter.notePersist();
         }
 }
 
-// Installs the provider inside create(), as pwbench does: PWRegion and
-// DualTxnWal each resolve it once, so a later swap would miss.
-class CountingPmemBackend extends PmemMmapBackend {
+// Installs the provider inside open(), as pwbench does: RegionAllocator and
+// TwoSlotWal each resolve it once, so a later swap would miss.
+class CountingPmemBackend extends PmemBackend {
         def counter: OpCounter;
 
         new(path: string, counter: OpCounter) super(path) { }
 
-        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+        def makePmemRegion(newMapping: Mapping, fd: int) -> PmemRegion {
                 if (newMapping == null) return null;
-                def region = PmemMmapRegion.new(newMapping, fd);
-                region.setPersistentOperations(CountingPersistentOperations.new(region.range, counter));
+                def region = PmemRegion.new(newMapping, fd);
+                region.setProvider(CountingProvider.new(region.range, counter));
                 return region;
         }
 }
@@ -267,25 +267,25 @@ class CountingPmemBackend extends PmemMmapBackend {
 // -------------------------------------------------- file instrumentation
 
 // The staging provider is wrapped as on the direct backend; boundary=legacy
-// replaces it (selectBoundary()), so it counts no lines.
-class CountingFileRegion extends FileMmapRegion {
+// replaces it (selectSync()), so it counts no lines.
+class CountingFileRegion extends MappedFileRegion {
         def counter: OpCounter;
 
         new(mapping: Mapping, fd: int, counter: OpCounter) super(mapping, fd) {
-                wrapProvider(CountingStagingOperations.new(range, counter));
+                setInnerProvider(CountingStoreOnlyProvider.new(range, counter));
         }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 counter.notePrepare();
         }
 
         def syncFileData() -> bool {
-                def success = RegionFileIO.fdatasync(fd);
+                def success = BackingFile.fdatasync(fd);
                 counter.notePersist();
                 return success;
         }
 
-        // With boundary=legacy, persistRange() -- format, and the WAL's scrub
+        // With boundary=legacy, persist() -- format, and the WAL's scrub
         // on close -- syncs its own pages with msync(MS_SYNC) rather than
         // fdatasync, so it is a boundary too.
         def syncMappedRange(offset: u64, size: u64) -> bool {
@@ -295,14 +295,14 @@ class CountingFileRegion extends FileMmapRegion {
         }
 }
 
-class CountingFileBackend extends FileMmapBackend {
+class CountingFileBackend extends MappedFileBackend {
         def counter: OpCounter;
 
         new(path: string, counter: OpCounter) super(path) {
-                boundary = OpsBenchConfig.boundary;
+                sync = OpsBenchConfig.boundary;
         }
 
-        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+        def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
                 if (newMapping == null) return null;
                 return CountingFileRegion.new(newMapping, fd, counter);
         }
@@ -314,15 +314,15 @@ class CountingFileBackend extends FileMmapBackend {
 // the direct and file regions. The region's dirty-marking provider forwards
 // every request to it, so the counts are the PMEM backend's for the same
 // operations.
-class CountingStagingOperations extends DirectIoStagingOperations {
+class CountingStoreOnlyProvider extends StoreOnlyProvider {
         def counter: OpCounter;
 
         new(range: Range<byte>, counter: OpCounter) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 counter.noteLine();
         }
@@ -332,10 +332,10 @@ class CountingDirectRegion extends DirectIoRegion {
         def counter: OpCounter;
 
         new(mapping: Mapping, fd: int, blockDevice: bool, counter) super(mapping, fd, blockDevice) {
-                wrapProvider(CountingStagingOperations.new(range, counter));
+                setInnerProvider(CountingStoreOnlyProvider.new(range, counter));
         }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 counter.notePrepare();
         }
 
@@ -389,7 +389,7 @@ class OpStats(name: string) {
         // and an allocation or free derives what it should have written back
         // from the record it committed, which must agree with every earlier
         // one. Returns null, or why the operation failed.
-        def check(index: int, got: OpCounts, region: PWRegion) -> string {
+        def check(index: int, got: OpCounts, region: RegionAllocator) -> string {
                 if (region != null) {
                         def rec = PWOps.latestRecord(region);
                         if (rec == null) return Strings.format2("%s %d: no valid record in the log after the commit", name, index);
@@ -451,9 +451,9 @@ def fail(msg: string) -> int {
         return 1;
 }
 
-def makeBackend(counter: OpCounter) -> TxnRegionBackend {
+def makeBackend(counter: OpCounter) -> StorageBackend {
         def path = OpsBenchConfig.path;
-        var backend: TxnRegionBackend;
+        var backend: StorageBackend;
         match (OpsBenchConfig.backend) {
                 PMEM => backend = CountingPmemBackend.new(path, counter);
                 FILE => backend = CountingFileBackend.new(path, counter);
@@ -462,18 +462,18 @@ def makeBackend(counter: OpCounter) -> TxnRegionBackend {
         return backend;
 }
 
-def open(backend: TxnRegionBackend, blocks: u64, fresh: bool) -> PWRegion {
-        return PWRegion.new(backend, blocks, Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, fresh);
+def open(backend: StorageBackend, blocks: u64, fresh: bool) -> RegionAllocator {
+        return RegionAllocator.new(backend, blocks, Array<Ref<MetadataDescriptor>>.new(0), BLOCK_SIZE, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
 }
 
 // Why {region}, just opened from {backend}, is not a mounted region of the
 // backend asked for that found {want} in its log; null if it is. The
 // anti-fallback check is pwbench's: a file mapping reported as a PMEM result
 // would invert the comparison, and so would the mutant provider.
-def openError(backend: TxnRegionBackend, region: PWRegion, want: DualWalRecovery) -> string {
+def openError(backend: StorageBackend, region: RegionAllocator, want: WalRecovery) -> string {
         if (region == null || region.backendRegion == null) {
                 if (OpsBenchConfig.backend == OpsBenchBackend.PMEM) {
-                        return "PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
+                        return "PmemBackend.open failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
                 }
                 if (CountingDirectBackend.?(backend) && CountingDirectBackend.!(backend).lastError != null) {
                         return Strings.format1("DirectIoBackend.create failed: %s", CountingDirectBackend.!(backend).lastError);
@@ -482,13 +482,13 @@ def openError(backend: TxnRegionBackend, region: PWRegion, want: DualWalRecovery
         }
         def got = region.backendRegion;
         match (OpsBenchConfig.backend) {
-                PMEM => if (!PmemMmapRegion.?(got)) return "pmem mode did not produce a PmemMmapRegion";
-                FILE => if (!FileMmapRegion.?(got)) return "file mode did not produce a FileMmapRegion";
+                PMEM => if (!PmemRegion.?(got)) return "pmem mode did not produce a PmemRegion";
+                FILE => if (!MappedFileRegion.?(got)) return "file mode did not produce a MappedFileRegion";
                 DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) {
                         return "direct mode did not produce a file-backed DirectIoRegion";
                 }
         }
-        if (ElidedWritebackOperations.?(got.persistentOperations())) {
+        if (ElidedWriteBackProvider.?(got.provider())) {
                 return "an elided-writeback provider is installed; this must be an ordinary build";
         }
         if (region.txn == null) return "the region did not format or mount (geometry or header mismatch)";
@@ -500,10 +500,10 @@ def openError(backend: TxnRegionBackend, region: PWRegion, want: DualWalRecovery
 }
 
 // Formats a fresh region of {blocks}: the region, or why there is none.
-def format(counter: OpCounter, blocks: u64) -> (PWRegion, string) {
+def format(counter: OpCounter, blocks: u64) -> (RegionAllocator, string) {
         def backend = makeBackend(counter);
         def region = open(backend, blocks, true);
-        def err = openError(backend, region, DualWalRecovery.CLEAN);
+        def err = openError(backend, region, WalRecovery.CLEAN);
         if (err == null) return (region, null);
         if (region != null) region.deallocate();
         return (null, err);
@@ -521,12 +521,12 @@ def runTimer() {
         stats.report();
 }
 
-def runAllocFree(counter: OpCounter, region: PWRegion, n: u32) -> string {
+def runAllocFree(counter: OpCounter, region: RegionAllocator, n: u32) -> string {
         def alloc = OpStats.new(Strings.format1("alloc-%d", n));
         def free = OpStats.new(Strings.format1("free-%d", n));
         for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
                 def measured = i >= OpsBenchConfig.warmup;
-                var inspect: PWRegion;          // warm-up only: read the record back
+                var inspect: RegionAllocator;          // warm-up only: read the record back
                 if (!measured) inspect = region;
                 var before = counter.snapshot();
                 def c0 = Target.rdtscOrdered();
@@ -551,9 +551,9 @@ def runAllocFree(counter: OpCounter, region: PWRegion, n: u32) -> string {
         return null;
 }
 
-// RegionTransaction.commit() with nothing buffered returns before the WAL, so
+// TransactionCache.commit() with nothing buffered returns before the WAL, so
 // it is expected to cost no boundary.
-def runEmptyCommit(counter: OpCounter, region: PWRegion) -> string {
+def runEmptyCommit(counter: OpCounter, region: RegionAllocator) -> string {
         def stats = OpStats.new("commit-empty").expect(OpCounts(0, 0, 0), 0);
         if (region.txn.isDirty()) return "the transaction is not empty before the empty commits";
         for (i < OpsBenchConfig.warmup + OpsBenchConfig.ops) {
@@ -579,7 +579,7 @@ def mountClean(counter: OpCounter, stats: OpStats, i: int, blocks: u64) -> strin
         def region = open(backend, blocks, false);
         def c1 = Target.rdtscOrdered();
         def got = counter.snapshot().minus(before);
-        var err = openError(backend, region, DualWalRecovery.CLEAN);
+        var err = openError(backend, region, WalRecovery.CLEAN);
         if (err == null) err = stats.check(i, got, null);
         if (region != null) region.deallocate();
         if (err != null) return Strings.format3("%s %d: %s", stats.name, i, err);
@@ -589,15 +589,15 @@ def mountClean(counter: OpCounter, stats: OpStats, i: int, blocks: u64) -> strin
 
 // One timed mount of the 1 MiB region after leaving, untimed, one committed
 // transaction of {k} u64 entries at {base} that was never applied
-// (PWOps.commitUnapplied). The replay goes through DualTxnWal.applyUpdate(),
+// (PWOps.commitUnapplied). The replay goes through TwoSlotWal.applyAfterImage(),
 // which prepares each entry on its own, then one boundary persists them all.
 def mountRecovering(counter: OpCounter, stats: OpStats, i: int, k: int, base: u64) -> string {
         // A value per sample, so the check below sees this sample's replay.
         def value = 0x5A5A_0000_0000u64 + u64.!(i) * 0x1_0000u64 + u64.!(k) * 0x100u64;
-        def raw = makeBackend(counter).create(SMALL_BLOCKS * BLOCK_SIZE, RW, false);
+        def raw = makeBackend(counter).open(SMALL_BLOCKS * BLOCK_SIZE, RW, OpenMode.ATTACH);
         if (raw == null) return Strings.format2("%s %d: could not reopen the region to leave a record in it", stats.name, i);
         def seq = PWOps.commitUnapplied(raw, BLOCK_SIZE, base, k, value);
-        raw.destroy();          // without close(): the record stays, the data was never applied
+        raw.close();          // without the log's close(): the record stays, the data was never applied
         if (seq == 0u64) return Strings.format2("%s %d: could not commit the unapplied record", stats.name, i);
 
         def backend = makeBackend(counter);
@@ -606,7 +606,7 @@ def mountRecovering(counter: OpCounter, stats: OpStats, i: int, k: int, base: u6
         def region = open(backend, SMALL_BLOCKS, false);
         def c1 = Target.rdtscOrdered();
         def got = counter.snapshot().minus(before);
-        var err = openError(backend, region, DualWalRecovery.REPLAYED);
+        var err = openError(backend, region, WalRecovery.REPLAYED);
         if (err == null) err = stats.check(i, got, null);
         if (err == null) {
                 for (j < k) {
@@ -617,7 +617,7 @@ def mountRecovering(counter: OpCounter, stats: OpStats, i: int, k: int, base: u6
                         }
                 }
         }
-        if (err == null) err = PersistentAllocatorInvariants.check(region);
+        if (err == null) err = AllocatorInvariants.check(region);
         if (region != null) region.deallocate();
         if (err != null) return Strings.format3("%s %d: %s", stats.name, i, err);
         if (i >= OpsBenchConfig.mountWarmup) stats.put(c1 - c0);
@@ -686,7 +686,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
         return v;
 }
 
-// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+// What X86_64CacheControl.writeBackLine() resolves to here, in its order.
 def cpuidWriteback() -> string {
         if (Target.supportsClwb()) return "CLWB";
         if (Target.supportsClflushOpt()) return "CLFLUSHOPT";
@@ -716,8 +716,8 @@ def main(args: Array<string>) -> int {
         for (i = 6; i < args.length; i++) {
                 if (Strings.equal(args[i], "writeback=auto")) OpsBenchConfig.writeback = OpsBenchWriteback.AUTO;
                 else if (Strings.equal(args[i], "writeback=none")) OpsBenchConfig.writeback = OpsBenchWriteback.NONE;
-                else if (Strings.equal(args[i], "boundary=fdatasync")) OpsBenchConfig.boundary = FileBoundary.FDATASYNC;
-                else if (Strings.equal(args[i], "boundary=legacy")) OpsBenchConfig.boundary = FileBoundary.LEGACY;
+                else if (Strings.equal(args[i], "boundary=fdatasync")) OpsBenchConfig.boundary = MappedFileSync.FDATASYNC_ONCE;
+                else if (Strings.equal(args[i], "boundary=legacy")) OpsBenchConfig.boundary = MappedFileSync.LEGACY_RANGE_MSYNC;
                 else if (Strings.equal(args[i], "boundary=msync")) {
                         System.puts("boundary=msync is not supported: the work check counts one boundary per fence, and msync issues one sync per run of marked pages\n");
                         return 2;
@@ -732,7 +732,7 @@ def main(args: Array<string>) -> int {
                 System.puts("writeback= applies only to the pmem backend\n");
                 return 2;
         }
-        if (OpsBenchConfig.boundary != FileBoundary.FDATASYNC && OpsBenchConfig.backend != OpsBenchBackend.FILE) {
+        if (OpsBenchConfig.boundary != MappedFileSync.FDATASYNC_ONCE && OpsBenchConfig.backend != OpsBenchBackend.FILE) {
                 System.puts("boundary= applies only to the file backend\n");
                 return 2;
         }
@@ -778,7 +778,7 @@ def main(args: Array<string>) -> int {
                         return fail(err);
                 }
         }
-        var err = PersistentAllocatorInvariants.check(region);
+        var err = AllocatorInvariants.check(region);
         if (err == null) err = runEmptyCommit(counter, region);
         region.deallocate();
         if (err != null) return fail(err);
@@ -788,7 +788,7 @@ def main(args: Array<string>) -> int {
         if (err == null) err = runLargeMounts(counter);
         if (err != null) return fail(err);
 
-        if (!RegionFileIO.unlink(OpsBenchConfig.path)) return fail("could not remove the region file");
+        if (!BackingFile.unlink(OpsBenchConfig.path)) return fail("could not remove the region file");
         OpsBenchConfig.path = null;
         if (OpsBenchConfig.writeback == OpsBenchWriteback.NONE) {
                 System.puts("OK timing-only: writeback=none, the region was never durable\n");

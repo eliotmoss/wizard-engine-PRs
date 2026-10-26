@@ -19,7 +19,7 @@
 // Round 0 is unmeasured, and audits. At every mark PWBTree reports, the work
 // since the previous mark is checked: COMPUTE none; ALLOC, PUBLISH and FREE are
 // one commit each, so one boundary and the lines the record it wrote predicts
-// (PWOps.latestRecord().commitLines(), read through a second DualTxnWal); WRITE
+// (PWOps.latestRecord().commitLines(), read through a second TwoSlotWal); WRITE
 // one boundary and exactly the lines the new nodes occupy, read back from them.
 // Every operation of the measured rounds must then do exactly the work, in
 // boundaries, prepare calls and lines, that the same operation did in round 0;
@@ -101,9 +101,9 @@ component TreeBenchConfig {
                                 .putd(attempt)
                                 .puts(".region")
                                 .toString();
-                        def fd = RegionFileIO.createExclusive(path);
+                        def fd = BackingFile.createExclusive(path);
                         if (fd >= 0) {
-                                RegionFileIO.close(fd);
+                                BackingFile.close(fd);
                                 return true;
                         }
                         if (fd != -LinuxConst.EEXIST) {
@@ -184,7 +184,7 @@ type OpCounts(boundaries: int, prepares: int, lines: int) #unboxed {
 // each operation and each phase is a difference.
 class OpCounter {
         var boundaries = 0;     // SFENCE / fdatasync / direct write-back
-        var prepares = 0;       // file and direct prepareChangedRange() calls
+        var prepares = 0;       // file and direct writeBack() calls
         var lines = 0;          // writeback requests
 
         def notePersist() { boundaries++; }
@@ -225,7 +225,7 @@ class TreeTimer(counter: OpCounter) {
         var recording = false;          // measured rounds, inside the operation loops
         var auditing = false;           // round 0
         var current: KindStats;
-        var region: PWRegion;
+        var region: RegionAllocator;
         var mark = 0u64;
         var markCounts: OpCounts;
         var writeLines = 0;             // the WRITE mark's lines, for the check after the put
@@ -287,72 +287,72 @@ class TreeTimer(counter: OpCounter) {
 
 // -------------------------------------------------- PMEM instrumentation
 
-// pwopsbench's CountingPersistentOperations: the production bodies, the
+// pwopsbench's CountingProvider: the production bodies, the
 // writeback selectable, each fence and line counted.
-class CountingPersistentOperations extends X86_64PersistentOperations {
+class CountingProvider extends NativeProvider {
         def counter: OpCounter;
 
         new(range: Range<byte>, counter: OpCounter) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 match (TreeBenchConfig.writeback) {
-                        AUTO => MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(cacheLine)));
+                        AUTO => X86_64CacheControl.writeBackLine(Pointer.atElement(range, int.!(lineOffset)));
                         NONE => ;       // still counted, so lines per operation stays checkable
                 }
                 counter.noteLine();
         }
 
-        def sfence() {
-                MmapRegionUtils.storeFence();
+        def fence() {
+                X86_64CacheControl.fence();
                 counter.notePersist();
         }
 }
 
-// Installs the provider inside create(): PWRegion, DualTxnWal and PWBTree's
+// Installs the provider inside open(): RegionAllocator, TwoSlotWal and PWBTree's
 // node writer each resolve it once, so a later swap would miss.
-class CountingPmemBackend extends PmemMmapBackend {
+class CountingPmemBackend extends PmemBackend {
         def counter: OpCounter;
 
         new(path: string, counter: OpCounter) super(path) { }
 
-        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+        def makePmemRegion(newMapping: Mapping, fd: int) -> PmemRegion {
                 if (newMapping == null) return null;
-                def region = PmemMmapRegion.new(newMapping, fd);
-                region.setPersistentOperations(CountingPersistentOperations.new(region.range, counter));
+                def region = PmemRegion.new(newMapping, fd);
+                region.setProvider(CountingProvider.new(region.range, counter));
                 return region;
         }
 }
 
 // -------------------------------------------------- file instrumentation
 
-class CountingFileRegion extends FileMmapRegion {
+class CountingFileRegion extends MappedFileRegion {
         def counter: OpCounter;
 
         new(mapping: Mapping, fd: int, counter: OpCounter) super(mapping, fd) {
-                wrapProvider(CountingStagingOperations.new(range, counter));
+                setInnerProvider(CountingStoreOnlyProvider.new(range, counter));
         }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 counter.notePrepare();
         }
 
         def syncFileData() -> bool {
-                def success = RegionFileIO.fdatasync(fd);
+                def success = BackingFile.fdatasync(fd);
                 counter.notePersist();
                 return success;
         }
 }
 
-class CountingFileBackend extends FileMmapBackend {
+class CountingFileBackend extends MappedFileBackend {
         def counter: OpCounter;
 
         new(path: string, counter: OpCounter) super(path) { }
 
-        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+        def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
                 if (newMapping == null) return null;
                 return CountingFileRegion.new(newMapping, fd, counter);
         }
@@ -363,15 +363,15 @@ class CountingFileBackend extends FileMmapBackend {
 // The production staging provider with each writeback request counted, for
 // the direct and file regions: their marking provider forwards every request
 // to it, so the counts are the PMEM backend's for the same operations.
-class CountingStagingOperations extends DirectIoStagingOperations {
+class CountingStoreOnlyProvider extends StoreOnlyProvider {
         def counter: OpCounter;
 
         new(range: Range<byte>, counter: OpCounter) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 counter.noteLine();
         }
@@ -381,10 +381,10 @@ class CountingDirectRegion extends DirectIoRegion {
         def counter: OpCounter;
 
         new(mapping: Mapping, fd: int, blockDevice: bool, counter) super(mapping, fd, blockDevice) {
-                wrapProvider(CountingStagingOperations.new(range, counter));
+                setInnerProvider(CountingStoreOnlyProvider.new(range, counter));
         }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 counter.notePrepare();
         }
 
@@ -433,38 +433,38 @@ def fail(msg: string) -> int {
 
 var directBackend: CountingDirectBackend;
 
-def openRegion(counter: OpCounter) -> PWRegion {
-        var backend: TxnRegionBackend;
+def openRegion(counter: OpCounter) -> RegionAllocator {
+        var backend: StorageBackend;
         def path = TreeBenchConfig.path;
         match (TreeBenchConfig.backend) {
                 PMEM => backend = CountingPmemBackend.new(path, counter);
                 FILE => backend = CountingFileBackend.new(path, counter);
                 DIRECT => backend = directBackend = CountingDirectBackend.new(path, counter);
         }
-        return PWRegion.new(backend, TreeBenchConfig.blocks,
-                Array<Ref<MetaDataDesc>>.new(0), TreeBenchConfig.blockSize, true);
+        return RegionAllocator.new(backend, TreeBenchConfig.blocks,
+                Array<Ref<MetadataDescriptor>>.new(0), TreeBenchConfig.blockSize, OpenMode.FORMAT);
 }
 
 // The anti-fallback check pwbench, pwsievebench and pwopsbench make: a file
 // mapping reported as a PMEM result would invert the comparison, and so would
 // the mutant provider.
-def wiringError(got: BackendRegion) -> string {
+def wiringError(got: StorageRegion) -> string {
         if (got == null) return "the backend region could not be created";
         match (TreeBenchConfig.backend) {
-                PMEM => if (!PmemMmapRegion.?(got)) return "pmem mode did not produce a PmemMmapRegion";
-                FILE => if (!FileMmapRegion.?(got)) return "file mode did not produce a FileMmapRegion";
+                PMEM => if (!PmemRegion.?(got)) return "pmem mode did not produce a PmemRegion";
+                FILE => if (!MappedFileRegion.?(got)) return "file mode did not produce a MappedFileRegion";
                 DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) {
                         return "direct mode did not produce a file-backed DirectIoRegion";
                 }
         }
-        if (ElidedWritebackOperations.?(got.persistentOperations())) {
+        if (ElidedWriteBackProvider.?(got.provider())) {
                 return "an elided-writeback provider is installed; this must be an ordinary build";
         }
         return null;
 }
 
 def discardReserved() {
-        if (TreeBenchConfig.path != null && RegionFileIO.unlink(TreeBenchConfig.path)) {
+        if (TreeBenchConfig.path != null && BackingFile.unlink(TreeBenchConfig.path)) {
                 TreeBenchConfig.path = null;
         }
 }
@@ -559,7 +559,7 @@ def runRound(round: int, timer: TreeTimer, counter: OpCounter) -> string {
         if (region == null || region.backendRegion == null) {
                 discardReserved();
                 if (TreeBenchConfig.backend == TreeBenchBackend.PMEM) {
-                        return "PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
+                        return "PmemBackend.open failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
                 }
                 if (directBackend != null && directBackend.lastError != null) {
                         return Strings.format1("DirectIoBackend.create failed: %s", directBackend.lastError);
@@ -667,7 +667,7 @@ def runRound(round: int, timer: TreeTimer, counter: OpCounter) -> string {
                         TreeBenchConfig.keys + TreeBenchConfig.ops, ref.size()).ln();
         }
         region.deallocate();
-        if (!RegionFileIO.unlink(TreeBenchConfig.path)) return "could not remove the region file";
+        if (!BackingFile.unlink(TreeBenchConfig.path)) return "could not remove the region file";
         TreeBenchConfig.path = null;
         return null;
 }
@@ -727,7 +727,7 @@ def parseU64(s: string, dflt: u64) -> u64 {
         return v;
 }
 
-// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+// What X86_64CacheControl.writeBackLine() resolves to here, in its order.
 def cpuidWriteback() -> string {
         if (Target.supportsClwb()) return "CLWB";
         if (Target.supportsClflushOpt()) return "CLFLUSHOPT";

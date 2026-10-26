@@ -10,17 +10,17 @@ The system is organised into four layers that sit between raw storage media and 
 
 ```
 ┌─────────────────────────────────────────────┐
-│  Allocator  (PWRegion / ImmixPWRegion)       │  block allocation + free list management
+│  Allocator  (RegionAllocator / ImmixRegionAllocator)       │  block allocation + free list management
 ├─────────────────────────────────────────────┤
-│  Transaction cache  (RegionTransaction)      │  write-behind DRAM buffer
+│  Transaction cache  (TransactionCache)      │  write-behind DRAM buffer
 ├─────────────────────────────────────────────┤
-│  Write-ahead log    (DualTxnWal)             │  two-slot redo log + recovery
+│  Write-ahead log    (TwoSlotWal)             │  two-slot redo log + recovery
 ├─────────────────────────────────────────────┤
-│  Backend region     (BackendRegion)          │  storage abstraction: memory / file / PMEM / direct I/O
+│  Backend region     (StorageRegion)          │  storage abstraction: memory / file / PMEM / direct I/O
 └─────────────────────────────────────────────┘
 ```
 
-All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live under `src/engine/x86-64/`.
+All interfaces live in `src/engine/StorageRegion.v3`; x86-64 implementations live under `src/engine/x86-64/`.
 
 ---
 
@@ -28,14 +28,14 @@ All interfaces live in `src/engine/TxnBackend.v3`; x86-64 implementations live u
 
 `DirectIoRegion` (`src/engine/x86-64/X86_64DirectIoBackend.v3`) is the third
 persistent backend. The region lives in a process-private anonymous mapping, the
-*staging buffer*; `create()` reads the whole region into it, and write-back is
+*staging buffer*; `open()` reads the whole region into it, and write-back is
 explicit: `pwrite` of whole 4 KiB units on an `O_DIRECT` descriptor, then one
 `fdatasync` per boundary. The target is either a regular file, created and
-sized as `FileMmapBackend` does (`direct`; nothing calls `fallocate`), or a raw
+sized as `MappedFileBackend` does (`direct`; nothing calls `fallocate`), or a raw
 block device (`direct-device`). (Corrected 2026-10-25: this said "a
 preallocated regular file".)
 
-Why a third one. `FileMmapRegion` is a page-cache backend: the kernel owns
+Why a third one. `MappedFileRegion` is a page-cache backend: the kernel owns
 writeback, may write any dirty page at any time, and keeps dirty data across
 the death of the process. Here nothing reaches the device unless the region
 writes it, and nothing survives the process unless it was written. Process death
@@ -43,14 +43,14 @@ therefore discards unwritten data the way a reset discards unflushed cache
 lines, which is what makes an ordinary `SIGKILL` loop sensitive to missing
 writebacks on this backend and on no other (see [crash behaviour](#crash-behaviour-process-death-is-the-crash)).
 
-**How it sits on the seam.** The boundary methods mirror `PmemMmapRegion`
-exactly: `prepareChangedRange` issues one `clwb()` per 64-byte line through the
-region's provider, and `persistChanges`/`persistRange` one `sfence()`. The
-provider, `DirectIoOperations`, forwards every call to an inner provider and, on
-`clwb()`, marks the line's 4 KiB unit dirty instead of executing CLWB. At the
+**How it sits on the seam.** The boundary methods mirror `PmemRegion`
+exactly: `writeBack` issues one `writeBackLine()` per 64-byte line through the
+region's provider, and `drain`/`persist` one `fence()`. The
+provider, `MarkingProvider`, forwards every call to an inner provider and, on
+`writeBackLine()`, marks the line's 4 KiB unit dirty instead of executing CLWB. At the
 fence the region writes every marked unit back (adjacent units in one `pwrite`)
-and then calls `fdatasync` once. `persistRange` drains every marked unit, not
-only its own range, because the `SFENCE` that ends a PMEM `persistRange`
+and then calls `fdatasync` once. `persist` drains every marked unit, not
+only its own range, because the `SFENCE` that ends a PMEM `persist`
 completes every outstanding CLWB. Two consequences:
 
 - The recorded `STORE`/`CLWB`/`SFENCE` trace of a history over this backend is
@@ -58,29 +58,29 @@ completes every outstanding CLWB. Two consequences:
   at 2 KiB and 4 KiB blocks). No conditional above the seam depends on the
   backend.
 - Because the dirty marking lives in the provider, the elided-writeback mutant
-  works unchanged: its no-op `clwb()` leaves nothing to write back.
+  works unchanged: its no-op `writeBackLine()` leaves nothing to write back.
 
 **Audit (2026-10-19).** A text search of the allocator and the log,
-`X86_64TxnPWRegion.v3` and `X86_64DualTxnWal.v3`, at `afcf5525` and again at
+`X86_64RegionAllocator.v3` and `X86_64TwoSlotWal.v3`, at `afcf5525` and again at
 `fc7466a3` (after the change to `format()` below), with comments set aside.
 Neither file has a type test (`.?`) or a cast to a backend or region class, or
-names a backend or region class other than the abstract `BackendRegion` and
-`TxnRegionBackend`. Of the medium words searched for (pmem, dax, mmap, msync,
+names a backend or region class other than the abstract `StorageRegion` and
+`StorageBackend`. Of the medium words searched for (pmem, dax, mmap, msync,
 fdatasync, direct, and also fsync, clwb, sfence, file and volatile), only
-"direct" occurs, in the name of `DirectRegionWriter`, the allocator's
+"direct" occurs, in the name of `UnloggedWriter`, the allocator's
 non-transactional writer. `backendRegion` is used only through
-`prepareChangedRange`, `persistChanges`, `persistRange`, `range` and `destroy`,
-besides null checks and being handed to `X86_64PersistentOps.ensureFor()` and
-`DualTxnWal`; the region itself comes from `TxnRegionBackend.create()`. The
+`writeBack`, `drain`, `persist`, `range` and `destroy`,
+besides null checks and being handed to `NativeProviders.installIfAbsent()` and
+`TwoSlotWal`; the region itself comes from `StorageBackend.open()`. The
 backend is chosen outside both files: by `X86_64Backends`
-(`X86_64TxnBackend.v3`) and `Backends` (`TxnBackend.v3`), through the wrappers
-in `X86_64PWRegion.v3`, or by a caller that passes its own `TxnRegionBackend`.
+(`X86_64MappedBackends.v3`) and `Backends` (`StorageRegion.v3`), through the wrappers
+in `X86_64RegionAllocators.v3`, or by a caller that passes its own `StorageBackend`.
 The change to `format()` adds one `backendRegion` call, a second
-`persistRange()`, for the magic. This is a search of the two files' text, not a
+`persist()`, for the magic. This is a search of the two files' text, not a
 proof: it does not follow the calls into the providers and regions, where the
 backends differ by design.
 
-**Safeguards.** Setting `O_DIRECT` proves little, so `create()` checks behaviour:
+**Safeguards.** Setting `O_DIRECT` proves little, so `open()` checks behaviour:
 a misaligned one-byte `pwrite` must fail with `EINVAL`. That refuses tmpfs (which
 accepts `O_DIRECT` and buffers anyway from kernel 6.6), ext4 with `data=journal`,
 and a flag mistranslated by an emulator; the probe writes back the byte it has
@@ -92,8 +92,8 @@ swap signature, before the region is zeroed. Both refusals were checked on
 sean-tan-PC against a mounted root partition and an ext4 signature.
 
 **What it costs elsewhere.** DRAM equal to the region; a mount reads the whole
-region before `PWRegion` can read its header; regions below 2 GiB, because
-`FdMmapRegion` forges its range with `int.!`. That cast is in the base class of
+region before `RegionAllocator` can read its header; regions below 2 GiB, because
+`FileBackedRegion` forges its range with `int.!`. That cast is in the base class of
 all three file-backed regions, so the limit is not the direct backend's alone;
 only `DirectIoBackend` refuses a larger region up front (`MAX_REGION`), and a
 PMEM or mapped-file region of 2 GiB or more is inferred, not tested, to trap at
@@ -207,7 +207,7 @@ contrast: the same mutant, under the same stricter acknowledgement check, is
 invisible to a kill loop on DAX, as the negative control documents.
 
 What these runs show and do not. They show that the production placement of
-write-back requests — every `prepareChangedRange`/`persistRange` the allocator,
+write-back requests — every `writeBack`/`persist` the allocator,
 the WAL and the sieve issue — is necessary, at arbitrary crash points, on real
 hardware, under a crash that discards exactly what was never handed to the
 kernel. The sensitivity is coarse: write-back is in 4 KiB units and every fence
@@ -220,14 +220,14 @@ stated in [PMEM Crash Model](pmem-crash-model.md#the-direct-backend-is-a-restric
 
 ## The file backend, a restriction of the PMEM model (2026-10-13)
 
-`FileMmapRegion` now sits on the persistent-operations seam as the direct
+`MappedFileRegion` now sits on the persistent-operations seam as the direct
 backend does, so the PMEM crash model, and with it every explorer result, speaks
-for it. `prepareChangedRange` issues one `clwb()` per 64-byte line through the
-region's provider, which is the direct backend's `DirectIoOperations` and marks
-the line's 4 KiB page; `persistChanges` and `persistRange` issue one `sfence()`
+for it. `writeBack` issues one `writeBackLine()` per 64-byte line through the
+region's provider, which is the direct backend's `MarkingProvider` and marks
+the line's 4 KiB page; `drain` and `persist` issue one `fence()`
 and then one `fdatasync` if any page is marked, and nothing otherwise. The
 recorded trace is the PMEM backend's for the same history
-(`file_mmap:trace_matches_pmem_region`). The argument that every image the
+(`mapped_file:trace_matches_pmem_region`). The argument that every image the
 backend can leave is one the model admits for that trace, its assumptions, and
 which of them are checked, are in
 [PMEM Crash Model](pmem-crash-model.md#the-file-backend-is-a-restriction-of-the-pmem-model-on-block-storage-only-conditionally).
@@ -238,13 +238,13 @@ which holds by construction only under stable writes, which sean-tan-PC's NVMe
 does not request, and nor does any of Magpie's block devices
 ([checked 2026-10-16](#b2-on-magpie)).
 
-Before the change the backend set a flag in `prepareChangedRange`, called
-`fdatasync` in `persistChanges`, and synced a `persistRange` with an `msync` of
+Before the change the backend set a flag in `writeBack`, called
+`fdatasync` in `drain`, and synced a `persist` with an `msync` of
 the range's own pages. Two things differ. The trace holds the `CLWB`s; before,
 it said nothing was ever written back, so the model could not speak for the
-backend. And a `persistRange` syncs every marked page, not only its own, because
-the `SFENCE` that ends a PMEM `persistRange` completes every outstanding `CLWB`.
-In the sieve that `persistRange` is the bitmap's, which now also makes the
+backend. And a `persist` syncs every marked page, not only its own, because
+the `SFENCE` that ends a PMEM `persist` completes every outstanding `CLWB`.
+In the sieve that `persist` is the bitmap's, which now also makes the
 allocation's after-images durable, one boundary earlier than before.
 
 ### The fence: one `fdatasync`
@@ -263,8 +263,8 @@ allocation's after-images durable, one boundary earlier than before.
   marked or not, with one flush. An unmarked dirty page holds each of its lines'
   full prefix, which is the model's eviction, so the superset is admitted.
 
-`FileBoundary.MSYNC` and `FileBoundary.LEGACY`, the boundary before the change,
-stay selectable through `FileMmapBackend.boundary` and the benchmarks'
+`MappedFileSync.MSYNC_PER_RUN` and `MappedFileSync.LEGACY_RANGE_MSYNC`, the boundary before the change,
+stay selectable through `MappedFileBackend.sync` and the benchmarks'
 `boundary=` keyword, for comparison only.
 
 ### Cost, old against new (sean-tan-PC, 2026-10-13)
@@ -453,7 +453,7 @@ page cache, does separate them: on 2026-10-21, one run each, the ordinary
 build's verdict was `SURVIVED` and the mutant's `LOST`, with every
 acknowledged step gone
 ([below](#a-kernel-reset-separates-the-file-backends-builds)). The rest of the evidence for this backend is the
-model and the checks in `FileMmapRegionTest.v3`.
+model and the checks in `MappedFileRegionTest.v3`.
 
 ### On Magpie
 
@@ -467,7 +467,7 @@ configurations and pins to the DAX namespace's node.
 # checks on their own, then the
 # opt-in PMEM DAX integration tests
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
-bin/unittest.x86-64-linux 'file_mmap:*'
+bin/unittest.x86-64-linux 'mapped_file:*'
 PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
 
 # B2 without root: stable pages requested, and whether any layer is dm-crypt
@@ -498,7 +498,7 @@ PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean PWOB_BLOCK_DIR=/home/users/u7599095 \
     PWOB_NUMA_NODE=0 scripts/pwops-bench.sh campaign
 ```
 
-The unit tests never touch DAX: `file_mmap:` writes its region in `/tmp`, and
+The unit tests never touch DAX: `mapped_file:` writes its region in `/tmp`, and
 the `O_DIRECT` re-read in whichever of `/tmp` and `bin/` honours `O_DIRECT`, so
 on Magpie it checks that path's filesystem and device. Nothing in the
 restriction's checks needs Magpie; the runs above price it there and confirm
@@ -1083,7 +1083,7 @@ with `gnudd`, GNU coreutils 9.7 (`af6f9680`).
 **Method.** Each case builds a fresh file system with default options (ext4
 mounts `data=ordered`) on a dm device over a loop file (`--direct-io=on`)
 under the owner's home on `nvme1n1p3`. It prepares a 2 MiB region (512 ×
-4096, two sieve steps, clean close) whose log chunk, at file offset 4096, is
+4096, two sieve steps, clean close) whose log block, at file offset 4096, is
 allocated and written. `filefrag` maps the chunk to eight device sectors,
 checked against an `O_DIRECT` read of the file. One `pwreboot fault-commit`
 process mounts the region, then commits one transaction while the dm table
@@ -1092,41 +1092,41 @@ storing a random nonce in an unused word of the sieve's root chunk, at file
 offset 12264, on another page. `dm-flakey` was not used: it also fails the
 device's empty flushes, which aborts the journal, Rebello et al.'s Table 1,
 Q8–Q9, a different case. The script then restores the linear table, compares
-the log chunk read through the page cache with an `O_DIRECT` read, lets the
+the log block read through the page cache with an `O_DIRECT` read, lets the
 process abandon the latched mount and reopen it in the same boot, and compares
 again. Last, it unmounts and remounts the file system, which drops the file's
 pages, and runs `fault-verify`. The direct-I/O backend runs the same steps as
 the control.
 
-| Case | `commit()` | Latched | Same-boot recovery; nonce | Log chunk, cache vs device | After remount: recovery; nonce | Verdict | FS |
+| Case | `commit()` | Latched | Same-boot recovery; nonce | Log block, cache vs device | After remount: recovery; nonce | Verdict | FS |
 |---|---|---|---|---|---|---|---|
 | ext4, file (2 runs) | 0 | yes | `REPLAYED`; present | differ; nonce in the cache only | `CLEAN`; present | `CONSISTENT` | rw |
 | ext4, direct (2 runs) | 0 | yes | `CLEAN`; absent | equal; no nonce | `CLEAN`; absent | `CONSISTENT` | rw |
 | XFS, file | 0 | yes | `REPLAYED`; present | differ; nonce in the cache only | `CLEAN`; present | `CONSISTENT` | rw |
 | XFS, direct | 0 | yes | `CLEAN`; absent | equal; no nonce | `CLEAN`; absent | `CONSISTENT` | rw |
 
-- **The fault hit the log chunk and nothing else.** ext4 logged `I/O error 10
+- **The fault hit the log block and nothing else.** ext4 logged `I/O error 10
   writing to inode 14 starting block 33281`, sector 266,248, the chunk; XFS
   logged `writeback error on inode 132, offset 4096, sector 112`. Both stayed
   `rw`, ext4's `errors_count` stayed 0, and XFS's remount reported "Ending
   clean mount", so this is a failed data write, not a journal failure.
 - **Both file systems kept the failed record in a clean page, and the reopen
   read it.** That is what Rebello et al. found for ext4 and XFS on Linux 5.2
-  (Table 1, Q4–Q5), seen again on 7.0. The reopened `FileMmapRegion` maps the
+  (Table 1, Q4–Q5), seen again on 7.0. The reopened `MappedFileRegion` maps the
   same file, so it read the record from the page cache, and recovery replayed
   it. The page stayed clean and nothing rewrote it: after the remount the
-  device's log chunk is byte for byte the pre-commit chunk, SHA-256
+  device's log block is byte for byte the pre-commit chunk, SHA-256
   `806427bd…` in every case, the controls' included.
 - **The disk then holds the transaction's data without its record.** Replay
   stored the nonce into its own page, outside the failed sectors, and
-  recovery's `persistChanges()` wrote that page through the restored device.
+  recovery's `drain()` wrote that page through the restored device.
   After the remount `recover()` returns `CLEAN` with the nonce present. The
   data became durable and its record never did, the reverse of write-ahead
   order, and the contract's "`recover() == CLEAN` resolves the attempted
   transaction as absent" fails for this backend after a same-boot reopen
   ([Persistence-failure contract](#persistence-failure-contract)). The
   invariants hold here because the transaction is one word.
-- **The direct-I/O backend is not affected by this failure.** Its `create()`
+- **The direct-I/O backend is not affected by this failure.** Its `open()`
   reads the region through `O_DIRECT`, so the reopen saw the device's copy, no
   record, and replayed nothing.
 - *Inference:* with after-images on several pages, a crash during the replay's
@@ -1195,7 +1195,7 @@ the script now selects the window by timestamp.
   page, the tear case. From 8 KiB up they sit on different pages (`slotBytes`,
   [Active on-region layout](#active-on-region-layout)), the stale-slot case,
   which includes the platform wrappers' default 512 KiB block
-  ([`PWRegionHeader`](#pwregionheader-88-bytes-stored-at-offset-0)). Both need
+  ([`RegionHeader`](#pwregionheader-88-bytes-stored-at-offset-0)). Both need
   a failed write on the file backend over ext4 or XFS and a reopen in the same
   boot; a crash alone does not produce them.
 - *Inference:* replay's idempotence does not help, since what recovery replays
@@ -1219,7 +1219,7 @@ each. It runs no engine code. A fresh file system with default options, on a
 dm device over a loop file (`--direct-io=on`) in `/var/tmp` on `nvme1n1p3`,
 holds a 1 MiB file of `A`, written and fsynced. One 4 KiB page, at file offset
 4096, is stored through a `MAP_SHARED` mapping and synced with `fdatasync`, as
-`FileMmapRegion`'s boundary does, while the page's eight sectors go to the dm
+`MappedFileRegion`'s boundary does, while the page's eight sectors go to the dm
 `error` target, as in the runs above; the table is read back after every load
 (`dm-tables.txt`). Before each step the script writes a marker line to
 `/dev/kmsg`, and it reads each case's kernel records back from there with the
@@ -1248,7 +1248,7 @@ All 17 checks matched the predictions in the script's header (`summary.txt`).
   allow (v7.0 `fs/ext4/super.c`, `include/linux/ratelimit_types.h`). So the
   second `fdatasync` sent no write of the page: it reported success for bytes
   the device never received. The runs above did not record the errno, since
-  `RegionFileIO.fdatasync()` returns only success or failure.
+  `BackingFile.fdatasync()` returns only success or failure.
 - **The failed page keeps its new bytes, and a reopen sees no error.** With
   the device restored, the page read B through the cache and A with
   `O_DIRECT`, and `fdatasync` returned 0 on the descriptor that saw the error
@@ -1263,11 +1263,11 @@ All 17 checks matched the predictions in the script's header (`summary.txt`).
   `posix_fadvise(POSIX_FADV_DONTNEED)` the page read B, the device's copy; C,
   never written, was gone. One run; the call is advice, not a guarantee.
 - **What this says about retrying a failed boundary.** *Inference:* a
-  `DualTxnWal` that retried its boundary would get 0 from the second
+  `TwoSlotWal` that retried its boundary would get 0 from the second
   `fdatasync` (step 2) and acknowledge a record the device lacks, lost at the
   next reboot even without a reopen; the latch forbids that retry. A retry
   that first stores the marked pages back would succeed once the error clears
-  (step 4), and `FileMmapRegion` keeps its marks after a failed sync
+  (step 4), and `MappedFileRegion` keeps its marks after a failed sync
   (`syncMarked()` clears them only on success), so it would know which pages
   to store. Against a lasting error every attempt fails (step 5), so a bounded
   retry still ends in the latch and the reopen above. Not built.
@@ -1476,7 +1476,7 @@ regions on a 2 MiB-aligned namespace will normally get 2 MiB entries, so the
 across the region could pay a multiple of it.
 
 A side observation from the same `filefrag` output: the 8 MiB region file is
-sparse (logical blocks 512–1535 unallocated). `RegionFileIO.create()` zeroes a
+sparse (logical blocks 512–1535 unallocated). `BackingFile.create()` zeroes a
 fresh region by extending it with `ftruncate`, so storage is allocated on first
 touch. Reads see zeros either way, so this is not a correctness issue, but a
 workload writing into untouched parts of a large region pays block allocation
@@ -1631,7 +1631,7 @@ dirty page, with `CLWB` on x86 — yet its slope equals the no-writeback slope,
 so a miss on the next commit's stores costs next to nothing per entry
 (plausibly because the record is written sequentially and the prefetchers
 cover it). What the PMEM backend does and the file backend does not is write
-back *within* the commit: `DualTxnWal.applyUpdate()` stores one after-image and
+back *within* the commit: `TwoSlotWal.applyAfterImage()` stores one after-image and
 immediately prepares its line, which on PMEM is a `CLWB`, and pwbench's entries
 are consecutive u64s. So seven of every eight after-image stores land in a line
 the previous entry's writeback has just evicted, a miss nothing can prefetch.
@@ -1686,7 +1686,7 @@ writeback per line) and keeps production's spacing: a whole record
 construction separates each writeback from the fence and from the next store to
 its line. It predicts production at stride 8 approaching the stride-64 residual
 (~1.5 µs at 24 entries rather than 16.2). This is a change to
-`RegionTransaction.applyToRegion()` and `DualTxnWal.applyUpdate()`, not to the
+`TransactionCache.applyToRegion()` and `TwoSlotWal.applyAfterImage()`, not to the
 benchmark. The crash model permits it — every writeback still precedes the same
 fence — but it reorders the recorded `STORE`/`CLWB` events, so the explorer and
 trace tests that pin that order need updating and rerunning. The layout
@@ -1696,22 +1696,22 @@ block-table entry, a chunk header — pays the same miss on this CPU. The line
 formula above already shows the redundancy: it counts `n` after-image
 writebacks for `ceil(n / 8)` distinct lines.
 
-It is now production. `DualTxnWal.storeUpdate()` stores an after-image and
-records its extent; `prepareApplied()` sorts the extents and prepares each line
-once, merging adjacent lines into one range; `RegionTransaction.applyToRegion()`
+It is now production. `TwoSlotWal.storeAfterImage()` stores an after-image and
+records its extent; `writeBackAfterImages()` sorts the extents and prepares each line
+once, merging adjacent lines into one range; `TransactionCache.applyToRegion()`
 stores the whole transaction and then calls it. The obligation is structural,
 not the caller's: every boundary that advances `dataDurableSeq` — the commit
-point, `persistAppliedData()` and recovery — prepares any extent still
-outstanding first. `applyUpdate()` keeps the per-entry behaviour for recovery
+point, `persistAfterImages()` and recovery — prepares any extent still
+outstanding first. `applyAfterImage()` keeps the per-entry behaviour for recovery
 replay and for the tests that pin it. Seven unit tests cover the change, among
 them a crash-explorer check of a three-transaction batched history against
 production recovery: exhaustive over every cut of the batched apply, bounded
 over the commit that reclaims its slot. Each of four deliberately broken
 variants fails at least one of them: a merged range left unprepared, the
-commit's drain removed, `persistAppliedData()`'s drain removed, and the facade
-skipping `prepareApplied()`. The full suite passes (2,004 tests). pwbench's
+commit's drain removed, `persistAfterImages()`'s drain removed, and the facade
+skipping `writeBackAfterImages()`. The full suite passes (2,004 tests). pwbench's
 `apply=entry` restored the old placement for the same-sitting comparisons below
-and on Raptor Lake; it and `RegionTransaction.perEntryWriteback` were removed
+and on Raptor Lake; it and `TransactionCache.perEntryWriteback` were removed
 on 2026-09-28 once those were recorded. `scripts/clwb-eviction.sh` still
 rebuilds and summarises the `-entry` directories and refuses new `-entry` runs.
 
@@ -1785,7 +1785,7 @@ per commit, median of three:
   *slower* per commit on both backends (+36 ns at 8 entries, +67 ns at 24,
   every pair): shrinking the function by 24 bytes moved the 2,291 functions
   after it, among them `writeAfterImage`, `noteExtent` and the timing
-  provider's `clwb`/`sfence`, which lost their alignment. A control build
+  provider's `writeBackLine`/`fence`, which lost their alignment. A control build
   padded back to the old layout, with every function at its old address and
   still no `divq`, is 48–75 ns faster than the fix and 11 ns (0.5 %) faster
   than the original at 8 entries, 0 ns at 24. So on this core out-of-order
@@ -2022,7 +2022,7 @@ type lives in computation, not in the persistence path.
   after each `fdatasync` described above. On the NVMe, persistence is 79–86 % of
   a step.
 - **Four boundaries per step on every backend**, as designed: three commits and
-  the bitmap's `persistRange()`, which on the file backend was then an `msync`
+  the bitmap's `persist()`, which on the file backend was then an `msync`
   (since 2026-10-13 an `fdatasync`; [old against new](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)). On the
   NVMe each costs about 235 µs (P-core), close to the 237 µs pwbench records for
   this machine's file-backend boundary. The direct backend is 2.6 % slower than the file backend
@@ -2198,9 +2198,9 @@ The sieve is one end of the interface: on PMEM a step is mostly computation,
 with a few boundaries around a bulk write. A B+Tree mutation is the other end:
 little computation, and every changed node is a fresh chunk that must be
 durable before it is published. `test/unittest/x86-64-linux/PWBTree.v3` is a
-B+Tree of u64 keys and values over a `PWRegion`. Like PWSieve it is a workload
+B+Tree of u64 keys and values over a `RegionAllocator`. Like PWSieve it is a workload
 driver, not engine code, and has no WASM component; the only interface under
-test is PWRegion's. `test/pwbtreebench.main.v3` times its operations through
+test is RegionAllocator's. `test/pwbtreebench.main.v3` times its operations through
 the production allocator and WAL.
 
 **Layout.** Every node is one chunk of one block (`allocChunk(1)`), so nothing
@@ -2216,11 +2216,11 @@ capacity, checked on open), the root node's offset, the height, the key and
 node counts, and a mutation count that never decreases. Format publishes an
 empty root leaf, so the height is at least 1 and every mutation replaces at
 least one node. Leaves have no sibling links and there is no delete: nothing
-scans a range or merges nodes. A chunk is block aligned, but PWRegion allows any
+scans a range or merges nodes. A chunk is block aligned, but RegionAllocator allows any
 block size that is a multiple of 8, so a node need not start on a cache line;
-its writebacks start on the line that holds its first word, as `persistRange()`
+its writebacks start on the line that holds its first word, as `persist()`
 aligns its range (tested at 4,104-byte blocks; until a review on 2026-10-14
-they started at the chunk and raised `PersistentOperationError` there).
+they started at the chunk and raised `PersistenceProviderError` there).
 
 **Copy-on-write, because a node cannot go through the log.** A redo entry
 carries at most 8 bytes in a 32-byte slot, so a 4 KiB node would overflow a
@@ -2236,7 +2236,7 @@ reported through an optional `onPhase` hook:
 | COMPUTE | descend, find the leaf slot, count the splits | 0 |
 | ALLOC | `allocChunk(1)` for each of the k new nodes, each its own commit | k |
 | COMPUTE | build the k nodes in DRAM, child offsets filled in | 0 |
-| WRITE | the nodes' direct stores; every line but the last node's handed to the provider, then one `persistRange()` over the last node, whose fence completes them all | 1 |
+| WRITE | the nodes' direct stores; every line but the last node's handed to the provider, then one `persist()` over the last node, whose fence completes them all | 1 |
 | PUBLISH | the root fields buffered, then `freeChunk()` of the old root node, which commits both | 1 |
 | FREE | `freeChunk()` of each other replaced node | h − 1 |
 
@@ -2250,7 +2250,7 @@ direct backends.
 
 **Several frees cannot share a commit; the first shares the publish.**
 `allocChunk()` and `freeChunk()` each end in `performCommit()`, which commits
-everything the shared `RegionTransaction` holds, and the allocator has no call
+everything the shared `TransactionCache` holds, and the allocator has no call
 that allocates or frees without committing. Buffering the root swap before the
 first free makes the swap and that free one transaction, PWSieve's retirement
 recipe; each later free commits on its own. Two orderings carry the argument:
@@ -2616,9 +2616,9 @@ empty tree, and still lost every acknowledged mutation. The acknowledgement
 check caught it. The integrity checks cannot, because an older tree is a
 consistent one.
 
-**The tree in the crash-image explorer.** `persistent_btree:`
-(`test/unittest/x86-64-linux/PersistentBTreeTest.v3`) does for the tree what
-`persistent_sieve:` does for the sieve:
+**The tree in the crash-image explorer.** `btree_crash:`
+(`test/unittest/x86-64-linux/BTreeCrashTest.v3`) does for the tree what
+`sieve_crash:` does for the sieve:
 - **What it records.** One put's `STORE`/`CLWB`/`SFENCE` order, over a
   recording PMEM region of 32 blocks of 2 KiB at capacity 3. It then mounts the
   images a crash could leave through production recovery.
@@ -2633,7 +2633,7 @@ consistent one.
   the tree after.
 - **The container.** Images are mounted in an anonymous mapping, not in a
   heap array, which `openArray()` used until 2026-10-19. The tree allocates
-  while it is checked, a collection can move a heap array, and `PWRegion`
+  while it is checked, a collection can move a heap array, and `RegionAllocator`
   keeps the raw address.
 
 How far each check reaches. A cut admits the distinct images that the product
@@ -2648,7 +2648,7 @@ admits 26,066,309,068,800, and 2,795 of its cuts admit more than 16:
   at its last, then each line alone at its last with the rest at their floors),
   then class vectors drawn at random from a seed fixed by the trace and the
   cut. It checked 18,330 images for the insert and 11,818 for the update, and
-  reports itself truncated. `persistent_sieve:`'s sweeps are bounded the same
+  reports itself truncated. `sieve_crash:`'s sweeps are bounded the same
   way. (Until 2026-10-20 this paragraph described the prefix odometer that
   preceded distinct images, which started from the floor image and varied the
   lowest lines first: up to about 2^70 images a cut, all but 72 of the insert's
@@ -2679,7 +2679,7 @@ What this does not show:
   counted before the explorer counted distinct images).
 - It covers two puts at one geometry, not the benchmark's 4 KiB blocks and 252
   keys a node.
-- It takes the bytes before the put as durable, as `persistent_sieve:` does.
+- It takes the bytes before the put as durable, as `sieve_crash:` does.
 - As for all of layer 1b, it assumes the hardware obeys the model.
 
 #### What these numbers cannot show
@@ -2767,15 +2767,15 @@ pwbench times a commit whose shape the harness chooses, and the sieve times a
 program. `test/pwopsbench.main.v3` times the operations the interface offers,
 one at a time, in the form of Corundum's Table 5 (Hoseinzadeh and Swanson,
 ASPLOS '21), which gives basic-operation latencies over 50,000 operations.
-Every operation goes through the production `PWRegion`, `RegionTransaction` and
-`DualTxnWal` on each backend. Corundum's BST, KVStore and B+Tree workloads are
+Every operation goes through the production `RegionAllocator`, `TransactionCache` and
+`TwoSlotWal` on each backend. Corundum's BST, KVStore and B+Tree workloads are
 out of scope; the sieve above is this project's workload.
 
 | Operation | What is timed | Persistence work |
 |---|---|---|
-| `alloc-1`, `alloc-8`, `alloc-64` | `PWRegion.allocChunk(n)` of n 4 KiB blocks, its own committed transaction | one boundary |
+| `alloc-1`, `alloc-8`, `alloc-64` | `RegionAllocator.allocChunk(n)` of n 4 KiB blocks, its own committed transaction | one boundary |
 | `free-1`, `free-8`, `free-64` | `freeChunk()` of that chunk, its own transaction | one boundary |
-| `commit-empty` | `RegionTransaction.commit()` with nothing buffered | none: it returns before the WAL (`X86_64TxnPWRegion.v3:444`) |
+| `commit-empty` | `TransactionCache.commit()` with nothing buffered | none: it returns before the WAL (`X86_64RegionAllocator.v3:444`) |
 | `timer` | an empty `rdtsc` window | the floor under every figure |
 | `mount-1mib`, `mount-64mib` | opening a cleanly closed region of 256 or 16,384 blocks | none: `close()` scrubbed the log, recovery reports `CLEAN` |
 | `recover-8`, `recover-24` | opening a 1 MiB region whose log holds one committed, unapplied transaction of 8 or 24 `u64` entries | one boundary, the replay; recovery reports `REPLAYED` |
@@ -2796,22 +2796,22 @@ out of scope; the sieve above is this project's workload.
   and writeback requests (lines). An allocation or free must make exactly one
   boundary and write back the record's lines plus each distinct line its
   after-images touch; that expectation is derived from the record the commit
-  wrote (`PWOps.latestRecord()`, read through a second `DualTxnWal` over the
+  wrote (`PWOps.latestRecord()`, read through a second `TwoSlotWal` over the
   same log) during warm-up, and every measured operation must match it. An
   empty commit and a clean mount must do nothing; a recovery of k entries one
-  boundary and k lines, because `redoSlot()` replays through `applyUpdate()`,
-  which prepares each entry on its own (`X86_64DualTxnWal.v3:426`), while
+  boundary and k lines, because `redoSlot()` replays through `applyAfterImage()`,
+  which prepares each entry on its own (`X86_64TwoSlotWal.v3:426`), while
   commits use the batched apply. Any mismatch fails the run with exit 1 and
   keeps the region image (tested by mutating an expectation). The suite hosts
   have no DAX mount, so `PWOpsTest.v3`'s six tests check the same expectations
-  on the production `PmemMmapRegion` boundary over anonymous memory, recording
+  on the production `PmemRegion` boundary over anonymous memory, recording
   every `CLWB` and `SFENCE`.
 - **How the recovery state is produced.** `PWOps.commitUnapplied()`, which is
   `PmemDaxIntegrationTest`'s recipe: open the cleanly closed region's backend
-  directly, without a `PWRegion`, build the production `DualTxnWal` over it,
+  directly, without a `RegionAllocator`, build the production `TwoSlotWal` over it,
   append k `u64` after-images to a chunk allocated for them, and `commit()`,
   which writes the record and its commit-point boundary exactly as a
-  `RegionTransaction` commit does. Nothing is applied, and the backend region
+  `TransactionCache` commit does. Nothing is applied, and the backend region
   is destroyed without `close()`, which would persist the data and scrub the
   record. The durable state is a crash straight after a commit point: the
   record valid, its after-images absent. That setup is untimed. The timed
@@ -2899,7 +2899,7 @@ PMEM path itself.
   repetitions and 282 µs in the fifth, `free-8` 278 µs in one of five, the file
   `alloc-64` 305–306 µs in two. Each run is internally tight; which level a run
   takes is not explained.
-- **An empty commit is no boundary.** `RegionTransaction.commit()` returns
+- **An empty commit is no boundary.** `TransactionCache.commit()` returns
   `true` before the WAL when nothing is buffered: no record, store, writeback
   or fence, checked on all 52,000 calls and by `pwops:empty_commit_issues_nothing`.
   It costs 5–6 ns against the empty window's 4–5 ns, 1–2 ns over the floor.
@@ -2907,7 +2907,7 @@ PMEM path itself.
 - **A clean mount is flat in region size on the file backend, and a read of
   the whole region on the direct one.** File: 16.2 µs at 1 MiB, 14.2 µs at
   64 MiB, opening and mapping the file and checking the header and log, with
-  pages faulted in only when touched. Direct: `DirectIoRegion.create()` reads
+  pages faulted in only when touched. Direct: `DirectIoRegion.open()` reads
   the region into its staging buffer (`X86_64DirectIoBackend.v3:397`), and
   `strace -T` shows that one `pread` is the mount's time. 64 MiB in 9.64 ms is
   about 7 GB/s; at that rate 1 MiB would take 0.15 ms, so most of the 1 MiB
@@ -2991,7 +2991,7 @@ boundary, are [below](#magpie-again-every-backend-in-one-sitting-2026-10-14)
   (24) of the replay, and the PMEM backend replays slower than the file backend
   on DAX: 27.5 µs against 15.7 µs at 24 entries, the inversion the batched apply
   removed from commits. It is paid once per recovery, not per commit. Replaying
-  through `storeUpdate()` and `prepareApplied()` would remove it; not done.
+  through `storeAfterImage()` and `writeBackAfterImages()` would remove it; not done.
 - **Interleaving the mounts paid off.** On `pmem-auto`, `mount-1mib` and both
   recoveries sit about 1.2 µs lower in repetitions 2 and 3 than in the others,
   all three together, hence their 5–15 % spreads; `file-dax`'s repetition 5 does
@@ -3254,7 +3254,7 @@ medium-dependent:
 
 On PMEM the remaining ~97 % is WAL record construction — `zeroBytes` and
 `computeRecordChecksum` walk the record a byte at a time
-(`X86_64DualTxnWal.v3:212,239`). At 13.7 µs per commit against 0.45 µs of
+(`X86_64TwoSlotWal.v3:212,239`). At 13.7 µs per commit against 0.45 µs of
 boundary, **record construction outweighs the entire durability boundary by
 29×**. Optimising the boundary further on PMEM would be effort spent on 3 % of
 the cost; the byte-at-a-time loops are where the time goes. That is a
@@ -3410,7 +3410,7 @@ concept of.
 
 The practical consequence is concrete: a persistent-region allocator on PMEM
 should run on the socket that owns the namespace, and an engine that cannot
-guarantee that should at least report the mismatch. Neither `PWRegion` nor the
+guarantee that should at least report the mismatch. Neither `RegionAllocator` nor the
 backends currently have any notion of NUMA (out of scope here, and recorded as
 future work).
 
@@ -3525,7 +3525,7 @@ Two clean results:
   [`CLWB` evicts on Cascade Lake](#clwb-evicts-on-cascade-lake-and-the-writebacks-cost-far-more-than-the-boundary-shows).
 
 The line count is exactly predictable. A record is a 64-byte header, a 48-byte
-trailer and one 32-byte `LogEntry` per buffered write, aligned up to 64, and
+trailer and one 32-byte `WalEntry` per buffered write, aligned up to 64, and
 each after-image was prepared separately (until 2026-09-28; since then each
 distinct data line is prepared once, so the `+ n` term becomes the number of
 data lines the transaction touched), so
@@ -3754,12 +3754,12 @@ Aeneas parses options left to right and each assignment overwrites the last
 | Program | Sources besides `$ENGINE` and `$TARGET_X86_64` |
 |---|---|
 | `unittest` | `test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3 $VIRGIL/lib/test/*.v3 T/*.v3 src/modules/*.v3 src/modules/wasi/*.v3 src/modules/wasi/x86-64-linux/*.v3 $VIRGIL/lib/x86-64-linux/SyscallLayouts.v3` |
-| `pwsievebench` | `T/PWSieve.v3 T/ElidedWritebackOps.v3 test/pwsievebench.main.v3` |
-| `pwopsbench` | `T/PWOps.v3 T/ElidedWritebackOps.v3 test/pwopsbench.main.v3` |
-| `pwbtreebench` | `T/PWBTree.v3 T/PWOps.v3 T/ElidedWritebackOps.v3 test/pwbtreebench.main.v3` |
-| `pwsieve` | `T/PWSieve.v3 T/ElidedWritebackOps.v3 test/pwsieve.main.v3` |
-| `pwbtree` | `T/PWBTree.v3 T/ElidedWritebackOps.v3 test/pwbtree.main.v3` |
-| `pwreboot` | `T/PWSieve.v3 T/ElidedWritebackOps.v3 test/pwreboot.main.v3` |
+| `pwsievebench` | `T/PWSieve.v3 T/ElidedWriteBackProvider.v3 test/pwsievebench.main.v3` |
+| `pwopsbench` | `T/PWOps.v3 T/ElidedWriteBackProvider.v3 test/pwopsbench.main.v3` |
+| `pwbtreebench` | `T/PWBTree.v3 T/PWOps.v3 T/ElidedWriteBackProvider.v3 test/pwbtreebench.main.v3` |
+| `pwsieve` | `T/PWSieve.v3 T/ElidedWriteBackProvider.v3 test/pwsieve.main.v3` |
+| `pwbtree` | `T/PWBTree.v3 T/ElidedWriteBackProvider.v3 test/pwbtree.main.v3` |
+| `pwreboot` | `T/PWSieve.v3 T/ElidedWriteBackProvider.v3 test/pwreboot.main.v3` |
 
 `bin/Build-x86-64-linux.v3`, which `build.sh` regenerates before every build,
 records the build time, the user and `git rev-list --count HEAD`, not the
@@ -3832,40 +3832,40 @@ Recording `v3c -version`, the clone's `git rev-parse HEAD` and `git status
 
 ## Layer 1 — Storage Abstraction
 
-**Files:** `src/engine/TxnBackend.v3`, `src/engine/x86-64/X86_64TxnBackend.v3`
+**Files:** `src/engine/StorageRegion.v3`, `src/engine/x86-64/X86_64MappedBackends.v3`
 
 ### Interfaces
 
 ```
-BackendRegion (abstract class)
+StorageRegion (abstract class)
     range: Range<byte>                       // the mapped bytes
-    persistentOperations()                   // per-region scalar/CLWB/SFENCE provider
-    destroy()                                // release storage
-    prepareChangedRange(offset, size)        // mark region dirty (write-behind)
-    persistChanges()                         // flush all pending dirty ranges
-    persistRange(offset, size)               // synchronously flush a specific range (used by WAL)
+    provider()                               // per-region scalar/CLWB/SFENCE provider
+    close()                                  // release storage
+    writeBack(offset, size)                  // start writing changed bytes back, one writeBackLine() per line
+    drain()                                  // complete every write-back since the last drain (one fence)
+    persist(offset, size)                    // write one range back and fence (used by the WAL)
 
-TxnRegionBackend (abstract class)           // factory for BackendRegion instances
-    create(size: u64, prot: BackendProt, fresh: bool) -> BackendRegion
+StorageBackend (abstract class)           // factory for StorageRegion instances
+    open(size: u64, access: int, mode: OpenMode) -> StorageRegion   // access: BackendProt masks; mode: FORMAT or ATTACH
     isPersistent() -> bool
     name() -> string
 ```
 
-The narrow `PersistentOperations` interface provides naturally aligned
-`storeU8`/`storeU16`/`storeU32`/`storeU64`, region-relative `clwb`, and
-`sfence`. A single provider belongs to each region, allowing active-WAL stores
+The narrow `PersistenceProvider` interface provides naturally aligned
+`storeU8`/`storeU16`/`storeU32`/`storeU64`, region-relative `writeBackLine`,
+and `fence`. A single provider belongs to each region, allowing active-WAL stores
 and PMEM writeback/fence requests to share one observable order. The production
 x86-64 provider performs ordinary native scalar stores and reaches the existing
 writeback/fence hooks. A recording provider mutates the same live byte image and
 retains typed `STORE`/`CLWB`/`SFENCE` events for deterministic tests.
 
 Loads have a seam of their own since 2026-10-19. The provider carries a
-nullable `loadObserver: PersistentLoadObserver`, null in production, whose one
-method, `observe(offset, length)`, is called with region-relative offsets
+nullable `loadObserver: LoadObserver`, null in production, whose one
+method, `beforeLoad(offset, length)`, is called with region-relative offsets
 *before* the bytes are loaded and may rewrite them. Every load the allocator,
 the WAL and the workloads make from a region is made, or observed first,
-through a `DirectRegionReader` over the region's provider (the counterpart of
-`DirectRegionWriter`): typed `load*` methods, `observe()` for byte loops, and
+through a `RegionReader` over the region's provider (the counterpart of
+`UnloggedWriter`): typed `load*` methods, `beforeLoad()` for byte loops, and
 per-layout `forge*` helpers that observe a layout's bytes before forging its
 `Ref`. With no observer, a reader load is the same `Pointer.load` as before,
 behind a call and a never-taken branch. A recording provider can keep loads too
@@ -3878,69 +3878,69 @@ what stays raw, the load audit and the cost are in
 
 ### Implementations
 
-| Class | Storage | `prepareChangedRange` | `persistChanges` | `persistRange` |
+| Class | Storage | `writeBack` | `drain` | `persist` |
 |---|---|---|---|---|
 | `VolatileRegion` | `Array<byte>` (GC'd) | no-op | no-op | no-op |
-| `FileMmapRegion` | file + `mmap(MAP_SHARED)` | provider `clwb()` per line marks its 4 KiB page (the direct backend's `DirectIoOperations`); sets `hasDirtyChanges` | fence, then one `fdatasync()` if any page is marked | as `persistChanges`, after marking the range: syncs every marked page |
-| `PmemMmapRegion` | file + `mmap(MAP_SHARED_VALIDATE\|MAP_SYNC)` | cache-line flush; sets `hasPendingWriteback` | store fence | flush range + store fence |
-| `DirectIoRegion` | anonymous staging buffer + `O_DIRECT` file or block device | provider `clwb()` per line marks its 4 KiB unit; sets `hasPendingWriteback` | fence, `pwrite` marked units, `fdatasync` | as `persistChanges`, after marking the range: drains every marked unit |
+| `MappedFileRegion` | file + `mmap(MAP_SHARED)` | provider `writeBackLine()` per line marks its 4 KiB page (the direct backend's `MarkingProvider`); sets `hasDirtyChanges` | fence, then one `fdatasync()` if any page is marked | as `drain`, after marking the range: syncs every marked page |
+| `PmemRegion` | file + `mmap(MAP_SHARED_VALIDATE\|MAP_SYNC)` | cache-line flush; sets `hasPendingWriteback` | store fence | flush range + store fence |
+| `DirectIoRegion` | anonymous staging buffer + `O_DIRECT` file or block device | provider `writeBackLine()` per line marks its 4 KiB unit; sets `hasPendingWriteback` | fence, `pwrite` marked units, `fdatasync` | as `drain`, after marking the range: drains every marked unit |
 
-`FileMmapRegion`, `PmemMmapRegion` and `DirectIoRegion` all extend `FdMmapRegion`, which holds the `Mapping` and `fd` and handles `destroy()`. For `DirectIoRegion` the `Mapping` is the anonymous staging buffer, not a mapping of the `fd`.
+`MappedFileRegion`, `PmemRegion` and `DirectIoRegion` all extend `FileBackedRegion`, which holds the `Mapping` and `fd` and handles `close()`. For `DirectIoRegion` the `Mapping` is the anonymous staging buffer, not a mapping of the `fd`.
 
-Until 2026-10-13 `FileMmapRegion` set a flag in `prepareChangedRange`, called `fdatasync` in `persistChanges` if it was set, and synced a `persistRange` with `msync(MS_SYNC)` of the range's own pages; it made no provider call, so its trace held no `CLWB` and the PMEM model said nothing about it. That boundary is still selectable, for the old-against-new comparison only, as `FileBoundary.LEGACY` (`FileMmapBackend.boundary`, the benchmarks' `boundary=legacy`), and so is `FileBoundary.MSYNC`, one `msync` per run of marked pages in place of the `fdatasync`; see [the file backend, a restriction of the PMEM model](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13).
+Until 2026-10-13 `MappedFileRegion` set a flag in `writeBack`, called `fdatasync` in `drain` if it was set, and synced a `persist` with `msync(MS_SYNC)` of the range's own pages; it made no provider call, so its trace held no `CLWB` and the PMEM model said nothing about it. That boundary is still selectable, for the old-against-new comparison only, as `MappedFileSync.LEGACY_RANGE_MSYNC` (`MappedFileBackend.sync`, the benchmarks' `boundary=legacy`), and so is `MappedFileSync.MSYNC_PER_RUN`, one `msync` per run of marked pages in place of the `fdatasync`; see [the file backend, a restriction of the PMEM model](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13).
 
 ```
-FdMmapRegion  (common mmap logic: bounds check, unmap, close fd)
-  ├── FileMmapRegion   (marks pages through the provider; fdatasync at each fence)
-  ├── PmemMmapRegion   (PMEM durability via clflush + sfence)
+FileBackedRegion  (common mmap logic: bounds check, unmap, close fd)
+  ├── MappedFileRegion   (marks pages through the provider; fdatasync at each fence)
+  ├── PmemRegion   (PMEM durability via clflush + sfence)
   └── DirectIoRegion   (explicit pwrite + O_DIRECT from a private staging buffer, then fdatasync)
 ```
 
-`MmapRegionUtils.flushCacheLine()` selects `CLWB`, `CLFLUSHOPT`, or `CLFLUSH`
-from CPUID feature bits, and `storeFence()` emits `SFENCE`; both reach native
+`X86_64CacheControl.writeBackLine()` selects `CLWB`, `CLFLUSHOPT`, or `CLFLUSH`
+from CPUID feature bits, and `fence()` emits `SFENCE`; both reach native
 pre-generated stubs in `X86_64Target`. Exact encodings and the production
-CPUID/writeback/fence path are covered by `PersistentOperationsTest.v3`.
+CPUID/writeback/fence path are covered by `ProviderTest.v3`.
 
 ### Backend factories
 
 | Factory | Creates |
 |---|---|
-| `VolatileBackend` (singleton via `Backends.getVolatile()`) | `VolatileRegion` |
-| `FileMmapBackend` | `FileMmapRegion` |
-| `PmemMmapBackend` | `PmemMmapRegion` |
+| `VolatileBackend` (singleton via `Backends.volatile()`) | `VolatileRegion` |
+| `MappedFileBackend` | `MappedFileRegion` |
+| `PmemBackend` | `PmemRegion` |
 | `DirectIoBackend(path, FILE \| BLOCK_DEVICE)` | `DirectIoRegion` |
 
 `X86_64Backends` is the platform-level component that dispatches among the first three; `DirectIoBackend` is constructed directly by its callers, and its `makeDirectRegion()` factory hook is what the test and timing subclasses override.
 
-### File I/O (`RegionFileIO`)
+### File I/O (`BackingFile`)
 
-`RegionFileIO` wraps the raw syscalls needed by the mmap backends:
+`BackingFile` wraps the raw syscalls needed by the mmap backends:
 
 - `open(path)` — opens an existing file (`O_RDWR`, mode `0644`); returns `-errno` if it does not exist
 - `create(path)` — creates/re-creates a fresh file (`O_RDWR | O_CREAT | O_TRUNC`, mode `0644`); `O_TRUNC` plus the `sizeBacking` `ftruncate` extension leaves the region zero-initialised
-- `openBacking(path, fresh)` — selects `create` for a fresh format, otherwise `open` (falling back to `create` when the file is missing)
+- `openBacking(path, mode)` — selects `create` for `OpenMode.FORMAT`, otherwise `open` (falling back to `create` when the file is missing)
 - `sizeBacking(fd, size)` — `ftruncate` + `fsync` an empty file to `size`; refuse, unchanged, a non-empty file of any other size (returns the reason, or null). Until 2026-10-21 it was `ensureSize`, which resized any file
 - `fdatasync(fd)` — data-only sync (no metadata)
 - `close(fd)`, `unlink(path)`
 
-Fresh-format intent reaches the backend through `TxnRegionBackend.create(size, prot, fresh)`: `PWRegion` passes its `forceFormat` flag down, so a fresh format zero-initialises the backing store while a mount attaches to the existing one without resizing it.
+Fresh-format intent reaches the backend through `StorageBackend.open(size, access, mode)`: `RegionAllocator` passes its `OpenMode` down, so a fresh format zero-initialises the backing store while a mount attaches to the existing one without resizing it.
 
 ### Supported PMEM path
 
-`PmemMmapBackend` expects a **regular file on an fsdax filesystem**, not a raw
+`PmemBackend` expects a **regular file on an fsdax filesystem**, not a raw
 device path:
 
 ```text
 /dev/pmem0 → ext4/XFS mounted with DAX → /mnt/pmem/wizard-region
-                                           └─ PmemMmapBackend path
+                                           └─ PmemBackend path
 ```
 
 This follows from both sides of the contract. Linux supports `MAP_SYNC` only
-for DAX files, while `PmemMmapBackend` uses the regular-file operations
+for DAX files, while `PmemBackend` uses the regular-file operations
 `open`, `lseek`, and `ftruncate` before mapping. A raw fsdax block device does
 not itself provide filesystem DAX, and `/dev/daxX.Y` has fixed-size,
 alignment-sensitive character-device semantics that do not fit
-`RegionFileIO.sizeBacking()`.
+`BackingFile.sizeBacking()`.
 
 For machines without physical PMEM, the recommended development setup is a
 QEMU-emulated NVDIMM exposed as `/dev/pmem0` inside an x86-64 Linux guest,
@@ -3953,22 +3953,22 @@ setup, safety constraints, and the staged validation plan.
 
 ## Layer 2 — Write-Ahead Log
 
-**Active file:** `src/engine/x86-64/X86_64DualTxnWal.v3`
+**Active file:** `src/engine/x86-64/X86_64TwoSlotWal.v3`
 
-**Comparison files:** `src/engine/x86-64/X86_64MultiTxnWal.v3`, `src/engine/x86-64/X86_64SingleTxnWal.v3`
+**Comparison files:** `src/engine/x86-64/X86_64RingWal.v3`, `src/engine/x86-64/X86_64SingleTxnWal.v3`
 
-`DualTxnWal` is the WAL wired into `PWRegion` and `RegionTransaction`. It keeps at most two committed transactions in fixed slots selected by `txnSeq % 2`. Redo entries are absolute, idempotent after-images, so recovery validates both slots and replays them in ascending sequence order without a superblock, epoch, replay floor, ring, or checkpoint policy. Fresh construction, record zeroing and fields, checksum publication, after-image application/replay, and slot scrubbing all store through the backend region's `PersistentOperations` provider.
+`TwoSlotWal` is the WAL wired into `RegionAllocator` and `TransactionCache`. It keeps at most two committed transactions in fixed slots selected by `txnSeq % 2`. Redo entries are absolute, idempotent after-images, so recovery validates both slots and replays them in ascending sequence order without a superblock, epoch, replay floor, ring, or checkpoint policy. Fresh construction, record zeroing and fields, checksum publication, after-image application/replay, and slot scrubbing all store through the backend region's `PersistenceProvider` provider.
 
-`MultiTxnWal` remains compiled and has dedicated comparison tests, but it is no longer on the allocator commit path. `SingleTxnWal` remains a reference implementation with baseline commit, recovery, checksum, boundary-count, and silent-overflow comparison tests. See `docs/wal-comparison.md` for the design comparison and `docs/checkpoint-policy.md` for the retained ring-WAL policy record.
+`RingWal` remains compiled and has dedicated comparison tests, but it is no longer on the allocator commit path. `SingleTxnWal` remains a reference implementation with baseline commit, recovery, checksum, boundary-count, and silent-overflow comparison tests. See `docs/wal-comparison.md` for the design comparison and `docs/checkpoint-policy.md` for the retained ring-WAL policy record.
 
 ### Active on-region layout
 
-The log chunk begins with a minimal header followed by two equal, 64-byte-aligned slots:
+The log block begins with a minimal header followed by two equal, 64-byte-aligned slots:
 
 ```
-Log chunk
+Log block
   ┌──────────────────────────────┐  offset 0
-  │ DualWalHeader           64 B │
+  │ WalHeader           64 B │
   ├──────────────────────────────┤
   │ slot 0: TxnRecord            │  even txnSeq
   ├──────────────────────────────┤
@@ -3978,7 +3978,7 @@ Log chunk
 slotBytes = alignDown((blockSize - 64) / 2, 64)
 ```
 
-Each slot contains `TxnRecordHeader` (64 B) + `LogEntry[]` + `TxnCommitTrailer` (48 B), padded to 64-byte alignment. The dual WAL uses distinct header/record/trailer magics so stale `MultiTxnWal` bytes cannot validate. The record header and trailer redundantly encode length, entry count and transaction sequence; `logEpoch` is reserved and must be zero. The trailer checksum covers the complete aligned record except its own checksum field.
+Each slot contains `WalRecordHeader` (64 B) + `WalEntry[]` + `WalRecordTrailer` (48 B), padded to 64-byte alignment. The dual WAL uses distinct header/record/trailer magics so stale `RingWal` bytes cannot validate. The record header and trailer redundantly encode length, entry count and transaction sequence; `logEpoch` is reserved and must be zero. The trailer checksum covers the complete aligned record except its own checksum field.
 
 ### Phase-B commit protocol
 
@@ -3990,28 +3990,28 @@ append(offset, value, width) -> bool
 commit() -> txnSeq
   1. select slot = nextTxnSeq % 2
   2. if that slot protects data not yet known durable:
-       persistAppliedData(); fail if the slot is still unreclaimable
+       persistAfterImages(); fail if the slot is still unreclaimable
   3. write the complete checksummed record into the slot
-  4. prepareChangedRange(record)
-  5. persistChanges()                         -- COMMIT POINT
+  4. writeBack(record)
+  5. drain()                         -- COMMIT POINT
        persists the new record together with the previous transaction's
        already-applied after-images
   6. dataDurableSeq = previous lastCommittedSeq
   7. publish slotSeq/lastCommittedSeq; advance nextTxnSeq
 ```
 
-The caller then applies the committing transaction's after-images. Their ranges remain pending and ride the next transaction's commit boundary, `RegionTransaction.flush()`, or `DualTxnWal.close()`. Thus steady state uses one persistence boundary per commit. An empty transaction writes a real zero-entry record, so every successful commit has a nonzero sequence and `0` is failure-only.
+The caller then applies the committing transaction's after-images. Their ranges remain pending and ride the next transaction's commit boundary, `TransactionCache.flush()`, or `TwoSlotWal.close()`. Thus steady state uses one persistence boundary per commit. An empty transaction writes a real zero-entry record, so every successful commit has a nonzero sequence and `0` is failure-only.
 
-The phase-B contract requires the caller to apply transaction N before committing N+1. `RegionTransaction.commit()` provides that ordering.
+The phase-B contract requires the caller to apply transaction N before committing N+1. `TransactionCache.commit()` provides that ordering.
 
 ### Recovery and close
 
 ```
-recover() -> DualWalRecovery
+recover() -> WalRecovery
   validate both slots
   if neither is valid: return CLEAN
   replay valid slots in ascending txnSeq order
-  persistChanges()
+  drain()
   if persistence fails: latch recovery-required, return PERSIST_FAILED, and retain both records
   dataDurableSeq = maxSeq; nextTxnSeq = maxSeq + 1
   return REPLAYED
@@ -4019,9 +4019,9 @@ recover() -> DualWalRecovery
 
 `CORRUPT` reports an invalid dual-WAL header. Recovery leaves valid records in place; replaying an already-durable after-image again is harmless.
 
-`close()` is the clean-unmount boundary: it persists the last applied transaction, then scrubs only slots whose data is known durable, oldest sequence first, each under its own `persistRange()`. Unrecovered records and records protected by a failed final persist remain available for the next mount.
+`close()` is the clean-unmount boundary: it persists the last applied transaction, then scrubs only slots whose data is known durable, oldest sequence first, each under its own `persist()`. Unrecovered records and records protected by a failed final persist remain available for the next mount.
 
-The order matters for correctness. Even sequences use slot 0, so sequence N+1 can sit in slot 0 with N in slot 1. Scrubbing by slot index would then erase N+1 first, and a crash before N's scrub would let recovery replay N's after-images over N+1's durable data, losing an acknowledged update. Scrubbing oldest first means an interrupted close leaves the newer record (`dual_wal:close_indeterminate_first_scrub_preserves_latest_value`, `pwregion_bd:sigkill_close_first_slot_scrub_preserves_latest_state`). The crash explorer does not cover close (`docs/THESIS.md`: "Not explored by the model"). Until 2026-10-20 this section did not give the order; `close()` has scrubbed oldest first since 2026-08-11 (ROADMAP, "Two-slot redo WAL, phase B").
+The order matters for correctness. Even sequences use slot 0, so sequence N+1 can sit in slot 0 with N in slot 1. Scrubbing by slot index would then erase N+1 first, and a crash before N's scrub would let recovery replay N's after-images over N+1's durable data, losing an acknowledged update. Scrubbing oldest first means an interrupted close leaves the newer record (`two_slot_wal:close_indeterminate_first_scrub_preserves_latest_value`, `allocator_file:sigkill_close_first_slot_scrub_preserves_latest_state`). The crash explorer does not cover close (`docs/THESIS.md`: "Not explored by the model"). Until 2026-10-20 this section did not give the order; `close()` has scrubbed oldest first since 2026-08-11 (ROADMAP, "Two-slot redo WAL, phase B").
 
 ### Persistence-failure contract
 
@@ -4030,15 +4030,15 @@ failures:
 
 - A nonzero `commit()` result is **acknowledged**. The persistence boundary
   reported success and the returned value is the transaction sequence.
-- If `prepareChangedRange(record)` or `persistChanges()` reports failure after
+- If `writeBack(record)` or `drain()` reports failure after
   the complete record has been constructed, `commit()` returns `0`, but this
   means **unacknowledged**, not aborted. Any complete valid record that reached
   durable storage may be replayed.
 - If preparing an acknowledged transaction's applied after-image fails,
-  `applyUpdate()` — or, on the batched path, `prepareApplied()` or the drain
+  `applyAfterImage()` — or, on the batched path, `writeBackAfterImages()` or the drain
   inside the next boundary — returns `false` and latches recovery-required,
   without advancing `dataDurableSeq`. Recovery uses
-  the same rule: it returns `PERSIST_FAILED` without issuing `persistChanges()`
+  the same rule: it returns `PERSIST_FAILED` without issuing `drain()`
   or advancing `dataDurableSeq`.
 - If either ordered write during fresh-header initialization fails, the new WAL
   remains closed and recovery-required. Fail-before-copy can require a fresh
@@ -4071,16 +4071,16 @@ byte-level idempotent and does not require durable invalidation merely to
 prevent a duplicate effect.
 
 Invalid input and capacity rejection can be known before a persistence
-boundary and are definite non-commits. `DualTxnWal.requiresRecovery()`
+boundary and are definite non-commits. `TwoSlotWal.requiresRecovery()`
 distinguishes those results from commit-originated persistence failure without
-changing the `u64` result or on-region format. `RegionTransaction` and
-`PWRegion` now expose the same distinction through `requiresRecovery()`, so a
+changing the `u64` result or on-region format. `TransactionCache` and
+`RegionAllocator` now expose the same distinction through `requiresRecovery()`, so a
 public failure with a clear latch remains a definite validation/capacity
 rejection while a set latch requires abandon, reopen, and recovery.
 
 The shadow tests make the rule executable: copy-then-fail can leave either a
 replayable record or a valid fresh header despite returning failure, while
-fail-before-copy discards those bytes at crash. `DualTxnWal` now latches
+fail-before-copy discards those bytes at crash. `TwoSlotWal` now latches
 fresh-header, commit-record, after-image preparation, overwrite-guard, recovery,
 explicit-flush, final-data-close, and slot-scrub persistence failures. Once
 latched, the instance rejects append, commit, apply, persist, recover and close
@@ -4093,9 +4093,9 @@ on the latched mount.
 
 ## Layer 3 — Transaction Cache
 
-**File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `RegionTransaction`)
+**File:** `src/engine/x86-64/X86_64RegionAllocator.v3` (class `TransactionCache`)
 
-`RegionTransaction` buffers writes in a DRAM `HashMap<u64, CachedUpdate>` before committing them to the WAL and then to the region. Reads check the cache first and fall through to the live region bytes on a miss.
+`TransactionCache` buffers writes in a DRAM `HashMap<u64, CachedUpdate>` before committing them to the WAL and then to the region. Reads check the cache first and fall through to the live region bytes on a miss.
 
 ```
 CachedUpdate(value: u64, size: u8)   #unboxed
@@ -4124,13 +4124,13 @@ commit()
   return true
 ```
 
-The committing transaction's applied after-images are recoverable from its durable slot, but their direct data persistence is deferred. The next commit's single phase-B boundary persists those pending ranges together with the next record. `flush()` calls `wal.persistAppliedData()` when an idle/unmount boundary is required, and `PWRegion.deallocate()` reaches the same operation through `wal.close()`.
+The committing transaction's applied after-images are recoverable from its durable slot, but their direct data persistence is deferred. The next commit's single phase-B boundary persists those pending ranges together with the next record. `flush()` calls `wal.persistAfterImages()` when an idle/unmount boundary is required, and `RegionAllocator.deallocate()` reaches the same operation through `wal.close()`.
 
-`DualTxnWal.applyUpdate()` now returns `false` and latches recovery-required if
-range preparation fails, and so do `storeUpdate()`/`prepareApplied()`, the
-batched pair `RegionTransaction` uses since 2026-09-28. `RegionTransaction.applyToRegion()` surfaces that
-result without clearing buffered writes. `RegionTransaction.requiresRecovery()`
-delegates to the WAL, and `PWRegion.requiresRecovery()` exposes it to allocator
+`TwoSlotWal.applyAfterImage()` now returns `false` and latches recovery-required if
+range preparation fails, and so do `storeAfterImage()`/`writeBackAfterImages()`, the
+batched pair `TransactionCache` uses since 2026-09-28. `TransactionCache.applyToRegion()` surfaces that
+result without clearing buffered writes. `TransactionCache.requiresRecovery()`
+delegates to the WAL, and `RegionAllocator.requiresRecovery()` exposes it to allocator
 callers; allocation and free entry points reject work after the latch is set.
 
 ### Read path (cache miss)
@@ -4148,17 +4148,17 @@ readU8(addr)
 
 ## Layer 4 — Block Allocator
 
-**File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `PWRegion`)
+**File:** `src/engine/x86-64/X86_64RegionAllocator.v3` (class `RegionAllocator`)
 
-`PWRegion` implements a first-fit block allocator over the persistent region; it hands out chunks, runs of one or more contiguous blocks. Once the region is formatted, every allocator metadata mutation (block-table entries, sentinels, chunk headers, the durable root) goes through `RegionTransaction`, so it is WAL-protected. Two kinds of store do not: `format()` writes its structures directly through the region's `DirectRegionWriter` (see *Format vs. mount*), and the transient Immix line marks are stored through a `DirectRegionWriter` with no writeback or fence (see *Immix GC extension*). Until 2026-10-20 this paragraph said that all metadata mutations go through `RegionTransaction`, which `format()` never did.
+`RegionAllocator` implements a first-fit block allocator over the persistent region; it hands out chunks, runs of one or more contiguous blocks. Once the region is formatted, every allocator metadata mutation (block-table entries, sentinels, chunk headers, the durable root) goes through `TransactionCache`, so it is WAL-protected. Two kinds of store do not: `format()` writes its structures directly through the region's `UnloggedWriter` (see *Format vs. mount*), and the transient Immix line marks are stored through a `UnloggedWriter` with no writeback or fence (see *Immix GC extension*). Until 2026-10-20 this paragraph said that all metadata mutations go through `TransactionCache`, which `format()` never did.
 
 ### Region layout
 
 ```
-Block 0      PWRegionHeader (88 B), then the free-list sentinels:
-             BlockLists.MAX_LISTS = 8 entries x 40 B at offsets 88-407,
+Block 0      RegionHeader (88 B), then the free-list sentinels:
+             FreeLists.MAX_LISTS = 8 entries x 40 B at offsets 88-407,
              of which SMALL_FREE (0) and LARGE_FREE (1) are used
-Block 1      WAL log chunk
+Block 1      WAL log block
 Block 2..    User data: chunks, allocated or free
 Last blocks  Metadata, carved down from the region's end: the block table
              (numBlocks + 1 entries) at the end, the descriptor table below
@@ -4166,9 +4166,9 @@ Last blocks  Metadata, carved down from the region's end: the block table
              below that
 ```
 
-`format()` sets the sentinels at `PWRegionHeader.size` and records that offset in the header's `sentinels` field; `validGeometry()` reserves all eight. The metadata blocks are the fewest whole blocks that hold the metadata area, and form one `METADATA` chunk. Until 2026-10-20 this diagram put the sentinels in the metadata area; they have followed the header since 2025-07-06 (`4d43a8cd`).
+`format()` sets the sentinels at `RegionHeader.size` and records that offset in the header's `sentinels` field; `validGeometry()` reserves all eight. The metadata blocks are the fewest whole blocks that hold the metadata area, and form one `METADATA` chunk. Until 2026-10-20 this diagram put the sentinels in the metadata area; they have followed the header since 2025-07-06 (`4d43a8cd`).
 
-### `PWRegionHeader` (88 bytes, stored at offset 0)
+### `RegionHeader` (88 bytes, stored at offset 0)
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -4177,11 +4177,11 @@ Last blocks  Metadata, carved down from the region's end: the block table
 | `numBlocks` | u64 | total blocks in region |
 | `numBytes` | u64 | total bytes in region |
 | `numDescs` | u64 | number of metadata descriptors |
-| `metaData` | u64 | offset to metadata area |
-| `metaDataDescs` | u64 | offset to descriptor table |
+| `metadata` | u64 | offset to metadata area |
+| `metadataDescriptors` | u64 | offset to descriptor table |
 | `magic` | u64 | `MAGIC_TAG \| FORMAT_VERSION << 56` = `0x0100_0050_5741_534D`: the "PWASM" tag `0x50_57_41_53_4D` in bytes 0–4, bytes 5–6 zero, the format version (1) in byte 7; see **Format version** below |
-| `blockSize` | u64 | bytes per block (wrapper default 512 KiB, `MemRegions.BlockSize = 512u64 * 1024u64`) |
-| `logChunk` | u64 | region-relative offset of the WAL log chunk (block 1 in the current layout) |
+| `blockSize` | u64 | bytes per block (wrapper default 512 KiB, `RegionDefaults.BlockSize = 512u64 * 1024u64`) |
+| `logBlock` | u64 | region-relative offset of the WAL log block (block 1 in the current layout) |
 | `userRoot` | u64 | region-relative offset of the caller's root object; `0` = none |
 
 #### The durable root
@@ -4190,7 +4190,7 @@ Last blocks  Metadata, carved down from the region's end: the block table
 region. Without it a mounted region is opaque to its owner: the block table
 records which chunks are in use, but not which of them the caller wants to
 reach after a restart, so every caller has to remember an offset out of band.
-`PWRegion.getUserRoot()` / `setUserRoot(offset)` publish and read one
+`RegionAllocator.getUserRoot()` / `setUserRoot(offset)` publish and read one
 region-relative offset transactionally, which is enough for a caller to anchor
 an arbitrary structure of its own.
 
@@ -4209,9 +4209,9 @@ marked used and nothing reaches it. This is a space leak, not an inconsistency
 cost of the current per-operation commit granularity.
 
 **Format change.** The header grew 80 → 88 bytes. Sentinels sit immediately
-after the header (`formatSentinels()` uses `PWRegionHeader.size`), so a region
+after the header (`formatSentinels()` uses `RegionHeader.size`), so a region
 formatted by an older build has them at offset 80, where this build's
-`userRoot` lies. `mount()` reads the `sentinels`, `blockTable` and `logChunk`
+`userRoot` lies. `mount()` reads the `sentinels`, `blockTable` and `logBlock`
 offsets from the stored header, and `magic`, `numBlocks` and `blockSize` sat at
 unchanged offsets, so until 2026-10-21 such a region still validated and
 mounted. Its `userRoot`, though, was the first 8 bytes of the `SMALL_FREE`
@@ -4221,9 +4221,9 @@ header had no version, so nothing refused an older region; and because
 `init()` formats any region without the magic, changing the magic's value
 alone would have formatted an older region, erasing it, rather than refusing
 it. Since 2026-10-21 the magic carries a format version, and such a region is
-refused (**Format version**, below). When the 72 → 80 growth added `logChunk`,
-`mount()` gained a fallback instead: a stored `logChunk` of 0 means block 1
-(`pwregion_bd:legacy_log_chunk_fallback`). Until 2026-10-20 this paragraph said
+refused (**Format version**, below). When the 72 → 80 growth added `logBlock`,
+`mount()` gained a fallback instead: a stored `logBlock` of 0 means block 1
+(`allocator_file:legacy_log_chunk_fallback`). Until 2026-10-20 this paragraph said
 an older region could not be mounted because the sentinel array would be read
 8 bytes early; `mount()` has read the stored `sentinels` offset since
 2026-03-13 (`bf2cf90a`). The mount of an 80-byte region was read from the code,
@@ -4232,38 +4232,38 @@ not tested.
 **Format version (2026-10-21).** The version sits in the magic word's top
 byte, which the 5-byte "PWASM" tag left unused, rather than in a field of its
 own: a new header field would move the free-list sentinels, which start at
-`PWRegionHeader.size` (88), onto different cache lines and change what a
-measured commit writes back. In `PWRegions`, `MAGIC_TAG` is the tag
+`RegionHeader.size` (88), onto different cache lines and change what a
+measured commit writes back. In `RegionFormat`, `MAGIC_TAG` is the tag
 (`0x50_57_41_53_4D`), `FORMAT_VERSION` is 1, and
 `MAGIC = MAGIC_TAG | FORMAT_VERSION << 56`; bytes 5 and 6 stay zero.
 `isTagged(magic)` holds when the low 7 bytes are the tag and those two zero
 bytes, whatever the version; `versionOf(magic)` is the top byte. Version 0 is
 every region formatted before 2026-10-21: its magic is the bare tag, and the
-88-byte regions among them carry the same layout as version 1. `init()` without
-`forceFormat` now does one of three things:
+88-byte regions among them carry the same layout as version 1. `init()` with
+`OpenMode.ATTACH` now does one of three things:
 
 - magic equal to `MAGIC`: mount, as before;
 - magic tagged with another version, older or newer: refuse. `init()`
   formats and writes nothing, a `format version mismatch` line is traced, and the
   region is left as `mount()` leaves a block-size or block-count mismatch:
-  `backendRegion` set, `txn` null and `logChunk` null, which is how a caller
+  `backendRegion` set, `txn` null and `logBlock` null, which is how a caller
   detects any refused mount. `requiresRecovery()` does not report it, as it
   does not report the geometry refusals: it is false while `txn` is null.
-  An `ImmixPWRegion` so refused has an empty line table, and
+  An `ImmixRegionAllocator` so refused has an empty line table, and
   `resetAllLineMarks()` on it writes nothing (see **Immix GC extension**);
 - anything else (zero, garbage, the tag with a nonzero byte 5 or 6): format,
   as before.
 
 Before `init()` runs, the backend checks the file's size (2026-10-21). An
-attach (`create()` without `fresh`) sizes only an empty file, one that was
+attach (`open()` with `OpenMode.ATTACH`) sizes only an empty file, one that was
 missing or has length 0, which is then formatted as before. A non-empty file
 whose length is not `numBlocks * blockSize` is refused before it is mapped or
-read: `RegionFileIO.sizeBacking()` returns the reason, which the mapped
+read: `BackingFile.sizeBacking()` returns the reason, which the mapped
 backends trace (`the region file has N bytes, not the M requested: refusing to
 resize it without a fresh format`) and `DirectIoBackend` keeps in `lastError`,
-and nothing is truncated, extended, synced or written. `PWRegion` is then left
-as after any backend failure: `backendRegion`, `txn` and `logChunk` all null,
-and an `ImmixPWRegion` has an empty line table. A null `txn` therefore still
+and nothing is truncated, extended, synced or written. `RegionAllocator` is then left
+as after any backend failure: `backendRegion`, `txn` and `logBlock` all null,
+and an `ImmixRegionAllocator` has an empty line table. A null `txn` therefore still
 detects every refused open. Reopening a region with fewer or more blocks than
 its file holds, of this version or another, changes no byte of it, provided
 no other process changes the file while it is being opened. The check
@@ -4271,8 +4271,8 @@ runs before anything can read the header, so it also refuses a non-empty file
 of another size that carries no magic, where a resize-and-format would destroy
 whatever the file holds: refusing every such file is the one rule that can
 never destroy a tagged region, and such a file is replaced only by
-`forceFormat` or after it is removed. At the requested size, the three
-outcomes above apply. `forceFormat` still opens the file with `O_TRUNC`, so a
+`OpenMode.FORMAT` or after it is removed. At the requested size, the three
+outcomes above apply. `OpenMode.FORMAT` still opens the file with `O_TRUNC`, so a
 forced format takes any size. `DirectIoBackend`'s file target shares the
 helper; its `BLOCK_DEVICE` target never sized the device and is unchanged: it
 refuses a device smaller than the region and uses the first `size` bytes of a
@@ -4301,7 +4301,7 @@ to 64 KiB, then refused). This predated the version and applied equally to the
 block-size and block-count refusals, and a file without the magic was resized
 and formatted.
 
-`forceFormat` still formats unconditionally, and it is the only way to bring a
+`OpenMode.FORMAT` still formats unconditionally, and it is the only way to bring a
 refused region to version 1: there is no in-place upgrade, so a refused region
 must be reformatted, losing its contents. `format()` stores the versioned
 `MAGIC`, still last and under a fence of its own. Of the harnesses,
@@ -4312,11 +4312,11 @@ and `pwbtree` kill loops format before they remount; `pwopsbench` checks
 another version gives `INVALID` ("the region has another format version"),
 since setup was run by a different build (run 2026-10-21 on a file-backed
 setup whose magic was then overwritten with the bare tag; the file was
-unchanged). `pwregion_bd:` checks the three outcomes over a file-backed
+unchanged). `allocator_file:` checks the three outcomes over a file-backed
 region that this build formatted and whose magic is then overwritten:
 `version_0_magic_refused_unchanged` stores the bare tag and
 `future_version_magic_refused_unchanged` version 2, and each requires a null
-`txn` and log chunk, the stored magic intact, and every byte of the backing
+`txn` and log block, the stored magic intact, and every byte of the backing
 file the same in the mapping while it is open and in the file once it is
 closed; `untagged_magic_reformatted` stores 0, `0xDEAD_BEEF_CAFE_F00D` and the
 tag with byte 5 set or with byte 6 set, and requires a mounted region with
@@ -4324,7 +4324,7 @@ the current magic and no root; `force_format_replaces_version_0` reformats a
 bare-tag region. A current region's remount is `persist_and_remount` and
 `legacy_log_chunk_fallback`. Made to format a tagged region instead of
 refusing it, the build fails both refusal tests (checked 2026-10-21). Three
-more open a file-backed `ImmixPWRegion` whose 128 line marks were all set to
+more open a file-backed `ImmixRegionAllocator` whose 128 line marks were all set to
 `0xA5` and written back: `immix_version_0_refused_unchanged` stores the bare
 tag, `immix_incompatible_descriptor_refused` version 2 with the line-mark
 descriptor's `unitSize` set to 0, and
@@ -4333,27 +4333,27 @@ requires the refusal above, an empty line table, and the backing file
 unchanged after a `resetAllLineMarks()` on the refused region. No region
 formatted by an older build was opened.
 
-Eight tests cover the size check (2026-10-21). Four `pwregion_bd:` tests
-reopen an eight-block (32 KiB) file-backed region without `forceFormat` at
+Eight tests cover the size check (2026-10-21). Four `allocator_file:` tests
+reopen an eight-block (32 KiB) file-backed region with `OpenMode.ATTACH` at
 four and at sixteen blocks: `current_version_other_size_refused_unchanged`
 (after an allocation and a root, which a reopen at eight blocks then finds),
 `version_0_other_size_refused_unchanged` (the bare tag),
 `untagged_other_size_refused_unchanged` (magic `0xDEAD_BEEF_CAFE_F00D`;
 formatted when reopened at its own size) and
 `immix_other_size_refused_unchanged` (the marked line table). Each requires a
-null `backendRegion`, `txn` and log chunk, an empty Immix line table after
+null `backendRegion`, `txn` and log block, an empty Immix line table after
 `resetAllLineMarks()`, and the closed file's length and every byte unchanged.
 `missing_and_empty_file_sized_and_formatted` opens a missing path at four
-blocks and a zero-length file at sixteen without `forceFormat`, and
+blocks and a zero-length file at sixteen with `OpenMode.ATTACH`, and
 `force_format_other_size_resizes` forces four and then sixteen blocks over
 the formatted file; each requires a formatted region and a file of the
-requested size. `txn_backend:attach_other_size_refused_unchanged` attaches
-`FileMmapBackend` and `PmemMmapBackend` at 4 KiB and at 16 KiB to an 8 KiB
+requested size. `storage_backend:attach_other_size_refused_unchanged` attaches
+`MappedFileBackend` and `PmemBackend` at 4 KiB and at 16 KiB to an 8 KiB
 patterned file and requires no region and the file unchanged. The PMEM
 backend refuses before it maps, so this runs on tmpfs; no DAX mount was
 available, and no PMEM open at a matching size was run.
 `direct_io:attach_other_size_refused_unchanged` checks the same through
-`DirectIoBackend` and `PWRegion`, then remounts at eight blocks and forces
+`DirectIoBackend` and `RegionAllocator`, then remounts at eight blocks and forces
 sixteen. With the old helper restored, the six refusal tests fail and the
 other two pass. A helper that refused every attach at another size, empty
 files included, fails only `missing_and_empty_file_sized_and_formatted`; one
@@ -4363,7 +4363,7 @@ over a 512-block file region, at 256 and at 1,024 blocks, fails with the
 reason traced and the file's length and SHA-1 unchanged, and still arms at
 512.
 
-### `BlockEntry` (40 bytes)
+### `BlockTableEntry` (40 bytes)
 
 The block table holds `numBlocks + 1` entries, one per block plus an
 end-of-region marker, but only the entry of a chunk's first block is live.
@@ -4373,14 +4373,14 @@ remainder's first entry a live role.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `listNum` | i16 | free-list index (see `ListKind`) |
+| `listNum` | i16 | free-list index (see `FreeListKind`) |
 | `used` | u1 | 1 = allocated |
 | `prev` | i64 | first entry of the previous chunk in address order |
 | `next` | i64 | first entry of the next chunk in address order |
 | `listPrev` | i64 | previous chunk on the same free list, or the list's sentinel |
 | `listNext` | i64 | next chunk on the same free list |
 
-`ListKind` values: `METADATA(-1)`, `NONE(-2)`, `USED(-3)`, `SMALL_FREE(0)`, `LARGE_FREE(1)`.
+`FreeListKind` values: `METADATA(-1)`, `NONE(-2)`, `USED(-3)`, `SMALL_FREE(0)`, `LARGE_FREE(1)`.
 An allocated chunk carries `NONE`, which `removeFromList()` sets; `USED` is
 defined but never stored. The header block and the log block are `METADATA`
 chunks of one block each, the metadata blocks one `METADATA` chunk, and the
@@ -4399,35 +4399,35 @@ chunks since 2025-07-24 (`faed4563`).
 ### Format vs. mount
 
 ```
-PWRegion.__new(backend, numBlocks, metaDataDescs, blockSize, forceFormat)
-  if forceFormat                  → format(blockSize)
+RegionAllocator.__new(backend, numBlocks, metadataDescriptors, blockSize, mode)
+  if mode == OpenMode.FORMAT      → format(blockSize)
   else if magic == MAGIC          → mount(blockSize)
   else if isTagged(magic)         → refuse: another format version; write nothing,
-                                    txn and logChunk stay null   -- since 2026-10-21
-  else                            → format(blockSize)            -- no PWRegion magic
+                                    txn and logBlock stay null   -- since 2026-10-21
+  else                            → format(blockSize)            -- no RegionAllocator magic
 
-format(blockSize)                -- every store through the DirectRegionWriter, not the log
+format(blockSize)                -- every store through the UnloggedWriter, not the log
   header: numBlocks, numBytes, blockSize, userRoot = 0
   formatSentinels(): header.sentinels = 88; clear all 8 entries
   block table (numBlocks + 1 entries) carved from the region's end; cleared
   descriptor table, then each descriptor's metadata, carved below it
   if numBlocks < metadataBlocks + 3: return     -- too small; magic never stored
   entries: block 0 (header) → block 1 (log), both METADATA
-  header.logChunk = block 1; fresh DualTxnWal header   -- the log persists its own
+  header.logBlock = block 1; fresh TwoSlotWal header   -- the log persists its own
   block 2 heads one free chunk of every user block, alone on LARGE_FREE
     → first metadata block (one METADATA chunk) → end marker (NONE, used)
-  backendRegion.persistRange(0, full_size)   -- everything but the magic
+  backendRegion.persist(0, full_size)   -- everything but the magic
   store MAGIC (the tag and FORMAT_VERSION)
-  backendRegion.persistRange(magic, 8)       -- then the magic's line alone
+  backendRegion.persist(magic, 8)       -- then the magic's line alone
 
 mount(blockSize)
   -- header fields are read one at a time through the region's
-  -- DirectRegionReader (magic in init(), then these), since 2026-10-19
+  -- RegionReader (magic in init(), then these), since 2026-10-19
   verify blockSize and numBlocks match header
   locate sentinels via header.sentinels
   restore block table handle via header.blockTable
-  locate log chunk via header.logChunk       -- fall back to block 1 if unset (0)
-  init DualTxnWal + RegionTransaction
+  locate log block via header.logBlock       -- fall back to block 1 if unset (0)
+  init TwoSlotWal + TransactionCache
   txn.recover()                              -- replay committed WAL if present
 ```
 
@@ -4441,12 +4441,12 @@ formatted; the refusal is described under **Format version** above.
 **The magic is published last (2026-10-19).** `mount()` trusts any header that
 carries the magic, so the magic must not become durable before what it vouches
 for. Until 2026-10-19 `format()` stored the magic last and made the whole
-region durable with one `persistRange()`; under the crash model a line can
+region durable with one `persist()`; under the crash model a line can
 become durable before lines stored ahead of it, so a crash inside that persist
 could leave the magic durable beside a block table that was not, and a later
 open would mount it. `format()` now persists everything else first, then
 stores the magic and persists its line under a fence of its own: one more fence
-per format, four in all with the log's two. `persistent_alloc:` records
+per format, four in all with the log's two. `allocator_crash:` records
 `format()` (598 events over 16 lines, at 8 blocks of 2 KiB) and opens every
 crash image as production does, mounting it if it carries the magic and
 reformatting it if not; every image must open into an allocator that passes the
@@ -4471,7 +4471,7 @@ included, with every other line at its floor (2026-10-20).
 These are zero-allocation wrappers around raw memory addresses:
 
 - `BlockTableHandle` — indexable view of the block table
-- `BlockEntryHandle` — single block entry; `.getCached(txn)` / `.setCached(txn)` for transactional access, and direct `.get(r)` / `.set(w, …)`, which take the region's `DirectRegionReader` (`region.reader()`, since 2026-10-19) and `DirectRegionWriter`
+- `BlockTableEntryHandle` — single block entry; `.getCached(txn)` / `.setCached(txn)` for transactional access, and direct `.get(r)` / `.set(w, …)`, which take the region's `RegionReader` (`region.reader()`, since 2026-10-19) and `UnloggedWriter`
 - `ChunkHandle` — allocated chunk with `offset` and `limit`; direct getters take the reader too
 - `LineMarkTableHandle` — line-mark bitmap for Immix GC
 
@@ -4479,29 +4479,31 @@ These are zero-allocation wrappers around raw memory addresses:
 
 ## Immix GC extension
 
-**File:** `src/engine/x86-64/X86_64TxnPWRegion.v3` (class `ImmixPWRegion`)
+**File:** `src/engine/x86-64/X86_64RegionAllocator.v3` (class `ImmixRegionAllocator`)
 
-`ImmixPWRegion extends PWRegion` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. The persisted line-mark metadata descriptor's `unitSize` controls the line size, and its `fixedBytes` prefix precedes the per-line table; the built-in `MemRegions` descriptor defaults to a 256-byte line size and no prefix.
+`ImmixRegionAllocator extends RegionAllocator` adds a line-mark metadata table alongside each allocated chunk. `createChunk()` stores the region-relative offset of the chunk's first line mark in its transactional header, so the link remains valid after remount. The persisted line-mark metadata descriptor's `unitSize` controls the line size, and its `fixedBytes` prefix precedes the per-line table; the built-in `RegionDefaults` descriptor defaults to a 256-byte line size and no prefix.
 
-- `resetAllLineMarks()` — clears all line marks at the start of a GC cycle. Line marks are explicitly transient GC state: mark/reset operations bypass `RegionTransaction` and issue no persistence boundary. A caller mounting after a crash must rebuild them; the allocator does not currently do that automatically.
-- Since 2026-10-21 the constructor rebuilds the line table from the stored descriptors only when `init()` leaves a transaction (`txn` non-null), that is, after a format or a mount. A region that `init()` leaves unopened (another format version, a stored block size or block count that does not match, or a region too small to format) keeps an empty table: `lineMarks` is `(0, 0)` and `numLineMarks` and `lineSize` are 0, so `resetAllLineMarks()` writes nothing. Before, the table was rebuilt whenever the backend region existed. On a refused region the constructor then read descriptors whose layout this build had not validated, and a reset stored into the refused file. A review on 2026-10-21 reproduced both: a version-0 region kept 128 line marks and a reset turned a stored `0xA5` into 0 in the file, and a version-2 image whose line-mark descriptor read as `unitSize` 0 threw `DivideByZeroException` in the constructor instead of returning a refused region. The geometry refusals had the same gap. The `pwregion_bd:immix_*` tests (**Format version**, above) cover all three refusals. With the check back to `backendRegion != null`, the version-0 and block-count tests fail on the non-empty table, and with that assertion removed they fail on the file, which first differs at byte 32,248, the first line mark; the descriptor test throws `DivideByZeroException` (checked 2026-10-21).
-- Since 2026-10-19 the marks' stores go through the persistent-operation seam, as every other store the allocator makes does. `LineMarkHandle.setMark(w, v)` takes the region's `DirectRegionWriter` (`lineMarkWriter()`), like the other non-cached setters, and `resetAllLineMarks()` passes it; before, both stored through a forged `Ref<LineMark>`. A recorded trace therefore shows each mark as a 1-byte `STORE`, and marking and resetting add no `CLWB` or `SFENCE` (`persistent_ops:immix_line_marks_cross_the_seam`). Since the same day `getMark(r)` reads through the region's `DirectRegionReader`, like the other direct getters, rather than through a forged ref.
+- `resetAllLineMarks()` — clears all line marks at the start of a GC cycle. Line marks are explicitly transient GC state: mark/reset operations bypass `TransactionCache` and issue no persistence boundary. A caller mounting after a crash must rebuild them; the allocator does not currently do that automatically.
+- Since 2026-10-21 the constructor rebuilds the line table from the stored descriptors only when `init()` leaves a transaction (`txn` non-null), that is, after a format or a mount. A region that `init()` leaves unopened (another format version, a stored block size or block count that does not match, or a region too small to format) keeps an empty table: `lineMarks` is `(0, 0)` and `numLineMarks` and `lineSize` are 0, so `resetAllLineMarks()` writes nothing. Before, the table was rebuilt whenever the backend region existed. On a refused region the constructor then read descriptors whose layout this build had not validated, and a reset stored into the refused file. A review on 2026-10-21 reproduced both: a version-0 region kept 128 line marks and a reset turned a stored `0xA5` into 0 in the file, and a version-2 image whose line-mark descriptor read as `unitSize` 0 threw `DivideByZeroException` in the constructor instead of returning a refused region. The geometry refusals had the same gap. The `allocator_file:immix_*` tests (**Format version**, above) cover all three refusals. With the check back to `backendRegion != null`, the version-0 and block-count tests fail on the non-empty table, and with that assertion removed they fail on the file, which first differs at byte 32,248, the first line mark; the descriptor test throws `DivideByZeroException` (checked 2026-10-21).
+- Since 2026-10-19 the marks' stores go through the persistent-operation seam, as every other store the allocator makes does. `LineMarkHandle.setMarkUnlogged(w, v)` takes the region's `UnloggedWriter` (`lineMarkWriter()`), like the other non-cached setters, and `resetAllLineMarks()` passes it; before, both stored through a forged `Ref<LineMark>`. A recorded trace therefore shows each mark as a 1-byte `STORE`, and marking and resetting add no `CLWB` or `SFENCE` (`provider:immix_line_marks_cross_the_seam`). Since the same day `getMarkInRegion(r)` reads through the region's `RegionReader`, like the other direct getters, rather than through a forged ref.
 
 ---
 
-## Platform wrappers
+## Platform factories
 
-**File:** `src/engine/x86-64/X86_64PWRegion.v3`
+**File:** `src/engine/x86-64/X86_64RegionAllocators.v3`
 
-Convenience subclasses that wire a backend to `PWRegion` / `ImmixPWRegion`:
+`RegionAllocators` opens a `RegionAllocator` / `ImmixRegionAllocator` over one
+backend, with the default block size:
 
-| Class | Backend |
+| Factory | Backend |
 |---|---|
-| `X86_64PWMemRegion` | `VolatileBackend` |
-| `X86_64PWNVRegion` | `PmemMmapBackend` (regular file on an fsdax mount) |
-| `X86_64PWBlockDeviceRegion` | `FileMmapBackend` |
-| `X86_64ImmixPWMemRegion` | `VolatileBackend` + Immix metadata |
-| `X86_64ImmixPWNVRegion` | `PmemMmapBackend` over fsdax + Immix metadata |
+| `inMemory()` | `VolatileBackend` |
+| `onPmem()` | `PmemBackend` (regular file on an fsdax mount) |
+| `onMappedFile()` | `MappedFileBackend` |
+| `onDirectIo()` | `DirectIoBackend` (a file or a raw block device) |
+| `immixInMemory()` | `VolatileBackend` + Immix metadata |
+| `immixOnPmem()` | `PmemBackend` over fsdax + Immix metadata |
 
 ---
 
@@ -4510,9 +4512,9 @@ Convenience subclasses that wire a backend to `PWRegion` / `ImmixPWRegion`:
 ### Write (allocation or metadata update)
 
 ```
-PWRegion.allocChunk(n)
-  → BlockEntryHandle.setUsedCached(txn, 1)
-    → RegionTransaction.writeU8(addr, val)
+RegionAllocator.allocChunk(n)
+  → BlockTableEntryHandle.setUsed(txn, 1)
+    → TransactionCache.writeU8(addr, val)
       cache[addr] = CachedUpdate(val, 1)
   → performCommit() → txn.commit()
       appendToWal()           -- wal.append per cache entry
@@ -4525,8 +4527,8 @@ PWRegion.allocChunk(n)
 ### Read (during an open transaction)
 
 ```
-BlockEntryHandle.getUsedCached(txn)
-  → RegionTransaction.readU8(addr)
+BlockTableEntryHandle.getUsed(txn)
+  → TransactionCache.readU8(addr)
       if cache.has(addr) → return cached value
       else → wal.readU8(offset) → reader.loadU8(regionStart + offset)
 ```
@@ -4534,13 +4536,13 @@ BlockEntryHandle.getUsedCached(txn)
 ### Crash recovery on remount
 
 ```
-PWRegion.mount()
+RegionAllocator.mount()
   → txn.recover() → wal.recover()
       validate the WAL header; if invalid → return CORRUPT
       validate the two fixed slots
       if neither slot is valid → return CLEAN
       replay valid records in ascending txnSeq order
-      persistChanges()                 -- replayed data durable
+      drain()                 -- replayed data durable
       return REPLAYED / PERSIST_FAILED
 ```
 
@@ -4556,10 +4558,10 @@ spec-parser coverage, of which 2,081 pass and the 7 listed in
 `results/20261025T112614Z-sean-tan-PC-unit-suite`, whose `summary.txt` gives
 the per-file counts and what was counted). The table below lists twelve of the
 twenty files. The other eight are `DirectIoRegionTest.v3` (23),
-`PersistentExplorerTest.v3` (16), `PersistentRecoveryTest.v3` (14),
-`PersistentAllocatorTest.v3` (13), `PersistentLazyExplorerTest.v3` (11),
-`PersistentTraceTest.v3` (10), `PersistentImageTest.v3` (10) and
-`PersistentControlTest.v3` (4); [ROADMAP](ROADMAP.md#tests) describes them. The
+`CrashExplorerTest.v3` (16), `CrashRecoveryTest.v3` (14),
+`AllocatorCrashTest.v3` (13), `ReadDrivenExplorerTest.v3` (11),
+`PersistenceTraceTest.v3` (10), `CrashModelTest.v3` (10) and
+`CrashControlTest.v3` (4); [ROADMAP](ROADMAP.md#tests) describes them. The
 opt-in `PmemDaxIntegrationTest.v3` (2) is a separate binary and did not run:
 no DAX filesystem was mounted. Earlier dated totals: audited 2026-07-31 and
 extended 2026-08-13, 173 registered tests across six files, all passing, in a
@@ -4568,22 +4570,22 @@ full binary of 1,884.
 | Test file | Tests | What it covers |
 |---|---:|---|
 | `SingleTxnWalTest.v3` | 4 | retained single-transaction WAL baseline: commit/recovery persistence ordering and ranges, checksum rejection, and silent-overflow characterization |
-| `DualTxnWalTest.v3` | 43 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement; and, for the batched apply (2026-09-28), a failed batched prepare and a failed boundary drain each requiring reopen, and an after-image left unprepared surviving the reclamation of its slot |
-| `PersistentOperationsTest.v3` | 21 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events; the store audit over `PWRegion`; and, since 2026-10-19, the load seam: reader loads equal raw loads, an observer runs before the load it is shown and its rewrite is what the code loads, the load audit (`load_audit_covers_fields`: a mount, recovery and walk observe the header fields mount reads and not the others, the WAL header and both records whole, and every block entry the walk visits) and the inert-bytes audits over every cut of an allocator scenario and a sieve step and every fourth cut of a B+Tree update (bytes neither observed nor stored set to 0x00, 0xFF and a hash change no load, store or verdict), and the B+Tree descents' node fetches, which no reattach exercises |
-| `RegionTransactionTest.v3` | 16 | transaction cache and active `DualTxnWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
-| `TxnPWRegionTest.v3` | 101 | (`pwregion:` 23, `txn_backend:` 13, `pwregion_immix:` 7, `pwregion_wrappers:` 5, `pwregion_recovery:` 2, `pwregion_overflow:` 1, `pwregion_bd:` 50; recounted 2026-10-21, and again with every row of this table on 2026-10-25) allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, format-version refusal (version 0 and a newer version refused with the backing file unchanged, untagged headers reformatted, and for an Immix region an empty line table on a version or block-count refusal, since 2026-10-21), mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `DualTxnWal` recovery |
-| `MultiTxnWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
+| `TwoSlotWalTest.v3` | 43 | active two-slot WAL, shadow live/durable crash model, phase-B boundary count, recovery, natural-alignment/entry-boundary and checksummed malformed-record validation, overwrite guard, fresh-header and after-image preparation faults, persistence outcomes including unacknowledged record replay, and recovery-required enforcement; and, for the batched apply (2026-09-28), a failed batched prepare and a failed boundary drain each requiring reopen, and an after-image left unprepared surviving the reclamation of its slot |
+| `ProviderTest.v3` | 21 | typed scalar-store recording and little-endian mutation, cache-line range translation and conditional fences, one/two-transaction phase-B order, and production recovery replay events; the store audit over `RegionAllocator`; and, since 2026-10-19, the load seam: reader loads equal raw loads, an observer runs before the load it is shown and its rewrite is what the code loads, the load audit (`load_audit_covers_fields`: a mount, recovery and walk observe the header fields mount reads and not the others, the WAL header and both records whole, and every block entry the walk visits) and the inert-bytes audits over every cut of an allocator scenario and a sieve step and every fourth cut of a B+Tree update (bytes neither observed nor stored set to 0x00, 0xFF and a hash change no load, store or verdict), and the B+Tree descents' node fetches, which no reattach exercises |
+| `TransactionCacheTest.v3` | 16 | transaction cache and active `TwoSlotWal` integration, commit/apply/flush recovery-required propagation, and oversize rejection |
+| `RegionAllocatorTest.v3` | 101 | (`allocator:` 23, `storage_backend:` 13, `allocator_immix:` 7, `allocator_factories:` 5, `allocator_recovery:` 2, `allocator_overflow:` 1, `allocator_file:` 50; recounted 2026-10-21, and again with every row of this table on 2026-10-25) allocator, direct hand-written and reproducibly generated mixed-history memory-order/free-list invariant checks, invalid-input rejection, copied/remounted Immix descriptors, prefix-aware line lookup/linkage/reset and transient persistence policy, all five platform wrappers, overflow and allocation/free recovery-required propagation, exclusive-create collision rejection, fresh/missing-file backend creation, mount geometry validation and legacy WAL-offset fallback, format-version refusal (version 0 and a newer version refused with the backing file unchanged, untagged headers reformatted, and for an Immix region an empty line table on a version or block-count refusal, since 2026-10-21), mmap/PMEM backend state, real-file `fdatasync` commit ordering and injected-error recovery, marked-page `fdatasync` format ordering and clean-close failure recovery, graceful and abrupt-process file-backed remount including N+1 piggyback and explicit-flush boundaries, and `TwoSlotWal` recovery |
+| `RingWalTest.v3` | 28 | retained ring WAL: superblocks, recovery, epochs, wrap/checkpoint, validation and hardening regressions |
 | `PWSieveTest.v3` | 13 | resumable segmented sieve workload: mount/reattach, foreign-root rejection, prime counts against an independent sieve, cross-object invariants after every commit, retirement returning blocks, leak reclamation, retention-window enforcement, and resume across real file-backed remounts |
-| `PWBTreeTest.v3` | 23 | the persistent B+Tree workload (2026-10-14; 22 tests until the invariant checker's of 2026-10-15), over regions in anonymous mappings rather than the volatile backend, whose heap array Virgil's copying collector moves under PWRegion's raw addresses (a collection during a test aborted the full binary on 2026-10-14; `pwsieve:` and the `pwregion:` groups still use that backend): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, a full region failing cleanly, three forced collections between mutations, and a corrupted or cyclic image refused rather than walked: a node that is its own child, one at the wrong level and impossible heights by `open()` and `forEach()`; a published root offset whose sum with the block size wraps past zero by `open()`; and a node reached twice by `open()` and by `compare()`, whose keys from `forEach()` must strictly increase, even when the repeated leaf is the size of the one it displaced; every check of `checkInvariants()` shown to fire, one violation planted per check in a tree of height 3, named by the check it was aimed at and refused by `open()`; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_bd:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
-| `PersistentBTreeTest.v3` | 7 | the B+Tree through the crash-image explorer (2026-10-15): a root-splitting insert and an update at height 3 recorded over a recording PMEM region, each crash image mounted through production recovery and checked against the tree's property (allocator invariants, `open()`, `checkInvariants()`, a second mount with nothing to reclaim, the contents before or after the put as the phase marks allow); the final cut exhaustive, every new node's lines at their floor from the WRITE mark at every cut, sweeps over every cut bounded at 4 distinct images a cut, a damaged image rejected, and dropping the tree's node writebacks caught |
+| `PWBTreeTest.v3` | 23 | the persistent B+Tree workload (2026-10-14; 22 tests until the invariant checker's of 2026-10-15), over regions in anonymous mappings rather than the volatile backend, whose heap array Virgil's copying collector moves under RegionAllocator's raw addresses (a collection during a test aborted the full binary on 2026-10-14; `pwsieve:` and the `allocator:` groups still use that backend): format, reattach, foreign-root and other-capacity refusal, the 252-key default capacity, splits to height 3 and beyond in ascending, descending and random key orders, updates, seeded histories at capacities 4 and 5 against a DRAM map with the invariants after every mutation, a planted leak and rootless orphans reclaimed, a full region failing cleanly, three forced collections between mutations, and a corrupted or cyclic image refused rather than walked: a node that is its own child, one at the wrong level and impossible heights by `open()` and `forEach()`; a published root offset whose sum with the block size wraps past zero by `open()`; and a node reached twice by `open()` and by `compare()`, whose keys from `forEach()` must strictly increase, even when the repeated leaf is the size of the one it displaced; every check of `checkInvariants()` shown to fire, one violation planted per check in a tree of height 3, named by the check it was aimed at and refused by `open()`; on the production PMEM boundary path, counted, k + h + 1 fences per put, each commit the lines its record predicts and WRITE the lines its new nodes occupy, again at 4,104-byte blocks, where nodes start mid-line; resume across real file-backed remounts (`pwbtree_file:`), one at 4,104-byte blocks through the production file provider; and a child on the direct backend killed at every phase mark of a root split and of an update (`pwbtree_dio:`) |
+| `BTreeCrashTest.v3` | 7 | the B+Tree through the crash-image explorer (2026-10-15): a root-splitting insert and an update at height 3 recorded over a recording PMEM region, each crash image mounted through production recovery and checked against the tree's property (allocator invariants, `open()`, `checkInvariants()`, a second mount with nothing to reclaim, the contents before or after the put as the phase marks allow); the final cut exhaustive, every new node's lines at their floor from the WRITE mark at every cut, sweeps over every cut bounded at 4 distinct images a cut, a damaged image rejected, and dropping the tree's node writebacks caught |
 | `PWOpsTest.v3` | 6 | the basic-operation benchmark's expectations on the production PMEM boundary path: exact `CLWB`/`SFENCE` counts per allocation and free against the record, the steady state alternating them returns to, no event for an empty commit, no boundary for a clean mount, and one line per replayed entry under one fence for a recovery |
-| `PersistentSieveTest.v3` | 8 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step (since 2026-10-19 a budget counts distinct images: 5,798 for the ordinary step's sweep at 4 per cut, against 5,776 before; since 2026-10-20 the budget is 16 and the sweep checks 22,659), and a damaged-bitmap self-check; since 2026-10-19 its images are mounted in an anonymous mapping, not a heap array the collector can move, and a forced collection under a mounted image leaves it in place; since 2026-10-19 a recovery that skips the record checksum (a test-only flag) is rejected at 12 images per cut, though not at 4, the suite's budget until 2026-10-20; at the suite's 16 since then a sweep with the flag set fails at cut 289 |
-| `FileMmapRegionTest.v3` | 6 | the file backend as a restriction of the PMEM model (2026-10-13): trace identity with the PMEM backend, every page written back before a fence covered by that fence's syncs, the file after every sync admitted by the model exactly (eager and marked-only images), an `O_DIRECT` re-read of every synced range, no sync under the elided-writeback mutant, and the legacy boundary unchanged; at 2 KiB and 4 KiB blocks, with the `fdatasync` and `msync` fences |
+| `SieveCrashTest.v3` | 8 | the sieve through the crash-image explorer: recorded step validates against the baseline, exhaustive final-cut check, budgeted allocator- and sieve-property sweeps over every cut of an ordinary and a retiring step (since 2026-10-19 a budget counts distinct images: 5,798 for the ordinary step's sweep at 4 per cut, against 5,776 before; since 2026-10-20 the budget is 16 and the sweep checks 22,659), and a damaged-bitmap self-check; since 2026-10-19 its images are mounted in an anonymous mapping, not a heap array the collector can move, and a forced collection under a mounted image leaves it in place; since 2026-10-19 a recovery that skips the record checksum (a test-only flag) is rejected at 12 images per cut, though not at 4, the suite's budget until 2026-10-20; at the suite's 16 since then a sweep with the flag set fails at cut 289 |
+| `MappedFileRegionTest.v3` | 6 | the file backend as a restriction of the PMEM model (2026-10-13): trace identity with the PMEM backend, every page written back before a fence covered by that fence's syncs, the file after every sync admitted by the model exactly (eager and marked-only images), an `O_DIRECT` re-read of every synced range, no sync under the elided-writeback mutant, and the legacy boundary unchanged; at 2 KiB and 4 KiB blocks, with the `fdatasync` and `msync` fences |
 
 The trace recorder deliberately has no durable image, background eviction,
 asynchronous writeback completion, crash cuts, or schedule exploration yet.
 Its scope is to prove that real active-WAL execution emits the expected ordered
-operations. `PWRegion.format()` and its direct header/block-table/descriptor
+operations. `RegionAllocator.format()` and its direct header/block-table/descriptor
 stores, non-cached allocator setters, retained comparison WALs, and transient
 Immix line marks remain outside the store seam pending a later audit. (Since the
 store audit of 2026-08-14 `format()` and the non-cached setters go through the
@@ -4594,7 +4596,7 @@ The platform wrapper classes each have a dedicated construction test. Immix
 coverage checks copied and remounted descriptors, descriptor-prefix-aware line
 geometry, bounded line lookup, chunk linkage, complete reset, and the explicit
 transient/non-WAL persistence policy. As of 2026-07-31, the direct
-`DualTxnWalTest` crash cases use
+`TwoSlotWalTest` crash cases use
 `ShadowDurableRegion`: a newly mounted WAL sees a live image restored from
 separate durable bytes, so unpersisted writes disappear. The core phase-B
 commit/apply/N+1, replay, flush, close, corruption, fail-before and torn-record
@@ -4605,7 +4607,7 @@ Normative copy-then-fail tests confirm that a complete record may replay and a
 complete header may reopen even though the original persistence call failed.
 
 The file-backed tests exercise the actual `fdatasync` code path (and, until
-2026-10-13, the page-aligned `msync(MS_SYNC)` that synced a `persistRange`),
+2026-10-13, the page-aligned `msync(MS_SYNC)` that synced a `persist`),
 including basic failure propagation, committed-WAL
 recovery, graceful close/remount, forked writers that call `exit_group`, and a
 writer deterministically stopped at either a split, exact-fit, or coalescing-
@@ -4640,12 +4642,12 @@ and XFS the remount replays a record that never reached the device
 priorities are maintained in `docs/ROADMAP.md` Next Steps #3.
 
 The default PMEM-labelled unit coverage is structural only:
-`txn_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping
-in `PmemMmapRegion`. It does not call `PmemMmapBackend.create()` and therefore
+`storage_backend:pmem_region_tracks_pending_writeback` wraps an anonymous mapping
+in `PmemRegion`. It does not call `PmemBackend.open()` and therefore
 does not exercise `MAP_SYNC`, filesystem DAX, an emulated `/dev/pmem0`, or a
 real PMEM device. The separate opt-in `PmemDaxIntegrationTest.v3` closes that
 functional gap: it reserves a unique private file inside a caller-supplied
-fsdax scratch directory, then requires production `PmemMmapBackend.create()` /
+fsdax scratch directory, then requires production `PmemBackend.open()` /
 `MAP_SYNC`, clean allocator remount, and WAL replay.
 Run it with:
 
@@ -4671,11 +4673,11 @@ the test sources already use ("layer 1b", "layer 3").
 
 | Evidence layer | Claim | Evidence | Blind spot |
 |---|---|---|---|
-| 0. Functional | Each component behaves correctly when nothing crashes: the cache's read and write-behind paths, allocation, splitting and coalescing, record validation, input rejection. | `region_transaction:`; `pwregion:`, including seeded 64-step mixed histories checked after every operation; the `dual_wal:` validation cases; `txn_backend:`; `pwsieve:`; `pwbtree:`. | Anything about crashes. |
-| 1a. Abstract WAL protocol | `DualTxnWal`, `RegionTransaction` and `PWRegion` preserve acknowledged updates at every abstract persistence boundary, and a failed or indeterminate boundary latches recovery-required instead of claiming durability. | `ShadowDurableRegion` (see below): separate live and durable bytes, with fail-before-copy, copy-then-fail and partial-copy outcomes; the `dual_wal:` crash and fault matrix; injection in `region_transaction:` and `pwregion_recovery:`. | One outcome per persistence call: no eviction, no asynchronous `CLWB`, one partial outcome rather than every subset of lines. |
-| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistent_trace:`, `persistent_image:`, `persistent_explore:`), checked against the WAL contract (`persistent_recovery:`), the allocator invariants (`persistent_alloc:`), the sieve's cross-object invariants (`persistent_sieve:`) and the B+Tree's (`persistent_btree:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `persistent_control:` keeps it sensitive to flush placement. Since 2026-10-20 the WAL properties also run under the lazy search, which runs once per set of images recovery cannot tell apart and checks its own partition, verdicts and seam (`persistent_lazy:`). See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios. Since 2026-10-19 the WAL scenarios cover every distinct image of every cut (lazily, since 2026-10-20, in 377 to 14,058 executions a history, sound as far as the load seam is complete, which `persistent_lazy:` checks only for the scenarios it runs); the allocator, format, sieve and B+Tree scenarios are budgeted in distinct images per cut, and an over-budget cut checks its extreme images and then a seeded random sample. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. Speaks for the direct and file backends through their restriction arguments; for the file backend on block storage only under assumptions B2–B5, of which nothing guarantees B2. |
-| 2. Backend translation | Each backend maps the abstract operations to the intended mechanism and propagates its result. | Instruction encodings and the native CPUID/writeback/fence smoke path (`persistent_ops:`); `fdatasync` ordering and real `EBADF` injection at the file-sync seam (`pwregion_bd:`); marking, coalescing, drain, the `O_DIRECT` probe and device refusals (`direct_io:`); fence coverage of every requested page and an `O_DIRECT` re-read of every synced range (`file_mmap:`); `MAP_SYNC` integration on Magpie's fsdax (`pmem_dax:`, opt-in). | Whether the protocol is correct; anything a crash loses. |
-| 3a. Process crash, nothing lost | The allocator, WAL and workload recover after the process dies without a clean close, both at named protocol boundaries and at arbitrary points over long histories. | Thirteen abrupt-termination tests at named boundaries (`pwregion_bd:`); the random-timer `pwsieve` kill loop on the file and PMEM backends, which requires every acknowledged step to survive; the `pwbtree` kill loop, which requires every acknowledged mutation to survive, on the file and PMEM backends (2026-10-14; until 2026-10-25 this cell said PMEM was not yet run). | Flush placement. Process death on an mmap backend loses nothing, because the page cache or the CPU cache keeps every store, so the surviving image is the model's eager one. The elided-writeback mutant passes here (measured 2026-09-18, again 2026-09-27, on the file backend after its 2026-10-13 change, and under the B+Tree on 2026-10-14). |
+| 0. Functional | Each component behaves correctly when nothing crashes: the cache's read and write-behind paths, allocation, splitting and coalescing, record validation, input rejection. | `transaction_cache:`; `allocator:`, including seeded 64-step mixed histories checked after every operation; the `two_slot_wal:` validation cases; `storage_backend:`; `pwsieve:`; `pwbtree:`. | Anything about crashes. |
+| 1a. Abstract WAL protocol | `TwoSlotWal`, `TransactionCache` and `RegionAllocator` preserve acknowledged updates at every abstract persistence boundary, and a failed or indeterminate boundary latches recovery-required instead of claiming durability. | `ShadowDurableRegion` (see below): separate live and durable bytes, with fail-before-copy, copy-then-fail and partial-copy outcomes; the `two_slot_wal:` crash and fault matrix; injection in `transaction_cache:` and `allocator_recovery:`. | One outcome per persistence call: no eviction, no asynchronous `CLWB`, one partial outcome rather than every subset of lines. |
+| 1b. PMEM event model | Production recovery restores an allowed state from every durable image a crash cut admits under the baseline profile, within the stated scenario bounds. | The crash-image explorer over recorded production traces (`persistence_trace:`, `crash_model:`, `crash_explorer:`), checked against the WAL contract (`crash_recovery:`), the allocator invariants (`allocator_crash:`), the sieve's cross-object invariants (`sieve_crash:`) and the B+Tree's (`btree_crash:`), including multi-transaction histories, crash during recovery and failed recovery boundaries. `crash_control:` keeps it sensitive to flush placement. Since 2026-10-20 the WAL properties also run under the lazy search, which runs once per set of images recovery cannot tell apart and checks its own partition, verdicts and seam (`read_driven:`). See [PMEM Crash Model](pmem-crash-model.md). | Short scenarios. Since 2026-10-19 the WAL scenarios cover every distinct image of every cut (lazily, since 2026-10-20, in 377 to 14,058 executions a history, sound as far as the load seam is complete, which `read_driven:` checks only for the scenarios it runs); the allocator, format, sieve and B+Tree scenarios are budgeted in distinct images per cut, and an over-budget cut checks its extreme images and then a seeded random sample. Assumes the trace is complete and the hardware obeys the model. Cannot see instruction emission or the kernel. Speaks for the direct and file backends through their restriction arguments; for the file backend on block storage only under assumptions B2–B5, of which nothing guarantees B2. |
+| 2. Backend translation | Each backend maps the abstract operations to the intended mechanism and propagates its result. | Instruction encodings and the native CPUID/writeback/fence smoke path (`provider:`); `fdatasync` ordering and real `EBADF` injection at the file-sync seam (`allocator_file:`); marking, coalescing, drain, the `O_DIRECT` probe and device refusals (`direct_io:`); fence coverage of every requested page and an `O_DIRECT` re-read of every synced range (`mapped_file:`); `MAP_SYNC` integration on Magpie's fsdax (`pmem_dax:`, opt-in). | Whether the protocol is correct; anything a crash loses. |
+| 3a. Process crash, nothing lost | The allocator, WAL and workload recover after the process dies without a clean close, both at named protocol boundaries and at arbitrary points over long histories. | Thirteen abrupt-termination tests at named boundaries (`allocator_file:`); the random-timer `pwsieve` kill loop on the file and PMEM backends, which requires every acknowledged step to survive; the `pwbtree` kill loop, which requires every acknowledged mutation to survive, on the file and PMEM backends (2026-10-14; until 2026-10-25 this cell said PMEM was not yet run). | Flush placement. Process death on an mmap backend loses nothing, because the page cache or the CPU cache keeps every store, so the surviving image is the model's eager one. The elided-writeback mutant passes here (measured 2026-09-18, again 2026-09-27, on the file backend after its 2026-10-13 change, and under the B+Tree on 2026-10-14). |
 | 3b. Real loss of unwritten data | On real hardware, under a crash that discards what was never written back, the production write-back placement is needed (the mutant loses acknowledged state) and suffices at the crash points reached (the ordinary build loses none). | Stage 2c warm reset over reserved DRAM (`pwreboot`: `SURVIVED` and `LOST`, 3 of 3 each); the `pwsieve` and `pwbtree` kill loops on the direct backend, at random crash points (see [Crash behaviour](#crash-behaviour-process-death-is-the-crash) and [the tree's](#crash-behaviour-of-the-tree)); `pwbtree_dio:`, a child killed at every phase mark of two tree mutations. | Stage 2c has one crash point per run, and DRAM stands in for PMEM. The direct backend works in 4 KiB units with drain-all fences, and says nothing about `CLWB`/`SFENCE`. |
 | 4. Physical durability | Acknowledged state survives power loss on the target medium and persistence domain. | None; not attainable on Magpie. ADR is assumed, and the DIMM audit (dirty-shutdown count 0 on all twelve DIMMs) is the baseline a future run would be read against. | — |
 
@@ -4690,7 +4692,7 @@ layers also do not merely coexist. Several tests exist to discharge the
 explorer's assumptions: the store audit shows that the trace is complete,
 `validate()` shows it is inside the model's domain, and the reduced search is
 checked against the full one. `direct_io:boundary_images_are_model_images`
-and `file_mmap:boundary_images_are_model_images` compare real file bytes with
+and `mapped_file:boundary_images_are_model_images` compare real file bytes with
 the model. Each crash layer also samples a predictable
 part of the explorer's image set: layer 3a the eager end, the direct backend
 the lazy end rounded up to 4 KiB, Stage 2c one real image. That is why layer
@@ -4701,7 +4703,7 @@ exact statement of what is covered, is in
 ### Resumable workload driver
 
 `test/unittest/x86-64-linux/PWSieve.v3` is a segmented Sieve of Eratosthenes
-over a `PWRegion`, used as a workload rather than as engine code. It exists to
+over a `RegionAllocator`, used as a workload rather than as engine code. It exists to
 drive the allocator the way a program would: stop at an arbitrary point, and on
 the next run find its own state through the durable root and continue. It has no
 WASM component -- the WASM-facing object-graph persistence layer is separate
@@ -4718,7 +4720,7 @@ Three ordering decisions carry the design:
 
 - **Bulk data is not logged.** A kilobyte bitmap would overflow a 32-byte-entry
   record slot many times over. Bitmaps are written through the
-  `PersistentOperations` seam and made durable *before* the transaction that
+  `PersistenceProvider` seam and made durable *before* the transaction that
   publishes their descriptor. Safe because an unpublished chunk is unreachable,
   so no reader can observe a partial one.
 - **Publication follows allocation, and leaks.** `allocChunk()` commits on its
@@ -4749,14 +4751,14 @@ Its harnesses sit at four of the [evidence layers](#correctness-argument-by-laye
 |---|---|---|
 | `PWSieveTest.v3` | 0 | Graceful remounts preserve and resume the workload; retirement recycles blocks; a leak is reclaimed |
 | `test/pwsieve.main.v3` (`make pwsieve`) | 3a | Random-timer `SIGKILL` at arbitrary points, remount, invariants, monotone progress, final count against an independent sieve |
-| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3a | The same loop through `PmemMmapBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Passed on Magpie 2026-09-01 (13 kills, all `REPLAYED`, 376,256 primes matching an independent sieve). Needs `PWASM_PMEM_TEST_DIR`. Executes the production path on real media but does **not** discriminate flush placement — a killed process on a DAX mapping loses nothing still in cache; that sensitivity is layers 1b and 3b's |
+| `test/pwsieve.main.v3` (`make pwsieve-pmem`) | 3a | The same loop through `PmemBackend`: `MAP_SYNC` + the native `CLWB`/`SFENCE` path on filesystem DAX. Passed on Magpie 2026-09-01 (13 kills, all `REPLAYED`, 376,256 primes matching an independent sieve). Needs `PWASM_PMEM_TEST_DIR`. Executes the production path on real media but does **not** discriminate flush placement — a killed process on a DAX mapping loses nothing still in cache; that sensitivity is layers 1b and 3b's |
 | `test/pwsieve.main.v3` (`make pwsieve-direct`) | 3b | The same loop on the direct backend, where process death discards what was never written back: the elided-writeback mutant loses every acknowledged step (see [Crash behaviour](#crash-behaviour-process-death-is-the-crash)) |
 | `test/pwreboot.main.v3` (`scripts/stage2c.sh`) | 3b | Stage 2c: the sieve armed, then a warm reset that discards the CPU cache over reserved DRAM, verified after reboot |
-| `PersistentSieveTest.v3`, `PersistentControlTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants; the control changes only the provider and must catch the mutant |
+| `SieveCrashTest.v3`, `CrashControlTest.v3` | 1b | Every durable image a crash schedule permits, mounted through production recovery, checked against both the allocator's and the workload's invariants; the control changes only the provider and must catch the mutant |
 
 The crash loop forks a child that sieves while the parent sleeps a seeded
 pseudo-random 50 us - 20 ms interval and sends `SIGKILL`. Across five seeds at
-25-30 iterations, every restart reported `DualWalRecovery.REPLAYED` -- the kills
+25-30 iterations, every restart reported `WalRecovery.REPLAYED` -- the kills
 all landed mid-transaction rather than while the child was idle -- and the final
 count matched the reference exactly (376,256 primes below 5,429,504). Same
 boundary as the rest of the file-backed work: process-crash consistency under one
@@ -4773,21 +4775,21 @@ replaced nodes after it. Its harnesses:
 
 | Harness | Evidence layer | What it shows |
 |---|---|---|
-| `PWBTreeTest.v3` (`pwbtree:`, `pwbtree_bd:`) | 0 | Format, reattach and refusal; splits to height 3 and beyond; seeded histories against a DRAM map with the invariants after every mutation; leaks reclaimed; a full region fails cleanly; the tree unchanged across forced collections; a corrupted or cyclic image refused; graceful remounts preserve and resume the tree |
+| `PWBTreeTest.v3` (`pwbtree:`, `pwbtree_file:`) | 0 | Format, reattach and refusal; splits to height 3 and beyond; seeded histories against a DRAM map with the invariants after every mutation; leaks reclaimed; a full region fails cleanly; the tree unchanged across forced collections; a corrupted or cyclic image refused; graceful remounts preserve and resume the tree |
 | `PWBTreeTest.v3` (`pwbtree:each_put_makes_k_plus_h_plus_1_boundaries`, `pwbtree:unaligned_block_size_writes_back_whole_lines`) | 0 | On the production PMEM boundary path over anonymous memory, counted: every put makes k + h + 1 fences, each commit the lines its record predicts, WRITE exactly the lines of its new nodes, and a lookup nothing; at 4 KiB and at 4,104-byte blocks |
 | `PWBTreeTest.v3` (`pwbtree_dio:`) | 3b | A child on the direct backend stopped at every phase mark of a root split (height 3 to 4) and of an update, then killed: the tree before the mutation up to the PUBLISH mark and after it from there on, and exactly the expected chunks reclaimed |
 | `test/pwbtree.main.v3` (`make pwbtree`, `make pwbtree-pmem`) | 3a | Random-timer `SIGKILL`, remount, invariants, the whole tree against a DRAM map; every acknowledged mutation survives, and the one in flight lands on the side its last phase mark allows; `OK` needs at least one acknowledgement checked, else `UNCHECKED`. File: `OK` on sean-tan-PC and on Magpie's `/home`. PMEM: `OK` on Magpie's DAX, 49 acknowledged-mutation checks, 0 lost. All 2026-10-14 ([the tree's crash behaviour](#crash-behaviour-of-the-tree)); until 2026-10-25 this row said PMEM was not yet run |
 | `test/pwbtree.main.v3` (`make pwbtree-direct`, `make pwbtree-direct-mutant`) | 3b | The same loop on the direct backend: the ordinary build `OK`, the elided-writeback mutant `LOST` with every acknowledged mutation lost (see [the tree's crash behaviour](#crash-behaviour-of-the-tree)) |
-| `PersistentBTreeTest.v3` (`persistent_btree:`) | 1b | Two recorded puts, an insert that splits a leaf and the root (height 2 to 3) and an update at height 3, through the crash-image explorer: each image mounted through production recovery and checked by the allocator walk, `open()`, `checkInvariants()` and the tree before or after the put as its phase marks allow; every cut bounded, the final cut and the new nodes' durability before the publish complete; the insert with its node writebacks elided is caught (see [what says the tree is consistent](#what-says-the-tree-is-consistent-and-how-far-it-reaches-2026-10-15)) |
+| `BTreeCrashTest.v3` (`btree_crash:`) | 1b | Two recorded puts, an insert that splits a leaf and the root (height 2 to 3) and an update at height 3, through the crash-image explorer: each image mounted through production recovery and checked by the allocator walk, `open()`, `checkInvariants()` and the tree before or after the put as its phase marks allow; every cut bounded, the final cut and the new nodes' durability before the publish complete; the insert with its node writebacks elided is caught (see [what says the tree is consistent](#what-says-the-tree-is-consistent-and-how-far-it-reaches-2026-10-15)) |
 | `test/pwbtreebench.main.v3` (`scripts/pwbtree-bench.sh`) | — | Cost per operation; fails any run whose operations do other persistence work than k + h + 1 boundaries and the audited round's prepare calls and lines |
 
 Until 2026-10-25 this section said no crash-image explorer scenario (layer 1b)
-drives the tree; `persistent_btree:` has done so since 2026-10-15.
+drives the tree; `btree_crash:` has done so since 2026-10-15.
 
 ### Shadow durable-memory test backend
 
-`DualTxnWalTest.v3` now contains a test-only `ShadowDurableRegion` implementing
-the existing `BackendRegion` interface. It is not a fourth production storage
+`TwoSlotWalTest.v3` now contains a test-only `ShadowDurableRegion` implementing
+the existing `StorageRegion` interface. It is not a fourth production storage
 backend. It is an executable model of the persistence contract:
 
 ```text
@@ -4800,13 +4802,13 @@ ordinary Pointer stores                  persistence operation
 ```
 
 - Direct WAL and after-image stores modify only the live array.
-- `persistRange(offset, size)` copies exactly that live range to the durable
+- `persist(offset, size)` copies exactly that live range to the durable
   shadow.
-- `prepareChangedRange(offset, size)` records a pending range;
-  `persistChanges()` copies every prepared range to the shadow and clears the
+- `writeBack(offset, size)` records a pending range;
+  `drain()` copies every prepared range to the shadow and clears the
   pending set.
 - `crash()` discards volatile state by restoring the live array from the shadow
-  and clearing pending ranges. A newly constructed `DualTxnWal` then mounts
+  and clearing pending ranges. A newly constructed `TwoSlotWal` then mounts
   those surviving bytes.
 
 The model supports three injected persistence outcomes:
@@ -4818,8 +4820,8 @@ The model supports three injected persistence outcomes:
    modelling a torn record/data update.
 
 This model operates at persistence-call granularity. Ordinary stores never
-reach the durable image through background eviction, `prepareChangedRange()`
-only queues whole ranges, and `persistChanges()` chooses one outcome for all
+reach the durable image through background eviction, `writeBack()`
+only queues whole ranges, and `drain()` chooses one outcome for all
 queued ranges. Consequently it does not enumerate arbitrary cache-line subsets
 or model `CLWB` completing before a later `SFENCE`. Those are deliberate scope
 limits, not claims about real PMEM. The planned trace-driven extension and its
@@ -4830,24 +4832,24 @@ This distinction exercises the recovery-required contract. A failed phase-B
 boundary returns `0` while a complete checksummed record may remain in the
 durable slot. Recovery is allowed to validate and replay that unacknowledged
 attempt because replaying after-images is idempotent. The model also injects
-`prepareChangedRange()` failure after an acknowledged commit and during replay:
+`writeBack()` failure after an acknowledged commit and during replay:
 both latch before a later boundary can claim durability. Fresh-header tests
 show the corresponding definite fail-before-copy/reformat and indeterminate
 copy-then-fail/clean-reopen outcomes.
 
-The direct `DualTxnWal` core crash/fault matrix and backend self-tests are in
+The direct `TwoSlotWal` core crash/fault matrix and backend self-tests are in
 place. Fresh initialization, commit, apply, recovery, explicit flush,
 final-data close and slot scrub now latch and enforce recovery-required state.
-That state now propagates through `RegionTransaction`/`PWRegion`. A test-only
-`ShadowTxnBackend` factory, exposing the same live/durable pair to `PWRegion`,
+That state now propagates through `TransactionCache`/`RegionAllocator`. A test-only
+`ShadowTxnBackend` factory, exposing the same live/durable pair to `RegionAllocator`,
 was planned so that complete allocator transactions would be checked after
 simulated crashes. It was not built, because other layers reached the same
-transactions under stronger fault models. `persistent_alloc:` mounts every image
-a split allocation and a coalescing free admit as a real `PWRegion` and walks
-it (layer 1b). `pwregion_recovery:` injects a failed commit point into an
+transactions under stronger fault models. `allocator_crash:` mounts every image
+a split allocation and a coalescing free admit as a real `RegionAllocator` and walks
+it (layer 1b). `allocator_recovery:` injects a failed commit point into an
 allocation and a free. The file-sync seam injects a real `EBADF` whose record
 may still be durable, which is the copy-then-fail case
-(`pwregion_bd:file_commit_fdatasync_failure_requires_reopen`). Exact-fit
+(`allocator_file:file_commit_fdatasync_failure_requires_reopen`). Exact-fit
 allocation is the one transaction shape left outside the explorer. It is covered
 by `SIGKILL` at its commit boundary and after its apply (layer 3a), which sees
 only the eager image. The shadow model establishes evidence layer 1a. It
@@ -4870,6 +4872,6 @@ test/unit.sh
 
 | # | Location | Description |
 |---|---|---|
-| 3 | `TxnBackend.v3:55-56` | Consider renaming `TxnRegionBackend` → `RegionManager` to better reflect its role as a factory. |
-| 4 | `X86_64TxnBackend.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
-| 7 | `X86_64TxnPWRegion.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |
+| 3 | `StorageRegion.v3:55-56` | Consider renaming `StorageBackend` → `RegionManager` to better reflect its role as a factory. |
+| 4 | `X86_64MappedBackends.v3:58` | Page size is hardcoded as `4096`; should be a named constant or queried via `sysconf(_SC_PAGESIZE)`. |
+| 7 | `X86_64RegionAllocator.v3` | `getHeader()` copies the header into a fresh `Array<byte>` on every call (minor GC pressure). |

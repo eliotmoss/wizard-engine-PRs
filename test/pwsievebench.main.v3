@@ -30,10 +30,10 @@
 // removes the bitmap's writebacks as well as the log's. On the file and direct
 // backends the boundary is timed in the region.
 //
-// boundary= (file only) chooses the file backend's fence (FileBoundary):
+// boundary= (file only) chooses the file backend's fence (MappedFileSync):
 // fdatasync (the default, and the production path), msync (one msync(MS_SYNC)
 // per run of marked pages), or legacy (the boundary before 2026-10-13: a flag
-// and fdatasync, persistRange an msync of its own pages). Every sync counts as
+// and fdatasync, persist an msync of its own pages). Every sync counts as
 // a boundary, so under msync a fence of several runs counts as several.
 //
 // Times are rdtsc cycles converted with a calibrated TSC frequency, reported
@@ -91,7 +91,7 @@ component SieveBenchConfig {
         def var blocks = 256u64;
         def var blockSize = 4096u64;
         def var writeback = SieveBenchWriteback.AUTO;
-        def var boundary = FileBoundary.FDATASYNC;      // file backend only
+        def var boundary = MappedFileSync.FDATASYNC_ONCE;      // file backend only
 
         // Reserve a private, uniquely named region file, exactly as pwbench
         // and pwsieve do: O_EXCL so an earlier run's artifact is never
@@ -111,9 +111,9 @@ component SieveBenchConfig {
                                 .putd(attempt)
                                 .puts(".region")
                                 .toString();
-                        def fd = RegionFileIO.createExclusive(path);
+                        def fd = BackingFile.createExclusive(path);
                         if (fd >= 0) {
-                                RegionFileIO.close(fd);
+                                BackingFile.close(fd);
                                 return true;
                         }
                         if (fd != -LinuxConst.EEXIST) {
@@ -359,22 +359,22 @@ class StepTimer {
 
 // -------------------------------------------------- PMEM instrumentation
 
-// pwbench's TimingPersistentOperations, less its deferred and CLFLUSH modes:
+// pwbench's TimingProvider, less its deferred and CLFLUSH modes:
 // the production bodies, with the instruction selectable and each fence and
 // line counted. Counted, not timed -- the step's wall time is the measure.
-class CountingPersistentOperations extends X86_64PersistentOperations {
+class CountingProvider extends NativeProvider {
         def timer: StepTimer;
 
         new(range: Range<byte>, timer: StepTimer) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
-                def line = Pointer.atElement(range, int.!(cacheLine));
+                def line = Pointer.atElement(range, int.!(lineOffset));
                 match (SieveBenchConfig.writeback) {
-                        AUTO => MmapRegionUtils.flushCacheLine(line);
+                        AUTO => X86_64CacheControl.writeBackLine(line);
                         CLWB => Target.clwb(line - Pointer.NULL);
                         CLFLUSHOPT => Target.clflushOpt(line - Pointer.NULL);
                         NONE => ;       // still counted, so lines per step stays checkable
@@ -382,45 +382,45 @@ class CountingPersistentOperations extends X86_64PersistentOperations {
                 timer.noteLine();
         }
 
-        def sfence() {
-                MmapRegionUtils.storeFence();
+        def fence() {
+                X86_64CacheControl.fence();
                 timer.notePersist();
         }
 }
 
-// Installs the provider inside create(), as pwbench does: PWRegion, DualTxnWal
+// Installs the provider inside open(), as pwbench does: RegionAllocator, TwoSlotWal
 // and PWSieve's bitmap writer each resolve it once, so a later swap would miss.
-class CountingPmemBackend extends PmemMmapBackend {
+class CountingPmemBackend extends PmemBackend {
         def timer: StepTimer;
 
         new(path: string, timer: StepTimer) super(path) { }
 
-        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+        def makePmemRegion(newMapping: Mapping, fd: int) -> PmemRegion {
                 if (newMapping == null) return null;
-                def region = PmemMmapRegion.new(newMapping, fd);
-                region.setPersistentOperations(CountingPersistentOperations.new(region.range, timer));
+                def region = PmemRegion.new(newMapping, fd);
+                region.setProvider(CountingProvider.new(region.range, timer));
                 return region;
         }
 }
 
 // -------------------------------------------------- file instrumentation
 
-class CountingFileRegion extends FileMmapRegion {
+class CountingFileRegion extends MappedFileRegion {
         def timer: StepTimer;
 
         new(mapping: Mapping, fd: int, timer: StepTimer) super(mapping, fd) { }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 timer.notePrepare();
         }
 
         def syncFileData() -> bool {
-                def success = RegionFileIO.fdatasync(fd);
+                def success = BackingFile.fdatasync(fd);
                 timer.notePersist();
                 return success;
         }
 
-        // With boundary=legacy, persistRange() -- the sieve's bitmap -- syncs
+        // With boundary=legacy, persist() -- the sieve's bitmap -- syncs
         // its own pages with msync(MS_SYNC) rather than fdatasync, so it is a
         // boundary too. With boundary=msync every fence is one msync per run of
         // marked pages, so a fence of several runs counts as several boundaries.
@@ -431,14 +431,14 @@ class CountingFileRegion extends FileMmapRegion {
         }
 }
 
-class CountingFileBackend extends FileMmapBackend {
+class CountingFileBackend extends MappedFileBackend {
         def timer: StepTimer;
 
         new(path: string, timer: StepTimer) super(path) {
-                boundary = SieveBenchConfig.boundary;
+                sync = SieveBenchConfig.boundary;
         }
 
-        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+        def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
                 if (newMapping == null) return null;
                 return CountingFileRegion.new(newMapping, fd, timer);
         }
@@ -451,7 +451,7 @@ class CountingDirectRegion extends DirectIoRegion {
 
         new(mapping: Mapping, fd: int, blockDevice: bool, timer) super(mapping, fd, blockDevice) { }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 timer.notePrepare();
         }
 
@@ -509,30 +509,30 @@ def fail(msg: string) -> int {
 
 var directBackend: CountingDirectBackend;
 
-def openRegion(timer: StepTimer) -> PWRegion {
-        var backend: TxnRegionBackend;
+def openRegion(timer: StepTimer) -> RegionAllocator {
+        var backend: StorageBackend;
         def path = SieveBenchConfig.path;
         match (SieveBenchConfig.backend) {
                 PMEM => backend = CountingPmemBackend.new(path, timer);
                 FILE => backend = CountingFileBackend.new(path, timer);
                 DIRECT => backend = directBackend = CountingDirectBackend.new(path, timer);
         }
-        return PWRegion.new(backend, SieveBenchConfig.blocks,
-                Array<Ref<MetaDataDesc>>.new(0), SieveBenchConfig.blockSize, true);
+        return RegionAllocator.new(backend, SieveBenchConfig.blocks,
+                Array<Ref<MetadataDescriptor>>.new(0), SieveBenchConfig.blockSize, OpenMode.FORMAT);
 }
 
 // The anti-fallback check pwbench and pwsieve make: a file mapping reported as
 // a PMEM result would invert the comparison, and so would the mutant provider.
-def wiringError(got: BackendRegion) -> string {
+def wiringError(got: StorageRegion) -> string {
         if (got == null) return "the backend region could not be created";
         match (SieveBenchConfig.backend) {
-                PMEM => if (!PmemMmapRegion.?(got)) return "pmem mode did not produce a PmemMmapRegion";
-                FILE => if (!FileMmapRegion.?(got)) return "file mode did not produce a FileMmapRegion";
+                PMEM => if (!PmemRegion.?(got)) return "pmem mode did not produce a PmemRegion";
+                FILE => if (!MappedFileRegion.?(got)) return "file mode did not produce a MappedFileRegion";
                 DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) {
                         return "direct mode did not produce a file-backed DirectIoRegion";
                 }
         }
-        if (ElidedWritebackOperations.?(got.persistentOperations())) {
+        if (ElidedWriteBackProvider.?(got.provider())) {
                 return "an elided-writeback provider is installed; this must be an ordinary build";
         }
         return null;
@@ -561,7 +561,7 @@ def referenceCount(limit: u64) -> u64 {
 // Removes this run's own region file when there is no image worth keeping:
 // the region could not be created, or it is not the backend asked for.
 def discardReserved() {
-        if (SieveBenchConfig.path != null && RegionFileIO.unlink(SieveBenchConfig.path)) {
+        if (SieveBenchConfig.path != null && BackingFile.unlink(SieveBenchConfig.path)) {
                 SieveBenchConfig.path = null;
         }
 }
@@ -576,7 +576,7 @@ def runRound(round: int, timer: StepTimer) -> string {
         if (region == null || region.backendRegion == null) {
                 discardReserved();
                 if (SieveBenchConfig.backend == SieveBenchBackend.PMEM) {
-                        return "PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
+                        return "PmemBackend.open failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)";
                 }
                 if (directBackend != null && directBackend.lastError != null) {
                         return Strings.format1("DirectIoBackend.create failed: %s", directBackend.lastError);
@@ -660,7 +660,7 @@ def runRound(round: int, timer: StepTimer) -> string {
                         sieve.cursor(), sieve.count()).ln();
         }
         region.deallocate();
-        if (!RegionFileIO.unlink(SieveBenchConfig.path)) return "could not remove the region file";
+        if (!BackingFile.unlink(SieveBenchConfig.path)) return "could not remove the region file";
         SieveBenchConfig.path = null;
         return null;
 }
@@ -759,14 +759,14 @@ def parseWriteback(arg: string) -> bool {
 def parseBoundary(arg: string) -> bool {
         if (arg == null || !Strings.startsWith(arg, "boundary=")) return false;
         def name = Arrays.range(arg, 9, arg.length);
-        if (Strings.equal(name, FileBoundary.FDATASYNC.arg)) SieveBenchConfig.boundary = FileBoundary.FDATASYNC;
-        else if (Strings.equal(name, FileBoundary.MSYNC.arg)) SieveBenchConfig.boundary = FileBoundary.MSYNC;
-        else if (Strings.equal(name, FileBoundary.LEGACY.arg)) SieveBenchConfig.boundary = FileBoundary.LEGACY;
+        if (Strings.equal(name, MappedFileSync.FDATASYNC_ONCE.arg)) SieveBenchConfig.boundary = MappedFileSync.FDATASYNC_ONCE;
+        else if (Strings.equal(name, MappedFileSync.MSYNC_PER_RUN.arg)) SieveBenchConfig.boundary = MappedFileSync.MSYNC_PER_RUN;
+        else if (Strings.equal(name, MappedFileSync.LEGACY_RANGE_MSYNC.arg)) SieveBenchConfig.boundary = MappedFileSync.LEGACY_RANGE_MSYNC;
         else return false;
         return true;
 }
 
-// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+// What X86_64CacheControl.writeBackLine() resolves to here, in its order.
 def cpuidWriteback() -> string {
         if (Target.supportsClwb()) return "CLWB";
         if (Target.supportsClflushOpt()) return "CLFLUSHOPT";
@@ -808,7 +808,7 @@ def main(args: Array<string>) -> int {
                 System.puts("writeback= applies only to the pmem backend\n");
                 return 2;
         }
-        if (SieveBenchConfig.boundary != FileBoundary.FDATASYNC && SieveBenchConfig.backend != SieveBenchBackend.FILE) {
+        if (SieveBenchConfig.boundary != MappedFileSync.FDATASYNC_ONCE && SieveBenchConfig.backend != SieveBenchBackend.FILE) {
                 System.puts("boundary= applies only to the file backend\n");
                 return 2;
         }

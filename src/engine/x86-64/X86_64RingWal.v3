@@ -1,4 +1,6 @@
-// Multi-Transaction Redo WAL
+// Ring redo WAL (RingWal): transaction records in a ring behind two
+// superblocks. Kept for comparison with TwoSlotWal; the record layouts both
+// share are in X86_64WalRecord.v3.
 
 layout WalSuperblock {
         +0      magic:                  u64;    // Constant signature identifying this as a WAL superblock
@@ -12,30 +14,7 @@ layout WalSuperblock {
         =64;
 }
 
-layout TxnRecordHeader {
-        +0      magic:          u64;    // Constant signature identifying the start of a transaction record
-        +8      version:        u16;    // Transaction-record format version. Used to reject incompatible record layouts
-        +16     headerSize:     u16;    // Size of this header in bytes
-        +24     entrySize:      u16;    // Size of each redo entry. Expected to match LogEntry.size
-        +32     recordLen:      u32;    // Total aligned record length: header + entries + commit trailer + padding
-        +40     entryCount:     u32;    // Number of redo entries immediately following this trailer
-        +48     logEpoch:       u64;    // WAL epoch this record belongs to. Must match the current superblock epoch
-        +56     txnSeq:         u64;    // Transaction sequence number. Defines commit order and recovery replay order
-        =64;
-}
-
-layout TxnCommitTrailer {
-        +0      magic:          u64;    // Constant signature identifying the commit trailer
-        +8      recordLen:      u32;    // Must match TxnRecordHeader.recordLen
-        +16     entryCount:     u32;    // Must match TxnRecordHeader.entryCount
-        +24     logEpoch:       u64;    // Must match both the record header and current superblock epoch
-        +32     txnSeq:         u64;    // Must match the record header
-        +40     checksum:       u64;    // Checksum for the complete transaction record.
-                                        // Computed over header, entries, trailer fields except this checksum
-        =48;
-}
-
-component MultiTxnWalConstants {
+component RingWalLayout {
         def SUPER_MAGIC = 0x5741_4c53_5550_4552_u64; // "WALSUPER"
         def RECORD_MAGIC = 0x5741_4c54_584e_4844_u64; // "WALTXNHD"
         def TRAILER_MAGIC = 0x5741_4c54_584e_434d_u64; // "WALTXNCM"
@@ -57,29 +36,27 @@ component MultiTxnWalConstants {
         def CHECKPOINT_FILL_EXPENSIVE = 50u64;
 }
 
-type WalPendingEntry(offset: u64, value: u64, width: u8) #unboxed { }
-
 type WalActiveRecord(txnSeq: u64, startOffset: u64, recordLen: u32, entryCount: u32) #unboxed { }
 
-// Outcome of MultiTxnWal.recover(). A caller must be able to distinguish an
+// Outcome of RingWal.recover(). A caller must be able to distinguish an
 // ordinary clean mount from an unusable log or a replay that was not made
 // durable.
-enum MultiWalRecovery {
+enum RingWalRecovery {
         CLEAN,          // no contiguous committed records needed replay
         REPLAYED,       // committed records were replayed and made durable
         CORRUPT,        // no valid superblock could be opened
         PERSIST_FAILED  // replay/epoch publication did not reach durability
 }
 
-class MultiTxnWal {
+class RingWal {
         def regionStart: u64;
-        def logChunkAddr: u64;
-        def var logChunkSize: u64;
-        def backendRegion: BackendRegion;
+        def logBlockAddr: u64;
+        def var logBlockSize: u64;
+        def backendRegion: StorageRegion;
 
         def var ringBase: u64;
         def var ringBytes: u64;
-        def var logChunkOffset: u64;
+        def var logBlockOffset: u64;
         def var currentGeneration: u64 = 0;
         def var currentSuperblockIndex = 0;
         def var nextSuperblockIndex = 1;
@@ -90,30 +67,30 @@ class MultiTxnWal {
         def var appliedSeqVolatile: u64 = 0;    // Highest sequence applied to region memory
         def var activeRecords = Vector<WalActiveRecord>.new();
         def var activeBytes: u64 = 0;           // Running sum of recordLen over activeRecords; drives the occupancy watermark
-        def var checkpointTxnThreshold: u64 = MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE;
-        def var checkpointFillPercent: u64 = MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE;
+        def var checkpointTxnThreshold: u64 = RingWalLayout.CHECKPOINT_TXN_EXPENSIVE;
+        def var checkpointFillPercent: u64 = RingWalLayout.CHECKPOINT_FILL_EXPENSIVE;
         def var poisoned = false;               // An invalid append poisoned the pending transaction
         private def pendingEntries = Vector<WalPendingEntry>.new();
         private var recoveryRequired = false;   // A failed compensating persist made the durable record indeterminate
         def var openOk = false;
 
-        new(regionStart, logChunkAddr, blockSize: u64, backendRegion, initializeFresh: bool) {
-                logChunkSize = blockSize;
-                logChunkOffset = logChunkAddr - regionStart;
-                ringBase = logChunkAddr + 2u64 * u64.!(WalSuperblock.size);
+        new(regionStart, logBlockAddr, blockSize: u64, backendRegion, mode: OpenMode) {
+                logBlockSize = blockSize;
+                logBlockOffset = logBlockAddr - regionStart;
+                ringBase = logBlockAddr + 2u64 * u64.!(WalSuperblock.size);
                 ringBytes = blockSize - 2u64 * u64.!(WalSuperblock.size);
                 activeRecords = Vector<WalActiveRecord>.new();
                 if (backendRegion == null) {
-                        Trace.OUT.puts("multi-transaction WAL requires a backend region").ln();
+                        Trace.OUT.puts("ring WAL requires a backend region").ln();
                         return;
                 }
                 configureCheckpointPolicy();
-                if (initializeFresh) {
+                if (mode == OpenMode.FORMAT) {
                         initializeSuperblocks();
                 } else {
                         openOk = loadSuperblock();
                         if (!openOk) {
-                                Trace.OUT.puts("corrupt multi-transaction WAL superblocks").ln();
+                                Trace.OUT.puts("corrupt ring WAL superblocks").ln();
                         }
                 }
         }
@@ -151,10 +128,10 @@ class MultiTxnWal {
 
         // --- Data application ---
 
-        def applyUpdate(offset: u64, value: u64, width: u8) {
+        def applyAfterImage(offset: u64, value: u64, width: u8) {
                 if (recoveryRequired || !openOk || !validEntryFields(offset, width)) return;
                 writeAfterImage(offset, value, width);
-                backendRegion.prepareChangedRange(offset, u64.view(width));
+                backendRegion.writeBack(offset, u64.view(width));
         }
 
         def noteApplied(txnSeq: u64) {
@@ -181,16 +158,16 @@ class MultiTxnWal {
                 def cost = backendRegion.checkpointCost();
                 match (cost) {
                         FREE => {
-                                checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_FREE;
-                                checkpointFillPercent = MultiTxnWalConstants.CHECKPOINT_FILL_FREE;
+                                checkpointTxnThreshold = RingWalLayout.CHECKPOINT_TXN_FREE;
+                                checkpointFillPercent = RingWalLayout.CHECKPOINT_FILL_FREE;
                         }
                         CHEAP => {
-                                checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_CHEAP;
-                                checkpointFillPercent = MultiTxnWalConstants.CHECKPOINT_FILL_CHEAP;
+                                checkpointTxnThreshold = RingWalLayout.CHECKPOINT_TXN_CHEAP;
+                                checkpointFillPercent = RingWalLayout.CHECKPOINT_FILL_CHEAP;
                         }
                         EXPENSIVE => {
-                                checkpointTxnThreshold = MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE;
-                                checkpointFillPercent = MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE;
+                                checkpointTxnThreshold = RingWalLayout.CHECKPOINT_TXN_EXPENSIVE;
+                                checkpointFillPercent = RingWalLayout.CHECKPOINT_FILL_EXPENSIVE;
                         }
                 }
         }
@@ -202,7 +179,7 @@ class MultiTxnWal {
                 // Checkpoint ordering is the durable-data boundary: all after-images
                 // up to targetSeq must reach the backend before the superblock
                 // publishes durableAppliedSeq.
-                if (!backendRegion.persistChanges()) return false;
+                if (!backendRegion.drain()) return false;
                 if (!writeSuperblock(targetSeq, logEpoch)) return false;
                 durableAppliedSeq = targetSeq;
                 reclaimAppliedRecords();
@@ -223,46 +200,46 @@ class MultiTxnWal {
                 def recordLen64 = alignedRecordLen(entryCount);
                 if (recordLen64 > ringBytes) return 0u64;
                 var start = reserveRecord(recordLen64);
-                if (start == MultiTxnWalConstants.NO_OFFSET) {
+                if (start == RingWalLayout.NO_OFFSET) {
                         checkpoint(appliedSeqVolatile);
                         start = reserveRecord(recordLen64);
-                        if (start == MultiTxnWalConstants.NO_OFFSET) return 0u64;
+                        if (start == RingWalLayout.NO_OFFSET) return 0u64;
                 }
 
                 def txnSeq = nextTxnSeq;
                 def absStart = ringBase + start;
                 zeroBytes(absStart, recordLen64);
 
-                recordStoreU64(absStart, TxnRecordHeader.magic.offset, MultiTxnWalConstants.RECORD_MAGIC);
-                recordStoreU16(absStart, TxnRecordHeader.version.offset, MultiTxnWalConstants.RECORD_VERSION);
-                recordStoreU16(absStart, TxnRecordHeader.headerSize.offset, u16.!(TxnRecordHeader.size));
-                recordStoreU16(absStart, TxnRecordHeader.entrySize.offset, u16.!(LogEntry.size));
-                recordStoreU32(absStart, TxnRecordHeader.recordLen.offset, u32.!(recordLen64));
-                recordStoreU32(absStart, TxnRecordHeader.entryCount.offset, entryCount);
-                recordStoreU64(absStart, TxnRecordHeader.logEpoch.offset, logEpoch);
-                recordStoreU64(absStart, TxnRecordHeader.txnSeq.offset, txnSeq);
+                recordStoreU64(absStart, WalRecordHeader.magic.offset, RingWalLayout.RECORD_MAGIC);
+                recordStoreU16(absStart, WalRecordHeader.version.offset, RingWalLayout.RECORD_VERSION);
+                recordStoreU16(absStart, WalRecordHeader.headerSize.offset, u16.!(WalRecordHeader.size));
+                recordStoreU16(absStart, WalRecordHeader.entrySize.offset, u16.!(WalEntry.size));
+                recordStoreU32(absStart, WalRecordHeader.recordLen.offset, u32.!(recordLen64));
+                recordStoreU32(absStart, WalRecordHeader.entryCount.offset, entryCount);
+                recordStoreU64(absStart, WalRecordHeader.logEpoch.offset, logEpoch);
+                recordStoreU64(absStart, WalRecordHeader.txnSeq.offset, txnSeq);
 
-                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                var entryAddr = absStart + u64.!(WalRecordHeader.size);
                 for (i < entries.length) {
                         def e = entries[i];
-                        recordStoreU64(entryAddr, LogEntry.offset.offset, e.offset);
-                        recordStoreU64(entryAddr, LogEntry.value.offset, e.value);
-                        recordStoreU8(entryAddr, LogEntry.width.offset, e.width);
-                        entryAddr += u64.!(LogEntry.size);
+                        recordStoreU64(entryAddr, WalEntry.offset.offset, e.offset);
+                        recordStoreU64(entryAddr, WalEntry.value.offset, e.value);
+                        recordStoreU8(entryAddr, WalEntry.width.offset, e.width);
+                        entryAddr += u64.!(WalEntry.size);
                 }
 
-                def trailerAddr = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.magic.offset, MultiTxnWalConstants.TRAILER_MAGIC);
-                recordStoreU32(trailerAddr, TxnCommitTrailer.recordLen.offset, u32.!(recordLen64));
-                recordStoreU32(trailerAddr, TxnCommitTrailer.entryCount.offset, entryCount);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.logEpoch.offset, logEpoch);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.txnSeq.offset, txnSeq);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, 0u64);
-                recordStoreU64(trailerAddr, TxnCommitTrailer.checksum.offset, computeRecordChecksum(absStart, recordLen64));
+                def trailerAddr = absStart + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size);
+                recordStoreU64(trailerAddr, WalRecordTrailer.magic.offset, RingWalLayout.TRAILER_MAGIC);
+                recordStoreU32(trailerAddr, WalRecordTrailer.recordLen.offset, u32.!(recordLen64));
+                recordStoreU32(trailerAddr, WalRecordTrailer.entryCount.offset, entryCount);
+                recordStoreU64(trailerAddr, WalRecordTrailer.logEpoch.offset, logEpoch);
+                recordStoreU64(trailerAddr, WalRecordTrailer.txnSeq.offset, txnSeq);
+                recordStoreU64(trailerAddr, WalRecordTrailer.checksum.offset, 0u64);
+                recordStoreU64(trailerAddr, WalRecordTrailer.checksum.offset, computeRecordChecksum(absStart, recordLen64));
 
-                // The WAL persistRange is the transaction commit point. Region data
+                // The WAL persist is the transaction commit point. Region data
                 // is applied only after this contiguous record is durable.
-                if (!backendRegion.persistRange(absStart - regionStart, recordLen64)) {
+                if (!backendRegion.persist(absStart - regionStart, recordLen64)) {
                         // The fully-written record must not survive the failure: a
                         // retry reuses this txnSeq, and two valid records with the
                         // same sequence let recovery replay the failed attempt's
@@ -274,8 +251,8 @@ class MultiTxnWal {
                         // a skipped seq is a gap that recovery treats as the end of
                         // the committed prefix, which would abandon later
                         // acknowledged transactions.
-                        recordStoreU64(absStart, TxnRecordHeader.magic.offset, 0u64);
-                        def scrubPersisted = backendRegion.persistRange(absStart - regionStart, u64.!(TxnRecordHeader.size));
+                        recordStoreU64(absStart, WalRecordHeader.magic.offset, 0u64);
+                        def scrubPersisted = backendRegion.persist(absStart - regionStart, u64.!(WalRecordHeader.size));
                         headOffset = start;
                         if (!scrubPersisted) recoveryRequired = true;
                         return 0u64;
@@ -288,7 +265,7 @@ class MultiTxnWal {
         }
 
         private def reserveRecord(recordLen: u64) -> u64 {
-                if (recordLen > ringBytes) return MultiTxnWalConstants.NO_OFFSET;
+                if (recordLen > ringBytes) return RingWalLayout.NO_OFFSET;
                 if (headOffset + recordLen <= ringBytes && rangeFree(headOffset, recordLen)) {
                         def start = headOffset;
                         headOffset = headOffset + recordLen;
@@ -300,7 +277,7 @@ class MultiTxnWal {
                         if (headOffset >= ringBytes) headOffset = 0u64;
                         return 0u64;
                 }
-                return MultiTxnWalConstants.NO_OFFSET;
+                return RingWalLayout.NO_OFFSET;
         }
 
         private def rangeFree(start: u64, len: u64) -> bool {
@@ -332,26 +309,26 @@ class MultiTxnWal {
         // --- Read (cache-miss fallthrough) ---
 
         def readU8(offset: u64) -> u8 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u8>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<u8>();
         }
 
         def readI16(offset: u64) -> i16 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i16>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<i16>();
         }
 
         def readU64(offset: u64) -> u64 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u64>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<u64>();
         }
 
         def readI64(offset: u64) -> i64 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i64>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<i64>();
         }
 
         // --- Recovery ---
 
-        def recover() -> MultiWalRecovery {
-                if (recoveryRequired) return MultiWalRecovery.PERSIST_FAILED;
-                if (!openOk) return MultiWalRecovery.CORRUPT;
+        def recover() -> RingWalRecovery {
+                if (recoveryRequired) return RingWalRecovery.PERSIST_FAILED;
+                if (!openOk) return RingWalRecovery.CORRUPT;
                 def candidates = scanCommittedRecords();
                 def selected = selectContiguousPrefix(candidates);
                 if (selected.length == 0) {
@@ -361,7 +338,7 @@ class MultiTxnWal {
                                 // writeSuperblock publishes the new epoch and adopts it
                                 // (and the new generation) in memory on success.
                                 if (!writeSuperblock(durableAppliedSeq, logEpoch + 1u64)) {
-                                        return MultiWalRecovery.PERSIST_FAILED;
+                                        return RingWalRecovery.PERSIST_FAILED;
                                 }
                         }
                         nextTxnSeq = durableAppliedSeq + 1u64;
@@ -369,7 +346,7 @@ class MultiTxnWal {
                         headOffset = 0u64;
                         activeRecords.resize(0);
                         activeBytes = 0u64;
-                        return MultiWalRecovery.CLEAN;
+                        return RingWalRecovery.CLEAN;
                 }
 
                 for (i < selected.length) {
@@ -380,25 +357,25 @@ class MultiTxnWal {
                 // Recovery publishes the replay only after persisted data reaches
                 // the backend. The epoch bump makes stale current-epoch records
                 // impossible to replay again after this checkpoint.
-                if (!backendRegion.persistChanges()) return MultiWalRecovery.PERSIST_FAILED;
+                if (!backendRegion.drain()) return RingWalRecovery.PERSIST_FAILED;
                 def recoveredMaxSeq = selected[selected.length - 1].txnSeq;
-                if (!writeSuperblock(recoveredMaxSeq, logEpoch + 1u64)) return MultiWalRecovery.PERSIST_FAILED;
+                if (!writeSuperblock(recoveredMaxSeq, logEpoch + 1u64)) return RingWalRecovery.PERSIST_FAILED;
                 durableAppliedSeq = recoveredMaxSeq;
                 appliedSeqVolatile = durableAppliedSeq;
                 nextTxnSeq = durableAppliedSeq + 1u64;
                 headOffset = 0u64;
                 activeRecords.resize(0);
                 activeBytes = 0u64;
-                return MultiWalRecovery.REPLAYED;
+                return RingWalRecovery.REPLAYED;
         }
 
         private def scanCommittedRecords() -> Vector<WalActiveRecord> {
                 var records = Vector<WalActiveRecord>.new();
                 var off = 0u64;
-                while (off + u64.!(TxnRecordHeader.size) <= ringBytes) {
+                while (off + u64.!(WalRecordHeader.size) <= ringBytes) {
                         var rec = validateRecord(off);
                         if (rec.txnSeq != 0u64) records.put(rec);
-                        off += MultiTxnWalConstants.ALIGNMENT;
+                        off += RingWalLayout.ALIGNMENT;
                 }
                 return records;
         }
@@ -424,13 +401,13 @@ class MultiTxnWal {
         }
 
         private def redoRecord(rec: WalActiveRecord) {
-                var entryAddr = ringBase + rec.startOffset + u64.!(TxnRecordHeader.size);
+                var entryAddr = ringBase + rec.startOffset + u64.!(WalRecordHeader.size);
                 for (i < rec.entryCount) {
-                        applyUpdate(
-                                recordLoadU64(entryAddr, LogEntry.offset.offset),
-                                recordLoadU64(entryAddr, LogEntry.value.offset),
-                                recordLoadU8(entryAddr, LogEntry.width.offset));
-                        entryAddr += u64.!(LogEntry.size);
+                        applyAfterImage(
+                                recordLoadU64(entryAddr, WalEntry.offset.offset),
+                                recordLoadU64(entryAddr, WalEntry.value.offset),
+                                recordLoadU8(entryAddr, WalEntry.width.offset));
+                        entryAddr += u64.!(WalEntry.size);
                 }
         }
 
@@ -448,7 +425,7 @@ class MultiTxnWal {
                 def firstPersisted = writeSuperblockCopy(0, 1u64, logEpoch, durableAppliedSeq);
                 def secondPersisted = writeSuperblockCopy(1, 2u64, logEpoch, durableAppliedSeq);
                 if (!firstPersisted || !secondPersisted) {
-                        Trace.OUT.puts("failed to persist fresh multi-transaction WAL superblocks").ln();
+                        Trace.OUT.puts("failed to persist fresh ring WAL superblocks").ln();
                         return;
                 }
                 currentGeneration = 2u64;
@@ -481,8 +458,8 @@ class MultiTxnWal {
         }
 
         def validateSuperblock(index: int) -> bool {
-                if (superblockLoadU64(index, WalSuperblock.magic.offset) != MultiTxnWalConstants.SUPER_MAGIC) return false;
-                if (superblockLoadU32(index, WalSuperblock.version.offset) != MultiTxnWalConstants.VERSION) return false;
+                if (superblockLoadU64(index, WalSuperblock.magic.offset) != RingWalLayout.SUPER_MAGIC) return false;
+                if (superblockLoadU32(index, WalSuperblock.version.offset) != RingWalLayout.VERSION) return false;
                 if (superblockLoadU64(index, WalSuperblock.superblockSize.offset) != u64.!(WalSuperblock.size)) return false;
                 if (superblockLoadU64(index, WalSuperblock.reserved.offset) != 0u64) return false;
                 return superblockLoadU64(index, WalSuperblock.checksum.offset) == computeSuperblockChecksum(index);
@@ -500,56 +477,56 @@ class MultiTxnWal {
 
         private def writeSuperblockCopy(index: int, generation: u64, epoch: u64, durableSeq: u64) -> bool {
                 zeroBytes(superblockAddr(index), u64.!(WalSuperblock.size));
-                superblockStoreU64(index, WalSuperblock.magic.offset, MultiTxnWalConstants.SUPER_MAGIC);
-                superblockStoreU32(index, WalSuperblock.version.offset, MultiTxnWalConstants.VERSION);
+                superblockStoreU64(index, WalSuperblock.magic.offset, RingWalLayout.SUPER_MAGIC);
+                superblockStoreU32(index, WalSuperblock.version.offset, RingWalLayout.VERSION);
                 superblockStoreU64(index, WalSuperblock.superblockSize.offset, u64.!(WalSuperblock.size));
                 superblockStoreU64(index, WalSuperblock.generation.offset, generation);
                 superblockStoreU64(index, WalSuperblock.logEpoch.offset, epoch);
                 superblockStoreU64(index, WalSuperblock.durableAppliedSeq.offset, durableSeq);
                 superblockStoreU64(index, WalSuperblock.reserved.offset, 0u64);
                 superblockStoreU64(index, WalSuperblock.checksum.offset, computeSuperblockChecksum(index));
-                return backendRegion.persistRange(superblockAddr(index) - regionStart, u64.!(WalSuperblock.size));
+                return backendRegion.persist(superblockAddr(index) - regionStart, u64.!(WalSuperblock.size));
         }
 
         private def validateRecord(offset: u64) -> WalActiveRecord {
                 var invalid = WalActiveRecord(0u64, 0u64, 0u32, 0u32);
                 def absStart = ringBase + offset;
-                def recordLen = recordLoadU32(absStart, TxnRecordHeader.recordLen.offset);
-                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
-                def recordEpoch = recordLoadU64(absStart, TxnRecordHeader.logEpoch.offset);
-                def txnSeq = recordLoadU64(absStart, TxnRecordHeader.txnSeq.offset);
-                if (recordLoadU64(absStart, TxnRecordHeader.magic.offset) != MultiTxnWalConstants.RECORD_MAGIC) return invalid;
-                if (recordLoadU16(absStart, TxnRecordHeader.version.offset) != MultiTxnWalConstants.RECORD_VERSION) return invalid;
-                if (recordLoadU16(absStart, TxnRecordHeader.headerSize.offset) != u16.!(TxnRecordHeader.size)) return invalid;
-                if (recordLoadU16(absStart, TxnRecordHeader.entrySize.offset) != u16.!(LogEntry.size)) return invalid;
-                if (recordLen < u32.!(TxnRecordHeader.size + TxnCommitTrailer.size)) return invalid;
-                if (u64.view(recordLen) % MultiTxnWalConstants.ALIGNMENT != 0u64) return invalid;
+                def recordLen = recordLoadU32(absStart, WalRecordHeader.recordLen.offset);
+                def entryCount = recordLoadU32(absStart, WalRecordHeader.entryCount.offset);
+                def recordEpoch = recordLoadU64(absStart, WalRecordHeader.logEpoch.offset);
+                def txnSeq = recordLoadU64(absStart, WalRecordHeader.txnSeq.offset);
+                if (recordLoadU64(absStart, WalRecordHeader.magic.offset) != RingWalLayout.RECORD_MAGIC) return invalid;
+                if (recordLoadU16(absStart, WalRecordHeader.version.offset) != RingWalLayout.RECORD_VERSION) return invalid;
+                if (recordLoadU16(absStart, WalRecordHeader.headerSize.offset) != u16.!(WalRecordHeader.size)) return invalid;
+                if (recordLoadU16(absStart, WalRecordHeader.entrySize.offset) != u16.!(WalEntry.size)) return invalid;
+                if (recordLen < u32.!(WalRecordHeader.size + WalRecordTrailer.size)) return invalid;
+                if (u64.view(recordLen) % RingWalLayout.ALIGNMENT != 0u64) return invalid;
                 if (offset + u64.view(recordLen) > ringBytes) return invalid;
 
-                def trailerAddr = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
-                if (trailerAddr + u64.!(TxnCommitTrailer.size) > absStart + u64.view(recordLen)) return invalid;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.magic.offset) != MultiTxnWalConstants.TRAILER_MAGIC) return invalid;
-                if (recordLoadU32(trailerAddr, TxnCommitTrailer.recordLen.offset) != recordLen) return invalid;
-                if (recordLoadU32(trailerAddr, TxnCommitTrailer.entryCount.offset) != entryCount) return invalid;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.logEpoch.offset) != recordEpoch) return invalid;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.txnSeq.offset) != txnSeq) return invalid;
+                def trailerAddr = absStart + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size);
+                if (trailerAddr + u64.!(WalRecordTrailer.size) > absStart + u64.view(recordLen)) return invalid;
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.magic.offset) != RingWalLayout.TRAILER_MAGIC) return invalid;
+                if (recordLoadU32(trailerAddr, WalRecordTrailer.recordLen.offset) != recordLen) return invalid;
+                if (recordLoadU32(trailerAddr, WalRecordTrailer.entryCount.offset) != entryCount) return invalid;
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.logEpoch.offset) != recordEpoch) return invalid;
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.txnSeq.offset) != txnSeq) return invalid;
                 if (recordEpoch != logEpoch) return invalid;
                 if (txnSeq <= durableAppliedSeq) return invalid;
-                if (recordLoadU64(trailerAddr, TxnCommitTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return invalid;
+                if (recordLoadU64(trailerAddr, WalRecordTrailer.checksum.offset) != computeRecordChecksum(absStart, u64.view(recordLen))) return invalid;
 
-                var entryAddr = absStart + u64.!(TxnRecordHeader.size);
+                var entryAddr = absStart + u64.!(WalRecordHeader.size);
                 for (i < entryCount) {
                         if (!validEntryFields(
-                                recordLoadU64(entryAddr, LogEntry.offset.offset),
-                                recordLoadU8(entryAddr, LogEntry.width.offset))) return invalid;
-                        entryAddr += u64.!(LogEntry.size);
+                                recordLoadU64(entryAddr, WalEntry.offset.offset),
+                                recordLoadU8(entryAddr, WalEntry.width.offset))) return invalid;
+                        entryAddr += u64.!(WalEntry.size);
                 }
                 return WalActiveRecord(txnSeq, offset, recordLen, entryCount);
         }
 
         private def alignedRecordLen(entryCount: u32) -> u64 {
-                def raw = u64.!(TxnRecordHeader.size + TxnCommitTrailer.size) + u64.view(entryCount) * u64.!(LogEntry.size);
-                return alignUp(raw, MultiTxnWalConstants.ALIGNMENT);
+                def raw = u64.!(WalRecordHeader.size + WalRecordTrailer.size) + u64.view(entryCount) * u64.!(WalEntry.size);
+                return alignUp(raw, RingWalLayout.ALIGNMENT);
         }
 
         private def alignUp(n: u64, alignment: u64) -> u64 {
@@ -562,14 +539,14 @@ class MultiTxnWal {
                 def regionSize = u64.!(backendRegion.range.length);
                 if (offset > regionSize || size > regionSize - offset) return false;
                 def end = offset + size;
-                def walStart = logChunkOffset;
-                def walEnd = logChunkOffset + logChunkSize;
+                def walStart = logBlockOffset;
+                def walEnd = logBlockOffset + logBlockSize;
                 if (offset < walEnd && walStart < end) return false;
                 return true;
         }
 
         private def writeAfterImage(offset: u64, value: u64, width: u8) {
-                def addr = PWRegionUtils.pointerFromU64(regionStart + offset);
+                def addr = RegionUtils.pointerFromU64(regionStart + offset);
                 match (width) {
                         1 => addr.store<u8>(u8.view(value));
                         2 => addr.store<u16>(u16.view(value));
@@ -586,8 +563,8 @@ class MultiTxnWal {
         }
 
         private def computeRecordChecksum(absStart: u64, recordLen: u64) -> u64 {
-                def entryCount = recordLoadU32(absStart, TxnRecordHeader.entryCount.offset);
-                def skip = absStart + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+                def entryCount = recordLoadU32(absStart, WalRecordHeader.entryCount.offset);
+                def skip = absStart + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size) + u64.view(WalRecordTrailer.checksum.offset);
                 return checksumBytes(absStart, recordLen, skip, 8u64);
         }
 
@@ -599,7 +576,7 @@ class MultiTxnWal {
                 while (ptr < end) {
                         var b: u64 = 0u64;
                         if (!(ptr >= skipStart && ptr < skipEnd)) {
-                                b = u64.view(PWRegionUtils.pointerFromU64(ptr).load<u8>());
+                                b = u64.view(RegionUtils.pointerFromU64(ptr).load<u8>());
                         }
                         h = (h << 7) | (h >> 57);
                         h = (h ^ b) * 0x1000_0000_01B3_u64;
@@ -612,76 +589,76 @@ class MultiTxnWal {
                 var ptr = start;
                 def end = start + len;
                 while (ptr < end) {
-                        PWRegionUtils.pointerFromU64(ptr).store<u8>(0u8);
+                        RegionUtils.pointerFromU64(ptr).store<u8>(0u8);
                         ptr++;
                 }
         }
 
         def superblockAddr(index: int) -> u64 {
-                return logChunkAddr + u64.view(index) * u64.!(WalSuperblock.size);
+                return logBlockAddr + u64.view(index) * u64.!(WalSuperblock.size);
         }
 
         def superblockAt(index: int) -> Ref<WalSuperblock> {
-                return Ref<WalSuperblock>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(superblockAddr(index)), WalSuperblock.size));
+                return Ref<WalSuperblock>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(superblockAddr(index)), WalSuperblock.size));
         }
 
         private def superblockLoadU64(index: int, offset: int) -> u64 {
-                return PWRegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).load<u64>();
+                return RegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).load<u64>();
         }
 
         private def superblockLoadU32(index: int, offset: int) -> u32 {
-                return PWRegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).load<u32>();
+                return RegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).load<u32>();
         }
 
         private def superblockStoreU64(index: int, offset: int, value: u64) {
-                PWRegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).store<u64>(value);
+                RegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).store<u64>(value);
         }
 
         private def superblockStoreU32(index: int, offset: int, value: u32) {
-                PWRegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).store<u32>(value);
+                RegionUtils.pointerFromU64(superblockAddr(index) + u64.view(offset)).store<u32>(value);
         }
 
-        def recordHeaderAt(addr: u64) -> Ref<TxnRecordHeader> {
-                return Ref<TxnRecordHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), TxnRecordHeader.size));
+        def recordHeaderAt(addr: u64) -> Ref<WalRecordHeader> {
+                return Ref<WalRecordHeader>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(addr), WalRecordHeader.size));
         }
 
-        def commitTrailerAt(addr: u64) -> Ref<TxnCommitTrailer> {
-                return Ref<TxnCommitTrailer>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), TxnCommitTrailer.size));
+        def recordTrailerAt(addr: u64) -> Ref<WalRecordTrailer> {
+                return Ref<WalRecordTrailer>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(addr), WalRecordTrailer.size));
         }
 
-        def logEntryAt(addr: u64) -> Ref<LogEntry> {
-                return Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(addr), LogEntry.size));
+        def walEntryAt(addr: u64) -> Ref<WalEntry> {
+                return Ref<WalEntry>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(addr), WalEntry.size));
         }
 
         private def recordLoadU64(addr: u64, offset: int) -> u64 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u64>();
+                return RegionUtils.pointerFromU64(addr + u64.view(offset)).load<u64>();
         }
 
         private def recordLoadU32(addr: u64, offset: int) -> u32 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u32>();
+                return RegionUtils.pointerFromU64(addr + u64.view(offset)).load<u32>();
         }
 
         private def recordLoadU16(addr: u64, offset: int) -> u16 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u16>();
+                return RegionUtils.pointerFromU64(addr + u64.view(offset)).load<u16>();
         }
 
         private def recordLoadU8(addr: u64, offset: int) -> u8 {
-                return PWRegionUtils.pointerFromU64(addr + u64.view(offset)).load<u8>();
+                return RegionUtils.pointerFromU64(addr + u64.view(offset)).load<u8>();
         }
 
         private def recordStoreU64(addr: u64, offset: int, value: u64) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u64>(value);
+                RegionUtils.pointerFromU64(addr + u64.view(offset)).store<u64>(value);
         }
 
         private def recordStoreU32(addr: u64, offset: int, value: u32) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u32>(value);
+                RegionUtils.pointerFromU64(addr + u64.view(offset)).store<u32>(value);
         }
 
         private def recordStoreU16(addr: u64, offset: int, value: u16) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u16>(value);
+                RegionUtils.pointerFromU64(addr + u64.view(offset)).store<u16>(value);
         }
 
         private def recordStoreU8(addr: u64, offset: int, value: u8) {
-                PWRegionUtils.pointerFromU64(addr + u64.view(offset)).store<u8>(value);
+                RegionUtils.pointerFromU64(addr + u64.view(offset)).store<u8>(value);
         }
 }

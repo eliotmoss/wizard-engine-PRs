@@ -1,0 +1,34 @@
+// x86-64 factories for the shared RegionAllocator and ImmixRegionAllocator
+// logic: each opens an allocator over one backend, with the default block size.
+component RegionAllocators {
+	// Volatile memory
+	def inMemory(numBlocks: u64, metadataDescriptors: Range<Ref<MetadataDescriptor>>, mode: OpenMode) -> RegionAllocator {
+		return RegionAllocator.new(X86_64Backends.volatile(), numBlocks, metadataDescriptors, RegionDefaults.BlockSize, mode);
+	}
+
+	// Persistent memory: a DAX file mapped with MAP_SYNC
+	def onPmem(path: string, numBlocks: u64, metadataDescriptors: Range<Ref<MetadataDescriptor>>, mode: OpenMode) -> RegionAllocator {
+		return RegionAllocator.new(X86_64Backends.pmem(path), numBlocks, metadataDescriptors, RegionDefaults.BlockSize, mode);
+	}
+
+	// A shared mapping of a regular file
+	def onMappedFile(path: string, numBlocks: u64, metadataDescriptors: Range<Ref<MetadataDescriptor>>, mode: OpenMode) -> RegionAllocator {
+		return RegionAllocator.new(X86_64Backends.mappedFile(path), numBlocks, metadataDescriptors, RegionDefaults.BlockSize, mode);
+	}
+
+	// A DRAM staging buffer written back with O_DIRECT to a file or a raw
+	// block device
+	def onDirectIo(path: string, target: DirectIoTarget, numBlocks: u64, metadataDescriptors: Range<Ref<MetadataDescriptor>>, mode: OpenMode) -> RegionAllocator {
+		return RegionAllocator.new(DirectIoBackend.new(path, target), numBlocks, metadataDescriptors, RegionDefaults.BlockSize, mode);
+	}
+
+	// Immix line marks over volatile memory
+	def immixInMemory(numBlocks: u64, metadataDescriptors: Range<Ref<MetadataDescriptor>>, mode: OpenMode) -> ImmixRegionAllocator {
+		return ImmixRegionAllocator.new(X86_64Backends.volatile(), numBlocks, metadataDescriptors, RegionDefaults.BlockSize, mode);
+	}
+
+	// Immix line marks over persistent memory
+	def immixOnPmem(path: string, numBlocks: u64, metadataDescriptors: Range<Ref<MetadataDescriptor>>, mode: OpenMode) -> ImmixRegionAllocator {
+		return ImmixRegionAllocator.new(X86_64Backends.pmem(path), numBlocks, metadataDescriptors, RegionDefaults.BlockSize, mode);
+	}
+}

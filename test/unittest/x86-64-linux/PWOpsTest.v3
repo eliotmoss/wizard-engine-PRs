@@ -5,7 +5,7 @@
 // expectation is derived from the record the commit wrote (PWOpsRecord), and a
 // recovery is expected to write back one line per replayed entry. The hosts
 // with a DAX mount are not the hosts where the suite runs, so these tests
-// check the expectations here, on the production PmemMmapRegion boundary path
+// check the expectations here, on the production PmemRegion boundary path
 // over anonymous memory, recording every CLWB and SFENCE it issues.
 //
 // Geometry is the benchmark's: 256 x 4096 = 1 MiB.
@@ -24,16 +24,16 @@ def PWX = [
 	()
 ];
 
-// A PMEM region over anonymous memory that outlives its PWRegion: destroy()
+// A PMEM region over anonymous memory that outlives its RegionAllocator: close()
 // drops only the pending-writeback flag, as a crash or an unmount would, and
 // leaves the bytes for the next mount, as the file on a DAX mount would.
-class PWOpsTestRegion extends PmemMmapRegion {
+class PWOpsTestRegion extends PmemRegion {
 	var released = false;
 
 	new(mapping: Mapping) super(mapping, -1) { }
 
-	def destroy() {
-		cleanupBeforeDestroy();
+	def close() {
+		cleanupBeforeClose();
 	}
 
 	// The end of the test: nothing may touch the region afterwards.
@@ -46,14 +46,14 @@ class PWOpsTestRegion extends PmemMmapRegion {
 
 class PWOpsTester(t: Tester) {
 	var container: PWOpsTestRegion;
-	var recorder: RecordingPersistentOperations;
+	var recorder: RecordingProvider;
 
 	new() {
 		def mapping = Mmap.reserve(PWOPS_BLOCKS * PWOPS_BLOCK_SIZE, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return;
 		container = PWOpsTestRegion.new(mapping);
-		recorder = RecordingPersistentOperations.new(container.range);
-		container.setPersistentOperations(recorder);
+		recorder = RecordingProvider.new(container.range);
+		container.setProvider(recorder);
 	}
 
 	def ready() -> bool {
@@ -62,12 +62,12 @@ class PWOpsTester(t: Tester) {
 		return false;
 	}
 
-	def open(fresh: bool) -> PWRegion {
-		return PWRegion.new(PreparedRegionBackend.new(container), PWOPS_BLOCKS,
-			Array<Ref<MetaDataDesc>>.new(0), PWOPS_BLOCK_SIZE, fresh);
+	def open(fresh: bool) -> RegionAllocator {
+		return RegionAllocator.new(PreparedStorageBackend.new(container), PWOPS_BLOCKS,
+			Array<Ref<MetadataDescriptor>>.new(0), PWOPS_BLOCK_SIZE, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
 	}
 
-	def count(kind: PersistentEventKind) -> int {
+	def count(kind: PersistenceEventKind) -> int {
 		var n = 0;
 		for (i < recorder.events.length) if (recorder.events[i].kind == kind) n++;
 		return n;
@@ -80,24 +80,24 @@ class PWOpsTester(t: Tester) {
 
 // One allocation or free, as the benchmark times it: exactly one boundary, and
 // the record's lines plus each distinct after-image line written back.
-def checkOp(tc: PWOpsTester, region: PWRegion, what: string) -> PWOpsRecord {
+def checkOp(tc: PWOpsTester, region: RegionAllocator, what: string) -> PWOpsRecord {
 	def rec = PWOps.latestRecord(region);
 	if (rec == null) {
 		tc.t.fail1("%s: no valid record in the log", what);
 		return null;
 	}
-	if (tc.count(PersistentEventKind.SFENCE) != 1) {
-		tc.t.fail2("%s: %d fences, expected 1", what, tc.count(PersistentEventKind.SFENCE));
+	if (tc.count(PersistenceEventKind.SFENCE) != 1) {
+		tc.t.fail2("%s: %d fences, expected 1", what, tc.count(PersistenceEventKind.SFENCE));
 	}
-	if (tc.count(PersistentEventKind.CLWB) != rec.commitLines()) {
+	if (tc.count(PersistenceEventKind.CLWB) != rec.commitLines()) {
 		tc.t.fail3("%s: %d lines written back, the record predicts %d", what,
-			tc.count(PersistentEventKind.CLWB), rec.commitLines());
+			tc.count(PersistenceEventKind.CLWB), rec.commitLines());
 	}
 	return rec;
 }
 
-def checkInvariants(tc: PWOpsTester, region: PWRegion) {
-	def err = PersistentAllocatorInvariants.check(region);
+def checkInvariants(tc: PWOpsTester, region: RegionAllocator) {
+	def err = AllocatorInvariants.check(region);
 	if (err != null) tc.t.fail1("allocator invariants: %s", err);
 }
 
@@ -168,7 +168,7 @@ def test_pwops_alloc_free_reach_a_steady_state(tc: PWOpsTester) {
 	tc.release();
 }
 
-// RegionTransaction.commit() with nothing buffered returns before the WAL: no
+// TransactionCache.commit() with nothing buffered returns before the WAL: no
 // record, no store, no writeback, no fence.
 def test_pwops_empty_commit_issues_nothing(tc: PWOpsTester) {
 	if (!tc.ready()) return;
@@ -202,10 +202,10 @@ def test_pwops_clean_mount_issues_no_boundary(tc: PWOpsTester) {
 			tc.t.fail("could not mount");
 			return tc.release();
 		}
-		tc.t.assertz(true, mounted.lastRecovery == DualWalRecovery.CLEAN);
-		tc.t.asserti(0, tc.count(PersistentEventKind.CLWB));
-		tc.t.asserti(0, tc.count(PersistentEventKind.SFENCE));
-		tc.t.asserti(0, tc.count(PersistentEventKind.STORE));
+		tc.t.assertz(true, mounted.lastRecovery == WalRecovery.CLEAN);
+		tc.t.asserti(0, tc.count(PersistenceEventKind.CLWB));
+		tc.t.asserti(0, tc.count(PersistenceEventKind.SFENCE));
+		tc.t.asserti(0, tc.count(PersistenceEventKind.STORE));
 		tc.t.assertz(true, PWOps.latestRecord(mounted) == null);
 		mounted.deallocate();
 	}
@@ -242,14 +242,14 @@ def test_pwops_commit_unapplied_leaves_record_without_data(tc: PWOpsTester) {
 	tc.recorder.clear();
 	tc.t.assert_eq(1u64, PWOps.commitUnapplied(tc.container, PWOPS_BLOCK_SIZE, base, 8, 0x5A00u64));
 	// The commit point only: the record's lines and one fence, no data.
-	tc.t.asserti(1, tc.count(PersistentEventKind.SFENCE));
+	tc.t.asserti(1, tc.count(PersistenceEventKind.SFENCE));
 	for (i < 8) tc.t.assert_eq(0u64, loadU64(tc, base + u64.!(i) * 8u64));
-	tc.container.destroy();
+	tc.container.close();
 	tc.release();
 }
 
 // The recovery the benchmark times: a mount that replays one record of k
-// entries. DualTxnWal replays with applyUpdate(), which prepares each entry
+// entries. TwoSlotWal replays with applyAfterImage(), which prepares each entry
 // on its own, so k u64 entries are k writebacks even where they share lines,
 // then one fence. The cycle repeats with the same counts, as the benchmark
 // requires.
@@ -264,16 +264,16 @@ def test_pwops_recovery_replays_with_one_line_per_entry(tc: PWOpsTester) {
 				tc.t.fail1("could not commit an unapplied record of %d entries", k);
 				return tc.release();
 			}
-			tc.container.destroy();
+			tc.container.close();
 			tc.recorder.clear();
 			def mounted = tc.open(false);
 			if (mounted.txn == null) {
 				tc.t.fail("could not mount for recovery");
 				return tc.release();
 			}
-			tc.t.assertz(true, mounted.lastRecovery == DualWalRecovery.REPLAYED);
-			tc.t.asserti(k, tc.count(PersistentEventKind.CLWB));
-			tc.t.asserti(1, tc.count(PersistentEventKind.SFENCE));
+			tc.t.assertz(true, mounted.lastRecovery == WalRecovery.REPLAYED);
+			tc.t.asserti(k, tc.count(PersistenceEventKind.CLWB));
+			tc.t.asserti(1, tc.count(PersistenceEventKind.SFENCE));
 			for (i < k) tc.t.assert_eq(value + u64.!(i), loadU64(tc, base + u64.!(i) * 8u64));
 			checkInvariants(tc, mounted);
 			mounted.deallocate();
@@ -281,7 +281,7 @@ def test_pwops_recovery_replays_with_one_line_per_entry(tc: PWOpsTester) {
 	}
 	// The close after each replay scrubbed the record: the next mount is clean.
 	def clean = tc.open(false);
-	tc.t.assertz(true, clean.lastRecovery == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, clean.lastRecovery == WalRecovery.CLEAN);
 	clean.deallocate();
 	tc.release();
 }

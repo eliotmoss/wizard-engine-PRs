@@ -25,9 +25,9 @@ component PmemDaxTestConfig {
 				.putd(attempt)
 				.puts(".region")
 				.toString();
-			def fd = RegionFileIO.createExclusive(path);
+			def fd = BackingFile.createExclusive(path);
 			if (fd >= 0) {
-				RegionFileIO.close(fd);
+				BackingFile.close(fd);
 				return true;
 			}
 			if (fd != -LinuxConst.EEXIST) {
@@ -41,7 +41,7 @@ component PmemDaxTestConfig {
 
 	def cleanup() -> bool {
 		if (path != null) {
-			def removed = RegionFileIO.unlink(path);
+			def removed = BackingFile.unlink(path);
 			path = null;
 			return removed;
 		}

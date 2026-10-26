@@ -1,7 +1,7 @@
 // Durable bytes for the PMEM crash model: cache-line state, asynchronous
 // writeback completion, background eviction, and the crash images they produce.
 //
-// First slice of milestone 4 in docs/pmem-crash-model.md. A PersistentTrace is
+// First slice of milestone 4 in docs/pmem-crash-model.md. A PersistenceTrace is
 // the frozen record of what a scenario stored, flushed and fenced; this layer
 // is what those events mean for durability. The machine replays a trace against
 // volatile per-line state and exposes each writeback decision as an explicit
@@ -24,13 +24,13 @@
 // Still out of scope: enumerating every permitted schedule, deduplicating the
 // resulting states, and feeding images into real recovery (milestones 4-5).
 
-// A durable image as a property reads it. A PersistentDurableImage holds every
-// byte. A lazy search's views (X86_64PersistentLazyExplorer.v3) hold some bytes
+// A durable image as a property reads it. A CrashImage holds every
+// byte. A lazy search's views (X86_64ReadDrivenExplorer.v3) hold some bytes
 // only as marks that stand for the crash image's byte at the same offset, and
 // decide such a byte when something reads it, which can branch the search.
 // read(), sameBytes() and firstDifference() mean the same on both kinds: the
 // bytes of the image the view stands for.
-class PersistentImageView {
+class CrashImageView {
 	def size() -> int;
 
 	// Little-endian scalar read, matching the byte order the recorded stores
@@ -45,23 +45,23 @@ class PersistentImageView {
 
 	// The lazy search whose crash image this view's undecided bytes stand
 	// for, or null for a view that knows every byte.
-	def origin() -> PersistentLazySearch {
+	def origin() -> ReadDrivenSearch {
 		return null;
 	}
 
-	def sameBytes(that: PersistentImageView) -> bool {
-		return PersistentImageViews.sameBytes(this, that);
+	def sameBytes(that: CrashImageView) -> bool {
+		return CrashImageViews.sameBytes(this, that);
 	}
 
 	// Index of the first differing byte, or -1 when the images are equal. This
 	// is what a counterexample needs to say *where* two schedules diverged.
-	def firstDifference(that: PersistentImageView) -> int {
-		return PersistentImageViews.firstDifference(this, that);
+	def firstDifference(that: CrashImageView) -> int {
+		return CrashImageViews.firstDifference(this, that);
 	}
 }
 
-component PersistentImageViews {
-	def sameBytes(a: PersistentImageView, b: PersistentImageView) -> bool {
+component CrashImageViews {
+	def sameBytes(a: CrashImageView, b: CrashImageView) -> bool {
 		if (a == null || b == null || a.size() != b.size()) return false;
 		return firstDifference(a, b) < 0;
 	}
@@ -69,7 +69,7 @@ component PersistentImageViews {
 	// Byte by byte. Two undecided bytes of one search's crash image at the same
 	// offset are the same byte, so they compare equal without a decision; an
 	// undecided byte compared with a known one is decided first.
-	def firstDifference(a: PersistentImageView, b: PersistentImageView) -> int {
+	def firstDifference(a: CrashImageView, b: CrashImageView) -> int {
 		if (a == null || b == null) return 0;
 		def n = if(a.size() < b.size(), a.size(), b.size());
 		def origin = a.origin();
@@ -87,7 +87,7 @@ component PersistentImageViews {
 }
 
 // An immutable durable byte image: what a crash at some cut left behind.
-class PersistentDurableImage(bytes: Array<byte>) extends PersistentImageView {
+class CrashImage(bytes: Array<byte>) extends CrashImageView {
 
 	def size() -> int {
 		return bytes.length;
@@ -106,7 +106,7 @@ class PersistentDurableImage(bytes: Array<byte>) extends PersistentImageView {
 	def read(offset: u64, width: int) -> u64 {
 		def size = u64.!(bytes.length);
 		if (width < 0 || offset > size || u64.!(width) > size - offset) {
-			System.error("PersistentImageError", "durable read leaves the image");
+			System.error("CrashImageError", "durable read leaves the image");
 		}
 		var v = 0u64;
 		var i = width;
@@ -128,17 +128,17 @@ class PersistentDurableImage(bytes: Array<byte>) extends PersistentImageView {
 
 	// Against another durable image, a byte comparison; against a lazy view,
 	// the view decides the bytes it does not know.
-	def sameBytes(that: PersistentImageView) -> bool {
-		if (!PersistentDurableImage.?(that)) return PersistentImageViews.sameBytes(this, that);
-		def other = PersistentDurableImage.!(that);
+	def sameBytes(that: CrashImageView) -> bool {
+		if (!CrashImage.?(that)) return CrashImageViews.sameBytes(this, that);
+		def other = CrashImage.!(that);
 		if (other.bytes.length != bytes.length) return false;
 		for (i < bytes.length) if (bytes[i] != other.bytes[i]) return false;
 		return true;
 	}
 
-	def firstDifference(that: PersistentImageView) -> int {
-		if (!PersistentDurableImage.?(that)) return PersistentImageViews.firstDifference(this, that);
-		def other = PersistentDurableImage.!(that);
+	def firstDifference(that: CrashImageView) -> int {
+		if (!CrashImage.?(that)) return CrashImageViews.firstDifference(this, that);
+		def other = CrashImage.!(that);
 		def n = if(bytes.length < other.bytes.length, bytes.length, other.bytes.length);
 		for (i < n) if (bytes[i] != other.bytes[i]) return i;
 		if (bytes.length != other.bytes.length) return n;
@@ -180,8 +180,8 @@ class PersistentDurableImage(bytes: Array<byte>) extends PersistentImageView {
 // writeback request obliges the next fence to complete. Both counts index the
 // line's store list from the start, so a completed writeback never has to be
 // subtracted out of an outstanding request.
-class PersistentLineState(line: u64) {
-	def stores = Vector<PersistentTraceEvent>.new();
+class CrashLineState(line: u64) {
+	def stores = Vector<PersistenceEvent>.new();
 	var durableCount = 0;
 	var requiredCount = 0;
 }
@@ -190,9 +190,9 @@ class PersistentLineState(line: u64) {
 // durable and how many an outstanding writeback request owes the next fence.
 // The durable image is a function of this, so an exploration deduplicates on
 // states and materializes bytes only for the ones it reports.
-class PersistentMachineState(pos: int, durableCounts: Array<int>, requiredCounts: Array<int>) {
+class CrashModelState(pos: int, durableCounts: Array<int>, requiredCounts: Array<int>) {
 
-	def sameState(that: PersistentMachineState) -> bool {
+	def sameState(that: CrashModelState) -> bool {
 		if (that == null || that.pos != pos) return false;
 		if (that.durableCounts.length != durableCounts.length) return false;
 		for (i < durableCounts.length) {
@@ -222,21 +222,21 @@ class PersistentMachineState(pos: int, durableCounts: Array<int>, requiredCounts
 // at the current position would leave. Event execution is fixed by the trace;
 // every durability choice is a separate call, which is exactly the branching
 // point the explorer will enumerate.
-class PersistentCrashMachine {
-	def trace: PersistentTrace;
+class CrashModel {
+	def trace: PersistenceTrace;
 	private var initialBytes: Array<byte>;
 	private var durable: Array<byte>;
-	private var lineStates: Array<PersistentLineState>;
+	private var lineStates: Array<CrashLineState>;
 	private var pos = 0;
 
 	// {initial} is the region's durable content before the scenario ran; null
 	// means a zeroed region.
 	new(trace, initial: Array<byte>) {
-		initialBytes = PersistentImages.startingImage(trace.regionBytes, initial);
+		initialBytes = CrashImages.startingImage(trace.regionBytes, initial);
 		durable = Arrays.dup(initialBytes);
 		def touched = trace.touchedLines();
-		lineStates = Array<PersistentLineState>.new(touched.length);
-		for (i < touched.length) lineStates[i] = PersistentLineState.new(touched[i]);
+		lineStates = Array<CrashLineState>.new(touched.length);
+		for (i < touched.length) lineStates[i] = CrashLineState.new(touched[i]);
 	}
 
 	def length() -> int {
@@ -297,7 +297,7 @@ class PersistentCrashMachine {
 		return true;
 	}
 
-	// Execute events up to the crash cut {count}, clamped like PersistentTrace
+	// Execute events up to the crash cut {count}, clamped like PersistenceTrace
 	// prefixes so a walk over 0..length() needs no special cases. Never rewinds.
 	def runTo(count: int) {
 		var target = count;
@@ -358,26 +358,26 @@ class PersistentCrashMachine {
 	// durable bytes at prefix length p are its bytes before the scenario with
 	// stores 0..p-1 applied, so an explorer can compute them from these without
 	// a restore() per prefix.
-	def storeInLine(index: int, k: int) -> PersistentTraceEvent {
+	def storeInLine(index: int, k: int) -> PersistenceEvent {
 		return lineStates[index].stores[k];
 	}
 
 	// The machine's whole state: trace position plus the two per-line prefix
 	// lengths. The durable image is a function of these, so an exploration can
 	// enumerate states and materialize bytes only when it needs them.
-	def snapshot() -> PersistentMachineState {
+	def snapshot() -> CrashModelState {
 		def durableCounts = Array<int>.new(lineStates.length);
 		def requiredCounts = Array<int>.new(lineStates.length);
 		for (i < lineStates.length) {
 			durableCounts[i] = lineStates[i].durableCount;
 			requiredCounts[i] = lineStates[i].requiredCount;
 		}
-		return PersistentMachineState.new(pos, durableCounts, requiredCounts);
+		return CrashModelState.new(pos, durableCounts, requiredCounts);
 	}
 
 	// Return to a previously snapshotted state. The durable image is rebuilt
 	// from the pre-scenario bytes, since a writeback cannot be undone in place.
-	def restore(state: PersistentMachineState) {
+	def restore(state: CrashModelState) {
 		pos = 0;
 		for (i < lineStates.length) lineStates[i].stores.clear();
 		while (pos < state.pos) step();
@@ -392,11 +392,11 @@ class PersistentCrashMachine {
 
 	// The durable image a crash at the current position leaves behind: caches,
 	// store buffers, and outstanding writebacks are discarded.
-	def crash() -> PersistentDurableImage {
-		return PersistentDurableImage.new(Arrays.dup(durable));
+	def crash() -> CrashImage {
+		return CrashImage.new(Arrays.dup(durable));
 	}
 
-	private def drainTo(st: PersistentLineState, count: int) -> int {
+	private def drainTo(st: CrashLineState, count: int) -> int {
 		var target = count;
 		if (target > st.stores.length) target = st.stores.length;
 		while (st.durableCount < target) {
@@ -406,7 +406,7 @@ class PersistentCrashMachine {
 		return st.durableCount;
 	}
 
-	private def applyStore(e: PersistentTraceEvent) {
+	private def applyStore(e: PersistenceEvent) {
 		def offset = int.!(e.offset);
 		def width = int.view(e.width);
 		var v = e.value;
@@ -417,11 +417,11 @@ class PersistentCrashMachine {
 	}
 
 	private def lineOf(offset: u64) -> u64 {
-		return offset - offset % MmapRegionUtils.CACHE_LINE_SIZE;
+		return offset - offset % CacheLines.CACHE_LINE_SIZE;
 	}
 
 	// The line list is short (it is the trace's touched set) and ascending.
-	private def lookup(line: u64) -> PersistentLineState {
+	private def lookup(line: u64) -> CrashLineState {
 		var lo = 0;
 		var hi = lineStates.length - 1;
 		while (lo <= hi) {
@@ -435,7 +435,7 @@ class PersistentCrashMachine {
 	}
 }
 
-component PersistentImages {
+component CrashImages {
 	// The durable image a scenario starts from: {initial} truncated or
 	// zero-extended to the trace's region size, or all zeroes when null.
 	def startingImage(regionBytes: u64, initial: Array<byte>) -> Array<byte> {
@@ -449,16 +449,16 @@ component PersistentImages {
 	// Minimal outcome at a crash cut: no background eviction and no early
 	// writeback completion, so only what a fence obliged is durable. This is the
 	// weakest image recovery must still cope with.
-	def lazyCrash(trace: PersistentTrace, initial: Array<byte>, crashAfter: int) -> PersistentDurableImage {
-		def m = PersistentCrashMachine.new(trace, initial);
+	def lazyCrash(trace: PersistenceTrace, initial: Array<byte>, crashAfter: int) -> CrashImage {
+		def m = CrashModel.new(trace, initial);
 		m.runTo(crashAfter);
 		return m.crash();
 	}
 
 	// Maximal outcome at a crash cut: every dirty line is evicted at every event
 	// boundary, so every store issued before the crash survives.
-	def eagerCrash(trace: PersistentTrace, initial: Array<byte>, crashAfter: int) -> PersistentDurableImage {
-		def m = PersistentCrashMachine.new(trace, initial);
+	def eagerCrash(trace: PersistenceTrace, initial: Array<byte>, crashAfter: int) -> CrashImage {
+		def m = CrashModel.new(trace, initial);
 		var target = crashAfter;
 		if (target > trace.length()) target = trace.length();
 		while (m.position() < target) {

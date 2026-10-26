@@ -9,11 +9,11 @@
 // sensitivity has to come from the layer-1b explorer instead. One mutant run
 // through both layers turns that from an argument into a result.
 //
-// Only clwb() is overridden. Stores and sfence() behave exactly as in
+// Only writeBackLine() is overridden. Stores and fence() behave exactly as in
 // production, so a commit still returns success and the transaction is still
 // acknowledged -- which is precisely what makes the missing durability a
 // violation of the acknowledgement contract rather than a visible error. A
-// mutant that also broke sfence() would be a different and much cruder
+// mutant that also broke fence() would be a different and much cruder
 // experiment.
 //
 // Nothing here is reachable from a normal build: the providers are installed
@@ -22,32 +22,32 @@
 
 // Production path, for the hardware run: no native CLWB is ever issued, so
 // dirty lines reach the medium only through ordinary cache pressure.
-class ElidedWritebackOperations extends X86_64PersistentOperations {
+class ElidedWriteBackProvider extends NativeProvider {
 	new(range: Range<byte>) super(range) { }
 
-	def clwb(cacheLine: u64) { }
+	def writeBackLine(lineOffset: u64) { }
 }
 
 // Recording path, for the explorer: stores and fences are still recorded, but a
 // writeback emits no event. The resulting trace is one in which nothing was
 // ever explicitly flushed, so the model must fall back on background eviction
 // -- which it treats as permitted at each boundary, never guaranteed.
-class ElidedWritebackRecordingOperations extends RecordingPersistentOperations {
+class ElidedWriteBackRecordingProvider extends RecordingProvider {
 	new(range: Range<byte>) super(range) { }
 
-	def clwb(cacheLine: u64) { }
+	def writeBackLine(lineOffset: u64) { }
 }
 
 // A PMEM region whose writebacks are elided and whose remaining operations are
-// recorded. Mirrors RecordingPmemBackend in PersistentAllocatorTest.v3, which
+// recorded. Mirrors RecordingPmemBackend in AllocatorCrashTest.v3, which
 // is the ordinary-build half of the same comparison; the two must differ in the
 // provider and nothing else, or the experiment is not controlled.
-class ElidedWritebackPmemBackend extends TxnRegionBackend {
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+class ElidedWriteBackPmemBackend extends StorageBackend {
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
 		def mapping = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
-		def region = PmemMmapRegion.new(mapping, -1);
-		region.setPersistentOperations(ElidedWritebackRecordingOperations.new(region.range));
+		def region = PmemRegion.new(mapping, -1);
+		region.setProvider(ElidedWriteBackRecordingProvider.new(region.range));
 		return region;
 	}
 
@@ -62,19 +62,19 @@ class ElidedWritebackPmemBackend extends TxnRegionBackend {
 
 // Wrap an existing backend and elide its writebacks, leaving everything else --
 // the file, the MAP_SYNC mapping, the region class -- exactly as production
-// built it. The crash loop needs this rather than ElidedWritebackPmemBackend
-// above, because the point there is to run the real PmemMmapBackend on real
+// built it. The crash loop needs this rather than ElidedWriteBackPmemBackend
+// above, because the point there is to run the real PmemBackend on real
 // DAX and change only the provider.
 //
-// The swap has to happen here, inside create(). PWRegion resolves its provider
-// once in its constructor and DualTxnWal caches it likewise, so a provider
+// The swap has to happen here, inside open(). RegionAllocator resolves its provider
+// once in its constructor and TwoSlotWal caches it likewise, so a provider
 // installed after the region is built would elide the data-range writebacks and
 // leave the log's intact -- a half-mutant that would prove nothing either way.
-class ElidedWritebackBackend(inner: TxnRegionBackend) extends TxnRegionBackend {
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
-		def region = inner.create(size, prot, fresh);
+class ElidedWriteBackBackend(inner: StorageBackend) extends StorageBackend {
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		def region = inner.open(size, access, mode);
 		if (region == null) return null;
-		region.setPersistentOperations(ElidedWritebackOperations.new(region.range));
+		region.setProvider(ElidedWriteBackProvider.new(region.range));
 		return region;
 	}
 

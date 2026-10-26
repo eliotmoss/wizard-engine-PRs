@@ -10,10 +10,10 @@
 // makes the model possible.
 //
 // This file supplies the half of that measurement which does not need hardware.
-// It records the *same* sieve step as persistent_sieve:step_images_satisfy_sieve
-// and sweeps it with the *same* PersistentSieveProperty, changing exactly one
+// It records the *same* sieve step as sieve_crash:step_images_satisfy_sieve
+// and sweeps it with the *same* SieveProperty, changing exactly one
 // variable: the persistent-operation provider. The ordinary provider must hold;
-// the elided-writeback mutant (ElidedWritebackOps.v3) must be caught.
+// the elided-writeback mutant (ElidedWriteBackProvider.v3) must be caught.
 //
 // The mutant being caught here is what licenses the claim that the hardware run
 // passing it is a limitation of the hardware run rather than evidence of
@@ -22,7 +22,7 @@
 // leans on it is worth less -- which is the point of keeping this permanently
 // rather than running it once.
 
-def PCT = UnitTests.registerT("persistent_control:", _, PersistentControlTester.new, _);
+def PCT = UnitTests.registerT("crash_control:", _, CrashControlTester.new, _);
 def PCTX = [
 	PCT("mutant_trace_is_still_modelable",     test_pctl_mutant_trace_is_still_modelable),
 	PCT("mutant_records_no_writeback",         test_pctl_mutant_records_no_writeback),
@@ -31,8 +31,8 @@ def PCTX = [
 	()
 ];
 
-class PersistentControlTester(t: Tester) {
-	// Deliberately identical to PersistentSieveTester's geometry. The two files
+class CrashControlTester(t: Tester) {
+	// Deliberately identical to SieveCrashTester's geometry. The two files
 	// are the two rows of one comparison, so a difference here would make the
 	// rows incomparable.
 	def BLOCKS = 8u64;
@@ -41,20 +41,20 @@ class PersistentControlTester(t: Tester) {
 	def BUDGET = 64;
 
 	var mounted: Array<byte>;       // durable bytes before the recorded scenario
-	var region: PWRegion;
+	var region: RegionAllocator;
 	var sieve: PWSieve;
-	var recorder: RecordingPersistentOperations;
+	var recorder: RecordingProvider;
 
 	// {elide} selects the mutant backend. Everything else is the ordinary
 	// recording setup, so the provider is the only thing that varies.
 	def openSieve(elide: bool) -> bool {
-		var backend: TxnRegionBackend;
-		if (elide) backend = ElidedWritebackPmemBackend.new();
+		var backend: StorageBackend;
+		if (elide) backend = ElidedWriteBackPmemBackend.new();
 		else backend = RecordingPmemBackend.new();
-		region = PWRegion.new(backend, BLOCKS,
-			Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, true);
+		region = RegionAllocator.new(backend, BLOCKS,
+			Array<Ref<MetadataDescriptor>>.new(0), BLOCK_SIZE, OpenMode.FORMAT);
 		if (region.backendRegion == null) return false;
-		recorder = RecordingPersistentOperations.!(region.backendRegion.persistentOperations());
+		recorder = RecordingProvider.!(region.backendRegion.provider());
 		sieve = PWSieve.new(region, LIVE);
 		return sieve.open();
 	}
@@ -64,7 +64,7 @@ class PersistentControlTester(t: Tester) {
 		for (i < mounted.length) mounted[i] = region.rng[i];
 	}
 
-	def recordStep(name: string) -> PersistentTrace {
+	def recordStep(name: string) -> PersistenceTrace {
 		snapshotMounted();
 		recorder.clear();
 		if (!sieve.step()) {
@@ -76,7 +76,7 @@ class PersistentControlTester(t: Tester) {
 
 	// Open, record one step, and tear the region down. Returns null after
 	// failing the test, so every caller can simply return.
-	def recordOneStep(elide: bool, name: string) -> PersistentTrace {
+	def recordOneStep(elide: bool, name: string) -> PersistenceTrace {
 		if (!openSieve(elide)) {
 			t.fail("could not lay out a recording sieve");
 			return null;
@@ -86,8 +86,8 @@ class PersistentControlTester(t: Tester) {
 		return trace;
 	}
 
-	def sieveProperty(name: string) -> PersistentImageProperty {
-		return PersistentSieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).property(name);
+	def sieveProperty(name: string) -> CrashImageProperty {
+		return SieveProperty.new(BLOCKS, BLOCK_SIZE, LIVE).property(name);
 	}
 
 	def cleanup() {
@@ -103,7 +103,7 @@ class PersistentControlTester(t: Tester) {
 // the interesting test below could "catch" the mutant for the wrong reason --
 // an unmodelable trace rather than a durability hole -- and would keep passing
 // if the explorer lost its sensitivity entirely.
-def test_pctl_mutant_trace_is_still_modelable(tc: PersistentControlTester) {
+def test_pctl_mutant_trace_is_still_modelable(tc: CrashControlTester) {
 	def trace = tc.recordOneStep(true, "pwsieve_step_elided");
 	if (trace == null) return;
 
@@ -116,31 +116,31 @@ def test_pctl_mutant_trace_is_still_modelable(tc: PersistentControlTester) {
 // else untouched. Asserting the STORE and SFENCE counts *match* the ordinary
 // run is the part that matters -- it rules out a mutant that simply does less
 // work, which would fail the sweep below for uninteresting reasons.
-def test_pctl_mutant_records_no_writeback(tc: PersistentControlTester) {
+def test_pctl_mutant_records_no_writeback(tc: CrashControlTester) {
 	def ordinary = tc.recordOneStep(false, "pwsieve_step_ordinary");
 	if (ordinary == null) return;
 	def mutant = tc.recordOneStep(true, "pwsieve_step_elided");
 	if (mutant == null) return;
 
-	tc.t.assertz(true, ordinary.count(PersistentEventKind.CLWB) > 0);
-	tc.t.asserti(0, mutant.count(PersistentEventKind.CLWB));
+	tc.t.assertz(true, ordinary.count(PersistenceEventKind.CLWB) > 0);
+	tc.t.asserti(0, mutant.count(PersistenceEventKind.CLWB));
 
-	tc.t.asserti(ordinary.count(PersistentEventKind.STORE),
-		mutant.count(PersistentEventKind.STORE));
-	tc.t.asserti(ordinary.count(PersistentEventKind.SFENCE),
-		mutant.count(PersistentEventKind.SFENCE));
+	tc.t.asserti(ordinary.count(PersistenceEventKind.STORE),
+		mutant.count(PersistenceEventKind.STORE));
+	tc.t.asserti(ordinary.count(PersistenceEventKind.SFENCE),
+		mutant.count(PersistenceEventKind.SFENCE));
 }
 
 // The control row, in the same file as the row it controls: with the ordinary
 // provider, every image every cut permits recovers into a consistent sieve.
-// persistent_sieve: already asserts this, and it is repeated here because a
+// sieve_crash: already asserts this, and it is repeated here because a
 // negative control that cites its positive control from another file is one
 // refactor away from comparing two different things.
-def test_pctl_ordinary_writeback_holds(tc: PersistentControlTester) {
+def test_pctl_ordinary_writeback_holds(tc: CrashControlTester) {
 	def trace = tc.recordOneStep(false, "pwsieve_step_ordinary");
 	if (trace == null) return;
 
-	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+	def result = CrashExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
 		tc.sieveProperty("sieve invariants survive every crash schedule of a step"));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.imagesChecked > trace.length());
@@ -153,15 +153,15 @@ def test_pctl_ordinary_writeback_holds(tc: PersistentControlTester) {
 //
 // What catches it is worth naming: the violation is structural -- a free block
 // reachable from the wrong size list -- so the *allocator* invariants inside
-// PersistentSieveProperty are enough, and the workload's cross-object checks are
+// SieveProperty are enough, and the workload's cross-object checks are
 // never reached. The mutant corrupts the region's own bookkeeping, not merely
 // the sieve's view of it, which is a stronger failure than this control needed
 // to produce.
-def test_pctl_elided_writeback_is_caught(tc: PersistentControlTester) {
+def test_pctl_elided_writeback_is_caught(tc: CrashControlTester) {
 	def trace = tc.recordOneStep(true, "pwsieve_step_elided");
 	if (trace == null) return;
 
-	def result = PersistentExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
+	def result = CrashExplorer.checkAllCuts(trace, tc.mounted, tc.BUDGET,
 		tc.sieveProperty("sieve invariants survive every crash schedule of a step"));
 	tc.t.assertz(false, result.ok());
 

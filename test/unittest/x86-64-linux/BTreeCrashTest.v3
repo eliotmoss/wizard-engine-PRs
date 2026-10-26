@@ -6,7 +6,7 @@
 // killed process loses nothing still in the cache. This instead records one
 // put()'s actual STORE/CLWB/SFENCE order, enumerates the durable images a crash
 // at each point could leave under the model in docs/pmem-crash-model.md, and
-// mounts every one of them through production recovery, as PersistentSieveTest
+// mounts every one of them through production recovery, as SieveCrashTest
 // does for the sieve.
 //
 // The property is the tree's own. The allocator's structural invariants; then
@@ -26,7 +26,7 @@
 // explorer must then find an image the property rejects.
 //
 // How far each check reaches. A cut admits the distinct images the product of
-// its lines' classes counts (PersistentExplorer.lineClasses); the log record is
+// its lines' classes counts (CrashExplorer.lineClasses); the log record is
 // written byte by byte, so a line of it can hold many distinct contents. On
 // 2026-10-20 the insert's busiest cut, 2,908 of 4,602, admitted
 // 1,194,997,579,776,000 distinct images, 4,422 of its cuts admitted more than
@@ -43,13 +43,13 @@
 // enumerating them; the sweep then checks the rest of the property on a sample.
 //
 // Images are mounted in an anonymous mapping (PWBTreeAnonRegion), not in a
-// heap array, which PersistentImageMounts.openArray() used until 2026-10-19:
+// heap array, which CrashImageMounts.openArray() used until 2026-10-19:
 // the tree allocates while it is checked, a collection can move a heap array,
-// and PWRegion keeps the raw address. Like openArray()'s, the mapping's
+// and RegionAllocator keeps the raw address. Like openArray()'s, the mapping's
 // boundaries succeed without reaching the writeback hooks; only what recovery
 // and the sweep leave in the bytes is examined.
 
-def PBT = UnitTests.registerT("persistent_btree:", _, PersistentBTreeTester.new, _);
+def PBT = UnitTests.registerT("btree_crash:", _, BTreeCrashTester.new, _);
 def PBTX = [
 	PBT("recorded_puts_are_modelable",      test_pbtree_recorded_puts_are_modelable),
 	PBT("final_cuts_are_exhaustive",        test_pbtree_final_cuts_are_exhaustive),
@@ -61,8 +61,8 @@ def PBTX = [
 	()
 ];
 
-class PersistentBTreeTester(t: Tester) {
-	// 2 KB blocks, the smallest the allocator commits at (PersistentSieveTest),
+class BTreeCrashTester(t: Tester) {
+	// 2 KB blocks, the smallest the allocator commits at (SieveCrashTest),
 	// and capacity 3, the least a split allows: a node is two cache lines, so
 	// the lines a put leaves in flight stay few, and a few dozen keys reach
 	// height 3.
@@ -72,9 +72,9 @@ class PersistentBTreeTester(t: Tester) {
 	def BUDGET = 4;
 
 	var mounted: Array<byte>;       // durable bytes before the recorded put
-	var region: PWRegion;
+	var region: RegionAllocator;
 	var tree: PWBTree;
-	var recorder: RecordingPersistentOperations;
+	var recorder: RecordingProvider;
 	var ref: PWBTreeReference;
 	var before: PWBTreeReference;   // the tree's contents before the recorded put
 	var after: PWBTreeReference;    // and after it
@@ -82,10 +82,10 @@ class PersistentBTreeTester(t: Tester) {
 	def marks = Vector<(PWBTreePhase, int)>.new();  // each phase mark, with the events before it
 
 	def openRecordingTree() -> bool {
-		region = PWRegion.new(RecordingPmemBackend.new(), BLOCKS,
-			Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, true);
+		region = RegionAllocator.new(RecordingPmemBackend.new(), BLOCKS,
+			Array<Ref<MetadataDescriptor>>.new(0), BLOCK_SIZE, OpenMode.FORMAT);
 		if (region.backendRegion == null) return false;
-		recorder = RecordingPersistentOperations.!(region.backendRegion.persistentOperations());
+		recorder = RecordingProvider.!(region.backendRegion.provider());
 		tree = PWBTree.new(region, CAPACITY);
 		ref = PWBTreeReference.new();
 		return tree.open();
@@ -108,8 +108,8 @@ class PersistentBTreeTester(t: Tester) {
 	// scratch tree of the same geometry: the last of them is the one that
 	// splits the root.
 	def insertsToReach(height: u64) -> int {
-		def scratch = PWRegion.new(RecordingPmemBackend.new(), BLOCKS,
-			Array<Ref<MetaDataDesc>>.new(0), BLOCK_SIZE, true);
+		def scratch = RegionAllocator.new(RecordingPmemBackend.new(), BLOCKS,
+			Array<Ref<MetadataDescriptor>>.new(0), BLOCK_SIZE, OpenMode.FORMAT);
 		def st = PWBTree.new(scratch, CAPACITY);
 		var n = -1;
 		if (st.open()) {
@@ -154,7 +154,7 @@ class PersistentBTreeTester(t: Tester) {
 
 	// Record exactly one put() as a scenario, from a snapshot of the durable
 	// bytes that preceded it, with its phase marks.
-	def recordPut(name: string, key: u64, value: u64) -> PersistentTrace {
+	def recordPut(name: string, key: u64, value: u64) -> PersistenceTrace {
 		before = copyReference(ref);
 		m0 = tree.mutations();
 		snapshotMounted();
@@ -179,7 +179,7 @@ class PersistentBTreeTester(t: Tester) {
 
 	// An insert that splits a leaf and the root: the tree goes from height 2
 	// to 3.
-	def recordSplitInsert(name: string) -> PersistentTrace {
+	def recordSplitInsert(name: string) -> PersistenceTrace {
 		def n = insertsToReach(3);
 		if (n < 0) return null;
 		if (!openRecordingTree()) {
@@ -201,7 +201,7 @@ class PersistentBTreeTester(t: Tester) {
 	}
 
 	// An update of a key in the middle of a tree of height 3.
-	def recordUpdate(name: string) -> PersistentTrace {
+	def recordUpdate(name: string) -> PersistenceTrace {
 		def n = insertsToReach(3);
 		if (n < 0) return null;
 		if (!openRecordingTree()) {
@@ -219,38 +219,38 @@ class PersistentBTreeTester(t: Tester) {
 	}
 
 	// {allowBefore} and {allowAfter} say which trees an image may hold.
-	def property(name: string, allowBefore: bool, allowAfter: bool) -> PersistentImageProperty {
-		return PersistentBTreeProperty.new(BLOCKS, BLOCK_SIZE, CAPACITY, before, after, m0,
+	def property(name: string, allowBefore: bool, allowAfter: bool) -> CrashImageProperty {
+		return BTreeProperty.new(BLOCKS, BLOCK_SIZE, CAPACITY, before, after, m0,
 			allowBefore, allowAfter).property(name);
 	}
 
 	// Every cut, each under the property its marks allow: before only up to
 	// the WRITE mark, either until the PUBLISH mark, after only from it on.
 	// {shift} moves the marks, for a trace with events removed before them.
-	def checkEveryCut(trace: PersistentTrace, shift: int) -> PersistentCheckResult {
+	def checkEveryCut(trace: PersistenceTrace, shift: int) -> CrashCheckResult {
 		def writeCut = markAt(PWBTreePhase.WRITE, 0) - shift;
 		def publishCut = markAt(PWBTreePhase.PUBLISH, 0) - shift;
-		var result = PersistentExplorer.checkCutRange(trace, mounted, 0, writeCut, BUDGET,
+		var result = CrashExplorer.checkCutRange(trace, mounted, 0, writeCut, BUDGET,
 			property("up to the WRITE mark, every image holds the tree before the put", true, false));
 		if (!result.ok()) return result;
 		var checked = result.imagesChecked;
 		var truncated = result.truncated;
 		var product = result.product, classes = result.classProduct;
-		result = PersistentExplorer.checkCutRange(trace, mounted, writeCut + 1, publishCut - 1, BUDGET,
+		result = CrashExplorer.checkCutRange(trace, mounted, writeCut + 1, publishCut - 1, BUDGET,
 			property("between the WRITE and PUBLISH marks, every image holds the tree before or after", true, true));
 		if (!result.ok()) return result;
 		checked += result.imagesChecked;
 		truncated = truncated || result.truncated;
-		product = PersistentExplorer.addCounts(product, result.product);
-		classes = PersistentExplorer.addCounts(classes, result.classProduct);
-		result = PersistentExplorer.checkCutRange(trace, mounted, publishCut, trace.length(), BUDGET,
+		product = CrashExplorer.addCounts(product, result.product);
+		classes = CrashExplorer.addCounts(classes, result.classProduct);
+		result = CrashExplorer.checkCutRange(trace, mounted, publishCut, trace.length(), BUDGET,
 			property("from the PUBLISH mark, every image holds the tree after the put", false, true));
 		if (!result.ok()) return result;
 		checked += result.imagesChecked;
 		truncated = truncated || result.truncated;
-		product = PersistentExplorer.addCounts(product, result.product);
-		classes = PersistentExplorer.addCounts(classes, result.classProduct);
-		return PersistentCheckResult.new(result.exploration, null, checked, truncated, product, classes);
+		product = CrashExplorer.addCounts(product, result.product);
+		classes = CrashExplorer.addCounts(classes, result.classProduct);
+		return CrashCheckResult.new(result.exploration, null, checked, truncated, product, classes);
 	}
 
 	// The cache lines the last put's new nodes occupy, region-relative, as
@@ -270,8 +270,8 @@ class PersistentBTreeTester(t: Tester) {
 	// The machine replays with no voluntary writeback, which leaves every line
 	// at its floor, and an image's lines range from the floor up, so -1 means
 	// every image at every such cut holds every store to those lines.
-	def firstPendingCut(trace: PersistentTrace, fromCut: int, lines: Array<u64>) -> int {
-		def m = PersistentCrashMachine.new(trace, mounted);
+	def firstPendingCut(trace: PersistenceTrace, fromCut: int, lines: Array<u64>) -> int {
+		def m = CrashModel.new(trace, mounted);
 		m.runTo(fromCut);
 		while (true) {
 			for (line in lines) if (m.pendingStores(line) > 0) return m.position();
@@ -294,7 +294,7 @@ def pbtreeValue(key: u64) -> u64 {
 }
 
 // Child {j} of the internal node at {node}: word 2 + 2j of its payload.
-def pbtreeChild(region: PWRegion, node: u64, j: int) -> u64 {
+def pbtreeChild(region: RegionAllocator, node: u64, j: int) -> u64 {
 	def addr = region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(2 + 2 * j);
 	return (Pointer.NULL + i64.view(addr)).load<u64>();
 }
@@ -311,19 +311,19 @@ def copyReference(ref: PWBTreeReference) -> PWBTreeReference {
 // The tree's property over one enumerated crash image. Mounting and reopening
 // are part of it, not preconditions: a restart that cannot find its tree has
 // lost it as surely as one that finds it inconsistent.
-class PersistentBTreeProperty(numBlocks: u64, blockSize: u64, capacity: int,
+class BTreeProperty(numBlocks: u64, blockSize: u64, capacity: int,
 	before: PWBTreeReference, after: PWBTreeReference, m0: u64,
 	allowBefore: bool, allowAfter: bool) {
 
-	def check(image: PersistentDurableImage) -> string {
+	def check(image: CrashImage) -> string {
 		def mapping = Mmap.reserve(u64.!(image.size()), Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return "could not map the durable image";
 		def container = PWBTreeAnonRegion.new(mapping);
 		for (i < image.size()) container.range[i] = image.bytes[i];
-		def region = PWRegion.new(PreparedRegionBackend.new(container), numBlocks,
-			Array<Ref<MetaDataDesc>>.new(0), blockSize, false);
+		def region = RegionAllocator.new(PreparedStorageBackend.new(container), numBlocks,
+			Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.ATTACH);
 		if (region.backendRegion == null) {
-			container.destroy();
+			container.close();
 			return "durable image did not mount as an allocator";
 		}
 		def violation = checkMounted(region);
@@ -331,8 +331,8 @@ class PersistentBTreeProperty(numBlocks: u64, blockSize: u64, capacity: int,
 		return violation;
 	}
 
-	private def checkMounted(region: PWRegion) -> string {
-		var violation = PersistentAllocatorInvariants.check(region);
+	private def checkMounted(region: RegionAllocator) -> string {
+		var violation = AllocatorInvariants.check(region);
 		if (violation != null) return violation;
 		def tree = PWBTree.new(region, capacity);
 		if (!tree.open()) return "the tree could not reopen after recovery";
@@ -351,7 +351,7 @@ class PersistentBTreeProperty(numBlocks: u64, blockSize: u64, capacity: int,
 		if (violation != null) return violation;
 		// The sweep committed its frees: the allocator must still be sound,
 		// and a second mount must find nothing left to reclaim.
-		violation = PersistentAllocatorInvariants.check(region);
+		violation = AllocatorInvariants.check(region);
 		if (violation != null) return violation;
 		def again = PWBTree.new(region, capacity);
 		if (!again.open()) return "the tree did not reopen after its own sweep";
@@ -359,39 +359,39 @@ class PersistentBTreeProperty(numBlocks: u64, blockSize: u64, capacity: int,
 		return null;
 	}
 
-	def property(name: string) -> PersistentImageProperty {
-		return PersistentImageProperty.new(name, 0u64, 0, check);
+	def property(name: string) -> CrashImageProperty {
+		return CrashImageProperty.new(name, 0u64, 0, check);
 	}
 }
 
 // {trace} without the CLWBs among its events [{from}, {to}), and how many were
 // dropped. Recording only appends a CLWB event, so the result is the trace the
 // same put would record with those writebacks removed from the program.
-def withoutWritebacks(trace: PersistentTrace, from: int, to: int, name: string) -> (PersistentTrace, int) {
-	def out = Vector<PersistentTraceEvent>.new();
+def withoutWritebacks(trace: PersistenceTrace, from: int, to: int, name: string) -> (PersistenceTrace, int) {
+	def out = Vector<PersistenceEvent>.new();
 	var removed = 0;
 	for (i < trace.events.length) {
 		def e = trace.events[i];
-		if (i >= from && i < to && e.kind == PersistentEventKind.CLWB) {
+		if (i >= from && i < to && e.kind == PersistenceEventKind.CLWB) {
 			removed++;
 			continue;
 		}
 		out.put(e);
 	}
-	return (PersistentTrace.new(name, trace.regionBytes, out.copy()), removed);
+	return (PersistenceTrace.new(name, trace.regionBytes, out.copy()), removed);
 }
 
 // A recorded put must satisfy the crash model's baseline, or nothing downstream
 // means anything; and it must be the put it is named for. The node stores go
 // through the same seam as the log, so they are held to the same contract.
-def test_pbtree_recorded_puts_are_modelable(tc: PersistentBTreeTester) {
+def test_pbtree_recorded_puts_are_modelable(tc: BTreeCrashTester) {
 	def insert = tc.recordSplitInsert("pwbtree_split_insert");
 	if (insert == null) return;
 	tc.t.assertz(true, insert.validate().ok());
 	tc.t.asserti(5, tc.tree.lastNodesAllocated());
 	tc.t.asserti(5, tc.countMarks(PWBTreePhase.ALLOC));
 	tc.t.asserti(1, tc.countMarks(PWBTreePhase.FREE));
-	tc.t.assertz(true, insert.count(PersistentEventKind.CLWB) > 0);
+	tc.t.assertz(true, insert.count(PersistenceEventKind.CLWB) > 0);
 	tc.cleanup();
 
 	def update = tc.recordUpdate("pwbtree_update");
@@ -406,11 +406,11 @@ def test_pbtree_recorded_puts_are_modelable(tc: PersistentBTreeTester) {
 // At the end of a put the last FREE's after-images are still write-behind, so
 // more than one image is permitted; every one must hold the tree after the put.
 // The search here is complete, so this is evidence rather than a sample.
-def test_pbtree_final_cuts_are_exhaustive(tc: PersistentBTreeTester) {
+def test_pbtree_final_cuts_are_exhaustive(tc: BTreeCrashTester) {
 	def insert = tc.recordSplitInsert("pwbtree_split_insert_end");
 	if (insert == null) return;
 	tc.cleanup();
-	var result = PersistentExplorer.checkImages(insert, tc.mounted, insert.length(), 64,
+	var result = CrashExplorer.checkImages(insert, tc.mounted, insert.length(), 64,
 		tc.property("every image a completed insert permits holds the tree after it", false, true));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.exhaustive());
@@ -419,7 +419,7 @@ def test_pbtree_final_cuts_are_exhaustive(tc: PersistentBTreeTester) {
 	def update = tc.recordUpdate("pwbtree_update_end");
 	if (update == null) return;
 	tc.cleanup();
-	result = PersistentExplorer.checkImages(update, tc.mounted, update.length(), 64,
+	result = CrashExplorer.checkImages(update, tc.mounted, update.length(), 64,
 		tc.property("every image a completed update permits holds the tree after it", false, true));
 	if (!result.ok()) tc.t.fail(result.toArtifact());
 	tc.t.assertz(true, result.exhaustive());
@@ -430,7 +430,7 @@ def test_pbtree_final_cuts_are_exhaustive(tc: PersistentBTreeTester) {
 // publish begins, to the end of the put, no new node's line has a store a crash
 // could lose. Both puts, so both the splitting insert's five nodes and the
 // update's three.
-def test_pbtree_new_nodes_durable_from_write_mark(tc: PersistentBTreeTester) {
+def test_pbtree_new_nodes_durable_from_write_mark(tc: BTreeCrashTester) {
 	def insert = tc.recordSplitInsert("pwbtree_split_insert_nodes");
 	if (insert == null) return;
 	var lines = tc.newNodeLines();
@@ -452,7 +452,7 @@ def test_pbtree_new_nodes_durable_from_write_mark(tc: PersistentBTreeTester) {
 
 // Every crash schedule at every point of a splitting insert must leave a tree
 // that reopens, passes its invariants, and holds the contents its mark allows.
-def test_pbtree_split_insert_images_satisfy_tree(tc: PersistentBTreeTester) {
+def test_pbtree_split_insert_images_satisfy_tree(tc: BTreeCrashTester) {
 	def trace = tc.recordSplitInsert("pwbtree_split_insert");
 	if (trace == null) return;
 	tc.cleanup();
@@ -463,7 +463,7 @@ def test_pbtree_split_insert_images_satisfy_tree(tc: PersistentBTreeTester) {
 
 // The same for an update, which splits nothing and frees two replaced nodes
 // after the publish.
-def test_pbtree_update_images_satisfy_tree(tc: PersistentBTreeTester) {
+def test_pbtree_update_images_satisfy_tree(tc: BTreeCrashTester) {
 	def trace = tc.recordUpdate("pwbtree_update");
 	if (trace == null) return;
 	tc.cleanup();
@@ -476,7 +476,7 @@ def test_pbtree_update_images_satisfy_tree(tc: PersistentBTreeTester) {
 // most complete image the insert permits, damage a value, which leaves the
 // structure sound and only the comparison can see; then a node's tag, which
 // open() must refuse. Assert which check names each.
-def test_pbtree_property_detects_a_damaged_image(tc: PersistentBTreeTester) {
+def test_pbtree_property_detects_a_damaged_image(tc: BTreeCrashTester) {
 	def trace = tc.recordSplitInsert("pwbtree_damaged");
 	if (trace == null) return;
 	// The leftmost leaf, three levels down.
@@ -485,8 +485,8 @@ def test_pbtree_property_detects_a_damaged_image(tc: PersistentBTreeTester) {
 	tc.cleanup();
 	def leaf = int.!(node) + ChunkHeader.size;
 
-	def intact = PersistentImages.eagerCrash(trace, tc.mounted, trace.length());
-	def property = PersistentBTreeProperty.new(tc.BLOCKS, tc.BLOCK_SIZE, tc.CAPACITY,
+	def intact = CrashImages.eagerCrash(trace, tc.mounted, trace.length());
+	def property = BTreeProperty.new(tc.BLOCKS, tc.BLOCK_SIZE, tc.CAPACITY,
 		tc.before, tc.after, tc.m0, false, true);
 	def baseline = property.check(intact);
 	if (baseline != null) tc.t.fail(baseline);
@@ -496,14 +496,14 @@ def test_pbtree_property_detects_a_damaged_image(tc: PersistentBTreeTester) {
 	for (i < damaged.length) damaged[i] = intact.bytes[i];
 	damaged[leaf + 24] = damaged[leaf + 24] ^ 0xFFu8;
 	tc.t.assert_string("the tree's value for a key differs from the reference",
-		property.check(PersistentDurableImage.new(damaged)));
+		property.check(CrashImage.new(damaged)));
 
 	// Word 0 is its tag.
 	damaged = Array<byte>.new(intact.size());
 	for (i < damaged.length) damaged[i] = intact.bytes[i];
 	damaged[leaf + 7] = damaged[leaf + 7] ^ 0xFFu8;
 	tc.t.assert_string("the tree could not reopen after recovery",
-		property.check(PersistentDurableImage.new(damaged)));
+		property.check(CrashImage.new(damaged)));
 }
 
 // The negative control. Drop the tree's own writebacks -- the CLWBs between the
@@ -512,7 +512,7 @@ def test_pbtree_property_detects_a_damaged_image(tc: PersistentBTreeTester) {
 // then names nodes whose lines need not have reached the medium, and the
 // explorer must find an image in which they have not. That is what the kill
 // loop cannot show on PMEM or on a file, where the mutant passes.
-def test_pbtree_elided_node_writeback_is_caught(tc: PersistentBTreeTester) {
+def test_pbtree_elided_node_writeback_is_caught(tc: BTreeCrashTester) {
 	def ordinary = tc.recordSplitInsert("pwbtree_split_insert");
 	if (ordinary == null) return;
 	def nodeLines = tc.tree.lastNodeLines();
@@ -528,9 +528,9 @@ def test_pbtree_elided_node_writeback_is_caught(tc: PersistentBTreeTester) {
 	// that did less work would fail for an uninteresting reason.
 	tc.t.assertz(true, mutant.validate().ok());
 	tc.t.asserti(nodeLines, removed);
-	tc.t.asserti(ordinary.count(PersistentEventKind.CLWB) - removed, mutant.count(PersistentEventKind.CLWB));
-	tc.t.asserti(ordinary.count(PersistentEventKind.STORE), mutant.count(PersistentEventKind.STORE));
-	tc.t.asserti(ordinary.count(PersistentEventKind.SFENCE), mutant.count(PersistentEventKind.SFENCE));
+	tc.t.asserti(ordinary.count(PersistenceEventKind.CLWB) - removed, mutant.count(PersistenceEventKind.CLWB));
+	tc.t.asserti(ordinary.count(PersistenceEventKind.STORE), mutant.count(PersistenceEventKind.STORE));
+	tc.t.asserti(ordinary.count(PersistenceEventKind.SFENCE), mutant.count(PersistenceEventKind.SFENCE));
 
 	// The complete check sees it at once: at the WRITE mark the nodes' stores
 	// are still pending, though the fence has run.

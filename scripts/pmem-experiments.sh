@@ -27,7 +27,7 @@
 #                 block storage                            (PWEXP_BLOCK_DIR)
 #   file-dax-legacy, file-block-legacy
 #                 file-dax and file-block with the file backend's boundary before
-#                 2026-10-13 (a flag and fdatasync, persistRange an msync of its
+#                 2026-10-13 (a flag and fdatasync, persist() an msync of its
 #                 own pages), for the old-against-new comparison only
 #   file-dax-msync, file-block-msync
 #                 the same with one msync(MS_SYNC) per run of marked pages instead
@@ -344,7 +344,7 @@ run_cost_one() {
 
 # Refuse a sweep point the WAL slot cannot hold before any run starts, rather
 # than discovering it as a failed run halfway through a campaign. The arithmetic
-# mirrors DualTxnWal's slotBytes: each of the two slots gets half of a block less
+# mirrors TwoSlotWal's slotBytes: each of the two slots gets half of a block less
 # the 64-byte WAL header, rounded down to 64 bytes, and a record is a 112-byte
 # header and trailer plus one 32-byte entry per write, rounded up to 64 (which
 # cannot overflow a 64-aligned slot that the unrounded record fits). The commit
@@ -475,7 +475,7 @@ control() {
     # piped to tee runs in a subshell, where rc=1 never reached the return below.
     : > "$log"
     rule "layer 1b: explorer must reject the elided-writeback mutant" | tee -a "$log"
-    "$UNIT_BIN" 'persistent_control:*' 2>&1 | tee -a "$log" || rc=1
+    "$UNIT_BIN" 'crash_control:*' 2>&1 | tee -a "$log" || rc=1
     rule "layer 3: ordinary build on real PMEM, expected OK" | tee -a "$log"
     # shellcheck disable=SC2086
     "$SIEVE_BIN" "$PWASM_PMEM_TEST_DIR" $SIEVE_ARGS pmem 2>&1 | tee -a "$log" || rc=1

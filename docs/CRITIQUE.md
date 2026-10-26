@@ -6,30 +6,30 @@ Tensions between the stated goals (persistent, recoverable region allocator for 
 
 ## 1. Transaction granularity is too fine
 
-The current design commits one WAL transaction per `allocChunk`/`freeChunk` call (`PWRegion.performCommit()`). A single logical WASM operation will likely span many allocator calls. If the system crashes mid-sequence, recovery produces a state where some allocations committed and others did not — which may be structurally incoherent from the WASM program's perspective even if the allocator itself is internally consistent.
+The current design commits one WAL transaction per `allocChunk`/`freeChunk` call (`RegionAllocator.performCommit()`). A single logical WASM operation will likely span many allocator calls. If the system crashes mid-sequence, recovery produces a state where some allocations committed and others did not — which may be structurally incoherent from the WASM program's perspective even if the allocator itself is internally consistent.
 
-`RegionTransaction` is well-positioned to support multi-operation transactions, but `performCommit()` at the end of every alloc/free prevents this. There needs to be a way for a caller to open a transaction, perform several allocator operations, and commit them atomically as one WAL record.
+`TransactionCache` is well-positioned to support multi-operation transactions, but `performCommit()` at the end of every alloc/free prevents this. There needs to be a way for a caller to open a transaction, perform several allocator operations, and commit them atomically as one WAL record.
 
 ---
 
 ## 2. WAL depth does not provide transaction concurrency
 
-The stack now routes through `DualTxnWal`, a two-slot redo log chosen because at most one transaction's applied data is deferred while the next record commits. `RegionTransaction` still exposes exactly one active transaction at a time, so the allocator serialises operations regardless of how many recovery records the WAL can hold. If WASM needs *concurrent* transactions (for example, multiple WASM threads each with an in-flight allocation), the current design has no ownership, isolation, conflict detection or externally visible ordering model. `MultiTxnWal` and `SingleTxnWal` are retained comparison implementations only; neither changes that transaction-layer limitation.
+The stack now routes through `TwoSlotWal`, a two-slot redo log chosen because at most one transaction's applied data is deferred while the next record commits. `TransactionCache` still exposes exactly one active transaction at a time, so the allocator serialises operations regardless of how many recovery records the WAL can hold. If WASM needs *concurrent* transactions (for example, multiple WASM threads each with an in-flight allocation), the current design has no ownership, isolation, conflict detection or externally visible ordering model. `RingWal` and `SingleTxnWal` are retained comparison implementations only; neither changes that transaction-layer limitation.
 
 ---
 
 ## 3. PMEM and block-device durability semantics are conflated
 
-`BackendRegion.prepareChangedRange` means different things for the two backends:
+`StorageRegion.writeBack` means different things for the two backends:
 
-- `PmemMmapRegion`: issues a cache-line flush immediately — side-effectful and ordering-sensitive
-- `FileMmapRegion`: sets `hasDirtyChanges = true` — deferred and batched
+- `PmemRegion`: issues a cache-line flush immediately — side-effectful and ordering-sensitive
+- `MappedFileRegion`: sets `hasDirtyChanges = true` — deferred and batched
 
-Similarly, `persistChanges()` issues a store fence for PMEM but an `fdatasync` for file-backed storage. The WAL commit protocol calls the same sequence in both cases, but the ordering guarantees between log commit and data application differ between backends in ways that are invisible to the WAL layer. This needs to be explicitly specified and verified, not just structurally similar code.
+Similarly, `drain()` issues a store fence for PMEM but an `fdatasync` for file-backed storage. The WAL commit protocol calls the same sequence in both cases, but the ordering guarantees between log commit and data application differ between backends in ways that are invisible to the WAL layer. This needs to be explicitly specified and verified, not just structurally similar code.
 
 The verification plan now treats this as a layered argument rather than asking
 one test to prove everything: a shadow durable-memory model checks the WAL
-protocol under the abstract `BackendRegion` contract; backend tests check the
+protocol under the abstract `StorageRegion` contract; backend tests check the
 translation to syscalls or cache instructions; abrupt process/VM tests check
 software crash recovery; and only controlled real-media interruption can
 support physical-durability claims. See `docs/persistent-backends.md`.
@@ -38,21 +38,21 @@ support physical-durability claims. See `docs/persistent-backends.md`.
 
 ## 4. Log-chunk location is explicit, but format validation remains narrow
 
-This original concern is resolved: `PWRegionHeader.logChunk` now stores the region-relative WAL location, and mount uses it with a defensive block-1 fallback for older headers where the field is zero. Dedicated tests now cover the zero-field fallback and stored block-size/num-block mismatch. The remaining validation risk is a nonzero log offset that points outside the mapped region.
+This original concern is resolved: `RegionHeader.logBlock` now stores the region-relative WAL location, and mount uses it with a defensive block-1 fallback for older headers where the field is zero. Dedicated tests now cover the zero-field fallback and stored block-size/num-block mismatch. The remaining validation risk is a nonzero log offset that points outside the mapped region.
 
 ---
 
 ## 5. Oversized transactions fail safely; recovery-required state is exposed
 
-`RegionTransaction` can still accumulate more `(addr, value)` pairs than one `DualTxnWal` slot can hold. The active path now fails safely: `DualTxnWal.commit()` returns `0`, `RegionTransaction.commit()` returns `false`, allocator operations propagate failure, and the dirty cache is retained instead of acknowledging a partial record.
+`TransactionCache` can still accumulate more `(addr, value)` pairs than one `TwoSlotWal` slot can hold. The active path now fails safely: `TwoSlotWal.commit()` returns `0`, `TransactionCache.commit()` returns `false`, allocator operations propagate failure, and the dirty cache is retained instead of acknowledging a partial record.
 
-`DualTxnWal.requiresRecovery()` now distinguishes commit persistence failure
-from definite validation/capacity rejection. `RegionTransaction` and
-`PWRegion` expose the same state through `requiresRecovery()`: an ordinary
+`TwoSlotWal.requiresRecovery()` now distinguishes commit persistence failure
+from definite validation/capacity rejection. `TransactionCache` and
+`RegionAllocator` expose the same state through `requiresRecovery()`: an ordinary
 oversize failure leaves it clear, while a persistence or after-image
 preparation failure sets it and requires abandon/reopen/recover. The
 transaction retains its dirty cache on failure, clean commits cannot mask a
-latch, and `PWRegion` allocation/free entry points reject later work. The
+latch, and `RegionAllocator` allocation/free entry points reject later work. The
 void-returning direct cache write methods can still accumulate volatile data if
 a caller ignores `requiresRecovery()`, but no commit on that WAL instance will
 accept it.
@@ -65,7 +65,7 @@ The cache is keyed by exact address — a write to `addr` at width 8 and a subse
 
 ---
 
-## 7. ImmixPWRegion line marks are not durable
+## 7. ImmixRegionAllocator line marks are not durable
 
 `resetAllLineMarks()` writes the marks outside the WAL. Since 2026-10-19 its stores go through the persistent-operation seam, so a recorded trace shows them, but no writeback or fence is issued for them. This is now an explicit, regression-tested policy: line marks are transient GC state and mark/reset operations issue no persistence boundary. After a crash, the region can still remount with line marks that do not correspond to the live/dead state of objects. The caller must rebuild them from a full heap scan, but that rebuild is not currently implemented. Until it is, the Immix extension cannot be considered crash-consistent.
 
@@ -79,8 +79,8 @@ The allocator is self-contained but has no connection to WASM execution. There i
 
 ## 9. A failed phase-B commit can leave an apparently valid record
 
-`DualTxnWal.appendCommittedRecord()` builds the complete record and checksum
-before calling `prepareChangedRange(record)` and `persistChanges()`. If either
+`TwoSlotWal.appendCommittedRecord()` builds the complete record and checksum
+before calling `writeBack(record)` and `drain()`. If either
 boundary operation fails, `commit()` returns `0` and does not advance the
 in-memory sequence state, but the record magic and checksum remain in the
 mapped slot. The older regression retries into the same parity slot before
@@ -102,13 +102,13 @@ live and durable byte arrays. Its fail-before-copy, copy-then-fail and
 partial-copy modes reproduce this ambiguity deterministically, including an
 immediate crash before the same-slot retry masks the record. The completed core
 fault matrix now covers fresh-header initialization and after-image range
-preparation as well: `applyUpdate()` returns `false` and latches before any
+preparation as well: `applyAfterImage()` returns `false` and latches before any
 later boundary can advance `dataDurableSeq`, and recovery reports
-`PERSIST_FAILED` without issuing `persistChanges()`. `DualTxnWal` rejects
+`PERSIST_FAILED` without issuing `drain()`. `TwoSlotWal` rejects
 same-instance work after any fresh-init, commit, apply, recovery, flush or close
 persistence failure, while `requiresRecovery()` distinguishes those failures
-from definite validation/capacity rejection. `RegionTransaction` propagates a
-failed `applyUpdate()` without clearing the cache, and both it and `PWRegion`
+from definite validation/capacity rejection. `TransactionCache` propagates a
+failed `applyAfterImage()` without clearing the cache, and both it and `RegionAllocator`
 expose the latch; allocator entry points reject subsequent work on that mount.
 The shadow supplies protocol-level evidence only; syscall, process/VM crash and
 physical-media evidence remain separate outer layers.

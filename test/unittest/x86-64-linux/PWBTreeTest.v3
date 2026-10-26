@@ -1,6 +1,6 @@
 // PWBTree tests
 //
-// Drives the persistent B+Tree over a PWRegion. Most tests use a 1 MiB region
+// Drives the persistent B+Tree over a RegionAllocator. Most tests use a 1 MiB region
 // (256 x 4096, the benchmark's) in an anonymous mapping and a capacity of 4
 // or 5 keys per node, so a few dozen keys reach a height of 3 or more; one
 // checks the default capacity, 252 at 4 KiB blocks. Contents are compared with
@@ -9,13 +9,13 @@
 //
 // Four groups: the tree itself (pwbtree:); the persistence work of each put()
 // on the production PMEM boundary path, counted exactly (pwbtree:, the
-// boundaries test); resume across a real file-backed remount (pwbtree_bd:); and
+// boundaries test); resume across a real file-backed remount (pwbtree_file:); and
 // a process killed at every phase mark of a mutation on the direct backend,
 // where death loses whatever was not written back (pwbtree_dio:).
 
 def BT_BLOCKS = 256u64;
 def BT_BLOCK_SIZE = 4096u64;
-// A multiple of 8, as PWRegion requires, and not of a cache line: chunks, and
+// A multiple of 8, as RegionAllocator requires, and not of a cache line: chunks, and
 // so node payloads, start at every 8-byte offset within a line.
 def BT_UNALIGNED_BLOCK_SIZE = 4104u64;
 
@@ -43,7 +43,7 @@ def BTX = [
 
 // Region memory outside the GC heap, where the tests would otherwise use the
 // volatile backend. That backend's region is an Array<byte> on the heap, and
-// Virgil's semispace collector moves it; PWRegion keeps regionStart, a raw
+// Virgil's semispace collector moves it; RegionAllocator keeps regionStart, a raw
 // address, and the region and the tree compute every other address from it,
 // so after a collection both read the old space. On 2026-10-14 the full suite
 // crashed this way in pwbtree:reclaims_planted_leak: a collection during the
@@ -58,13 +58,13 @@ class PWBTreeAnonRegion extends VolatileRegion {
                 mapping = m;
         }
 
-        def destroy() {
+        def close() {
                 if (mapping != null) mapping.range.unmap();
         }
 }
 
-class PWBTreeAnonBackend extends TxnRegionBackend {
-        def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+class PWBTreeAnonBackend extends StorageBackend {
+        def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
                 def m = Mmap.reserve(size, Mmap.PROT_READ | Mmap.PROT_WRITE);
                 if (m == null) return null;
                 return PWBTreeAnonRegion.new(m);
@@ -76,14 +76,14 @@ class PWBTreeAnonBackend extends TxnRegionBackend {
 def BT_ANON = PWBTreeAnonBackend.new();
 
 class PWBTreeTester(t: Tester) {
-        var region: PWRegion;
+        var region: RegionAllocator;
 
         new() {
                 region = anonRegion(BT_BLOCKS);
         }
 
-        def anonRegion(blocks: u64) -> PWRegion {
-                return PWRegion.new(BT_ANON, blocks, Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
+        def anonRegion(blocks: u64) -> RegionAllocator {
+                return RegionAllocator.new(BT_ANON, blocks, Array<Ref<MetadataDescriptor>>.new(0), BT_BLOCK_SIZE, OpenMode.FORMAT);
         }
 
         def open(capacity: int) -> PWBTree {
@@ -122,7 +122,7 @@ class PWBTreeTester(t: Tester) {
         def usedBlocks() -> u64 {
                 var used: u64 = 0;
                 for (i < region.numBlocks) {
-                        if (region.blockTableHandle[i].getUsed(region.reader())) used++;
+                        if (region.blockTableHandle[i].getUsedInRegion(region.reader())) used++;
                 }
                 return used;
         }
@@ -440,7 +440,7 @@ def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
         // A root offset, block aligned, whose sum with the block size wraps
         // to zero; setUserRoot() would refuse it, so it is planted as a stray
         // write would leave it.
-        def userRootField = tc.region.regionStart + u64.view(PWRegionHeader.userRoot.offset);
+        def userRootField = tc.region.regionStart + u64.view(RegionHeader.userRoot.offset);
         def wrapping = 0u64 - BT_BLOCK_SIZE;
         tc.t.assert_eq(0xFFFF_FFFF_FFFF_F000u64, wrapping);
         tc.region.txn.writeU64(userRootField, wrapping);
@@ -486,12 +486,12 @@ def test_btree_corrupted_image_fails_cleanly(tc: PWBTreeTester) {
 }
 
 // The address of child {j}'s offset in the internal node at {node}.
-def btreeChildAddr(region: PWRegion, node: u64, j: int) -> u64 {
+def btreeChildAddr(region: RegionAllocator, node: u64, j: int) -> u64 {
         return region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(2 + 2 * j);
 }
 
 // The key count of the node at {node}: word 1 of its payload.
-def btreeNodeKeys(region: PWRegion, node: u64) -> u64 {
+def btreeNodeKeys(region: RegionAllocator, node: u64) -> u64 {
         return btreeLoad(region.regionStart + node + u64.!(ChunkHeader.size) + 8u64);
 }
 
@@ -698,12 +698,12 @@ def btreeViolation(tc: PWBTreeTester, tree: PWBTree, want: string) {
 
 // Word {w} of the payload of the node at {node}: 0 the tag, 1 the key count;
 // a leaf's key i is word 2 + 2i, an internal node's key i word 3 + 2i.
-def btreeWordAddr(region: PWRegion, node: u64, w: int) -> u64 {
+def btreeWordAddr(region: RegionAllocator, node: u64, w: int) -> u64 {
         return region.regionStart + node + u64.!(ChunkHeader.size) + 8u64 * u64.!(w);
 }
-def btreeNodeKeysAddr(region: PWRegion, node: u64) -> u64 { return btreeWordAddr(region, node, 1); }
-def btreeLeafKeyAddr(region: PWRegion, node: u64, i: int) -> u64 { return btreeWordAddr(region, node, 2 + 2 * i); }
-def btreeInnerKeyAddr(region: PWRegion, node: u64, i: int) -> u64 { return btreeWordAddr(region, node, 3 + 2 * i); }
+def btreeNodeKeysAddr(region: RegionAllocator, node: u64) -> u64 { return btreeWordAddr(region, node, 1); }
+def btreeLeafKeyAddr(region: RegionAllocator, node: u64, i: int) -> u64 { return btreeWordAddr(region, node, 2 + 2 * i); }
+def btreeInnerKeyAddr(region: RegionAllocator, node: u64, i: int) -> u64 { return btreeWordAddr(region, node, 3 + 2 * i); }
 
 // Sets root field {field} through the log and commits; returns what was there.
 def btreeSetRootField(tc: PWBTreeTester, tree: PWBTree, field: int, v: u64) -> u64 {
@@ -720,30 +720,30 @@ def btreeSetRootField(tc: PWBTreeTester, tree: PWBTree, field: int, v: u64) -> u
 
 // A PMEM region over anonymous memory, as PWOpsTest's, with a provider that
 // counts writebacks and fences.
-class PWBTreeCountingOps extends X86_64PersistentOperations {
+class PWBTreeCountingProvider extends NativeProvider {
         var lines = 0;
         var fences = 0;
 
         new(range: Range<byte>) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 lines++;
         }
 
-        def sfence() {
+        def fence() {
                 fences++;
         }
 }
 
-class PWBTreeAnonPmemRegion extends PmemMmapRegion {
+class PWBTreeAnonPmemRegion extends PmemRegion {
         new(mapping: Mapping) super(mapping, -1) { }
 
-        def destroy() {
-                cleanupBeforeDestroy();
+        def close() {
+                cleanupBeforeClose();
         }
 
         def release() {
@@ -755,7 +755,7 @@ class PWBTreeAnonPmemRegion extends PmemMmapRegion {
 // ALLOC, PUBLISH and FREE are one commit each, so one fence and the lines its
 // record predicts (PWOps.latestRecord().commitLines(), from the record's real
 // offset, so at any block size); WRITE one fence.
-class PWBTreeMarkAudit(t: Tester, region: PWRegion, ops: PWBTreeCountingOps) {
+class PWBTreeMarkAudit(t: Tester, region: RegionAllocator, ops: PWBTreeCountingProvider) {
         var lastLines = 0;
         var lastFences = 0;
         def marks = Array<int>.new(5);
@@ -804,8 +804,8 @@ def test_btree_each_put_makes_k_plus_h_plus_1_boundaries(tc: PWBTreeTester) {
 
 // A block size that is not a multiple of a line: node payloads start mid-line,
 // and the writebacks must start on the line that holds the first word, as
-// persistRange()'s do. The production provider (and this counting one) raises
-// PersistentOperationError on a writeback that does not start on a line.
+// persist()'s do. The production provider (and this counting one) raises
+// PersistenceProviderError on a writeback that does not start on a line.
 def test_btree_unaligned_block_size_writes_back_whole_lines(tc: PWBTreeTester) {
         def unaligned = btreeBoundaryHistory(tc, BT_UNALIGNED_BLOCK_SIZE);
         tc.t.assertz(true, unaligned > 0);
@@ -821,10 +821,10 @@ def btreeBoundaryHistory(tc: PWBTreeTester, blockSize: u64) -> int {
                 return 0;
         }
         def container = PWBTreeAnonPmemRegion.new(mapping);
-        def ops = PWBTreeCountingOps.new(container.range);
-        container.setPersistentOperations(ops);
-        tc.region = PWRegion.new(PreparedRegionBackend.new(container), BT_BLOCKS,
-                Array<Ref<MetaDataDesc>>.new(0), blockSize, true);
+        def ops = PWBTreeCountingProvider.new(container.range);
+        container.setProvider(ops);
+        tc.region = RegionAllocator.new(PreparedStorageBackend.new(container), BT_BLOCKS,
+                Array<Ref<MetadataDescriptor>>.new(0), blockSize, OpenMode.FORMAT);
         def tree = tc.open(4);
         def audit = PWBTreeMarkAudit.new(tc.t, tc.region, ops);
         var unaligned = 0;
@@ -890,7 +890,7 @@ def btreeBoundaryHistory(tc: PWBTreeTester, blockSize: u64) -> int {
 
 def BTREE_BD_PATH = "/tmp/wiz_test_pwbtree_region";
 
-def BTBD = UnitTests.registerT("pwbtree_bd:", _, PWBTreeFileTester.new, _);
+def BTBD = UnitTests.registerT("pwbtree_file:", _, PWBTreeFileTester.new, _);
 def BTBDX = [
         BTBD("resumes_after_remount",           test_btree_bd_resumes_after_remount),
         BTBD("resume_is_idempotent",            test_btree_bd_resume_is_idempotent),
@@ -900,19 +900,19 @@ def BTBDX = [
 ];
 
 class PWBTreeFileTester(t: Tester) {
-        var region: PWRegion;
+        var region: RegionAllocator;
         var tree: PWBTree;
         var blockSize = BT_BLOCK_SIZE;
 
         new() {
-                RegionFileIO.unlink(BTREE_BD_PATH);
+                BackingFile.unlink(BTREE_BD_PATH);
                 region = openRegion(true);
                 tree = PWBTree.new(region, 4);
         }
 
-        private def openRegion(forceFormat: bool) -> PWRegion {
-                return PWRegion.new(X86_64Backends.getFileMapped(BTREE_BD_PATH), BT_BLOCKS,
-                        Array<Ref<MetaDataDesc>>.new(0), blockSize, forceFormat);
+        private def openRegion(forceFormat: bool) -> RegionAllocator {
+                return RegionAllocator.new(X86_64Backends.mappedFile(BTREE_BD_PATH), BT_BLOCKS,
+                        Array<Ref<MetadataDescriptor>>.new(0), blockSize, if(forceFormat, OpenMode.FORMAT, OpenMode.ATTACH));
         }
 
         // Start again on a fresh file at {size}.
@@ -954,7 +954,7 @@ class PWBTreeFileTester(t: Tester) {
                         region.deallocate();
                         region = null;
                 }
-                RegionFileIO.unlink(BTREE_BD_PATH);
+                BackingFile.unlink(BTREE_BD_PATH);
         }
 }
 
@@ -1017,7 +1017,7 @@ def test_btree_bd_invariants_hold_across_remounts(tc: PWBTreeFileTester) {
 
 // The production file provider at a block size that is not a multiple of a
 // line: splits write nodes whose payloads start mid-line, and their writebacks
-// must start on a line or the provider raises PersistentOperationError.
+// must start on a line or the provider raises PersistenceProviderError.
 def test_btree_bd_unaligned_block_size_splits_and_resumes(tc: PWBTreeFileTester) {
         tc.reformat(BT_UNALIGNED_BLOCK_SIZE);
         tc.open();
@@ -1105,9 +1105,9 @@ class PWBTreeDirectTester(t: Tester) {
                 return false;
         }
 
-        def openRegion(fresh: bool) -> PWRegion {
-                return PWRegion.new(DirectIoBackend.new(path, DirectIoTarget.FILE), BTDIO_BLOCKS,
-                        Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, fresh);
+        def openRegion(fresh: bool) -> RegionAllocator {
+                return RegionAllocator.new(DirectIoBackend.new(path, DirectIoTarget.FILE), BTDIO_BLOCKS,
+                        Array<Ref<MetadataDescriptor>>.new(0), BT_BLOCK_SIZE, if(fresh, OpenMode.FORMAT, OpenMode.ATTACH));
         }
 
         // Runs {script} on a fresh region with {hook} on the target put, in
@@ -1130,7 +1130,7 @@ class PWBTreeDirectTester(t: Tester) {
         def phasesOf(script: PWBTreeScript) -> Array<PWBTreePhase> {
                 def stopper = PWBTreeMarkStopper.new(-1);
                 def status = run(script, stopper.mark);
-                RegionFileIO.unlink(path);
+                BackingFile.unlink(path);
                 if (status != 0) {
                         t.fail1("the uninterrupted script failed (%d)", status);
                         return null;
@@ -1141,7 +1141,7 @@ class PWBTreeDirectTester(t: Tester) {
         // Fork a child that runs {script}, stopping at mark {target}; returns
         // true once it is stopped and killed.
         def killAtMark(script: PWBTreeScript, target: int) -> bool {
-                RegionFileIO.unlink(path);
+                BackingFile.unlink(path);
                 def pid = Linux.syscall(LinuxConst.SYS_fork, ()).0;
                 if (pid == 0) {
                         def stopper = PWBTreeMarkStopper.new(target);
@@ -1215,7 +1215,7 @@ class PWBTreeDirectTester(t: Tester) {
                         else if (tree.checkInvariants() != null) t.fail1("mark %d: a later put broke the tree", target);
                         region.deallocate();
                 }
-                RegionFileIO.unlink(path);
+                BackingFile.unlink(path);
         }
 }
 
@@ -1227,8 +1227,8 @@ def tc_assertMutations(t: Tester, tree: PWBTree, want: u64, target: int) {
 // leaf, every internal node on its path and the root, is the target.
 def btdioRootSplitScript() -> PWBTreeScript {
         def script = PWBTreeScript.new();
-        def region = PWRegion.new(BT_ANON, BTDIO_BLOCKS,
-                Array<Ref<MetaDataDesc>>.new(0), BT_BLOCK_SIZE, true);
+        def region = RegionAllocator.new(BT_ANON, BTDIO_BLOCKS,
+                Array<Ref<MetadataDescriptor>>.new(0), BT_BLOCK_SIZE, OpenMode.FORMAT);
         def tree = PWBTree.new(region, BTDIO_CAPACITY);
         if (!tree.open()) return null;
         def rng = PWBTreeRandom.new(BTDIO_SEED);

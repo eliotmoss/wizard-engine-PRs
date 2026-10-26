@@ -5,7 +5,7 @@
 // CLWBs requested, and background eviction is the maximal outcome. No DAX
 // mapping or PMEM hardware is required.
 
-def PIT = UnitTests.registerT("persistent_image:", _, PersistentImageTester.new, _);
+def PIT = UnitTests.registerT("crash_model:", _, CrashModelTester.new, _);
 def PITX = [
 	PIT("store_is_volatile_until_writeback", test_image_store_is_volatile_until_writeback),
 	PIT("fence_completes_requested_writeback", test_image_fence_completes_requested_writeback),
@@ -20,25 +20,25 @@ def PITX = [
 	()
 ];
 
-class PersistentImageTester(t: Tester) {
+class CrashModelTester(t: Tester) {
 	def A = 0x1111_2222_3333_4444_u64;
 	def B = 0x5555_6666_7777_8888_u64;
 	def C = 0x9999_AAAA_BBBB_CCCC_u64;
 
-	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistentTraceEvent {
-		return PersistentTraceEvent(seq, PersistentEventKind.STORE, offset, width, value);
+	def store(seq: u64, offset: u64, width: u8, value: u64) -> PersistenceEvent {
+		return PersistenceEvent(seq, PersistenceEventKind.STORE, offset, width, value);
 	}
 
-	def clwb(seq: u64, cacheLine: u64) -> PersistentTraceEvent {
-		return PersistentTraceEvent(seq, PersistentEventKind.CLWB, cacheLine, 0u8, 0u64);
+	def clwb(seq: u64, cacheLine: u64) -> PersistenceEvent {
+		return PersistenceEvent(seq, PersistenceEventKind.CLWB, cacheLine, 0u8, 0u64);
 	}
 
-	def fence(seq: u64) -> PersistentTraceEvent {
-		return PersistentTraceEvent(seq, PersistentEventKind.SFENCE, 0u64, 0u8, 0u64);
+	def fence(seq: u64) -> PersistenceEvent {
+		return PersistenceEvent(seq, PersistenceEventKind.SFENCE, 0u64, 0u8, 0u64);
 	}
 
-	def trace(name: string, events: Array<PersistentTraceEvent>) -> PersistentTrace {
-		def result = PersistentTrace.new(name, 256u64, events);
+	def trace(name: string, events: Array<PersistenceEvent>) -> PersistenceTrace {
+		def result = PersistenceTrace.new(name, 256u64, events);
 		// A trace the model cannot represent must never reach the machine.
 		def check = result.validate();
 		if (!check.ok()) {
@@ -47,26 +47,26 @@ class PersistentImageTester(t: Tester) {
 		return result;
 	}
 
-	def machine(tr: PersistentTrace) -> PersistentCrashMachine {
-		return PersistentCrashMachine.new(tr, null);
+	def machine(tr: PersistenceTrace) -> CrashModel {
+		return CrashModel.new(tr, null);
 	}
 
-	def assertDurable(expect: u64, image: PersistentDurableImage, offset: u64, width: int) {
+	def assertDurable(expect: u64, image: CrashImage, offset: u64, width: int) {
 		t.assert_eq(expect, image.read(offset, width));
 	}
 
-	def makePmemRegion() -> PmemMmapRegion {
+	def makePmemRegion() -> PmemRegion {
 		def mapping = Mmap.reserve(4096u64, Mmap.PROT_READ | Mmap.PROT_WRITE);
 		if (mapping == null) return null;
-		def region = PmemMmapRegion.new(mapping, -1);
-		region.setPersistentOperations(RecordingPersistentOperations.new(region.range));
+		def region = PmemRegion.new(mapping, -1);
+		region.setProvider(RecordingProvider.new(region.range));
 		return region;
 	}
 
-	def firstStoreAt(tr: PersistentTrace, offset: u64) -> int {
+	def firstStoreAt(tr: PersistenceTrace, offset: u64) -> int {
 		for (i < tr.length()) {
 			def e = tr.events[i];
-			if (e.kind == PersistentEventKind.STORE && e.offset == offset) return i;
+			if (e.kind == PersistenceEventKind.STORE && e.offset == offset) return i;
 		}
 		return -1;
 	}
@@ -75,7 +75,7 @@ class PersistentImageTester(t: Tester) {
 // A store changes live state only. Without an explicit writeback or a
 // background eviction it is lost by a crash, which is the whole reason the WAL
 // needs flush-and-fence at its commit point.
-def test_image_store_is_volatile_until_writeback(tc: PersistentImageTester) {
+def test_image_store_is_volatile_until_writeback(tc: CrashModelTester) {
 	def tr = tc.trace("volatile_store", [tc.store(1u64, 8u64, 8u8, tc.A)]);
 	def m = tc.machine(tr);
 	m.runTo(1);
@@ -91,7 +91,7 @@ def test_image_store_is_volatile_until_writeback(tc: PersistentImageTester) {
 
 // SFENCE is the commit point: after it returns, everything the preceding CLWBs
 // requested is durable. Before it, nothing is owed to the crash image.
-def test_image_fence_completes_requested_writeback(tc: PersistentImageTester) {
+def test_image_fence_completes_requested_writeback(tc: CrashModelTester) {
 	def tr = tc.trace("fenced_store", [
 		tc.store(1u64, 8u64, 8u8, tc.A),
 		tc.clwb(2u64, 0u64),
@@ -110,14 +110,14 @@ def test_image_fence_completes_requested_writeback(tc: PersistentImageTester) {
 	tc.assertDurable(tc.A, m.crash(), 8u64, 8);
 
 	// Same outcome through the canonical minimal schedule, at both cuts.
-	tc.assertDurable(0u64, PersistentImages.lazyCrash(tr, null, 2), 8u64, 8);
-	tc.assertDurable(tc.A, PersistentImages.lazyCrash(tr, null, 3), 8u64, 8);
+	tc.assertDurable(0u64, CrashImages.lazyCrash(tr, null, 2), 8u64, 8);
+	tc.assertDurable(tc.A, CrashImages.lazyCrash(tr, null, 3), 8u64, 8);
 }
 
 // A fence only completes what the earlier CLWBs asked for. A store issued after
 // the CLWB and before the fence is dirty on the same line, yet is not durable
 // -- the property the WAL's piggybacked boundary depends on.
-def test_image_clwb_covers_only_earlier_stores(tc: PersistentImageTester) {
+def test_image_clwb_covers_only_earlier_stores(tc: CrashModelTester) {
 	def tr = tc.trace("late_store", [
 		tc.store(1u64, 8u64, 8u8, tc.A),
 		tc.clwb(2u64, 0u64),
@@ -135,13 +135,13 @@ def test_image_clwb_covers_only_earlier_stores(tc: PersistentImageTester) {
 
 	// The later store is still permitted to reach the domain early: a completion
 	// is not a snapshot taken at the CLWB.
-	tc.assertDurable(tc.B, PersistentImages.eagerCrash(tr, null, 4), 16u64, 8);
+	tc.assertDurable(tc.B, CrashImages.eagerCrash(tr, null, 4), 16u64, 8);
 }
 
 // A 64-byte writeback is not failure-atomic. It may leave a causally valid
 // partial line, so a half-written WAL record must be a state the model can
 // produce rather than one it collapses away.
-def test_image_writeback_tears_at_store_granularity(tc: PersistentImageTester) {
+def test_image_writeback_tears_at_store_granularity(tc: CrashModelTester) {
 	def tr = tc.trace("torn_line", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 8u64, 8u8, tc.B),
@@ -168,7 +168,7 @@ def test_image_writeback_tears_at_store_granularity(tc: PersistentImageTester) {
 // Stores to one line reach the persistence domain in program order, so an
 // overwritten value can only be durable together with, or ahead of, its
 // successor -- never after it.
-def test_image_same_line_stores_persist_in_order(tc: PersistentImageTester) {
+def test_image_same_line_stores_persist_in_order(tc: CrashModelTester) {
 	def tr = tc.trace("overwrite", [
 		tc.store(1u64, 24u64, 8u8, tc.A),
 		tc.store(2u64, 24u64, 8u8, tc.B)
@@ -186,17 +186,17 @@ def test_image_same_line_stores_persist_in_order(tc: PersistentImageTester) {
 // Background eviction needs no CLWB, so the maximal image contains every store
 // issued before the crash even when the scenario never flushed anything. The
 // two canonical schedules bracket every image the explorer can reach.
-def test_image_eviction_is_the_maximal_outcome(tc: PersistentImageTester) {
+def test_image_eviction_is_the_maximal_outcome(tc: CrashModelTester) {
 	def tr = tc.trace("unflushed", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.store(2u64, 128u64, 8u8, tc.B)
 	]);
 
-	def lazy = PersistentImages.lazyCrash(tr, null, 2);
+	def lazy = CrashImages.lazyCrash(tr, null, 2);
 	tc.assertDurable(0u64, lazy, 0u64, 8);
 	tc.assertDurable(0u64, lazy, 128u64, 8);
 
-	def eager = PersistentImages.eagerCrash(tr, null, 2);
+	def eager = CrashImages.eagerCrash(tr, null, 2);
 	tc.assertDurable(tc.A, eager, 0u64, 8);
 	tc.assertDurable(tc.B, eager, 128u64, 8);
 
@@ -213,7 +213,7 @@ def test_image_eviction_is_the_maximal_outcome(tc: PersistentImageTester) {
 // A CLWB of a line nothing wrote contributes no state and owes the fence
 // nothing, which is what keeps the explorer's per-cut state bounded by the
 // trace's touched lines rather than by the region size.
-def test_image_clwb_of_unwritten_line_owes_nothing(tc: PersistentImageTester) {
+def test_image_clwb_of_unwritten_line_owes_nothing(tc: CrashModelTester) {
 	def tr = tc.trace("empty_line_flush", [
 		tc.store(1u64, 0u64, 8u8, tc.A),
 		tc.clwb(2u64, 128u64),
@@ -235,13 +235,13 @@ def test_image_clwb_of_unwritten_line_owes_nothing(tc: PersistentImageTester) {
 // Durable bytes are little-endian, matching the recorded stores. The digest is
 // what deduplicates the states two schedules reach, so equal bytes must hash
 // equally and any difference must be locatable.
-def test_image_reads_and_digests_content(tc: PersistentImageTester) {
+def test_image_reads_and_digests_content(tc: CrashModelTester) {
 	def tr = tc.trace("endianness", [
 		tc.store(1u64, 0u64, 4u8, 0x0102_0304_u64),
 		tc.store(2u64, 8u64, 2u8, 0xBEEF_u64)
 	]);
 
-	def image = PersistentImages.eagerCrash(tr, null, 2);
+	def image = CrashImages.eagerCrash(tr, null, 2);
 	tc.t.asserti(256, image.size());
 	tc.assertDurable(0x04u64, image, 0u64, 1);
 	tc.assertDurable(0x03u64, image, 1u64, 1);
@@ -250,12 +250,12 @@ def test_image_reads_and_digests_content(tc: PersistentImageTester) {
 	// Widths beyond the recorded store read the surrounding durable bytes.
 	tc.assertDurable(0x0000_0000_0102_0304_u64, image, 0u64, 8);
 
-	def same = PersistentImages.eagerCrash(tr, null, 2);
+	def same = CrashImages.eagerCrash(tr, null, 2);
 	tc.t.assertz(true, image.sameBytes(same));
 	tc.t.assert_eq(image.digest(), same.digest());
 	tc.t.asserti(-1, image.firstDifference(same));
 
-	def shorter = PersistentImages.eagerCrash(tr, null, 1);
+	def shorter = CrashImages.eagerCrash(tr, null, 1);
 	tc.t.assertz(false, image.sameBytes(shorter));
 	tc.t.assertz(false, image.digest() == shorter.digest());
 	tc.t.asserti(8, image.firstDifference(shorter));
@@ -264,12 +264,12 @@ def test_image_reads_and_digests_content(tc: PersistentImageTester) {
 // A scenario does not always start on a blank region: the durable image it
 // begins from is the region's prior content, which is what lets a later slice
 // explore a crash on an already-formatted region.
-def test_image_starting_image_seeds_durable_bytes(tc: PersistentImageTester) {
+def test_image_starting_image_seeds_durable_bytes(tc: CrashModelTester) {
 	def initial = Array<byte>.new(16);
 	for (i < initial.length) initial[i] = 0xAAu8;
 
 	def tr = tc.trace("seeded", [tc.store(1u64, 0u64, 1u8, 0x11u64)]);
-	def m = PersistentCrashMachine.new(tr, initial);
+	def m = CrashModel.new(tr, initial);
 
 	def before = m.crash();
 	tc.t.asserti(256, before.size());
@@ -283,46 +283,46 @@ def test_image_starting_image_seeds_durable_bytes(tc: PersistentImageTester) {
 	tc.assertDurable(0xAAu64, m.crash(), 1u64, 1);
 }
 
-// The model applied to a recorded production trace: a real DualTxnWal commit,
+// The model applied to a recorded production trace: a real TwoSlotWal commit,
 // after-image application, and explicit flush. The after-image is durable only
 // once its own boundary runs -- until then it is recoverable from the record,
 // not from the data. Once every touched line has been flushed and fenced, the
 // minimal and maximal schedules agree, so that cut has exactly one image.
-def test_image_real_wal_after_image_needs_its_flush(tc: PersistentImageTester) {
+def test_image_real_wal_after_image_needs_its_flush(tc: CrashModelTester) {
 	def region = tc.makePmemRegion();
 	if (region == null) {
 		tc.t.fail("trace mapping allocation failed");
 		return;
 	}
-	def recorder = RecordingPersistentOperations.!(region.persistentOperations());
+	def recorder = RecordingProvider.!(region.provider());
 	def base = u64.view(Pointer.atElement(region.range, 0));
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 
 	def value = 0x8877_6655_4433_2211_u64;
 	recorder.clear();
 	tc.t.assertz(true, wal.append(200u64, value, 8u8));
 	tc.t.assert_eq(1u64, wal.commit());
-	tc.t.assertz(true, wal.applyUpdate(200u64, value, 8u8));
-	tc.t.assertz(true, wal.persistAppliedData());
+	tc.t.assertz(true, wal.applyAfterImage(200u64, value, 8u8));
+	tc.t.assertz(true, wal.persistAfterImages());
 	def tr = recorder.snapshot("dual_wal_commit_apply_flush");
 	tc.t.assertz(true, tr.validate().ok());
 
 	// The commit point: the record is durable, the after-image does not exist yet.
 	def commitFence = tr.length() - 3;
-	def atCommit = PersistentImages.lazyCrash(tr, null, commitFence);
+	def atCommit = CrashImages.lazyCrash(tr, null, commitFence);
 	tc.t.assertz(false, 0u64 == atCommit.read(1536u64, 8));
 	tc.assertDurable(0u64, atCommit, 200u64, 8);
 
 	// The after-image is applied, but rides the next boundary.
 	def applied = tc.firstStoreAt(tr, 200u64);
 	tc.t.assertz(true, applied > 0);
-	tc.assertDurable(0u64, PersistentImages.lazyCrash(tr, null, applied + 1), 200u64, 8);
-	tc.assertDurable(value, PersistentImages.eagerCrash(tr, null, applied + 1), 200u64, 8);
+	tc.assertDurable(0u64, CrashImages.lazyCrash(tr, null, applied + 1), 200u64, 8);
+	tc.assertDurable(value, CrashImages.eagerCrash(tr, null, applied + 1), 200u64, 8);
 
 	// After the flush, every touched line has been written back and fenced, so
 	// the schedule no longer matters.
-	def full = PersistentImages.lazyCrash(tr, null, tr.length());
+	def full = CrashImages.lazyCrash(tr, null, tr.length());
 	tc.assertDurable(value, full, 200u64, 8);
-	tc.t.assertz(true, full.sameBytes(PersistentImages.eagerCrash(tr, null, tr.length())));
-	region.destroy();
+	tc.t.assertz(true, full.sameBytes(CrashImages.eagerCrash(tr, null, tr.length())));
+	region.close();
 }

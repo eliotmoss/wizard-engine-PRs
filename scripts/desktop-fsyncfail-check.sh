@@ -8,7 +8,7 @@
 #   sudo env PWROOT_USER=sean-tan scripts/desktop-fsyncfail-check.sh run --yes-inject-io-errors [scenario...]
 # Scenarios, all three by default, in this order:
 #   single      4 KiB blocks. One transaction after a clean close (both slots
-#               scrubbed), so it is sequence 1; the whole log chunk fails.
+#               scrubbed), so it is sequence 1; the whole log block fails.
 #   stale-slot  8 KiB blocks, so the two log slots lie on different 4 KiB
 #               pages. Prepare leaves two acknowledged records, N-2 and N-1;
 #               only the page holding slot N mod 2 fails; after the same-boot
@@ -36,7 +36,7 @@
 # maps exactly the failing sectors to the `error` target and the rest
 # linearly; the commit runs; the all-linear table goes back before anything
 # reads those sectors again, so the device fails one write, as in Rebello's
-# transient faults. The failing sectors are the log chunk's (single), or the
+# transient faults. The failing sectors are the log block's (single), or the
 # 4 KiB page holding slot N mod 2 (stale-slot, tear). Not dm-flakey: with
 # error_writes it fails every write bio
 # while down, and the empty flush that dm sends to each target with
@@ -131,22 +131,22 @@ number() { local n; n=$(value "$1" "$2") || return 2; [[ "$n" =~ ^[0-9]+$ ]] || 
 # For the summary: the last value of a key, or ?.
 get() { [ -f "$2" ] || { say '?'; return 0; }; awk -v k="$1" '$1 == k { v=$2 } END { print (v == "" ? "?" : v) }' "$2"; }
 
-# ---- the log chunk's two slots (docs/persistent-backends.md, "Active on-region layout")
+# ---- the log block's two slots (docs/persistent-backends.md, "Active on-region layout")
 #
 # Header 64 B, then slot 0 and slot 1 of slotBytes = alignDown((blockSize -
 # 64) / 2, 64) each; slot k holds sequences of parity k. A record is
-# TxnRecordHeader (magic +0, entryCount +40, txnSeq +56; 64 B), 32-byte
-# entries, then TxnCommitTrailer (magic +0, txnSeq +32). The driver validates
+# WalRecordHeader (magic +0, entryCount +40, txnSeq +56; 64 B), 32-byte
+# entries, then WalRecordTrailer (magic +0, txnSeq +32). The driver validates
 # records with the WAL's own validateSlot(), checksum included; these readers
 # check the structure in a raw copy (no checksum), so the device's copy can be
 # checked too. Reads of the copies are bounds-checked: od returns 0 on a short
 # read.
 REC_MAGIC=4924476513641318468   # 0x4457414c54584844, "DWALTXHD"
 TRL_MAGIC=4924476513641317197   # 0x4457414c5458434d, "DWALTXCM"
-set_slots() { # block size [prepare.state]: SLOT_BYTES, SLOT_REL0/1 (offsets in the log chunk)
+set_slots() { # block size [prepare.state]: SLOT_BYTES, SLOT_REL0/1 (offsets in the log block)
     SLOT_BYTES=$(( ($1 - 64) / 2 / 64 * 64 ))
     SLOT_REL0=64 SLOT_REL1=$((64 + SLOT_BYTES))
-    [ $((SLOT_REL1 + SLOT_BYTES)) -le "$LOG_BYTES" ] || die "the slots do not fit the log chunk"
+    [ $((SLOT_REL1 + SLOT_BYTES)) -le "$LOG_BYTES" ] || die "the slots do not fit the log block"
     if [ "$#" = 2 ]; then
         [ "$(number slot_bytes "$2")" = "$SLOT_BYTES" ] || die "the driver's slotBytes differs from alignDown((blockSize - 64) / 2, 64) = $SLOT_BYTES"
         [ "$(number slot0_offset "$2")" = $((LOG_OFF + SLOT_REL0)) ] && [ "$(number slot1_offset "$2")" = $((LOG_OFF + SLOT_REL1)) ] \
@@ -206,14 +206,14 @@ set_fail_range() { # FAIL_OFF, FAIL_BYTES (file offsets), OTHER_PAGE, TEST_SLOT
     of=$((o / 4096 * 4096)); ol=$(((o + SLOT_BYTES - 1) / 4096 * 4096))
     [ "$tf" = "$tl" ] || die "slot $TEST_SLOT spans two 4 KiB pages"
     [ "$of" = "$ol" ] || die "slot $((1 - TEST_SLOT)) spans two 4 KiB pages"
-    [ "$tf" -ge "$LOG_OFF" ] && [ $((tf + 4096)) -le $((LOG_OFF + LOG_BYTES)) ] || die "the failing page is outside the log chunk"
+    [ "$tf" -ge "$LOG_OFF" ] && [ $((tf + 4096)) -le $((LOG_OFF + LOG_BYTES)) ] || die "the failing page is outside the log block"
     case "$SCN" in
         stale-slot) [ "$tf" != "$of" ] || die "stale-slot needs the two slots on different pages (block size $BS)" ;;
         tear) [ "$tf" = "$of" ] || die "tear needs both slots on one page (block size $BS)" ;;
     esac
     FAIL_OFF=$tf FAIL_BYTES=4096 OTHER_PAGE=$of
 }
-fail_sectors() { # from S (the log chunk's first sector) and N: FS0, FN (the failing sectors), OS (the other slot's page)
+fail_sectors() { # from S (the log block's first sector) and N: FS0, FN (the failing sectors), OS (the other slot's page)
     FS0=$((S + (FAIL_OFF - LOG_OFF) / 512)) FN=$((FAIL_BYTES / 512)) OS=
     [ -z "$OTHER_PAGE" ] || OS=$((S + (OTHER_PAGE - LOG_OFF) / 512))
     [ $((FS0 % 8)) = 0 ] && [ "$FS0" -ge "$S" ] && [ $((FS0 + FN)) -le $((S + N)) ] || die "unexpected failing sectors $FS0+$FN"
@@ -285,7 +285,7 @@ next_arg() { # commit.log: next's sequence for fault-verify-acks, 0 if next was 
     s=$(get next_seq_expected "$1")
     if [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" != 0 ]; then say "$s"; else say 1; fi
 }
-# The log chunk's device sectors. FIEMAP offsets are bytes on the file
+# The log block's device sectors. FIEMAP offsets are bytes on the file
 # system's device, which starts at sector 0 of the dm device.
 map_log_chunk() { # region file, filefrag output file: S (first sector), FLAGS
     as_user filefrag -v -b512 -s "$1" | as_user tee "$2" > /dev/null
@@ -294,14 +294,14 @@ map_log_chunk() { # region file, filefrag output file: S (first sector), FLAGS
         $1 ~ /^[0-9]+$/ && NF >= 6 && $2 ~ /^[0-9]+$/ && $2 <= l0 && l0 + n - 1 <= $3 {
             s = $4 + (l0 - $2); flags = ($NF ~ /[a-z]/) ? $NF : "-"; found++
         }
-        END { if (found == 1) print s, flags }') || die "the log chunk does not lie in one extent; see $2"
+        END { if (found == 1) print s, flags }') || die "the log block does not lie in one extent; see $2"
     local f
     for f in ${FLAGS//,/ }; do
-        case "$f" in -|last|eof|merged) ;; *) die "the log chunk's extent is flagged $f: not allocated and written" ;; esac
+        case "$f" in -|last|eof|merged) ;; *) die "the log block's extent is flagged $f: not allocated and written" ;; esac
     done
 }
 
-# ---- the log chunk read back, and the summary tables (run; check reuses them)
+# ---- the log block read back, and the summary tables (run; check reuses them)
 
 nonce_in() { # bytes on stdin; 1 if the nonce's bytes occur at a byte boundary
     local hex pat
@@ -309,7 +309,7 @@ nonce_in() { # bytes on stdin; 1 if the nonce's bytes occur at a byte boundary
     pat=" $(printf '%s' "$NONCE_HEX" | sed -E 's/(..)/\1 /g')"
     case "$hex" in *"$pat"*) say 1 ;; *) say 0 ;; esac
 }
-compare_log() { # tag: the log chunk through the page cache and through O_DIRECT
+compare_log() { # tag: the log block through the page cache and through O_DIRECT
     local b=$CD/log-$1-buffered.bin d=$CD/log-$1-direct.bin sb sd rb=1 rd=1 slb sld
     as_user "$DD" if="$R" bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$b" status=none || rb=0
     as_user "$DD" if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$d" status=none || rd=0
@@ -343,10 +343,10 @@ summary_header() { # scenario
     say ""
     case "$1" in
         single)
-            say "==== single: one transaction after a clean close; the log chunk fails"
+            say "==== single: one transaction after a clean close; the log block fails"
             say "# commit = commit() succeeded; latched = requiresRecovery() after it"
             say "# same-boot = the reopen in the same process: recovery, marker visible"
-            say "# log x/yz = buffered and O_DIRECT copies of the log chunk equal (x), nonce in buffered (y) and direct (z)"
+            say "# log x/yz = buffered and O_DIRECT copies of the log block equal (x), nonce in buffered (y) and direct (z)"
             say "# after-drop = fault-verify after umount + mount: recovery, visible, verdict"
             say "# fs = rw or ro after the reopen (ro: a journal failure, not the case under test)"
             # shellcheck disable=SC2059
@@ -357,7 +357,7 @@ summary_header() { # scenario
             say "# commit = commit N succeeded; latched = requiresRecovery() after it"
             say "# same-boot = the reopen: recovery; M = its value then (A, B, C, D, 0, other)"
             say "# next = next's commit() result / sequence (0: none)"
-            say "# log x/b/d = buffered and O_DIRECT copies of the log chunk equal (x); slot 0,1 sequences in the buffered (b) and O_DIRECT (d) copy, - = no record"
+            say "# log x/b/d = buffered and O_DIRECT copies of the log block equal (x); slot 0,1 sequences in the buffered (b) and O_DIRECT (d) copy, - = no record"
             say "# after-drop = fault-verify-acks after umount + mount: recovery; slots found; M; M2; verdict (every acknowledged transaction present, N whole or absent)"
             # shellcheck disable=SC2059
             printf "$FMT_STALE" case commit latched same-boot M next log@commit log@reopen log@next log@drop after-drop slots M M2 verdict fs
@@ -366,7 +366,7 @@ summary_header() { # scenario
             say "==== tear: N-2 (M = A) and N-1 (M = B) acknowledged; N stores M = C and Z = E; the page holding both slots fails"
             say "# commit = commit N succeeded; latched = requiresRecovery() after it"
             say "# same-boot = the reopen: recovery; M and Z then (A, B, C, E, 0, other)"
-            say "# log x/b/d = buffered and O_DIRECT copies of the log chunk equal (x); slot 0,1 sequences in the buffered (b) and O_DIRECT (d) copy, - = no record"
+            say "# log x/b/d = buffered and O_DIRECT copies of the log block equal (x); slot 0,1 sequences in the buffered (b) and O_DIRECT (d) copy, - = no record"
             say "# after-drop = fault-verify-acks after umount + mount: recovery; slots found; M; Z; verdict (N-1 present, N whole or absent)"
             # shellcheck disable=SC2059
             printf "$FMT_TEAR" case commit latched same-boot M Z log@commit log@reopen log@drop after-drop slots M Z verdict fs
@@ -452,7 +452,7 @@ PREDICTIONS (not results).
 
 ==== single: 4 KiB blocks. One transaction (one redo entry: a nonce in the
 marker word) is committed after a clean close, so it is sequence 1 and lands
-in slot 1 of the log chunk; the error target fails the write of that chunk.
+in slot 1 of the log block; the error target fails the write of that chunk.
 "Visible" means the marker holds the nonce.
 
 file on ext4 (data=ordered) and XFS:
@@ -460,7 +460,7 @@ file on ext4 (data=ordered) and XFS:
   same-boot reopen: REPLAYED, visible. ext4 marks the failed page clean but
     keeps its new bytes (Rebello Table 1, Q4-Q5), and the reopened MAP_SHARED
     mapping reads that page.
-  log chunk, buffered vs O_DIRECT: differ; the nonce is in the buffered copy
+  log block, buffered vs O_DIRECT: differ; the nonce is in the buffered copy
     only, after the commit and again after the reopen (recovery never stores
     to a record, so its page stays clean and is never rewritten).
   after the restore and the cache drop (umount + mount): CLEAN, and still
@@ -471,9 +471,9 @@ file on ext4 (data=ordered) and XFS:
 
 direct on ext4 and XFS (control):
   commit 0, latched: the O_DIRECT pwrite of the log unit returns EIO.
-  same-boot reopen: CLEAN, not visible: create() reads the region through
+  same-boot reopen: CLEAN, not visible: open() reads the region through
     O_DIRECT, from the device.
-  log chunk, buffered vs O_DIRECT: equal; the nonce is in neither.
+  log block, buffered vs O_DIRECT: equal; the nonce is in neither.
   after the drop: CLEAN, not visible.
 
 What other outcomes would mean:
@@ -490,7 +490,7 @@ What other outcomes would mean:
     fails as a control.
 
 ==== stale-slot: 8 KiB blocks. slotBytes = alignDown((8192 - 64) / 2, 64) =
-4032, so slot 0 is bytes 64-4095 of the log chunk (its first 4 KiB page,
+4032, so slot 0 is bytes 64-4095 of the log block (its first 4 KiB page,
 with the header) and slot 1 is bytes 4096-8127 (its second page).
 fault-prepare leaves N-2 = 1 (M = A) in slot 1 and N-1 = 2 (M = B) in slot
 0, both acknowledged, their data flushed, no clean close. N = 3 stores M = C
@@ -533,7 +533,7 @@ What other outcomes would mean:
   file, after the drop 4,- (slot 1 holds no valid record): only 4 replays;
     M = C from the same-boot replay's write, CONSISTENT: the stale record did
     not survive whole, so nothing undid N-1.
-  Recovery as written (DualTxnWal.recover()) does not check that the two
+  Recovery as written (TwoSlotWal.recover()) does not check that the two
     sequences are adjacent; it replays every valid slot in ascending order.
     A recovery that refused non-adjacent sequences would show CORRUPT after
     the drop (verdict INCONSISTENT: the loss detected and the region
@@ -545,7 +545,7 @@ What other outcomes would mean:
   direct, the reopen read 2,3 or M = C: the control read a cached copy.
 
 ==== tear: 4 KiB blocks. slotBytes = alignDown((4096 - 64) / 2, 64) = 1984:
-slot 0 is bytes 64-2047 and slot 1 bytes 2048-4031 of the log chunk's one
+slot 0 is bytes 64-2047 and slot 1 bytes 2048-4031 of the log block's one
 page. fault-prepare as for stale-slot: N-2 = 1 (M = A) in slot 1, N-1 = 2
 (M = B) in slot 0. N = 3 (slot 1) stores M = C and Z = E; Z is 0 before, and
 N-2 and N-1 never touch it. The error target covers the page. Nothing is
@@ -631,8 +631,8 @@ if [ "$CMD" = check ]; then
         prep=-
         if [ "$SCN" != single ]; then
             "$DD" if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$d/log-before.bin" status=none \
-                || die "O_DIRECT read of the log chunk failed"
-            [ "$(stat -c %s "$d/log-before.bin")" = "$LOG_BYTES" ] || die "short read of the log chunk"
+                || die "O_DIRECT read of the log block failed"
+            [ "$(stat -c %s "$d/log-before.bin")" = "$LOG_BYTES" ] || die "short read of the log block"
             prep=$(check_prepared "$d/log-before.bin" "after fault-prepare")
             if [ "$BE" = file ]; then
                 # run's mapping code on this file, on /: the arithmetic only.
@@ -687,8 +687,8 @@ if [ "$CMD" = check ]; then
             return 0
         fi
         "$DD" if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$d/log-after.bin" status=none \
-            || die "O_DIRECT read of the log chunk failed"
-        [ "$(stat -c %s "$d/log-after.bin")" = "$LOG_BYTES" ] || die "short read of the log chunk"
+            || die "O_DIRECT read of the log block failed"
+        [ "$(stat -c %s "$d/log-after.bin")" = "$LOG_BYTES" ] || die "short read of the log block"
         logafter=$(slots_of "$d/log-after.bin")
         [ "$BE" != file ] || cp --reflink=never -- "$R" "$d/emulated.region"
         verify_pair "$R" "$d/verify.log"
@@ -711,7 +711,7 @@ if [ "$CMD" = check ]; then
         "$DD" if="$d/page-before.bin" of="$d/emulated.region" bs=4096 seek=$((FAIL_OFF / 4096)) count=1 conv=notrunc status=none \
             || die "could not write the page into the copy"
         "$DD" if="$d/emulated.region" bs=4096 skip=$((LOG_OFF / 4096)) count=$((LOG_BYTES / 4096)) of="$d/log-emulated.bin" status=none \
-            || die "could not read the copy's log chunk"
+            || die "could not read the copy's log block"
         emu=$(slots_of "$d/log-emulated.bin")
         verify_pair "$d/emulated.region" "$d/verify-emulated.log"
         got="emulated log $emu | verify found $(seqs "$d/verify-emulated.log" found) $(get recovery "$d/verify-emulated.log") M=$(get m_is "$d/verify-emulated.log") $(get x_word "$CL")=$(get x_is "$d/verify-emulated.log") $(get verdict "$d/verify-emulated.log") exit $VRC"
@@ -744,24 +744,24 @@ backend (file, then direct): $(set -- $SCENARIOS; say "$# x $(set -- $FILESYSTEM
      stale-slot; $STEPS sieve steps; clean close; for stale-slot and tear a
      second mount commits N-2 and N-1, flushes, exits without closing; log
      chunk rewritten and fdatasynced)
-  4  filefrag -v -b512 -s: the log chunk must lie in one extent with no flag
+  4  filefrag -v -b512 -s: the log block must lie in one extent with no flag
      but last/eof/merged; its O_DIRECT copies through the file and through
      the dm device must match and start with the WAL header magic; for
      stale-slot and tear both slots must hold N-2's and N-1's records
   5  as $U: pwreboot fault-commit mounts (stale-slot, tear: replays N-2 and
-     N-1, checked against step 4; the device's log chunk re-read unchanged)
+     N-1, checked against step 4; the device's log block re-read unchanged)
      and prints READY
   6  table: linear | failing sectors -> error | linear, read back and
-     compared; failing sectors = the log chunk (single) or the 4 KiB page of
+     compared; failing sectors = the log block (single) or the 4 KiB page of
      slot N mod 2 (stale-slot, tear); an O_DIRECT read of the failing block
      must fail, the blocks either side and (stale-slot) the other slot's
      page must not
-  7  go-commit: commit N; the all-linear table is restored; the log chunk is
+  7  go-commit: commit N; the all-linear table is restored; the log block is
      read buffered and O_DIRECT (checksums, slot sequences, the value N wrote)
   8  go-reopen: abandon, reopen, recover in the same process; stale-slot:
-     log chunk read, then go-next: next commits; log chunk read again;
+     log block read, then go-next: next commits; log block read again;
      file-system state and the run's dmesg lines recorded
-  9  umount + mount (drops the file's pages); log chunk read again; region
+  9  umount + mount (drops the file's pages); log block read again; region
      copied; as $U: pwreboot fault-verify (single) or fault-verify-acks
   10 umount, dmsetup remove, losetup -d, image deleted
 Never touched: nvme0n1 and its partitions, existing dm or loop devices, idle
@@ -811,7 +811,7 @@ predictions | as_user tee "$OUT/predictions.txt" > /dev/null
     say "run_dir $RUNDIR"
     say "scenarios $SCENARIOS"
     say "geometry $BLOCKS blocks of 4096 (single, tear) or 8192 (stale-slot); setup $STEPS sieve steps; image $IMAGE_SIZE sparse; loop --direct-io=on"
-    say "fault dm error target over the log chunk's sectors (single) or slot N mod 2's 4 KiB page (stale-slot, tear), for one commit (see the script's header for why not dm-flakey)"
+    say "fault dm error target over the log block's sectors (single) or slot N mod 2's 4 KiB page (stale-slot, tear), for one commit (see the script's header for why not dm-flakey)"
     say "cache_drop umount+mount (not drop_caches)"
     say "images deleted after each case; region-before-verify.img keeps each region"
     say "$XFS_NOTE"
@@ -968,7 +968,7 @@ run_case() { # scenario, fs, backend
     [ "$(value scenario "$PS")" = "$SCN" ] && [ "$(number block_size "$PS")" = "$BS" ] || die "prepared scenario or block size differs"
     LOG_OFF=$(number log_offset "$PS"); LOG_BYTES=$(number log_bytes "$PS")
     SC=$(number setup_cursor "$PS"); SN=$(number setup_count "$PS")
-    [ $((LOG_OFF % 4096)) = 0 ] && [ $((LOG_BYTES % 4096)) = 0 ] && [ "$LOG_BYTES" -gt 0 ] || die "log chunk is not 4 KiB aligned"
+    [ $((LOG_OFF % 4096)) = 0 ] && [ $((LOG_BYTES % 4096)) = 0 ] && [ "$LOG_BYTES" -gt 0 ] || die "log block is not 4 KiB aligned"
     as_user sync -f "$R"
     if [ "$SCN" = single ]; then set_slots "$BS"; else set_slots "$BS" "$PS"; fi
     set_fail_range
@@ -979,11 +979,11 @@ run_case() { # scenario, fs, backend
     "$DD" if="$DEV" iflag=direct bs=4096 skip=$((S / 8)) count=$((N / 8)) status=none | as_user tee "$CD/log-device-before.bin" > /dev/null
     as_user "$DD" if="$R" iflag=direct bs=4096 skip=$((LOG_OFF / 4096)) count=$((N / 8)) of="$CD/log-file-before.bin" status=none
     [ "$(stat -c %s "$CD/log-device-before.bin")" = "$LOG_BYTES" ] || die "short read of the device's log sectors"
-    cmp -s "$CD/log-device-before.bin" "$CD/log-file-before.bin" || die "the device's sectors $S+$N do not hold the file's log chunk"
+    cmp -s "$CD/log-device-before.bin" "$CD/log-file-before.bin" || die "the device's sectors $S+$N do not hold the file's log block"
     [ "$(head -c 8 "$CD/log-device-before.bin")" = DAEHLAWD ] || die "sectors $S+$N do not start with the WAL header magic"
     PREP_SLOTS=-
-    [ "$SCN" = single ] || PREP_SLOTS=$(check_prepared "$CD/log-device-before.bin" "the device's log chunk after fault-prepare")
-    # The failing sectors: the log chunk (single) or slot N mod 2's page.
+    [ "$SCN" = single ] || PREP_SLOTS=$(check_prepared "$CD/log-device-before.bin" "the device's log block after fault-prepare")
+    # The failing sectors: the log block (single) or slot N mod 2's page.
     fail_sectors
     {
         say "log_offset $LOG_OFF"; say "log_bytes $LOG_BYTES"; say "log_sector $S"; say "log_sectors $N"; say "extent_flags $FLAGS"
@@ -1001,9 +1001,9 @@ run_case() { # scenario, fs, backend
         set_values "$CD/commit.log"
         NONCE_HEX=$(value value_c_le_hex "$CD/commit.log")
         # The mount replayed N-2 and N-1 without storing to a record: the
-        # device's log chunk must be the one checked above.
+        # device's log block must be the one checked above.
         "$DD" if="$DEV" iflag=direct bs=4096 skip=$((S / 8)) count=$((N / 8)) status=none | as_user tee "$CD/log-device-ready.bin" > /dev/null
-        cmp -s "$CD/log-device-before.bin" "$CD/log-device-ready.bin" || die "the log chunk on the device changed between fault-prepare and READY"
+        cmp -s "$CD/log-device-before.bin" "$CD/log-device-ready.bin" || die "the log block on the device changed between fault-prepare and READY"
     fi
     [[ "$NONCE_HEX" =~ ^[0-9a-f]{16}$ ]] || die "bad nonce_le_hex"
     # The run window by time, not by line count: the ring buffer drops its

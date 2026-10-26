@@ -1,12 +1,15 @@
-// x86-64 specific transaction backend implementations
+// x86-64 storage regions over a file descriptor: the PMEM region (a MAP_SYNC
+// mapping of a DAX file) and the mapped file (a shared mapping of a regular
+// file), their backends, and the backing-file I/O the direct-I/O backend
+// shares (X86_64DirectIoBackend.v3).
 
-class FdMmapRegion extends BackendRegion {
+class FileBackedRegion extends StorageRegion {
 	def var mapping: Mapping;
 	def var fd: int;
 
 	new(mapping: Mapping, fd: int)
 		super(CiRuntime.forgeRange<byte>(mapping.range.start, int.!(mapping.range.size()))) {
-		setPersistentOperations(X86_64PersistentOperations.new(range));
+		setProvider(NativeProvider.new(range));
 	}
 
 	def validRange(offset: u64, size: u64) -> bool {
@@ -14,10 +17,10 @@ class FdMmapRegion extends BackendRegion {
 		return offset <= regionSize && size <= regionSize - offset;
 	}
 
-	def cleanupBeforeDestroy() { }
+	def cleanupBeforeClose() { }
 
-	def destroy() {
-		cleanupBeforeDestroy();
+	def close() {
+		cleanupBeforeClose();
 		if (mapping != null) {
 			mapping.range.unmap();
 			mapping = null;
@@ -27,33 +30,47 @@ class FdMmapRegion extends BackendRegion {
 
 	def closeFd() {
 		if (fd >= 0) {
-			RegionFileIO.close(fd);
+			BackingFile.close(fd);
 			fd = -1;
 		}
 	}
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		return false;
 	}
 
-	def persistChanges() -> bool {
+	def drain() -> bool {
 		return false;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
+	def persist(offset: u64, size: u64) -> bool {
 		return false;
 	}
 }
 
-component MmapRegionUtils {
+// Splitting a region-relative range into 64-byte lines for the provider.
+component CacheLines {
 	def CACHE_LINE_SIZE = 64u64;
+
+	// Write back every line that overlaps [offset, offset + size), one
+	// writeBackLine() each through the region's provider, in ascending
+	// region-relative order.
+	def writeBackLines(region: FileBackedRegion, offset: u64, size: u64) -> bool {
+		if (!region.validRange(offset, size)) return false;
+		if (size == 0) return true;
+		def end = offset + size;
+		var line = offset - (offset % CACHE_LINE_SIZE);
+		while (line < end) {
+			region.provider().writeBackLine(line);
+			line += CACHE_LINE_SIZE;
+		}
+		return true;
+	}
+}
+
+// Mapping a region: the page size and the translation of BackendProt masks.
+component RegionMapping {
 	def PAGE_SIZE = 4096u64;
-	private def WRITEBACK_UNSELECTED = 0;
-	private def WRITEBACK_CLWB = 1;
-	private def WRITEBACK_CLFLUSHOPT = 2;
-	private def WRITEBACK_CLFLUSH = 3;
-	private def WRITEBACK_UNSUPPORTED = -1;
-	private var selectedWriteback = WRITEBACK_UNSELECTED;
 
 	def convertProt(prot: int) -> int {
 		var mmapProt = Mmap.PROT_NONE;
@@ -62,81 +79,22 @@ component MmapRegionUtils {
 		if ((prot & BackendProt.EXEC.mask) != 0) mmapProt |= Mmap.PROT_EXEC;
 		return mmapProt;
 	}
-
-	def flushRange(region: FdMmapRegion, offset: u64, size: u64) -> bool {
-		if (!region.validRange(offset, size)) return false;
-		if (size == 0) return true;
-		// Flush cache lines to PMEM
-		// CLWB (Cache Line Write Back) is the preferred instruction
-		// Falls back to CLFLUSHOPT or CLFLUSH on older CPUs
-		def end = offset + size;
-		var cacheLine = offset - (offset % CACHE_LINE_SIZE);
-
-		// Flush each cache line in ascending region-relative order.
-		while (cacheLine < end) {
-			region.persistentOperations().clwb(cacheLine);
-			cacheLine += CACHE_LINE_SIZE;
-		}
-		return true;
-	}
-
-	// Write one cache line back. CLWB is preferred because the architecture
-	// allows it to leave the line cached, which CLFLUSHOPT and CLFLUSH do not;
-	// whether it does is the core's choice. Measured (docs/persistent-backends.md):
-	// on Cascade Lake it evicts exactly as CLFLUSHOPT does, and on Raptor Lake a
-	// re-load after it costs ~12-14 ns against ~53 ns after CLFLUSHOPT. So a
-	// store into a line just written back may miss either way, which is why a
-	// transaction's after-images are all stored before any line is written back.
-	// Falls back to CLFLUSHOPT, then CLFLUSH, on processors without CLWB.
-	def flushCacheLine(addr: Pointer) {
-		def rawAddr = addr - Pointer.NULL;
-		def instruction = writebackInstruction();
-		if (instruction == WRITEBACK_CLWB) {
-			Target.clwb(rawAddr);
-		} else if (instruction == WRITEBACK_CLFLUSHOPT) {
-			Target.clflushOpt(rawAddr);
-		} else if (instruction == WRITEBACK_CLFLUSH) {
-			Target.clflush(rawAddr);
-		} else {
-			System.error("PersistentOperationError", "no supported cache-line writeback instruction");
-		}
-	}
-
-	// CPU features cannot change while the process is running. Cache the choice
-	// so a large range does not execute CPUID once per cache line.
-	private def writebackInstruction() -> int {
-		if (selectedWriteback != WRITEBACK_UNSELECTED) return selectedWriteback;
-		if (Target.supportsClwb()) {
-			selectedWriteback = WRITEBACK_CLWB;
-		} else if (Target.supportsClflushOpt()) {
-			selectedWriteback = WRITEBACK_CLFLUSHOPT;
-		} else if (Target.supportsClflush()) {
-			selectedWriteback = WRITEBACK_CLFLUSH;
-		} else {
-			selectedWriteback = WRITEBACK_UNSUPPORTED;
-		}
-		return selectedWriteback;
-	}
-
-	// Platform-specific store fence
-	def storeFence() {
-		Target.sfence();
-	}
 }
 
-// How a FileMmapRegion's fence reaches the file. FDATASYNC and MSYNC both make
-// the region a restriction of the PMEM crash model: one fdatasync() of the whole
-// file whenever a page is marked, or one msync(MS_SYNC) per run of marked pages.
-// LEGACY is the boundary used until 2026-10-13 -- a flag set by
-// prepareChangedRange(), an fdatasync() if it is set, and an msync() of a
-// persistRange()'s own pages only -- whose trace has no CLWB, so the crash model
-// says nothing about it. It is selectable only for the old-against-new
-// comparison (pwbench, pwsievebench and pwopsbench boundary=), as is MSYNC for
-// the choice of fence; remove both once those comparisons are recorded.
-enum FileBoundary(arg: string) {
-	FDATASYNC("fdatasync"),
-	MSYNC("msync"),
-	LEGACY("legacy")
+// How a MappedFileRegion's fence reaches the file. FDATASYNC_ONCE and
+// MSYNC_PER_RUN both make the region a restriction of the PMEM crash model:
+// one fdatasync() of the whole file whenever a page is marked, or one
+// msync(MS_SYNC) per run of marked pages. LEGACY_RANGE_MSYNC is the sync used
+// until 2026-10-13 -- a flag set by writeBack(), an fdatasync() if it is set,
+// and an msync() of a persist()'s own pages only -- whose trace has no CLWB,
+// so the crash model says nothing about it. It is selectable only for the
+// old-against-new comparison (pwbench, pwsievebench and pwopsbench
+// boundary=), as is MSYNC_PER_RUN for the choice of fence; remove both once
+// those comparisons are recorded. {arg} is the value boundary= takes.
+enum MappedFileSync(arg: string) {
+	FDATASYNC_ONCE("fdatasync"),
+	MSYNC_PER_RUN("msync"),
+	LEGACY_RANGE_MSYNC("legacy")
 }
 
 // A MAP_SHARED mapping of a regular file. On block storage the region lives in
@@ -144,105 +102,105 @@ enum FileBoundary(arg: string) {
 // time, and keeps dirty pages across the death of the process. On a DAX mount
 // there is no page cache, and stores reach the media through the CPU cache.
 //
-// The boundary methods mirror PmemMmapRegion's, as DirectIoRegion's do:
-// prepareChangedRange() issues one clwb() per 64-byte line through the
-// provider, persistChanges() and persistRange() one sfence(), so a recorded
-// trace is the PMEM backend's for the same history. The provider is the direct
-// backend's DirectIoOperations, which marks the line's 4 KiB page instead of
-// executing CLWB, and every fence syncs the marked pages before it returns, as
-// SFENCE completes every outstanding CLWB. A provider whose clwb() does nothing
-// (ElidedWritebackOperations) therefore marks nothing, and its fences sync
-// nothing: the mutant, as on the direct backend.
+// The persistence calls mirror PmemRegion's, as DirectIoRegion's do:
+// writeBack() issues one writeBackLine() per 64-byte line through the
+// provider, drain() and persist() one fence(), so a recorded trace is the PMEM
+// backend's for the same history. The provider is the direct backend's
+// MarkingProvider, which marks the line's 4 KiB page instead of executing
+// CLWB, and every fence syncs the marked pages before it returns, as SFENCE
+// completes every outstanding CLWB. A provider whose writeBackLine() does
+// nothing (ElidedWriteBackProvider) therefore marks nothing, and its fences
+// sync nothing: the mutant, as on the direct backend.
 //
 // What a crash can leave is argued in docs/pmem-crash-model.md ("The file
 // backend is a restriction of the PMEM model"): under the assumptions stated
 // there, for block storage and for DAX, every durable image is one the PMEM
 // model admits for the same trace. A crash inside a fence's sync corresponds to
 // the cut just before that fence's SFENCE.
-class FileMmapRegion extends FdMmapRegion {
-	def var dirty: DirectIoDirtyUnits;
-	// Set by preparing a nonzero range, cleared by a successful
-	// persistChanges(): PmemMmapRegion's hasPendingWriteback, so the recorded
+class MappedFileRegion extends FileBackedRegion {
+	def var dirty: DirtyUnits;
+	// Set by writing back a nonzero range, cleared by a successful
+	// drain(): PmemRegion's hasPendingWriteback, so the recorded
 	// fences match.
 	def var hasDirtyChanges = false;
-	def var boundary = FileBoundary.FDATASYNC;
+	def var sync = MappedFileSync.FDATASYNC_ONCE;
 
 	new(mapping: Mapping, fd: int) super(mapping, fd) {
 		// Built here rather than in a field initializer: Virgil runs field
 		// initializers before super(), when {range} is not yet set.
-		def page = MmapRegionUtils.PAGE_SIZE;
-		dirty = DirectIoDirtyUnits.new(page, (u64.!(range.length) + page - 1u64) / page);
-		wrapProvider(DirectIoStagingOperations.new(range));
+		def page = RegionMapping.PAGE_SIZE;
+		dirty = DirtyUnits.new(page, (u64.!(range.length) + page - 1u64) / page);
+		setInnerProvider(StoreOnlyProvider.new(range));
 	}
 
-	// Install {inner} beneath the page-marking provider. Only before the
-	// region reaches PWRegion, which captures the provider at construction.
-	def wrapProvider(inner: PersistentOperations) {
-		setPersistentOperations(DirectIoOperations.new(inner, dirty));
+	// Install {inner} beneath the page-marking provider. Only before the region
+	// reaches RegionAllocator, which captures the provider at construction.
+	def setInnerProvider(inner: PersistenceProvider) {
+		setProvider(MarkingProvider.new(inner, dirty));
 	}
 
-	// Benchmark-only, with FileMmapBackend.boundary: choose the fence, before
-	// the region reaches PWRegion. LEGACY also restores the provider the region
-	// had before 2026-10-13, which marks nothing.
-	def selectBoundary(b: FileBoundary) {
-		boundary = b;
-		if (b == FileBoundary.LEGACY) setPersistentOperations(X86_64PersistentOperations.new(range));
+	// Benchmark-only, with MappedFileBackend.sync: choose the fence, before the
+	// region reaches RegionAllocator. LEGACY_RANGE_MSYNC also restores the
+	// provider the region had before 2026-10-13, which marks nothing.
+	def selectSync(b: MappedFileSync) {
+		sync = b;
+		if (b == MappedFileSync.LEGACY_RANGE_MSYNC) setProvider(NativeProvider.new(range));
 	}
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
-		if (boundary == FileBoundary.LEGACY) {
+		if (sync == MappedFileSync.LEGACY_RANGE_MSYNC) {
 			if (!validRange(offset, size)) return false;
-		} else if (!MmapRegionUtils.flushRange(this, offset, size)) {
+		} else if (!CacheLines.writeBackLines(this, offset, size)) {
 			return false;
 		}
 		if (size != 0) hasDirtyChanges = true;
-		onRangePrepared(offset, size);
+		onWriteBack(offset, size);
 		return true;
 	}
 
 	// Observation hook paired with syncFileData() below. The default backend is
 	// intentionally silent; integration tests override it to trace ordering
 	// without reimplementing dirty-state transitions.
-	def onRangePrepared(offset: u64, size: u64) { }
+	def onWriteBack(offset: u64, size: u64) { }
 
 	// Syncs every marked page, not only this range's: the fence that ends a
-	// PMEM persistRange() completes every outstanding CLWB, and the crash
+	// PMEM persist() completes every outstanding CLWB, and the crash
 	// model's images depend on that. The pending flag is left as
-	// PmemMmapRegion leaves it, so the recorded fences match.
-	def persistRange(offset: u64, size: u64) -> bool {
+	// PmemRegion leaves it, so the recorded fences match.
+	def persist(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
 		if (!validRange(offset, size)) return false;
 		if (size == 0) return true;
-		if (boundary == FileBoundary.LEGACY) {
-			def pageSize = MmapRegionUtils.PAGE_SIZE;
+		if (sync == MappedFileSync.LEGACY_RANGE_MSYNC) {
+			def pageSize = RegionMapping.PAGE_SIZE;
 			def syncStart = offset - (offset % pageSize);
 			def rangeEnd = offset + size;
 			def syncEnd = ((rangeEnd + pageSize - 1u64) / pageSize) * pageSize;
 			return syncMappedRange(syncStart, syncEnd - syncStart);
 		}
 		if (fd < 0) return false;
-		if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
-		persistentOperations().sfence();
+		if (!CacheLines.writeBackLines(this, offset, size)) return false;
+		provider().fence();
 		return syncMarked();
 	}
 
 	// Like syncFileData(), keep the actual range-sync syscall behind a narrow
 	// seam. Inputs are validated, page-aligned offsets and sizes computed by
-	// syncMarked() (or by a LEGACY persistRange()), so tests can observe the
+	// syncMarked() (or by a LEGACY_RANGE_MSYNC persist()), so tests can observe the
 	// exact translation or inject a syscall failure without duplicating that
 	// logic.
 	def syncMappedRange(offset: u64, size: u64) -> bool {
 		return Mmap.sync(mapping.range.start + i64.view(offset), size, Mmap.MS_SYNC);
 	}
 
-	def persistChanges() -> bool {
+	def drain() -> bool {
 		if (mapping == null || fd < 0) return false;
 		if (!hasDirtyChanges) return true;
-		if (boundary == FileBoundary.LEGACY) {
+		if (sync == MappedFileSync.LEGACY_RANGE_MSYNC) {
 			if (!syncFileData()) return false;
 		} else {
-			persistentOperations().sfence();
+			provider().fence();
 			if (!syncMarked()) return false;
 		}
 
@@ -256,10 +214,10 @@ class FileMmapRegion extends FdMmapRegion {
 	// background eviction admits it. Nothing marked, nothing synced.
 	def syncMarked() -> bool {
 		if (dirty.isEmpty()) return true;
-		if (boundary != FileBoundary.MSYNC) {
+		if (sync != MappedFileSync.MSYNC_PER_RUN) {
 			if (!syncFileData()) return false;
 		} else {
-			def page = MmapRegionUtils.PAGE_SIZE;
+			def page = RegionMapping.PAGE_SIZE;
 			def length = u64.!(range.length);
 			def hi = dirty.hi;
 			var u = dirty.lo;
@@ -282,14 +240,14 @@ class FileMmapRegion extends FdMmapRegion {
 
 	// Keep the syscall behind a narrow virtual seam so backend integration tests
 	// can observe its ordering and inject failures without replacing the
-	// FileMmapRegion persistence state machine.
+	// MappedFileRegion persistence state machine.
 	def syncFileData() -> bool {
-		return RegionFileIO.fdatasync(fd);
+		return BackingFile.fdatasync(fd);
 	}
 
-	// Nothing is synced on destroy: the page cache keeps what was not, and the
+	// Nothing is synced on close: the page cache keeps what was not, and the
 	// WAL's close() is the clean path.
-	def cleanupBeforeDestroy() {
+	def cleanupBeforeClose() {
 		hasDirtyChanges = false;
 		if (dirty != null) dirty.clear();
 	}
@@ -300,36 +258,36 @@ class FileMmapRegion extends FdMmapRegion {
 	}
 }
 
-class PmemMmapRegion extends FdMmapRegion {
+class PmemRegion extends FileBackedRegion {
 	def var hasPendingWriteback = false;
 
 	new(mapping: Mapping, fd: int) super(mapping, fd) { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
-		if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
+		if (!CacheLines.writeBackLines(this, offset, size)) return false;
 		if (size != 0) hasPendingWriteback = true;
 		return true;
 	}
 
-	def persistChanges() -> bool {
+	def drain() -> bool {
 		if (mapping == null) return false;
 		if (!hasPendingWriteback) return true;
-		persistentOperations().sfence();
+		provider().fence();
 		hasPendingWriteback = false;
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
+	def persist(offset: u64, size: u64) -> bool {
 		if (mapping == null) return false;
 		if (!validRange(offset, size)) return false;
 		if (size == 0) return true;
-		if (!MmapRegionUtils.flushRange(this, offset, size)) return false;
-		persistentOperations().sfence();
+		if (!CacheLines.writeBackLines(this, offset, size)) return false;
+		provider().fence();
 		return true;
 	}
 
-	def cleanupBeforeDestroy() {
+	def cleanupBeforeClose() {
 		hasPendingWriteback = false;
 	}
 
@@ -340,35 +298,35 @@ class PmemMmapRegion extends FdMmapRegion {
 }
 
 // Persistent memory backend using mmap with MAP_SYNC (for PMEM/DAX)
-class PmemMmapBackend extends TxnRegionBackend {
+class PmemBackend extends StorageBackend {
 	def path: string;  // Path to PMEM device or DAX file
 
 	// TODO: think about whether we want a single path to be able to used to create multiple regions
 	new(path) { }
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
-		def fd = RegionFileIO.openBacking(path, fresh);
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		def fd = BackingFile.openBacking(path, mode);
 		if (fd < 0) return null;
-		def err = RegionFileIO.sizeBacking(fd, size);
+		def err = BackingFile.sizeBacking(fd, size);
 		if (err != null) {
 			Trace.OUT.puts(err).ln();
-			RegionFileIO.close(fd);
+			BackingFile.close(fd);
 			return null;
 		}
 
-		var mmapProt = MmapRegionUtils.convertProt(prot);
+		var mmapProt = RegionMapping.convertProt(access);
 		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED_VALIDATE | Mmap.MAP_SYNC, fd, 0);
-		def region = makePersistentRegion(mapping, fd);
+		def region = makePmemRegion(mapping, fd);
 		if (region == null) {
-			RegionFileIO.close(fd);
+			BackingFile.close(fd);
 			return null;
 		}
 		return region;
 	}
 
-	def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+	def makePmemRegion(newMapping: Mapping, fd: int) -> PmemRegion {
 		if (newMapping == null) return null;
-		return PmemMmapRegion.new(newMapping, fd);
+		return PmemRegion.new(newMapping, fd);
 	}
 
 	def isPersistent() -> bool {
@@ -380,38 +338,38 @@ class PmemMmapBackend extends TxnRegionBackend {
 	}
 }
 
-class FileMmapBackend extends TxnRegionBackend {
+class MappedFileBackend extends StorageBackend {
 	def path: string;
 	// Benchmark-only: the fence every region this backend creates uses (see
-	// FileBoundary).
-	var boundary = FileBoundary.FDATASYNC;
+	// MappedFileSync).
+	var sync = MappedFileSync.FDATASYNC_ONCE;
 
 	new(path) { }
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
-		def fd = RegionFileIO.openBacking(path, fresh);
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		def fd = BackingFile.openBacking(path, mode);
 		if (fd < 0) return null;
-		def err = RegionFileIO.sizeBacking(fd, size);
+		def err = BackingFile.sizeBacking(fd, size);
 		if (err != null) {
 			Trace.OUT.puts(err).ln();
-			RegionFileIO.close(fd);
+			BackingFile.close(fd);
 			return null;
 		}
 
-		def mmapProt = MmapRegionUtils.convertProt(prot);
+		def mmapProt = RegionMapping.convertProt(access);
 		def mapping = Mmap.map(size, mmapProt, Mmap.MAP_SHARED, fd, 0);
-		def region = makeFileRegion(mapping, fd);
+		def region = makeMappedFileRegion(mapping, fd);
 		if (region == null) {
-			RegionFileIO.close(fd);
+			BackingFile.close(fd);
 			return null;
 		}
-		if (boundary != FileBoundary.FDATASYNC) region.selectBoundary(boundary);
+		if (sync != MappedFileSync.FDATASYNC_ONCE) region.selectSync(sync);
 		return region;
 	}
 
-	def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+	def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
 		if (newMapping == null) return null;
-		return FileMmapRegion.new(newMapping, fd);
+		return MappedFileRegion.new(newMapping, fd);
 	}
 
 	def isPersistent() -> bool {
@@ -423,7 +381,7 @@ class FileMmapBackend extends TxnRegionBackend {
 	}
 }
 
-component RegionFileIO {
+component BackingFile {
 	def FILE_MODE = 420;	// 0644 octal
 	def PRIVATE_FILE_MODE = 384;	// 0600 octal
 
@@ -466,10 +424,10 @@ component RegionFileIO {
 		return int.!(r.0);
 	}
 
-	// Obtain a backing fd for a region: a fresh format re-creates the file (zeroed),
-	// otherwise attach to the existing file, creating it zeroed if it is missing.
-	def openBacking(path: string, fresh: bool) -> int {
-		if (fresh) return create(path);
+	// Obtain a backing fd for a region: FORMAT re-creates the file (zeroed),
+	// ATTACH opens the existing file, creating it zeroed if it is missing.
+	def openBacking(path: string, mode: OpenMode) -> int {
+		if (mode == OpenMode.FORMAT) return create(path);
 		var fd = open(path);
 		if (fd < 0) fd = create(path);  // missing -> fresh, zeroed
 		return fd;
@@ -482,7 +440,7 @@ component RegionFileIO {
 	// unchanged, before anything maps or reads it, since the caller has not yet
 	// seen its header. Until 2026-10-21 any file was truncated or extended to
 	// {size} here, so a mount that asked for the wrong geometry cut or grew an
-	// existing region before PWRegion refused it.
+	// existing region before RegionAllocator refused it.
 	def sizeBacking(fd: int, size: u64) -> string {
 		def fileSize = Linux.syscall(LinuxConst.SYS_lseek, (fd, 0, LinuxConst.SEEK_END)).0;
 		if (fileSize < 0) return "could not read the size of the region file";
@@ -521,21 +479,21 @@ component RegionFileIO {
 // Factory for creating backend instances
 component X86_64Backends {
 	// Use platform-independent backends by default
-	def getVolatile() -> TxnRegionBackend {
-		return Backends.getVolatile();
+	def volatile() -> StorageBackend {
+		return Backends.volatile();
 	}
 	
 	// Get mmap-based backend (delegates to platform-independent version)
-	def getMmap() -> TxnRegionBackend {
+	def getMmap() -> StorageBackend {
 		return Backends.getMmap();
 	}
 	
 	// Get PMEM backend (x86-64 specific with cache flush instructions)
-	def getPersistent(path: string) -> TxnRegionBackend {
-		return PmemMmapBackend.new(path);
+	def pmem(path: string) -> StorageBackend {
+		return PmemBackend.new(path);
 	}
 
-	def getFileMapped(path: string) -> TxnRegionBackend {
-		return FileMmapBackend.new(path);
+	def mappedFile(path: string) -> StorageBackend {
+		return MappedFileBackend.new(path);
 	}
 }

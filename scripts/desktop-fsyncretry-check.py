@@ -3,7 +3,7 @@
 
 What does Linux leave after an fdatasync() fails with EIO, and what does a
 retry do? One 4 KiB page of a 1 MiB file, stored through a MAP_SHARED mapping
-and made durable with fdatasync(), as FileMmapRegion's boundary does (Rebello
+and made durable with fdatasync(), as MappedFileRegion's boundary does (Rebello
 et al., ATC '20; docs/persistent-backends.md, "A failed write below ext4 and
 XFS: the same-boot reopen replays a record the disk lacks").
   scripts/desktop-fsyncretry-check.py check [--dir DIR]

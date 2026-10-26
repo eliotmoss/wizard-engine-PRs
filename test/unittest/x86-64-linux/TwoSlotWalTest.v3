@@ -1,4 +1,4 @@
-// DualTxnWal Tests
+// TwoSlotWal Tests
 // Tests the two-slot persistent redo log and its recovery flow (phase B:
 // piggybacked persistence boundary, one boundary per commit in steady state).
 //
@@ -6,7 +6,7 @@
 // aligned down to 64 = 448. Slot 0 is at logAddr+64, slot 1 at logAddr+512.
 // txnSeq parity selects the slot: odd sequences land in slot 1, even in slot 0.
 
-def DWT = UnitTests.registerT("dual_wal:", _, DualTxnWalTester.new, _);
+def DWT = UnitTests.registerT("two_slot_wal:", _, TwoSlotWalTester.new, _);
 def DWTX = [
 	DWT("fresh_header", test_dual_fresh_header),
 	DWT("fresh_header_fail_before_copy_requires_reformat", test_dual_fresh_header_fail_before_copy_requires_reformat),
@@ -65,38 +65,38 @@ enum ShadowPersistOutcome {
 	PARTIAL_COPY_THEN_FAIL
 }
 
-// Test-only executable model of BackendRegion durability. Pointer writes made
+// Test-only executable model of StorageRegion durability. Pointer writes made
 // by the WAL mutate {range}, the live image. Persistence operations explicitly
 // copy live bytes into {durable}; crash() discards every unpersisted write by
 // restoring the live image from that durable shadow.
-class ShadowDurableRegion extends BackendRegion {
+class ShadowDurableRegion extends StorageRegion {
 	var durable: Array<byte>;
 	var pendingOffsets = Vector<u64>.new();
 	var pendingSizes = Vector<u64>.new();
-	var prepareChangedRangeCount = 0;
-	var persistRangeCount = 0;
-	var persistChangesCount = 0;
-	var failNextPrepareChangedRange = false;
-	var nextPersistRangeOutcome = ShadowPersistOutcome.SUCCESS;
-	var nextPersistChangesOutcome = ShadowPersistOutcome.SUCCESS;
+	var writeBackCount = 0;
+	var persistCount = 0;
+	var drainCount = 0;
+	var failNextWriteBack = false;
+	var nextPersistOutcome = ShadowPersistOutcome.SUCCESS;
+	var nextDrainOutcome = ShadowPersistOutcome.SUCCESS;
 
 	new(range: Range<byte>) super(range) {
 		durable = Array<byte>.new(range.length);
 		for (i < durable.length) durable[i] = range[i];
 	}
 
-	def destroy() { }
+	def close() { }
 
 	def validRange(offset: u64, size: u64) -> bool {
 		def regionSize = u64.!(range.length);
 		return offset <= regionSize && size <= regionSize - offset;
 	}
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
-		prepareChangedRangeCount++;
+	def writeBack(offset: u64, size: u64) -> bool {
+		writeBackCount++;
 		if (!validRange(offset, size)) return false;
-		if (failNextPrepareChangedRange) {
-			failNextPrepareChangedRange = false;
+		if (failNextWriteBack) {
+			failNextWriteBack = false;
 			return false;
 		}
 		if (size != 0u64) {
@@ -106,11 +106,11 @@ class ShadowDurableRegion extends BackendRegion {
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
-		persistRangeCount++;
+	def persist(offset: u64, size: u64) -> bool {
+		persistCount++;
 		if (!validRange(offset, size)) return false;
-		def outcome = nextPersistRangeOutcome;
-		nextPersistRangeOutcome = ShadowPersistOutcome.SUCCESS;
+		def outcome = nextPersistOutcome;
+		nextPersistOutcome = ShadowPersistOutcome.SUCCESS;
 		match (outcome) {
 			SUCCESS => {
 				copyLiveRange(offset, size);
@@ -128,10 +128,10 @@ class ShadowDurableRegion extends BackendRegion {
 		}
 	}
 
-	def persistChanges() -> bool {
-		persistChangesCount++;
-		def outcome = nextPersistChangesOutcome;
-		nextPersistChangesOutcome = ShadowPersistOutcome.SUCCESS;
+	def drain() -> bool {
+		drainCount++;
+		def outcome = nextDrainOutcome;
+		nextDrainOutcome = ShadowPersistOutcome.SUCCESS;
 		match (outcome) {
 			SUCCESS => {
 				copyPreparedRanges(false);
@@ -155,9 +155,9 @@ class ShadowDurableRegion extends BackendRegion {
 	def crash() {
 		for (i < durable.length) range[i] = durable[i];
 		clearPreparedRanges();
-		failNextPrepareChangedRange = false;
-		nextPersistRangeOutcome = ShadowPersistOutcome.SUCCESS;
-		nextPersistChangesOutcome = ShadowPersistOutcome.SUCCESS;
+		failNextWriteBack = false;
+		nextPersistOutcome = ShadowPersistOutcome.SUCCESS;
+		nextDrainOutcome = ShadowPersistOutcome.SUCCESS;
 	}
 
 	private def clearPreparedRanges() {
@@ -186,36 +186,36 @@ class ShadowDurableRegion extends BackendRegion {
 
 // A region that counts persistence-API calls, to pin down the boundary count
 // per commit and the piggybacked-durability induction property.
-class DualWalCountingRegion extends BackendRegion {
-	var prepareChangedRangeCount = 0;
-	var persistRangeCount = 0;
-	var persistChangesCount = 0;
+class TwoSlotWalCountingRegion extends StorageRegion {
+	var writeBackCount = 0;
+	var persistCount = 0;
+	var drainCount = 0;
 
 	new(range: Range<byte>) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
-		prepareChangedRangeCount++;
+	def writeBack(offset: u64, size: u64) -> bool {
+		writeBackCount++;
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
-		persistRangeCount++;
+	def persist(offset: u64, size: u64) -> bool {
+		persistCount++;
 		return true;
 	}
 
-	def persistChanges() -> bool {
-		persistChangesCount++;
+	def drain() -> bool {
+		drainCount++;
 		return true;
 	}
 }
 
-class DualTxnWalTester(t: Tester) {
+class TwoSlotWalTester(t: Tester) {
 	var data: Array<byte>;
-	var backendRegion: BackendRegion;
+	var backendRegion: StorageRegion;
 	var shadowRegion: ShadowDurableRegion;
-	var wal: DualTxnWal;
+	var wal: TwoSlotWal;
 	var regionStart: u64;
 	var logAddr: u64;
 
@@ -226,14 +226,14 @@ class DualTxnWalTester(t: Tester) {
 		logAddr = regionStart + 1024u64;
 		shadowRegion = ShadowDurableRegion.new(data[0 ..+ data.length]);
 		backendRegion = shadowRegion;
-		wal = DualTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, true);
+		wal = TwoSlotWal.new(regionStart, logAddr, 1024u64, backendRegion, OpenMode.FORMAT);
 	}
 
-	def reopen() -> DualTxnWal {
-		return DualTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, false);
+	def reopen() -> TwoSlotWal {
+		return TwoSlotWal.new(regionStart, logAddr, 1024u64, backendRegion, OpenMode.ATTACH);
 	}
 
-	def crashAndReopen() -> DualTxnWal {
+	def crashAndReopen() -> TwoSlotWal {
 		shadowRegion.crash();
 		return reopen();
 	}
@@ -245,36 +245,36 @@ class DualTxnWalTester(t: Tester) {
 		return wal.commit();
 	}
 
-	// The full per-transaction cycle as RegionTransaction drives it: commit,
+	// The full per-transaction cycle as TransactionCache drives it: commit,
 	// then apply the after-images (whose persist rides the next boundary).
 	def commitAndApply(offset: u64, value: u64, width: u8) -> u64 {
 		wal.append(offset, value, width);
 		def seq = wal.commit();
-		wal.applyUpdate(offset, value, width);
+		wal.applyAfterImage(offset, value, width);
 		return seq;
 	}
 
 	def corruptChecksumOfSlot(slot: int) -> u64 {
 		def recordAddr = wal.slotAddr(slot);
-		def entryCount = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
-		def addr = recordAddr + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
-		def old = PWRegionUtils.pointerFromU64(addr).load<u64>();
-		PWRegionUtils.pointerFromU64(addr).store<u64>(old + 1u64);
+		def entryCount = RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.entryCount.offset)).load<u32>();
+		def addr = recordAddr + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size) + u64.view(WalRecordTrailer.checksum.offset);
+		def old = RegionUtils.pointerFromU64(addr).load<u64>();
+		RegionUtils.pointerFromU64(addr).store<u64>(old + 1u64);
 		return addr;
 	}
 
 	// Replace the log with one canonical, durable one-entry record in slot 1.
 	// Malformed-record tests use this before each independent mutation.
 	def resetCommittedRecord() -> u64 {
-		wal = DualTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, true);
+		wal = TwoSlotWal.new(regionStart, logAddr, 1024u64, backendRegion, OpenMode.FORMAT);
 		writeTxn(200u64, 0x55u64, 1u8);
 		return wal.slotAddr(1);
 	}
 
 	def trailerAddrOfSlot(slot: int) -> u64 {
 		def recordAddr = wal.slotAddr(slot);
-		def entryCount = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
-		return recordAddr + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size);
+		def entryCount = RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.entryCount.offset)).load<u32>();
+		return recordAddr + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size);
 	}
 
 	// Recompute the production record checksum after a structural mutation.
@@ -282,8 +282,8 @@ class DualTxnWalTester(t: Tester) {
 	// passing only because arbitrary byte corruption invalidated the checksum.
 	def recomputeChecksumOfSlot(slot: int) {
 		def recordAddr = wal.slotAddr(slot);
-		def recordLen = PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.recordLen.offset)).load<u32>();
-		def checksumAddr = trailerAddrOfSlot(slot) + u64.view(TxnCommitTrailer.checksum.offset);
+		def recordLen = RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.recordLen.offset)).load<u32>();
+		def checksumAddr = trailerAddrOfSlot(slot) + u64.view(WalRecordTrailer.checksum.offset);
 		var h = 0x9E37_79B9_7F4A_7C15_u64;
 		var ptr = recordAddr;
 		def end = recordAddr + u64.view(recordLen);
@@ -291,18 +291,18 @@ class DualTxnWalTester(t: Tester) {
 		while (ptr < end) {
 			var b: u64 = 0u64;
 			if (!(ptr >= checksumAddr && ptr < skipEnd)) {
-				b = u64.view(PWRegionUtils.pointerFromU64(ptr).load<u8>());
+				b = u64.view(RegionUtils.pointerFromU64(ptr).load<u8>());
 			}
 			h = (h << 7) | (h >> 57);
 			h = (h ^ b) * 0x1000_0000_01B3_u64;
 			ptr++;
 		}
-		PWRegionUtils.pointerFromU64(checksumAddr).store<u64>(h);
+		RegionUtils.pointerFromU64(checksumAddr).store<u64>(h);
 	}
 }
 
 // Fresh initialization: a valid header, computed slot geometry, empty slots.
-def test_dual_fresh_header(tc: DualTxnWalTester) {
+def test_dual_fresh_header(tc: TwoSlotWalTester) {
 	tc.t.assertz(true, tc.wal.openOk);
 	tc.t.assertz(true, tc.wal.validateHeader());
 	tc.t.assert_eq(448u64, tc.wal.slotBytes);
@@ -316,68 +316,68 @@ def test_dual_fresh_header(tc: DualTxnWalTester) {
 // A definite failure before the fresh header reaches durable storage leaves no
 // mountable WAL. Initialization latches immediately, performs no second
 // persist, and requires another fresh format rather than same-instance retry.
-def test_dual_fresh_header_fail_before_copy_requires_reformat(tc: DualTxnWalTester) {
+def test_dual_fresh_header_fail_before_copy_requires_reformat(tc: TwoSlotWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def log = base + 1024u64;
 	def region = ShadowDurableRegion.new(data[0 ..+ data.length]);
-	region.nextPersistRangeOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	region.nextPersistOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
 
-	def failed = DualTxnWal.new(base, log, 1024u64, region, true);
+	def failed = TwoSlotWal.new(base, log, 1024u64, region, OpenMode.FORMAT);
 	tc.t.assertz(false, failed.openOk);
 	tc.t.assertz(true, failed.requiresRecovery());
-	tc.t.assert_eq(1, region.persistRangeCount);
+	tc.t.assert_eq(1, region.persistCount);
 
-	def prepareCount = region.prepareChangedRangeCount;
-	def persistChangesCount = region.persistChangesCount;
+	def prepareCount = region.writeBackCount;
+	def drainCount = region.drainCount;
 	tc.t.assertz(false, failed.append(200u64, 0x55u64, 1u8));
 	tc.t.assert_eq(0u64, failed.commit());
-	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(true, failed.recover() == WalRecovery.PERSIST_FAILED);
 	failed.close();
-	tc.t.assert_eq(prepareCount, region.prepareChangedRangeCount);
-	tc.t.assert_eq(1, region.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, region.persistChangesCount);
+	tc.t.assert_eq(prepareCount, region.writeBackCount);
+	tc.t.assert_eq(1, region.persistCount);
+	tc.t.assert_eq(drainCount, region.drainCount);
 
 	region.crash();
-	def corrupt = DualTxnWal.new(base, log, 1024u64, region, false);
+	def corrupt = TwoSlotWal.new(base, log, 1024u64, region, OpenMode.ATTACH);
 	tc.t.assertz(false, corrupt.openOk);
 	tc.t.assertz(false, corrupt.requiresRecovery());
-	tc.t.assertz(true, corrupt.recover() == DualWalRecovery.CORRUPT);
+	tc.t.assertz(true, corrupt.recover() == WalRecovery.CORRUPT);
 
-	def reformatted = DualTxnWal.new(base, log, 1024u64, region, true);
+	def reformatted = TwoSlotWal.new(base, log, 1024u64, region, OpenMode.FORMAT);
 	tc.t.assertz(true, reformatted.openOk);
 	tc.t.assertz(false, reformatted.requiresRecovery());
-	tc.t.assertz(true, reformatted.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reformatted.recover() == WalRecovery.CLEAN);
 }
 
 // A fresh-header persist can copy every byte and still report failure. The
 // creating instance must latch, but after a crash a new instance may validate
 // the complete durable header and open the empty WAL normally.
-def test_dual_fresh_header_copy_then_fail_reopens_clean(tc: DualTxnWalTester) {
+def test_dual_fresh_header_copy_then_fail_reopens_clean(tc: TwoSlotWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def log = base + 1024u64;
 	def region = ShadowDurableRegion.new(data[0 ..+ data.length]);
-	region.nextPersistRangeOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
+	region.nextPersistOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
 
-	def failed = DualTxnWal.new(base, log, 1024u64, region, true);
+	def failed = TwoSlotWal.new(base, log, 1024u64, region, OpenMode.FORMAT);
 	tc.t.assertz(false, failed.openOk);
 	tc.t.assertz(true, failed.requiresRecovery());
-	tc.t.assert_eq(1, region.persistRangeCount);
+	tc.t.assert_eq(1, region.persistCount);
 
 	region.crash();
-	def reopened = DualTxnWal.new(base, log, 1024u64, region, false);
+	def reopened = TwoSlotWal.new(base, log, 1024u64, region, OpenMode.ATTACH);
 	tc.t.assertz(true, reopened.openOk);
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 }
 
 // An empty transaction commits as an entryCount=0 record: a successful commit
 // always returns a nonzero sequence, so the 0 failure sentinel is unambiguous
-// (MultiTxnWal returned durableAppliedSeq here, colliding with 0 when fresh).
-def test_dual_empty_commit_returns_seq(tc: DualTxnWalTester) {
+// (RingWal returned durableAppliedSeq here, colliding with 0 when fresh).
+def test_dual_empty_commit_returns_seq(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.wal.commit());
 	tc.t.assert_eq(2u64, tc.wal.nextTxnSeq);
 	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
@@ -385,7 +385,7 @@ def test_dual_empty_commit_returns_seq(tc: DualTxnWalTester) {
 
 // Sequence parity alternates the slots; the third commit overwrites slot 1
 // after earlier boundaries have piggybacked the destroyed record's data.
-def test_dual_commit_alternates_slots(tc: DualTxnWalTester) {
+def test_dual_commit_alternates_slots(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x22u64, 1u8));
@@ -398,11 +398,11 @@ def test_dual_commit_alternates_slots(tc: DualTxnWalTester) {
 }
 
 // Commit -> crash -> recover: the committed record replays its after-images.
-def test_dual_commit_crash_recover(tc: DualTxnWalTester) {
+def test_dual_commit_crash_recover(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
 	tc.t.assert_eq(0u8, tc.data[200]);	// crashed before apply
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
@@ -413,7 +413,7 @@ def test_dual_commit_crash_recover(tc: DualTxnWalTester) {
 // Recovery must preserve every supported multi-byte after-image width, including
 // signed values whose high bit is set. Commit the complete record but crash before
 // application so these assertions exercise production redo rather than live data.
-def test_dual_mixed_width_signed_values_recover(tc: DualTxnWalTester) {
+def test_dual_mixed_width_signed_values_recover(tc: TwoSlotWalTester) {
 	def offset16 = 200u64;
 	def offset32 = 204u64;
 	def offset64 = 208u64;
@@ -426,15 +426,15 @@ def test_dual_mixed_width_signed_values_recover(tc: DualTxnWalTester) {
 	tc.t.assertz(true, tc.wal.append(offset64, value64, 8u8));
 	tc.t.assert_eq(1u64, tc.wal.commit());
 
-	def addr16 = PWRegionUtils.pointerFromU64(tc.regionStart + offset16);
-	def addr32 = PWRegionUtils.pointerFromU64(tc.regionStart + offset32);
-	def addr64 = PWRegionUtils.pointerFromU64(tc.regionStart + offset64);
+	def addr16 = RegionUtils.pointerFromU64(tc.regionStart + offset16);
+	def addr32 = RegionUtils.pointerFromU64(tc.regionStart + offset32);
+	def addr64 = RegionUtils.pointerFromU64(tc.regionStart + offset64);
 	tc.t.assert_eq(0i16, addr16.load<i16>());
 	tc.t.assert_eq(0u32, addr32.load<u32>());
 	tc.t.assert_eq(0i64, addr64.load<i64>());
 
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(i16.view(u16.view(value16)), addr16.load<i16>());
 	tc.t.assert_eq(u32.view(value32), addr32.load<u32>());
 	tc.t.assert_eq(i64.view(value64), addr64.load<i64>());
@@ -450,15 +450,15 @@ def test_dual_mixed_width_signed_values_recover(tc: DualTxnWalTester) {
 // The PMEM crash model admits only naturally aligned 1/2/4/8-byte stores.
 // Aligned stores at the end of a cache line are legal and cannot cross it;
 // unaligned stores are definite validation failures before persistence.
-def test_dual_scalar_entry_alignment(tc: DualTxnWalTester) {
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+def test_dual_scalar_entry_alignment(tc: TwoSlotWalTester) {
+	def drainCount = tc.shadowRegion.drainCount;
 	def invalidOffsets = [201u64, 202u64, 204u64];
 	def invalidWidths = [2u8, 4u8, 8u8];
 	for (i < invalidOffsets.length) {
 		tc.t.assertz(false, tc.wal.append(invalidOffsets[i], 0xAAu64, invalidWidths[i]));
 		tc.t.assert_eq(0u64, tc.wal.commit());
 		tc.t.assertz(false, tc.wal.requiresRecovery());
-		tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+		tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 	}
 
 	// These stores end exactly at a 64-byte boundary. Their natural alignment
@@ -468,17 +468,17 @@ def test_dual_scalar_entry_alignment(tc: DualTxnWalTester) {
 	tc.t.assertz(true, tc.wal.append(60u64, 0x4455_6677u64, 4u8));
 	tc.t.assertz(true, tc.wal.append(56u64, 0x8899_AABB_CCDD_EEFF_u64, 8u8));
 	tc.t.assert_eq(1u64, tc.wal.commit());
-	tc.t.assert_eq(persistChangesCount + 1, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(drainCount + 1, tc.shadowRegion.drainCount);
 	tc.t.assertz(false, tc.wal.requiresRecovery());
 }
 
 // Appends must reject entries that escape the backend or overlap any part of
 // the WAL chunk. Exact neighbors remain valid user-data offsets and recover
 // normally, proving that the overlap checks do not exclude adjacent bytes.
-def test_dual_invalid_entry_ranges_rejected(tc: DualTxnWalTester) {
+def test_dual_invalid_entry_ranges_rejected(tc: TwoSlotWalTester) {
 	def regionSize = u64.!(tc.data.length);
-	def walStart = tc.wal.logChunkOffset;
-	def walEnd = walStart + tc.wal.logChunkSize;
+	def walStart = tc.wal.logBlockOffset;
+	def walEnd = walStart + tc.wal.logBlockSize;
 
 	// Outside or crossing the region end, including an offset whose addition
 	// would overflow if validation computed offset + width first.
@@ -496,7 +496,7 @@ def test_dual_invalid_entry_ranges_rejected(tc: DualTxnWalTester) {
 	tc.t.assertz(false, tc.wal.poisoned);
 	tc.t.assertz(false, tc.wal.requiresRecovery());
 	tc.t.assert_eq(1u64, tc.wal.nextTxnSeq);
-	tc.t.assert_eq(0, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(0, tc.shadowRegion.drainCount);
 
 	// The final byte before and the first eight bytes after the WAL are legal.
 	def valueAfter = 0x8877_6655_4433_2211_u64;
@@ -505,135 +505,135 @@ def test_dual_invalid_entry_ranges_rejected(tc: DualTxnWalTester) {
 	tc.t.assert_eq(1u64, tc.wal.commit());
 
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0xAAu8, tc.data[int.!(walStart - 1u64)]);
-	tc.t.assert_eq(valueAfter, PWRegionUtils.pointerFromU64(tc.regionStart + walEnd).load<u64>());
+	tc.t.assert_eq(valueAfter, RegionUtils.pointerFromU64(tc.regionStart + walEnd).load<u64>());
 }
 
 // Remounting a WAL that never committed anything is clean.
-def test_dual_clean_empty_recover(tc: DualTxnWalTester) {
+def test_dual_clean_empty_recover(tc: TwoSlotWalTester) {
 	var reopened = tc.reopen();
 	tc.t.assertz(true, reopened.openOk);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 }
 
 // A torn record (checksum never settled) is rejected: nothing replays and the
 // sequence restarts.
-def test_dual_torn_record_rejected(tc: DualTxnWalTester) {
+def test_dual_torn_record_rejected(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
 	def checksumAddr = tc.corruptChecksumOfSlot(1);
-	tc.t.assertz(true, tc.shadowRegion.persistRange(checksumAddr - tc.regionStart, 8u64));
+	tc.t.assertz(true, tc.shadowRegion.persist(checksumAddr - tc.regionStart, 8u64));
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 }
 
 // Header format guards must reject structurally malformed records even when
 // the mutation is covered by a freshly valid checksum.
-def test_dual_malformed_record_headers_rejected(tc: DualTxnWalTester) {
+def test_dual_malformed_record_headers_rejected(tc: TwoSlotWalTester) {
 	def slot = 1;
 	var recordAddr = tc.resetCommittedRecord();
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(1u64, tc.wal.validateSlot(slot));
 
-	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.magic.offset)).store<u64>(0u64);
+	RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.magic.offset)).store<u64>(0u64);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
-	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.version.offset)).store<u16>(2u16);
+	RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.version.offset)).store<u16>(2u16);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
-	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.headerSize.offset)).store<u16>(0u16);
+	RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.headerSize.offset)).store<u16>(0u16);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
-	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.entrySize.offset)).store<u16>(0u16);
+	RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.entrySize.offset)).store<u16>(0u16);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
-	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.logEpoch.offset)).store<u64>(1u64);
+	RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.logEpoch.offset)).store<u64>(1u64);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	// Keep header/trailer sequences mutually consistent so parity is the only
 	// invalid sequence property in this final case.
 	recordAddr = tc.resetCommittedRecord();
-	PWRegionUtils.pointerFromU64(recordAddr + u64.view(TxnRecordHeader.txnSeq.offset)).store<u64>(2u64);
-	PWRegionUtils.pointerFromU64(tc.trailerAddrOfSlot(slot) + u64.view(TxnCommitTrailer.txnSeq.offset)).store<u64>(2u64);
+	RegionUtils.pointerFromU64(recordAddr + u64.view(WalRecordHeader.txnSeq.offset)).store<u64>(2u64);
+	RegionUtils.pointerFromU64(tc.trailerAddrOfSlot(slot) + u64.view(WalRecordTrailer.txnSeq.offset)).store<u64>(2u64);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	// Exercise mount/recovery, not only the validator directly.
-	tc.t.assertz(true, tc.shadowRegion.persistRange(recordAddr - tc.regionStart, tc.wal.slotBytes));
+	tc.t.assertz(true, tc.shadowRegion.persist(recordAddr - tc.regionStart, tc.wal.slotBytes));
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 }
 
 // Trailer identity and header-mirroring guards receive the same checksummed
 // mutation treatment, preventing a malformed commit marker from replaying.
-def test_dual_malformed_record_trailers_rejected(tc: DualTxnWalTester) {
+def test_dual_malformed_record_trailers_rejected(tc: TwoSlotWalTester) {
 	def slot = 1;
 	var recordAddr = tc.resetCommittedRecord();
 	var trailerAddr = tc.trailerAddrOfSlot(slot);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(1u64, tc.wal.validateSlot(slot));
 
-	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.magic.offset)).store<u64>(0u64);
+	RegionUtils.pointerFromU64(trailerAddr + u64.view(WalRecordTrailer.magic.offset)).store<u64>(0u64);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
 	trailerAddr = tc.trailerAddrOfSlot(slot);
-	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.recordLen.offset)).store<u32>(0u32);
+	RegionUtils.pointerFromU64(trailerAddr + u64.view(WalRecordTrailer.recordLen.offset)).store<u32>(0u32);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
 	trailerAddr = tc.trailerAddrOfSlot(slot);
-	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.entryCount.offset)).store<u32>(0u32);
+	RegionUtils.pointerFromU64(trailerAddr + u64.view(WalRecordTrailer.entryCount.offset)).store<u32>(0u32);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
 	trailerAddr = tc.trailerAddrOfSlot(slot);
-	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.logEpoch.offset)).store<u64>(1u64);
+	RegionUtils.pointerFromU64(trailerAddr + u64.view(WalRecordTrailer.logEpoch.offset)).store<u64>(1u64);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
 	recordAddr = tc.resetCommittedRecord();
 	trailerAddr = tc.trailerAddrOfSlot(slot);
-	PWRegionUtils.pointerFromU64(trailerAddr + u64.view(TxnCommitTrailer.txnSeq.offset)).store<u64>(2u64);
+	RegionUtils.pointerFromU64(trailerAddr + u64.view(WalRecordTrailer.txnSeq.offset)).store<u64>(2u64);
 	tc.recomputeChecksumOfSlot(slot);
 	tc.t.assert_eq(0u64, tc.wal.validateSlot(slot));
 
-	tc.t.assertz(true, tc.shadowRegion.persistRange(recordAddr - tc.regionStart, tc.wal.slotBytes));
+	tc.t.assertz(true, tc.shadowRegion.persist(recordAddr - tc.regionStart, tc.wal.slotBytes));
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 }
 
 // Two valid slots replay in ascending txnSeq order: the later record's
 // after-image for a shared offset must win.
-def test_dual_two_slots_replay_in_order(tc: DualTxnWalTester) {
+def test_dual_two_slots_replay_in_order(tc: TwoSlotWalTester) {
 	tc.wal.append(200u64, 0x11u64, 1u8);
 	tc.wal.append(201u64, 0xAAu64, 1u8);
 	tc.t.assert_eq(1u64, tc.wal.commit());
-	tc.wal.applyUpdate(200u64, 0x11u64, 1u8);
-	tc.wal.applyUpdate(201u64, 0xAAu64, 1u8);
+	tc.wal.applyAfterImage(200u64, 0x11u64, 1u8);
+	tc.wal.applyAfterImage(201u64, 0xAAu64, 1u8);
 	tc.t.assert_eq(2u64, tc.commitAndApply(200u64, 0x22u64, 1u8));
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0x11u8, tc.data[200]);	// seq 1 data rode seq 2's boundary
 	tc.t.assert_eq(0xAAu8, tc.data[201]);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x22u8, tc.data[200]);	// seq 2 replayed after seq 1
 	tc.t.assert_eq(0xAAu8, tc.data[201]);	// seq 1's other entry survived
 	tc.t.assert_eq(2u64, reopened.dataDurableSeq);
@@ -643,7 +643,7 @@ def test_dual_two_slots_replay_in_order(tc: DualTxnWalTester) {
 // After a slot is overwritten, recovery replays exactly the latest two
 // transactions; the destroyed record's data was made durable by a later
 // commit's piggybacked boundary before it was destroyed.
-def test_dual_replay_latest_two_after_overwrite(tc: DualTxnWalTester) {
+def test_dual_replay_latest_two_after_overwrite(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(202u64, 0x33u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(3u64, tc.commitAndApply(201u64, 0x22u64, 1u8));	// overwrites seq 1's slot
@@ -652,7 +652,7 @@ def test_dual_replay_latest_two_after_overwrite(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0x33u8, tc.data[202]);	// seq 1 record gone, data durable
 	tc.t.assert_eq(0x11u8, tc.data[200]);	// seq 2 data rode seq 3's boundary
 	tc.t.assert_eq(0u8, tc.data[201]);	// seq 3 after-image still pending
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x11u8, tc.data[200]);
 	tc.t.assert_eq(0x22u8, tc.data[201]);
 	tc.t.assert_eq(0x33u8, tc.data[202]);
@@ -662,7 +662,7 @@ def test_dual_replay_latest_two_after_overwrite(tc: DualTxnWalTester) {
 
 // A record too large for a slot fails commit() cleanly: no sequence burned,
 // and the WAL stays usable for the next transaction.
-def test_dual_oversize_commit_fails(tc: DualTxnWalTester) {
+def test_dual_oversize_commit_fails(tc: TwoSlotWalTester) {
 	for (i < 25) {
 		tc.wal.append(u64.view(2048 + i * 8), u64.view(i), 8u8);
 	}
@@ -676,7 +676,7 @@ def test_dual_oversize_commit_fails(tc: DualTxnWalTester) {
 // An invalid append poisons the pending transaction: commit() must fail
 // rather than durably committing a transaction that silently lost a write.
 // The poison clears with the failed commit, so the next transaction works.
-def test_dual_poisoned_append_fails_commit(tc: DualTxnWalTester) {
+def test_dual_poisoned_append_fails_commit(tc: TwoSlotWalTester) {
 	tc.t.assertz(true, tc.wal.append(200u64, 0x11u64, 1u8));
 	tc.t.assertz(false, tc.wal.append(201u64, 0x22u64, 3u8));	// invalid width
 	tc.t.assertz(true, tc.wal.poisoned);
@@ -690,7 +690,7 @@ def test_dual_poisoned_append_fails_commit(tc: DualTxnWalTester) {
 // Mounting without recovery scans the slots for the sequence but leaves the
 // records unrecovered: the overwrite guard must refuse to destroy them until
 // recover() has replayed and persisted their data.
-def test_dual_unrecovered_slot_blocks_overwrite(tc: DualTxnWalTester) {
+def test_dual_unrecovered_slot_blocks_overwrite(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x22u64, 1u8));
 
@@ -700,7 +700,7 @@ def test_dual_unrecovered_slot_blocks_overwrite(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0u64, reopened.commit());	// slot 1 holds unrecovered seq 1
 	tc.t.assertz(false, reopened.requiresRecovery());	// no backend failure
 
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	reopened.append(202u64, 0x33u64, 1u8);
 	tc.t.assert_eq(3u64, reopened.commit());
 	tc.t.assert_eq(3u64, reopened.slotSeqs[1]);
@@ -709,41 +709,41 @@ def test_dual_unrecovered_slot_blocks_overwrite(tc: DualTxnWalTester) {
 // A persistence failure in the commit overwrite guard latches this WAL
 // instance. Every mutating or persistence operation is rejected without
 // reaching the backend; only a new instance may recover and resume.
-def test_dual_failed_persist_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_failed_persist_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x55u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x66u64, 1u8));
 
 	// Reopen without recovery. Committing seq 3 would overwrite the only
 	// unrecovered copy of seq 1, so the guard first attempts a data persist.
 	var failed = tc.crashAndReopen();
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
 	tc.t.assertz(true, failed.append(210u64, 0x11u64, 1u8));
 	tc.t.assert_eq(0u64, failed.commit());
 	tc.t.assertz(true, failed.requiresRecovery());
 	tc.t.assert_eq(3u64, failed.nextTxnSeq);		// sequence not burned
 
-	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
-	def persistRangeCount = tc.shadowRegion.persistRangeCount;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	def prepareCount = tc.shadowRegion.writeBackCount;
+	def persistCount = tc.shadowRegion.persistCount;
+	def drainCount = tc.shadowRegion.drainCount;
 
 	tc.t.assertz(false, failed.append(210u64, 0x22u64, 1u8));
 	tc.t.assert_eq(0u64, failed.commit());
-	failed.applyUpdate(300u64, 0x77u64, 1u8);
+	failed.applyAfterImage(300u64, 0x77u64, 1u8);
 	tc.t.assert_eq(0u8, tc.data[300]);
-	tc.t.assertz(false, failed.persistAppliedData());
-	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(false, failed.persistAfterImages());
+	tc.t.assertz(true, failed.recover() == WalRecovery.PERSIST_FAILED);
 	failed.close();
 
 	// None of the rejected operations may prepare or persist more bytes.
-	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
-	tc.t.assert_eq(persistRangeCount, tc.shadowRegion.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.writeBackCount);
+	tc.t.assert_eq(persistCount, tc.shadowRegion.persistCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	// A fresh instance resolves the durable state, then accepts new work.
 	tc.shadowRegion.crash();
 	var reopened = tc.reopen();
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, tc.data[200]);
 	tc.t.assert_eq(0x66u8, tc.data[201]);
 	tc.t.assertz(true, reopened.append(210u64, 0x33u64, 1u8));
@@ -753,34 +753,34 @@ def test_dual_failed_persist_requires_reopen(tc: DualTxnWalTester) {
 // A failure while persisting replayed after-images is indeterminate: the
 // current WAL instance must latch recovery-required and reject further work.
 // A newly constructed instance can inspect the durable slots and replay again.
-def test_dual_recovery_persist_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_recovery_persist_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x5Au64, 1u8));
 
 	var failed = tc.crashAndReopen();
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
-	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.t.assertz(true, failed.recover() == WalRecovery.PERSIST_FAILED);
 	tc.t.assertz(true, failed.requiresRecovery());
 	tc.t.assert_eq(1u64, failed.slotSeqs[1]);
 	tc.t.assert_eq(1u64, failed.lastCommittedSeq);
 	tc.t.assert_eq(2u64, failed.nextTxnSeq);
 	tc.t.assert_eq(0u64, failed.dataDurableSeq);
 
-	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
-	def persistRangeCount = tc.shadowRegion.persistRangeCount;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	def prepareCount = tc.shadowRegion.writeBackCount;
+	def persistCount = tc.shadowRegion.persistCount;
+	def drainCount = tc.shadowRegion.drainCount;
 
 	tc.t.assertz(false, failed.append(201u64, 0x66u64, 1u8));
 	tc.t.assert_eq(0u64, failed.commit());
-	failed.applyUpdate(300u64, 0x77u64, 1u8);
+	failed.applyAfterImage(300u64, 0x77u64, 1u8);
 	tc.t.assert_eq(0u8, tc.data[300]);
-	tc.t.assertz(false, failed.persistAppliedData());
-	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(false, failed.persistAfterImages());
+	tc.t.assertz(true, failed.recover() == WalRecovery.PERSIST_FAILED);
 	failed.close();
 
 	// Rejected operations must not issue another persistence request.
-	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
-	tc.t.assert_eq(persistRangeCount, tc.shadowRegion.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.writeBackCount);
+	tc.t.assert_eq(persistCount, tc.shadowRegion.persistCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	// The failed replay was not durable. A fresh instance replays the retained
 	// record again, persists it successfully, and makes it survive another crash.
@@ -788,7 +788,7 @@ def test_dual_recovery_persist_failure_requires_reopen(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0u8, tc.data[200]);
 	var reopened = tc.reopen();
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x5Au8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
@@ -798,15 +798,15 @@ def test_dual_recovery_persist_failure_requires_reopen(tc: DualTxnWalTester) {
 
 // A corrupt WAL header makes the log unusable, and recover() reports it as
 // CORRUPT rather than conflating it with a clean mount.
-def test_dual_corrupt_header_reports_corrupt(tc: DualTxnWalTester) {
+def test_dual_corrupt_header_reports_corrupt(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
-	PWRegionUtils.pointerFromU64(tc.logAddr).store<u64>(0u64);	// scrub header magic
-	tc.t.assertz(true, tc.shadowRegion.persistRange(tc.logAddr - tc.regionStart, 8u64));
+	RegionUtils.pointerFromU64(tc.logAddr).store<u64>(0u64);	// scrub header magic
+	tc.t.assertz(true, tc.shadowRegion.persist(tc.logAddr - tc.regionStart, 8u64));
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assertz(false, reopened.openOk);
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CORRUPT);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CORRUPT);
 	tc.t.assert_eq(0u8, tc.data[200]);	// nothing replayed
 	tc.t.assert_eq(0u64, reopened.commit());	// and nothing can commit
 }
@@ -814,14 +814,14 @@ def test_dual_corrupt_header_reports_corrupt(tc: DualTxnWalTester) {
 // Phase B: crash after the record is applied but before the next commit's
 // boundary persisted the data. The record is still valid, so recovery re-runs
 // the (idempotent) after-images and completes durability.
-def test_dual_apply_then_crash_recover(tc: DualTxnWalTester) {
+def test_dual_apply_then_crash_recover(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x77u64, 1u8));
 	tc.t.assert_eq(0x77u8, tc.data[200]);		// applied...
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);	// ...but its persist is deferred
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0u8, tc.data[200]);		// unpersisted after-image disappeared
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x77u8, tc.data[200]);		// durable record restored it
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
@@ -832,7 +832,7 @@ def test_dual_apply_then_crash_recover(tc: DualTxnWalTester) {
 // Phase B: back-to-back full transaction cycles, then a crash. The two
 // surviving records replay; every transaction's data is intact because each
 // destroyed record's data had already ridden a later commit's boundary.
-def test_dual_back_to_back_commits_then_crash(tc: DualTxnWalTester) {
+def test_dual_back_to_back_commits_then_crash(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x22u64, 1u8));
 	tc.t.assert_eq(3u64, tc.commitAndApply(202u64, 0x33u64, 1u8));
@@ -843,7 +843,7 @@ def test_dual_back_to_back_commits_then_crash(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0x11u8, tc.data[200]);		// persisted by seq 2 boundary
 	tc.t.assert_eq(0x22u8, tc.data[201]);		// persisted by seq 3 boundary
 	tc.t.assert_eq(0u8, tc.data[202]);		// seq 3 data was still pending
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x11u8, tc.data[200]);
 	tc.t.assert_eq(0x22u8, tc.data[201]);
 	tc.t.assert_eq(0x33u8, tc.data[202]);
@@ -852,41 +852,41 @@ def test_dual_back_to_back_commits_then_crash(tc: DualTxnWalTester) {
 }
 
 // Phase B boundary count and the induction property: each commit issues
-// exactly one persistChanges (no per-record persistRange), and a durable
+// exactly one drain (no per-record persist), and a durable
 // record N+1 implies txn N's data is durable (dataDurableSeq == N).
-def test_dual_one_boundary_per_commit(tc: DualTxnWalTester) {
+def test_dual_one_boundary_per_commit(tc: TwoSlotWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
-	def region = DualWalCountingRegion.new(data[0 ..+ data.length]);
-	def wal = DualTxnWal.new(base, base + 1024u64, 1024u64, region, true);
-	region.prepareChangedRangeCount = 0;
-	region.persistRangeCount = 0;
-	region.persistChangesCount = 0;
+	def region = TwoSlotWalCountingRegion.new(data[0 ..+ data.length]);
+	def wal = TwoSlotWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
+	region.writeBackCount = 0;
+	region.persistCount = 0;
+	region.drainCount = 0;
 
 	for (n < 3u64) {
 		def seq = n + 1u64;
 		wal.append(200u64 + seq, seq, 1u8);
 		tc.t.assert_eq(seq, wal.commit());
-		wal.applyUpdate(200u64 + seq, seq, 1u8);
-		tc.t.assert_eq(int.!(seq), region.persistChangesCount);	// one boundary per commit
-		tc.t.assert_eq(0, region.persistRangeCount);		// record rode persistChanges
+		wal.applyAfterImage(200u64 + seq, seq, 1u8);
+		tc.t.assert_eq(int.!(seq), region.drainCount);	// one boundary per commit
+		tc.t.assert_eq(0, region.persistCount);		// record rode drain
 		tc.t.assert_eq(seq - 1u64, wal.dataDurableSeq);		// record N durable => txn N-1 data durable
 	}
 	// Each commit prepares the record plus the txn's single applied entry.
-	tc.t.assert_eq(6, region.prepareChangedRangeCount);
+	tc.t.assert_eq(6, region.writeBackCount);
 }
 
-// persistAppliedData() is the explicit idle/unmount boundary: it completes
+// persistAfterImages() is the explicit idle/unmount boundary: it completes
 // durability for applied data without requiring another commit.
-def test_dual_flush_persists_applied_data(tc: DualTxnWalTester) {
+def test_dual_flush_persists_applied_data(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x44u64, 1u8));
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
-	tc.t.assertz(true, tc.wal.persistAppliedData());
+	tc.t.assertz(true, tc.wal.persistAfterImages());
 	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0x44u8, tc.data[200]);		// explicit flush survived crash
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.wal = reopened;
 	// The slot is now reclaimable: seq 3 overwrites it without a guard retry.
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x55u64, 1u8));
@@ -896,25 +896,25 @@ def test_dual_flush_persists_applied_data(tc: DualTxnWalTester) {
 // An explicit flush failure leaves the persistence outcome uncertain. The
 // current instance must reject all further work; after a crash, a new instance
 // replays the retained record and makes the after-image durable.
-def test_dual_flush_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_flush_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x45u64, 1u8));
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
-	tc.t.assertz(false, tc.wal.persistAppliedData());
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.t.assertz(false, tc.wal.persistAfterImages());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
 	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
 
-	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
-	tc.t.assertz(false, tc.wal.persistAppliedData());
+	def prepareCount = tc.shadowRegion.writeBackCount;
+	def drainCount = tc.shadowRegion.drainCount;
+	tc.t.assertz(false, tc.wal.persistAfterImages());
 	tc.t.assertz(false, tc.wal.append(201u64, 0x46u64, 1u8));
 	tc.t.assert_eq(0u64, tc.wal.commit());
-	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.writeBackCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0u8, tc.data[200]);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x45u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.shadowRegion.crash();
@@ -923,7 +923,7 @@ def test_dual_flush_failure_requires_reopen(tc: DualTxnWalTester) {
 
 // A clean close() persists the deferred data and scrubs the reclaimable
 // slots, so a clean remount is replay-free (CLEAN, sequence restarts).
-def test_dual_close_scrubs_for_clean_remount(tc: DualTxnWalTester) {
+def test_dual_close_scrubs_for_clean_remount(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x22u64, 1u8));
 	tc.wal.close();
@@ -931,7 +931,7 @@ def test_dual_close_scrubs_for_clean_remount(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0u64, tc.wal.slotSeqs[1]);
 
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 	tc.t.assert_eq(0x11u8, tc.data[200]);	// data persisted by close()
 	tc.t.assert_eq(0x22u8, tc.data[201]);
@@ -940,23 +940,23 @@ def test_dual_close_scrubs_for_clean_remount(tc: DualTxnWalTester) {
 // close() uses the same final-data persistence boundary as explicit flush. If
 // it fails, close must retain the record, latch recovery-required, and perform
 // no slot scrubbing so a new instance can replay after a crash.
-def test_dual_close_data_persist_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_close_data_persist_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x77u64, 1u8));
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
 	tc.wal.close();
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
 	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
 
-	def persistRangeCount = tc.shadowRegion.persistRangeCount;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	def persistCount = tc.shadowRegion.persistCount;
+	def drainCount = tc.shadowRegion.drainCount;
 	tc.wal.close();
-	tc.t.assert_eq(persistRangeCount, tc.shadowRegion.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(persistCount, tc.shadowRegion.persistCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0u8, tc.data[200]);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x77u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.shadowRegion.crash();
@@ -966,26 +966,26 @@ def test_dual_close_data_persist_failure_requires_reopen(tc: DualTxnWalTester) {
 // If persisting a slot scrub fails, the data is already durable but the
 // record's durable state is uncertain. close() must latch recovery-required,
 // retain conservative slot metadata, and stop before scrubbing another slot.
-def test_dual_close_scrub_persist_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_close_scrub_persist_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x88u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(201u64, 0x99u64, 1u8));
 
-	def persistRangeCount = tc.shadowRegion.persistRangeCount;
-	tc.shadowRegion.nextPersistRangeOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+	def persistCount = tc.shadowRegion.persistCount;
+	tc.shadowRegion.nextPersistOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
 	tc.wal.close();
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 	tc.t.assert_eq(2u64, tc.wal.dataDurableSeq);
 	tc.t.assert_eq(2u64, tc.wal.slotSeqs[0]);
 	tc.t.assert_eq(1u64, tc.wal.slotSeqs[1]);
-	tc.t.assert_eq(persistRangeCount + 1, tc.shadowRegion.persistRangeCount);
+	tc.t.assert_eq(persistCount + 1, tc.shadowRegion.persistCount);
 
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	def drainCount = tc.shadowRegion.drainCount;
 	tc.wal.close();
-	tc.t.assert_eq(persistRangeCount + 1, tc.shadowRegion.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(persistCount + 1, tc.shadowRegion.persistCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x88u8, tc.data[200]);
 	tc.t.assert_eq(0x99u8, tc.data[201]);
 	tc.t.assert_eq(2u64, reopened.dataDurableSeq);
@@ -998,11 +998,11 @@ def test_dual_close_scrub_persist_failure_requires_reopen(tc: DualTxnWalTester) 
 // surviving record must be the newer one. Otherwise recovery can replay an old
 // after-image over data that the final close boundary already made durable.
 // COPY_THEN_FAIL models the indeterminate result at exactly that first scrub.
-def test_dual_close_indeterminate_first_scrub_preserves_latest_value(tc: DualTxnWalTester) {
+def test_dual_close_indeterminate_first_scrub_preserves_latest_value(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.commitAndApply(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(2u64, tc.commitAndApply(200u64, 0x22u64, 1u8));
 
-	tc.shadowRegion.nextPersistRangeOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
+	tc.shadowRegion.nextPersistOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
 	tc.wal.close();
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 	tc.t.assert_eq(2u64, tc.wal.dataDurableSeq);
@@ -1012,7 +1012,7 @@ def test_dual_close_indeterminate_first_scrub_preserves_latest_value(tc: DualTxn
 	// Sequence 1 (slot 1) was reclaimed first; sequence 2 remains replayable.
 	tc.t.assert_eq(2u64, reopened.validateSlot(0));
 	tc.t.assert_eq(0u64, reopened.validateSlot(1));
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x22u8, tc.data[200]);
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0x22u8, tc.data[200]);
@@ -1020,7 +1020,7 @@ def test_dual_close_indeterminate_first_scrub_preserves_latest_value(tc: DualTxn
 
 // close() must never scrub a slot whose data is not known durable: records
 // scanned by a mount that skipped recover() survive close and still replay.
-def test_dual_close_keeps_unrecovered_records(tc: DualTxnWalTester) {
+def test_dual_close_keeps_unrecovered_records(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x99u64, 1u8));	// committed, never applied
 
 	var reopened = tc.crashAndReopen();	// scans the durable slot but does not recover
@@ -1029,20 +1029,20 @@ def test_dual_close_keeps_unrecovered_records(tc: DualTxnWalTester) {
 
 	tc.shadowRegion.crash();
 	var again = tc.reopen();
-	tc.t.assertz(true, again.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, again.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x99u8, tc.data[200]);
 }
 
 // The shadow distinguishes process-visible writes from durable bytes:
 // unpersisted stores disappear, while a prepared + persisted store survives.
-def test_shadow_crash_restores_durable_bytes(tc: DualTxnWalTester) {
+def test_shadow_crash_restores_durable_bytes(tc: TwoSlotWalTester) {
 	tc.data[200] = 0x11u8;
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0u8, tc.data[200]);
 
 	tc.data[200] = 0x22u8;
-	tc.t.assertz(true, tc.shadowRegion.prepareChangedRange(200u64, 1u64));
-	tc.t.assertz(true, tc.shadowRegion.persistChanges());
+	tc.t.assertz(true, tc.shadowRegion.writeBack(200u64, 1u64));
+	tc.t.assertz(true, tc.shadowRegion.drain());
 	tc.data[200] = 0x33u8;	// live-only overwrite
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0x22u8, tc.data[200]);
@@ -1051,11 +1051,11 @@ def test_shadow_crash_restores_durable_bytes(tc: DualTxnWalTester) {
 // A persistence call can copy every requested byte and still report failure.
 // The crash must reveal those bytes, making the outcome observably
 // indeterminate rather than equivalent to FAIL_BEFORE_COPY.
-def test_shadow_copy_then_fail_is_durable(tc: DualTxnWalTester) {
+def test_shadow_copy_then_fail_is_durable(tc: TwoSlotWalTester) {
 	tc.data[200] = 0x44u8;
-	tc.t.assertz(true, tc.shadowRegion.prepareChangedRange(200u64, 1u64));
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
-	tc.t.assertz(false, tc.shadowRegion.persistChanges());
+	tc.t.assertz(true, tc.shadowRegion.writeBack(200u64, 1u64));
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
+	tc.t.assertz(false, tc.shadowRegion.drain());
 	tc.data[200] = 0x55u8;	// discardable live mutation after the failed call
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0x44u8, tc.data[200]);
@@ -1063,11 +1063,11 @@ def test_shadow_copy_then_fail_is_durable(tc: DualTxnWalTester) {
 
 // The partial outcome copies the first half of each prepared range and loses
 // the rest at crash, providing a deterministic torn-write model.
-def test_shadow_partial_copy_then_fail(tc: DualTxnWalTester) {
+def test_shadow_partial_copy_then_fail(tc: TwoSlotWalTester) {
 	for (i < 8) tc.data[300 + i] = u8.!(i + 1);
-	tc.t.assertz(true, tc.shadowRegion.prepareChangedRange(300u64, 8u64));
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.PARTIAL_COPY_THEN_FAIL;
-	tc.t.assertz(false, tc.shadowRegion.persistChanges());
+	tc.t.assertz(true, tc.shadowRegion.writeBack(300u64, 8u64));
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.PARTIAL_COPY_THEN_FAIL;
+	tc.t.assertz(false, tc.shadowRegion.drain());
 	tc.shadowRegion.crash();
 	for (i < 4) tc.t.assert_eq(u8.!(i + 1), tc.data[300 + i]);
 	for (i < 4) tc.t.assert_eq(0u8, tc.data[304 + i]);
@@ -1075,15 +1075,15 @@ def test_shadow_partial_copy_then_fail(tc: DualTxnWalTester) {
 
 // Failure while preparing the record means the later persistence boundary was
 // never entered. Restoring the durable image removes the complete live record.
-def test_dual_failed_prepare_then_crash_is_clean(tc: DualTxnWalTester) {
-	tc.shadowRegion.failNextPrepareChangedRange = true;
+def test_dual_failed_prepare_then_crash_is_clean(tc: TwoSlotWalTester) {
+	tc.shadowRegion.failNextWriteBack = true;
 	tc.wal.append(200u64, 0x66u64, 1u8);
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 }
@@ -1094,30 +1094,30 @@ def test_dual_failed_prepare_then_crash_is_clean(tc: DualTxnWalTester) {
 // The batched apply fails as the per-entry one does: a failed preparation
 // latches the instance, nothing further reaches the region's persistence API,
 // and after a crash the durable record replays both after-images.
-def test_dual_batched_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_batched_prepare_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assertz(true, tc.wal.append(200u64, 0x67u64, 1u8));
 	tc.t.assertz(true, tc.wal.append(201u64, 0x68u64, 1u8));
 	tc.t.assert_eq(1u64, tc.wal.commit());
-	tc.t.assertz(true, tc.wal.storeUpdate(200u64, 0x67u64, 1u8));
-	tc.t.assertz(true, tc.wal.storeUpdate(201u64, 0x68u64, 1u8));
-	tc.shadowRegion.failNextPrepareChangedRange = true;
-	tc.t.assertz(false, tc.wal.prepareApplied());
+	tc.t.assertz(true, tc.wal.storeAfterImage(200u64, 0x67u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeAfterImage(201u64, 0x68u64, 1u8));
+	tc.shadowRegion.failNextWriteBack = true;
+	tc.t.assertz(false, tc.wal.writeBackAfterImages());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
 
-	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
-	tc.t.assertz(false, tc.wal.storeUpdate(202u64, 0x69u64, 1u8));
-	tc.t.assertz(false, tc.wal.prepareApplied());
-	tc.t.assertz(false, tc.wal.persistAppliedData());
+	def prepareCount = tc.shadowRegion.writeBackCount;
+	def drainCount = tc.shadowRegion.drainCount;
+	tc.t.assertz(false, tc.wal.storeAfterImage(202u64, 0x69u64, 1u8));
+	tc.t.assertz(false, tc.wal.writeBackAfterImages());
+	tc.t.assertz(false, tc.wal.persistAfterImages());
 	tc.t.assert_eq(0u8, tc.data[202]);
-	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.writeBackCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(0u8, tc.data[201]);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x67u8, tc.data[200]);
 	tc.t.assert_eq(0x68u8, tc.data[201]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
@@ -1127,10 +1127,10 @@ def test_dual_batched_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
 // outstanding, it is the drain's -- latches the instance, and the commit fails
 // without claiming transaction 1's data durable. The durable record replays it.
 // (Whether the drain happens at all is what the next test establishes.)
-def test_dual_boundary_drain_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_boundary_drain_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
-	tc.t.assertz(true, tc.wal.storeUpdate(200u64, 0x67u64, 1u8));
-	tc.shadowRegion.failNextPrepareChangedRange = true;
+	tc.t.assertz(true, tc.wal.storeAfterImage(200u64, 0x67u64, 1u8));
+	tc.shadowRegion.failNextWriteBack = true;
 	tc.t.assertz(true, tc.wal.append(300u64, 0x77u64, 1u8));
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
@@ -1138,7 +1138,7 @@ def test_dual_boundary_drain_failure_requires_reopen(tc: DualTxnWalTester) {
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
 
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x67u8, tc.data[200]);
 	tc.t.assert_eq(0u8, tc.data[300]);
 	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
@@ -1149,47 +1149,47 @@ def test_dual_boundary_drain_failure_requires_reopen(tc: DualTxnWalTester) {
 // the one after it may destroy the record. Transaction 3 reclaims transaction
 // 1's slot, so after the crash nothing but a drained writeback can supply
 // transaction 1's byte: the shadow region makes only prepared ranges durable.
-def test_dual_unprepared_after_image_survives_slot_reclaim(tc: DualTxnWalTester) {
+def test_dual_unprepared_after_image_survives_slot_reclaim(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
-	tc.t.assertz(true, tc.wal.storeUpdate(200u64, 0x67u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeAfterImage(200u64, 0x67u64, 1u8));
 	tc.t.assert_eq(2u64, tc.writeTxn(300u64, 0x77u64, 1u8));
-	tc.t.assertz(true, tc.wal.storeUpdate(300u64, 0x77u64, 1u8));
+	tc.t.assertz(true, tc.wal.storeAfterImage(300u64, 0x77u64, 1u8));
 	tc.t.assert_eq(3u64, tc.writeTxn(301u64, 0x78u64, 1u8));
 	tc.t.assert_eq(3u64, tc.wal.slotSeqs[1]);	// transaction 1's record is gone
 	tc.t.assert_eq(2u64, tc.wal.dataDurableSeq);
 
 	var reopened = tc.crashAndReopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x67u8, tc.data[200]);
 	tc.t.assert_eq(0x77u8, tc.data[300]);
 	tc.t.assert_eq(0x78u8, tc.data[301]);
 }
 
-def test_dual_apply_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_apply_prepare_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x67u64, 1u8));
-	tc.shadowRegion.failNextPrepareChangedRange = true;
-	tc.t.assertz(false, tc.wal.applyUpdate(200u64, 0x67u64, 1u8));
+	tc.shadowRegion.failNextWriteBack = true;
+	tc.t.assertz(false, tc.wal.applyAfterImage(200u64, 0x67u64, 1u8));
 	tc.t.assert_eq(0x67u8, tc.data[200]);
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
 
-	def prepareCount = tc.shadowRegion.prepareChangedRangeCount;
-	def persistRangeCount = tc.shadowRegion.persistRangeCount;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
+	def prepareCount = tc.shadowRegion.writeBackCount;
+	def persistCount = tc.shadowRegion.persistCount;
+	def drainCount = tc.shadowRegion.drainCount;
 	tc.t.assertz(false, tc.wal.append(201u64, 0x68u64, 1u8));
 	tc.t.assert_eq(0u64, tc.wal.commit());
-	tc.t.assertz(false, tc.wal.applyUpdate(201u64, 0x68u64, 1u8));
-	tc.t.assertz(false, tc.wal.persistAppliedData());
-	tc.t.assertz(true, tc.wal.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(false, tc.wal.applyAfterImage(201u64, 0x68u64, 1u8));
+	tc.t.assertz(false, tc.wal.persistAfterImages());
+	tc.t.assertz(true, tc.wal.recover() == WalRecovery.PERSIST_FAILED);
 	tc.wal.close();
 	tc.t.assert_eq(0u8, tc.data[201]);
-	tc.t.assert_eq(prepareCount, tc.shadowRegion.prepareChangedRangeCount);
-	tc.t.assert_eq(persistRangeCount, tc.shadowRegion.persistRangeCount);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(prepareCount, tc.shadowRegion.writeBackCount);
+	tc.t.assert_eq(persistCount, tc.shadowRegion.persistCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assert_eq(0u8, tc.data[200]);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x67u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.shadowRegion.crash();
@@ -1197,24 +1197,24 @@ def test_dual_apply_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
 }
 
 // The same preparation failure can occur while recovery is applying a valid
-// record. Recovery must stop before persistChanges(), retain the record, and
+// record. Recovery must stop before drain(), retain the record, and
 // report PERSIST_FAILED so another instance can replay the complete update.
-def test_dual_recovery_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
+def test_dual_recovery_prepare_failure_requires_reopen(tc: TwoSlotWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x69u64, 1u8));
 
 	var failed = tc.crashAndReopen();
-	tc.shadowRegion.failNextPrepareChangedRange = true;
-	def persistChangesCount = tc.shadowRegion.persistChangesCount;
-	tc.t.assertz(true, failed.recover() == DualWalRecovery.PERSIST_FAILED);
+	tc.shadowRegion.failNextWriteBack = true;
+	def drainCount = tc.shadowRegion.drainCount;
+	tc.t.assertz(true, failed.recover() == WalRecovery.PERSIST_FAILED);
 	tc.t.assertz(true, failed.requiresRecovery());
 	tc.t.assert_eq(0x69u8, tc.data[200]);
 	tc.t.assert_eq(0u64, failed.dataDurableSeq);
-	tc.t.assert_eq(persistChangesCount, tc.shadowRegion.persistChangesCount);
+	tc.t.assert_eq(drainCount, tc.shadowRegion.drainCount);
 
 	tc.shadowRegion.crash();
 	tc.t.assert_eq(0u8, tc.data[200]);
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x69u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.dataDurableSeq);
 	tc.shadowRegion.crash();
@@ -1223,25 +1223,25 @@ def test_dual_recovery_prepare_failure_requires_reopen(tc: DualTxnWalTester) {
 
 // A definite fail-before-copy outcome leaves no durable record, so immediate
 // crash/reopen must not replay the attempted transaction.
-def test_dual_failed_persist_before_copy_then_crash_is_clean(tc: DualTxnWalTester) {
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
+def test_dual_failed_persist_before_copy_then_crash_is_clean(tc: TwoSlotWalTester) {
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.FAIL_BEFORE_COPY;
 	tc.wal.append(200u64, 0x77u64, 1u8);
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 }
 
-// Normative recovery-required contract: persistChanges copied the complete
+// Normative recovery-required contract: drain copied the complete
 // record but reported failure, so commit() returned 0 (unacknowledged, not
 // aborted). After a crash, recovery may replay the valid durable record because
 // its after-images are idempotent.
-def test_dual_indeterminate_persist_record_replays(tc: DualTxnWalTester) {
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
+def test_dual_indeterminate_persist_record_replays(tc: TwoSlotWalTester) {
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.COPY_THEN_FAIL;
 	tc.wal.append(200u64, 0x99u64, 1u8);
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
@@ -1250,7 +1250,7 @@ def test_dual_indeterminate_persist_record_replays(tc: DualTxnWalTester) {
 	var reopened = tc.crashAndReopen();
 	tc.t.assertz(false, reopened.requiresRecovery());
 	tc.t.assert_eq(0u8, tc.data[200]);
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.REPLAYED);
 	tc.t.assert_eq(0x99u8, tc.data[200]);
 	tc.t.assert_eq(2u64, reopened.nextTxnSeq);
 	tc.t.assertz(true, reopened.append(201u64, 0xAAu64, 1u8));
@@ -1259,15 +1259,15 @@ def test_dual_indeterminate_persist_record_replays(tc: DualTxnWalTester) {
 
 // A partially persisted record has no matching complete trailer/checksum.
 // Recovery must reject it rather than publish the failed transaction.
-def test_dual_partial_record_persist_then_crash_is_rejected(tc: DualTxnWalTester) {
-	tc.shadowRegion.nextPersistChangesOutcome = ShadowPersistOutcome.PARTIAL_COPY_THEN_FAIL;
+def test_dual_partial_record_persist_then_crash_is_rejected(tc: TwoSlotWalTester) {
+	tc.shadowRegion.nextDrainOutcome = ShadowPersistOutcome.PARTIAL_COPY_THEN_FAIL;
 	tc.wal.append(200u64, 0x88u64, 1u8);
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assertz(true, tc.wal.requiresRecovery());
 
 	var reopened = tc.crashAndReopen();
 	tc.t.assertz(false, reopened.requiresRecovery());
-	tc.t.assertz(true, reopened.recover() == DualWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == WalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.nextTxnSeq);
 	tc.t.assertz(true, reopened.append(201u64, 0x44u64, 1u8));

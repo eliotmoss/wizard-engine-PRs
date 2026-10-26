@@ -30,13 +30,13 @@ OBJDUMP=$(ENGINE) src/objdump.main.v3
 UNITTEST=$(ENGINE) test/unittest/*.v3 test/wasm-spec/*.v3 test/unittest.main.v3
 UNITTEST_X86_64_LINUX=test/unittest/x86-64-linux/*.v3 $(WASI) $(WASI_X86_64_LINUX)
 PMEMTEST_X86_64_LINUX=test/integration/x86-64-linux/PmemDaxIntegrationTest.v3 test/pmem-integration.main.v3
-PWSIEVE_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsieve.main.v3
-PWREBOOT_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwreboot.main.v3
-PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbench.main.v3
-PWSIEVEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwsievebench.main.v3
-PWOPSBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwopsbench.main.v3
-PWBTREEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtreebench.main.v3
-PWBTREE_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/ElidedWritebackOps.v3 test/pwbtree.main.v3
+PWSIEVE_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwsieve.main.v3
+PWREBOOT_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwreboot.main.v3
+PWBENCH_X86_64_LINUX=test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwbench.main.v3
+PWSIEVEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWSieve.v3 test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwsievebench.main.v3
+PWOPSBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwopsbench.main.v3
+PWBTREEBENCH_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/PWOps.v3 test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwbtreebench.main.v3
+PWBTREE_X86_64_LINUX=test/unittest/x86-64-linux/PWBTree.v3 test/unittest/x86-64-linux/ElidedWriteBackProvider.v3 test/pwbtree.main.v3
 WIZENG=$(ENGINE) $(WAVE) $(WASI) $(WALI) src/SpectestMode.v3 src/WasmMode.v3 src/wizeng.main.v3  src/modules/*.v3 src/modules/wizeng/*.v3
 
 TAGS: $(WIZENG) $(WAVE) $(WASI) $(WALI) $(SPECTEST) $(UNITTEST) $(WASI_X86_64_LINUX) $(JIT) $(X86_64)
@@ -112,7 +112,7 @@ pwsieve-pmem: bin/pwsieve.x86-64-linux
 # same seed, with cache-line writeback elided. docs/pmem-emulation.md predicts
 # this still reports OK, because a MAP_SYNC mapping's memory is the media and a
 # killed process loses nothing still in cache. Run it against pwsieve-pmem above
-# and the layer-1b sweep in persistent_control: to complete the 2x2.
+# and the layer-1b sweep in crash_control: to complete the 2x2.
 pwsieve-pmem-mutant: bin/pwsieve.x86-64-linux
 	@if [ -z "$(PWASM_PMEM_TEST_DIR)" ]; then \
 		echo "PWASM_PMEM_TEST_DIR must name an assigned writable directory on an fsdax mount"; \

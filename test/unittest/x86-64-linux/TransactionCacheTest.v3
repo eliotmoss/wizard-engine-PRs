@@ -1,7 +1,7 @@
-// RegionTransaction Tests
+// TransactionCache Tests
 // Tests cached transactional writes and the encapsulated redo-log commit flow.
 
-def T = UnitTests.registerT("region_transaction:", _, RegionTransactionTester.new, _);
+def T = UnitTests.registerT("transaction_cache:", _, RegionTransactionTester.new, _);
 def X = [
 	T("basic_u8_flow", test_basic_u8_flow),
 	T("basic_u64_flow", test_basic_u64_flow),
@@ -22,19 +22,19 @@ def X = [
 	()
 ];
 
-class CountingBackend extends TxnRegionBackend {
+class CountingBackend extends StorageBackend {
 	def range: Range<byte>;
-	def var prepareChangedRangeCount = 0;
-	def var persistRangeCount = 0;
-	def var persistChangesCount = 0;
+	def var writeBackCount = 0;
+	def var persistCount = 0;
+	def var drainCount = 0;
 	def var lastDirtyOffset: u64 = 0;
 	def var lastDirtySize: u64 = 0;
-	def var failPrepareChangedRangeAt = 0;
-	def var failNextPersistChanges = false;
+	def var failWriteBackAt = 0;
+	def var failNextDrain = false;
 
 	new(range) { }
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
 		return CountingRegion.new(range, this);
 	}
 
@@ -47,33 +47,33 @@ class CountingBackend extends TxnRegionBackend {
 	}
 }
 
-class CountingRegion extends BackendRegion {
+class CountingRegion extends StorageRegion {
 	def counter: CountingBackend;
 
 	new(range: Range<byte>, counter: CountingBackend) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
-		counter.prepareChangedRangeCount++;
+	def writeBack(offset: u64, size: u64) -> bool {
+		counter.writeBackCount++;
 		counter.lastDirtyOffset = offset;
 		counter.lastDirtySize = size;
-		if (counter.prepareChangedRangeCount == counter.failPrepareChangedRangeAt) {
-			counter.failPrepareChangedRangeAt = 0;
+		if (counter.writeBackCount == counter.failWriteBackAt) {
+			counter.failWriteBackAt = 0;
 			return false;
 		}
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
-		counter.persistRangeCount++;
+	def persist(offset: u64, size: u64) -> bool {
+		counter.persistCount++;
 		return true;
 	}
 
-	def persistChanges() -> bool {
-		counter.persistChangesCount++;
-		if (counter.failNextPersistChanges) {
-			counter.failNextPersistChanges = false;
+	def drain() -> bool {
+		counter.drainCount++;
+		if (counter.failNextDrain) {
+			counter.failNextDrain = false;
 			return false;
 		}
 		return true;
@@ -81,10 +81,10 @@ class CountingRegion extends BackendRegion {
 }
 
 class RegionTransactionTester(t: Tester) {
-	var txn: RegionTransaction;
-	var wal: DualTxnWal;
+	var txn: TransactionCache;
+	var wal: TwoSlotWal;
 	var backend: CountingBackend;
-	var backendRegion: BackendRegion;
+	var backendRegion: StorageRegion;
 	// Backing memory for the pointers to test read-through and write-back
 	var dummyData: Array<byte>;
 
@@ -94,12 +94,12 @@ class RegionTransactionTester(t: Tester) {
 		for (i < dummyData.length) dummyData[i] = 0xAAu8;
 		def regionStart = u64.view(Pointer.atElement(dummyData, 0));
 		backend = CountingBackend.new(dummyData[0 ..+ dummyData.length]);
-		backendRegion = backend.create(u64.!(dummyData.length), BackendProt.READ.mask | BackendProt.WRITE.mask, true);
-		wal = DualTxnWal.new(regionStart, regionStart + 1024u64, 1024u64, backendRegion, true);
-		txn = RegionTransaction.new(wal, regionStart);
-		backend.prepareChangedRangeCount = 0;
-		backend.persistRangeCount = 0;
-		backend.persistChangesCount = 0;
+		backendRegion = backend.open(u64.!(dummyData.length), BackendProt.READ.mask | BackendProt.WRITE.mask, OpenMode.FORMAT);
+		wal = TwoSlotWal.new(regionStart, regionStart + 1024u64, 1024u64, backendRegion, OpenMode.FORMAT);
+		txn = TransactionCache.new(wal, regionStart);
+		backend.writeBackCount = 0;
+		backend.persistCount = 0;
+		backend.drainCount = 0;
 	}
 
 	def getAddr(offset: int) -> u64 {
@@ -116,13 +116,13 @@ class RegionTransactionTester(t: Tester) {
 	}
 
 	// The first transaction gets txnSeq 1, which parity-maps to slot 1.
-	def recordHeader() -> Ref<TxnRecordHeader> {
+	def recordHeader() -> Ref<WalRecordHeader> {
 		return wal.recordHeaderAt(wal.slotAddr(1));
 	}
 
-	def logEntry(index: u32) -> Ref<LogEntry> {
-		def addr = wal.slotAddr(1) + u64.!(TxnRecordHeader.size) + u64.view(index) * u64.!(LogEntry.size);
-		return wal.logEntryAt(addr);
+	def logEntry(index: u32) -> Ref<WalEntry> {
+		def addr = wal.slotAddr(1) + u64.!(WalRecordHeader.size) + u64.view(index) * u64.!(WalEntry.size);
+		return wal.walEntryAt(addr);
 	}
 }
 
@@ -192,7 +192,7 @@ def test_commit_applies_and_clears(tc: RegionTransactionTester) {
 }
 
 // Test 5: WAL commit uses one persistence boundary (phase B): the record is
-// prepared and persisted via persistChanges (no per-record persistRange), and
+// prepared and persisted via drain (no per-record persist), and
 // the applied data is only prepared -- its persist rides the next boundary.
 def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	var addr = tc.getAddr(200);
@@ -201,9 +201,9 @@ def test_commit_uses_persistence_api(tc: RegionTransactionTester) {
 	tc.txn.writeU64(addr, val);
 	tc.txn.commit();
 
-	tc.t.assert_eq(0, tc.backend.persistRangeCount);
-	tc.t.assert_eq(2, tc.backend.prepareChangedRangeCount);	// record + applied data
-	tc.t.assert_eq(1, tc.backend.persistChangesCount);
+	tc.t.assert_eq(0, tc.backend.persistCount);
+	tc.t.assert_eq(2, tc.backend.writeBackCount);	// record + applied data
+	tc.t.assert_eq(1, tc.backend.drainCount);
 	tc.t.assert_eq(addr - tc.wal.regionStart, tc.backend.lastDirtyOffset);
 	tc.t.assert_eq(8u64, tc.backend.lastDirtySize);
 }
@@ -217,7 +217,7 @@ def test_next_commit_persists_previous_data(tc: RegionTransactionTester) {
 
 	tc.txn.writeU64(tc.getAddr(208), 0x22u64);
 	tc.txn.commit();
-	tc.t.assert_eq(2, tc.backend.persistChangesCount);	// still one boundary per commit
+	tc.t.assert_eq(2, tc.backend.drainCount);	// still one boundary per commit
 	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);		// record 2 durable => txn 1 data durable
 	tc.t.assert_eq(2u64, tc.wal.lastCommittedSeq);
 }
@@ -230,7 +230,7 @@ def test_flush_completes_durability(tc: RegionTransactionTester) {
 	tc.t.assert_eq(0u64, tc.wal.dataDurableSeq);
 
 	tc.t.assertz(true, tc.txn.flush());
-	tc.t.assert_eq(2, tc.backend.persistChangesCount);	// commit boundary + flush
+	tc.t.assert_eq(2, tc.backend.drainCount);	// commit boundary + flush
 	tc.t.assert_eq(1u64, tc.wal.dataDurableSeq);
 }
 
@@ -317,19 +317,19 @@ def test_commit_overflow_then_success(tc: RegionTransactionTester) {
 	tc.t.assertz(true, tc.txn.isDirty());
 	tc.t.assertz(false, tc.txn.requiresRecovery());
 
-	var txn2 = RegionTransaction.new(tc.wal, tc.wal.regionStart);
+	var txn2 = TransactionCache.new(tc.wal, tc.wal.regionStart);
 	txn2.writeU64(tc.getAddr(3000), 0x99u64);
 	tc.t.assertz(true, txn2.commit());
 	tc.t.assert_eq(1u64, tc.wal.lastCommittedSeq);
 	tc.t.assertz(false, txn2.isDirty());
 }
 
-// A failed commit boundary is indeterminate. RegionTransaction must expose the
+// A failed commit boundary is indeterminate. TransactionCache must expose the
 // WAL latch, retain its buffered writes, and reject a same-instance retry
 // without issuing another persistence operation.
 def test_commit_persist_failure_requires_recovery(tc: RegionTransactionTester) {
 	def addr = tc.getAddr(200);
-	tc.backend.failNextPersistChanges = true;
+	tc.backend.failNextDrain = true;
 	tc.txn.writeU64(addr, 0x1234u64);
 
 	tc.t.assertz(false, tc.txn.commit());
@@ -338,18 +338,18 @@ def test_commit_persist_failure_requires_recovery(tc: RegionTransactionTester) {
 	tc.t.assert_eq(0u64, tc.wal.lastCommittedSeq);
 	tc.t.assert_eq(0x1234u64, tc.txn.readU64(addr));
 
-	def persistChangesCount = tc.backend.persistChangesCount;
+	def drainCount = tc.backend.drainCount;
 	tc.t.assertz(false, tc.txn.commit());
-	tc.t.assert_eq(persistChangesCount, tc.backend.persistChangesCount);
+	tc.t.assert_eq(drainCount, tc.backend.drainCount);
 }
 
 // A record can be acknowledged before preparing its live after-image fails.
-// The facade must propagate applyUpdate()'s failure and keep the cache dirty so
+// The facade must propagate applyAfterImage()'s failure and keep the cache dirty so
 // it never reports a fully completed transaction on the poisoned mount.
 def test_apply_prepare_failure_requires_recovery(tc: RegionTransactionTester) {
 	def addr = tc.getAddr(200);
 	// The record is prepared first; fail the second preparation, for the data.
-	tc.backend.failPrepareChangedRangeAt = 2;
+	tc.backend.failWriteBackAt = 2;
 	tc.txn.writeU64(addr, 0x5678u64);
 
 	tc.t.assertz(false, tc.txn.commit());
@@ -367,11 +367,11 @@ def test_flush_failure_requires_recovery(tc: RegionTransactionTester) {
 	tc.t.assertz(true, tc.txn.commit());
 	tc.t.assertz(false, tc.txn.isDirty());
 
-	tc.backend.failNextPersistChanges = true;
+	tc.backend.failNextDrain = true;
 	tc.t.assertz(false, tc.txn.flush());
 	tc.t.assertz(true, tc.txn.requiresRecovery());
 
-	def persistChangesCount = tc.backend.persistChangesCount;
+	def drainCount = tc.backend.drainCount;
 	tc.t.assertz(false, tc.txn.commit());
-	tc.t.assert_eq(persistChangesCount, tc.backend.persistChangesCount);
+	tc.t.assert_eq(drainCount, tc.backend.drainCount);
 }

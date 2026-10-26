@@ -1,15 +1,15 @@
 # `maybeCheckpoint()` Policy — Design Options
 
-> **Status:** historical design record for the retained `MultiTxnWal`.
-> Option E + light F was implemented and is covered by `MultiTxnWalTest.v3`,
-> but `MultiTxnWal` is no longer wired into `PWRegion`; the active
-> `DualTxnWal` has no checkpoint policy.
+> **Status:** historical design record for the retained `RingWal`.
+> Option E + light F was implemented and is covered by `RingWalTest.v3`,
+> but `RingWal` is no longer wired into `RegionAllocator`; the active
+> `TwoSlotWal` has no checkpoint policy.
 
 This document records the design discussion that replaced the original no-op
 `maybeCheckpoint()` stub with a real checkpoint policy.
 
-In the former `MultiTxnWal` wiring, `maybeCheckpoint()` was called by
-`RegionTransaction.commit()` after `noteApplied(txnSeq)` and before `clear()`.
+In the former `RingWal` wiring, `maybeCheckpoint()` was called by
+`TransactionCache.commit()` after `noteApplied(txnSeq)` and before `clear()`.
 It decides whether to invoke the
 `checkpoint(targetSeq)`, which persists applied region data, publishes
 `durableAppliedSeq` via the superblock, and reclaims now-durable ring records.
@@ -21,16 +21,16 @@ Before the implemented policy, checkpoints fired only lazily inside
 ## What `checkpoint()` actually costs vs. buys
 
 The per-commit floor cost is **already paid regardless of policy**:
-`appendCommittedRecord` does a `persistRange` on the record itself (the commit
+`appendCommittedRecord` does a `persist` on the record itself (the commit
 point). On the file backend that is an `msync`; on PMEM a flush + fence. So the
 WAL does **not** batch record durability — every `commit()` is already
 synchronous for its own record.
 
 What `checkpoint()` adds on top:
 
-- `persistChanges()` — `fdatasync` (file, only if dirty) / `storeFence` (PMEM) /
+- `drain()` — `fdatasync` (file, only if dirty) / `fence` (PMEM) /
   no-op (volatile) — makes the **applied region data** durable.
-- `writeSuperblock()` — another `persistRange` (a second `msync` on file) plus a
+- `writeSuperblock()` — another `persist` (a second `msync` on file) plus a
   generation bump.
 - `reclaimAppliedRecords()` — frees ring space.
 
@@ -73,7 +73,7 @@ collapses into the count policy.
 | **C** | Count threshold | `lag ≥ N` (i.e. `activeRecords.length ≥ N`) | bounded recovery (≤ N txns); amortizes sync over N commits; trivial & O(1); deterministic to unit-test | N is a magic number; ignores record-size variance (N huge txns ≠ N tiny ones in ring terms) |
 | **D** | Occupancy watermark | ring usage ≥ X% of `ringBytes` (e.g. 50–75%) | targets the real constraint directly; pre-empts the lazy ring-full stall; adapts to record size | needs a running `activeBytes` counter; still a magic %; does not cap recovery txn-count directly |
 | **E** | Hybrid count-OR-occupancy | `lag ≥ N` **OR** `usage ≥ watermark` | bounds both recovery length and ring pressure; robust to many-small and few-large workloads | two knobs to tune |
-| **F** | Backend-aware | thresholds vary by backend cost (volatile→always, PMEM→low, file→high/occupancy-only) | matches the cost asymmetry above | needs a cost signal from `BackendRegion`; more surface area |
+| **F** | Backend-aware | thresholds vary by backend cost (volatile→always, PMEM→low, file→high/occupancy-only) | matches the cost asymmetry above | needs a cost signal from `StorageRegion`; more surface area |
 | **G** | Adaptive feedback | tighten threshold when `reserveRecord` hits ring-full | self-tuning | premature for current stage; harder to test |
 
 ---
@@ -96,7 +96,7 @@ Rationale:
   partial prefix).
 - Backend sensitivity matters because the file backend is the only one where this
   is genuinely expensive; on volatile/PMEM a much lower threshold (even
-  near-always) is affordable. Cheapest implementation: two `MultiTxnWal`
+  near-always) is affordable. Cheapest implementation: two `RingWal`
   constants, optionally overridden via an `isPersistent()` / cost hint.
 
 Implementation footprint is small: add an `activeBytes` running counter
@@ -117,10 +117,10 @@ def maybeCheckpoint() -> bool {
 
 ## Open decisions before implementing
 
-1. **How configurable** — fixed constants in `MultiTxnWalConstants`, or
+1. **How configurable** — fixed constants in `RingWalLayout`, or
    backend-aware (volatile/PMEM aggressive, file lazy)?
 2. **Failure handling** — `maybeCheckpoint`'s result is currently discarded by
-   `RegionTransaction.commit`. A failed checkpoint is not fatal (data is still
+   `TransactionCache.commit`. A failed checkpoint is not fatal (data is still
    recoverable from the WAL), so should it stay best-effort/silent, or be
    surfaced up? (Ties into Roadmap Next Steps #2, commit-failure propagation.)
 
@@ -145,11 +145,11 @@ def maybeCheckpoint() -> bool {
 
 Resolutions to the open decisions:
 
-1. **How configurable** — backend-aware. `BackendRegion.checkpointCost()` returns
+1. **How configurable** — backend-aware. `StorageRegion.checkpointCost()` returns
    a `CheckpointCost` class (`FREE` volatile / `CHEAP` PMEM / `EXPENSIVE` file;
    `EXPENSIVE` is the conservative default for unknown backends).
    `configureCheckpointPolicy()` maps each class to a `(txnThreshold, fillPercent)`
-   pair held in `MultiTxnWalConstants`:
+   pair held in `RingWalLayout`:
    - `FREE` → (1, 1%) — reclaim on essentially every commit; checkpoint is free.
    - `CHEAP` → (8, 25%) — low cap; store fences are cheap.
    - `EXPENSIVE` → (64, 50%) — lazy; amortize `fdatasync` + superblock `msync`.
@@ -160,6 +160,6 @@ Resolutions to the open decisions:
 `activeBytes` is a running counter maintained in `appendCommittedRecord`
 (increment) and `reclaimAppliedRecords` (recompute over kept records), and reset
 wherever `activeRecords` is reset (mount/recovery). The lazy ring-full checkpoint
-in `reserveRecord` is retained as a backstop. Tests: `MultiTxnWalTest.v3`
+in `reserveRecord` is retained as a backstop. Tests: `RingWalTest.v3`
 (`checkpoint_policy_thresholds`, `maybe_checkpoint_count`,
 `maybe_checkpoint_occupancy`).

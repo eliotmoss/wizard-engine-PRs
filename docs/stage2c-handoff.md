@@ -381,7 +381,7 @@ prompt on for the reboot. Remove both files after Stage 2c.
 - Scope, schedule and freeze: `docs/THESIS.md`. Task list: `docs/ROADMAP.md`,
   Stage 2c item.
 - Code: `test/pwreboot.main.v3` (harness modes), `scripts/stage2c.sh`
-  (operator), `test/unittest/x86-64-linux/ElidedWritebackOps.v3` (the mutant),
+  (operator), `test/unittest/x86-64-linux/ElidedWriteBackProvider.v3` (the mutant),
   `test/unittest/x86-64-linux/PWSieve.v3` (the workload).
 - A local dry run needs no reboot and works anywhere, including WSL:
 

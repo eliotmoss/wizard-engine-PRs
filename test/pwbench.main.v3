@@ -1,6 +1,6 @@
 // Persistence-boundary cost characterization.
 //
-// Phase B of DualTxnWal exists to reach one persistence boundary per commit,
+// Phase B of TwoSlotWal exists to reach one persistence boundary per commit,
 // and its design note justifies the per-commit data flush as "cheap fences --
 // acceptable". That is an assertion with no measurement behind it, and it is
 // the only quantitative claim in the argument that the unified interface hides
@@ -23,8 +23,8 @@
 //
 // Instrumentation is asymmetric because the primitives are. On PMEM the
 // boundary is a CLWB loop plus one SFENCE, both issued through the
-// PersistentOperations provider, so a timing provider measures it. On a file
-// the boundary is one fdatasync behind FileMmapRegion.syncFileData() (or, with
+// PersistenceProvider provider, so a timing provider measures it. On a file
+// the boundary is one fdatasync behind MappedFileRegion.syncFileData() (or, with
 // boundary=msync, an msync per run of marked pages behind syncMappedRange()),
 // so a timing region measures that. Both report the same semantic unit -- the
 // prepare side and the persist side of one boundary -- and the difference in
@@ -57,12 +57,12 @@
 // apart. 64 puts each entry on its own cache line, which keeps the number of
 // writebacks per commit while removing every same-line store after one.
 //
-// boundary= (file only) chooses the file backend's fence (FileBoundary), for
+// boundary= (file only) chooses the file backend's fence (MappedFileSync), for
 // the old-against-new comparison and the choice of fence (the cost campaign of
 // scripts/pmem-experiments.sh): fdatasync (the default, and the production
 // path -- one fdatasync whenever a page is marked), msync (one msync(MS_SYNC)
 // per run of marked pages), or legacy (the boundary before 2026-10-13: a flag
-// and fdatasync, persistRange an msync of its own pages). Every fdatasync and
+// and fdatasync, persist an msync of its own pages). Every fdatasync and
 // every msync is a persist sample, so under msync a fence of several runs is
 // several samples, and "boundaries per commit" counts syncs per commit. clwb
 // lines counts the writeback requests the file region's provider receives,
@@ -92,7 +92,7 @@ enum BenchBackend(arg: string, label: string) {
 }
 
 // The writeback the PMEM timing provider issues per cache line. AUTO is
-// MmapRegionUtils.flushCacheLine(), unchanged; the others bypass its CPUID
+// X86_64CacheControl.writeBackLine(), unchanged; the others bypass its CPUID
 // selection to hold the instruction fixed.
 enum BenchWriteback(arg: string, label: string) {
         AUTO("auto", "auto (production CPUID selection)"),
@@ -118,7 +118,7 @@ component BenchConfig {
         def var blockSize = 4096u64;
         def var writeback = BenchWriteback.AUTO;
         def var stride = 8u64;          // bytes between consecutive entries
-        def var boundary = FileBoundary.FDATASYNC;      // file backend only
+        def var boundary = MappedFileSync.FDATASYNC_ONCE;      // file backend only
 
         def backendName() -> string {
                 return backend.label;
@@ -147,9 +147,9 @@ component BenchConfig {
                                 .putd(attempt)
                                 .puts(".region")
                                 .toString();
-                        def fd = RegionFileIO.createExclusive(path);
+                        def fd = BackingFile.createExclusive(path);
                         if (fd >= 0) {
-                                RegionFileIO.close(fd);
+                                BackingFile.close(fd);
                                 return true;
                         }
                         if (fd != -LinuxConst.EEXIST) {
@@ -276,10 +276,10 @@ class BoundaryTimer {
 // The PMEM boundary is issued through the provider seam, so timing lives here.
 // Both methods reimplement the production body rather than delegating, which
 // is this codebase's established idiom for a seam override (see
-// RecordingPersistentOperations and FilePersistenceTraceRegion) -- the bodies
-// are one-liners over MmapRegionUtils, so there is no state machine to
+// RecordingProvider and FilePersistenceTraceRegion) -- the bodies
+// are one-liners over CacheLines and X86_64CacheControl, so there is no state machine to
 // duplicate and no risk of drifting from production behaviour.
-class TimingPersistentOperations extends X86_64PersistentOperations {
+class TimingProvider extends NativeProvider {
         def timer: BoundaryTimer;
         // writeback=deferred only: the distinct lines requested since the last
         // fence. A few dozen per commit, so a linear scan is the cheap choice.
@@ -287,20 +287,20 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
 
         new(range: Range<byte>, timer: BoundaryTimer) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 def c0 = Target.rdtsc();
                 if (BenchConfig.writeback == BenchWriteback.DEFERRED) {
-                        deferLine(cacheLine);
+                        deferLine(lineOffset);
                         timer.notePrepare(Target.rdtsc() - c0);
                         return;
                 }
-                def line = Pointer.atElement(range, int.!(cacheLine));
+                def line = Pointer.atElement(range, int.!(lineOffset));
                 match (BenchConfig.writeback) {
-                        AUTO => MmapRegionUtils.flushCacheLine(line);
+                        AUTO => X86_64CacheControl.writeBackLine(line);
                         CLWB => Target.clwb(line - Pointer.NULL);
                         CLFLUSHOPT => Target.clflushOpt(line - Pointer.NULL);
                         CLFLUSH => Target.clflush(line - Pointer.NULL);
@@ -313,11 +313,11 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
 
         // Every fence the region issues comes through here, so draining the
         // deferred lines first keeps each writeback ahead of its fence.
-        def sfence() {
+        def fence() {
                 if (pending.length > 0) {
                         def c1 = Target.rdtsc();
                         for (i < pending.length) {
-                                MmapRegionUtils.flushCacheLine(Pointer.atElement(range, int.!(pending[i])));
+                                X86_64CacheControl.writeBackLine(Pointer.atElement(range, int.!(pending[i])));
                         }
                         timer.notePrepare(Target.rdtsc() - c1);
                         timer.clwbLines += pending.length;
@@ -327,7 +327,7 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
                         pending.resize(0);
                 }
                 def c0 = Target.rdtsc();
-                MmapRegionUtils.storeFence();
+                X86_64CacheControl.fence();
                 timer.notePersist(Target.rdtsc() - c0);
         }
 
@@ -337,18 +337,18 @@ class TimingPersistentOperations extends X86_64PersistentOperations {
         }
 }
 
-// Installs the timing provider inside create(), via the factory seam. It has to
-// be inside create(): PWRegion and DualTxnWal each resolve their provider once
+// Installs the timing provider inside open(), via the factory seam. It has to
+// be inside open(): RegionAllocator and TwoSlotWal each resolve their provider once
 // at construction, so a later swap would miss the log's own writebacks.
-class TimingPmemBackend extends PmemMmapBackend {
+class TimingPmemBackend extends PmemBackend {
         def timer: BoundaryTimer;
 
         new(path: string, timer: BoundaryTimer) super(path) { }
 
-        def makePersistentRegion(newMapping: Mapping, fd: int) -> PmemMmapRegion {
+        def makePmemRegion(newMapping: Mapping, fd: int) -> PmemRegion {
                 if (newMapping == null) return null;
-                def region = PmemMmapRegion.new(newMapping, fd);
-                region.setPersistentOperations(TimingPersistentOperations.new(region.range, timer));
+                def region = PmemRegion.new(newMapping, fd);
+                region.setProvider(TimingProvider.new(region.range, timer));
                 return region;
         }
 }
@@ -358,15 +358,15 @@ class TimingPmemBackend extends PmemMmapBackend {
 // The file region's staging provider with each writeback request counted, as
 // pwopsbench's: the region's page-marking provider forwards every request to
 // it, so clwb lines are the PMEM backend's for the same commits.
-class CountingStagingOperations extends DirectIoStagingOperations {
+class CountingStoreOnlyProvider extends StoreOnlyProvider {
         def timer: BoundaryTimer;
 
         new(range: Range<byte>, timer: BoundaryTimer) super(range) { }
 
-        def clwb(cacheLine: u64) {
-                if (cacheLine % MmapRegionUtils.CACHE_LINE_SIZE != 0u64 ||
-                        cacheLine >= u64.!(range.length)) {
-                        System.error("PersistentOperationError", "invalid cache-line writeback offset");
+        def writeBackLine(lineOffset: u64) {
+                if (lineOffset % CacheLines.CACHE_LINE_SIZE != 0u64 ||
+                        lineOffset >= u64.!(range.length)) {
+                        System.error("PersistenceProviderError", "invalid cache-line writeback offset");
                 }
                 if (timer.recording) timer.clwbLines++;
         }
@@ -374,25 +374,25 @@ class CountingStagingOperations extends DirectIoStagingOperations {
 
 // The file boundary is one fdatasync behind syncFileData(), or with
 // boundary=msync one msync per run of marked pages behind syncMappedRange()
-// (with boundary=legacy, a persistRange()'s msync of its own pages); each sync
-// is one persist sample. onRangePrepared is the paired seam on the prepare
+// (with boundary=legacy, a persist()'s msync of its own pages); each sync
+// is one persist sample. onWriteBack is the paired seam on the prepare
 // side; it does no syscall, so it is counted rather than timed.
-class TimingFileRegion extends FileMmapRegion {
+class TimingFileRegion extends MappedFileRegion {
         def timer: BoundaryTimer;
 
-        // boundary=legacy replaces this provider (selectBoundary()), so it
+        // boundary=legacy replaces this provider (selectSync()), so it
         // counts no lines.
         new(mapping: Mapping, fd: int, timer: BoundaryTimer) super(mapping, fd) {
-                wrapProvider(CountingStagingOperations.new(range, timer));
+                setInnerProvider(CountingStoreOnlyProvider.new(range, timer));
         }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 timer.notePrepare(0);
         }
 
         def syncFileData() -> bool {
                 def c0 = Target.rdtsc();
-                def success = RegionFileIO.fdatasync(fd);
+                def success = BackingFile.fdatasync(fd);
                 timer.notePersist(Target.rdtsc() - c0);
                 return success;
         }
@@ -405,14 +405,14 @@ class TimingFileRegion extends FileMmapRegion {
         }
 }
 
-class TimingFileBackend extends FileMmapBackend {
+class TimingFileBackend extends MappedFileBackend {
         def timer: BoundaryTimer;
 
         new(path: string, timer: BoundaryTimer) super(path) {
-                boundary = BenchConfig.boundary;
+                sync = BenchConfig.boundary;
         }
 
-        def makeFileRegion(newMapping: Mapping, fd: int) -> FileMmapRegion {
+        def makeMappedFileRegion(newMapping: Mapping, fd: int) -> MappedFileRegion {
                 if (newMapping == null) return null;
                 return TimingFileRegion.new(newMapping, fd, timer);
         }
@@ -431,7 +431,7 @@ class TimingDirectRegion extends DirectIoRegion {
 
         new(mapping: Mapping, fd: int, blockDevice: bool, timer) super(mapping, fd, blockDevice) { }
 
-        def onRangePrepared(offset: u64, size: u64) {
+        def onWriteBack(offset: u64, size: u64) {
                 timer.notePrepare(0);
         }
 
@@ -512,16 +512,16 @@ def fail(msg: string) -> int {
 
 var directBackend: TimingDirectBackend;
 
-def openRegion(timer: BoundaryTimer) -> PWRegion {
-        var backend: TxnRegionBackend;
+def openRegion(timer: BoundaryTimer) -> RegionAllocator {
+        var backend: StorageBackend;
         match (BenchConfig.backend) {
                 PMEM => backend = TimingPmemBackend.new(BenchConfig.path, timer);
                 FILE => backend = TimingFileBackend.new(BenchConfig.path, timer);
                 DIRECT => backend = directBackend = TimingDirectBackend.new(BenchConfig.path, DirectIoTarget.FILE, timer);
                 DIRECT_DEVICE => backend = directBackend = TimingDirectBackend.new(BenchConfig.path, DirectIoTarget.BLOCK_DEVICE, timer);
         }
-        return PWRegion.new(backend, BenchConfig.blocks,
-                Array<Ref<MetaDataDesc>>.new(0), BenchConfig.blockSize, true);
+        return RegionAllocator.new(backend, BenchConfig.blocks,
+                Array<Ref<MetadataDescriptor>>.new(0), BenchConfig.blockSize, OpenMode.FORMAT);
 }
 
 // One transaction of exactly {entries} aligned u64 redo entries, committed
@@ -529,7 +529,7 @@ def openRegion(timer: BoundaryTimer) -> PWRegion {
 // going through allocChunk is what makes the record size a controlled
 // variable: an allocation's entry count depends on whether it splits, which
 // would put the independent variable outside the harness's control.
-def runCommits(region: PWRegion, base: u64, count: int, timer: BoundaryTimer) -> bool {
+def runCommits(region: RegionAllocator, base: u64, count: int, timer: BoundaryTimer) -> bool {
         for (i < count) {
                 for (e < BenchConfig.entries) {
                         region.txn.writeU64(base + u64.!(e) * BenchConfig.stride, u64.!(i) + 0x5A5A0000u64);
@@ -590,19 +590,19 @@ def report(timer: BoundaryTimer, measured: int, wallNs: long, faults: long) {
         }
 }
 
-// The per-transaction ceiling, mirroring DualTxnWal's geometry: each of the two
-// record slots gets half the log chunk less the WAL header, rounded down to the
+// The per-transaction ceiling, mirroring TwoSlotWal's geometry: each of the two
+// record slots gets half the log block less the WAL header, rounded down to the
 // 64-byte record alignment, and a record is a header, a trailer and one 32-byte
-// LogEntry per buffered write. Reported as an
+// WalEntry per buffered write. Reported as an
 // estimate rather than enforced, because the commit itself is the authority --
 // this exists so an oversized sweep point fails with a number instead of a
 // shrug.
 def maxEntriesEstimate(blockSize: u64) -> u64 {
-        if (blockSize <= u64.!(DualWalHeader.size)) return 0;
-        def slot = ((blockSize - u64.!(DualWalHeader.size)) / 2u64) & ~63u64;
-        def fixed = u64.!(TxnRecordHeader.size + TxnCommitTrailer.size);
+        if (blockSize <= u64.!(WalHeader.size)) return 0;
+        def slot = ((blockSize - u64.!(WalHeader.size)) / 2u64) & ~63u64;
+        def fixed = u64.!(WalRecordHeader.size + WalRecordTrailer.size);
         if (slot <= fixed) return 0;
-        return (slot - fixed) / u64.!(LogEntry.size);
+        return (slot - fixed) / u64.!(WalEntry.size);
 }
 
 def parseU64(s: string, dflt: u64) -> u64 {
@@ -658,8 +658,8 @@ def main(args: Array<string>) -> int {
                 System.puts("writeback= applies only to the pmem backend\n");
                 return 2;
         }
-        // The fence is FileMmapRegion's; no other backend has the choice.
-        if (BenchConfig.boundary != FileBoundary.FDATASYNC && BenchConfig.backend != BenchBackend.FILE) {
+        // The fence is MappedFileRegion's; no other backend has the choice.
+        if (BenchConfig.boundary != MappedFileSync.FDATASYNC_ONCE && BenchConfig.backend != BenchBackend.FILE) {
                 System.puts("boundary= applies only to the file backend\n");
                 return 2;
         }
@@ -673,7 +673,7 @@ def main(args: Array<string>) -> int {
                 System.puts("commits and entries must be positive\n");
                 return 2;
         }
-        // PWRegion refuses a geometry too small to format, but only after the
+        // RegionAllocator refuses a geometry too small to format, but only after the
         // region file exists; refusing the obvious case here keeps a typo from
         // looking like a backend failure.
         if (BenchConfig.blocks < 4) {
@@ -703,7 +703,7 @@ def main(args: Array<string>) -> int {
         def region = openRegion(timer);
         if (region == null || region.backendRegion == null) {
                 if (BenchConfig.backend == BenchBackend.PMEM) {
-                        return fail("PmemMmapBackend.create failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
+                        return fail("PmemBackend.open failed; the directory must be on a filesystem-DAX mount (MAP_SYNC has no fallback)");
                 }
                 if (directBackend != null && directBackend.lastError != null) {
                         return fail(Strings.format1("DirectIoBackend.create failed: %s", directBackend.lastError));
@@ -716,8 +716,8 @@ def main(args: Array<string>) -> int {
         def got = region.backendRegion;
         var mismatch: string;
         match (BenchConfig.backend) {
-                PMEM => if (!PmemMmapRegion.?(got)) mismatch = "pmem mode did not produce a PmemMmapRegion";
-                FILE => if (!FileMmapRegion.?(got)) mismatch = "file mode did not produce a FileMmapRegion";
+                PMEM => if (!PmemRegion.?(got)) mismatch = "pmem mode did not produce a PmemRegion";
+                FILE => if (!MappedFileRegion.?(got)) mismatch = "file mode did not produce a MappedFileRegion";
                 DIRECT => if (!DirectIoRegion.?(got) || DirectIoRegion.!(got).blockDevice) mismatch = "direct mode did not produce a file-backed DirectIoRegion";
                 DIRECT_DEVICE => if (!DirectIoRegion.?(got) || !DirectIoRegion.!(got).blockDevice) mismatch = "direct-device mode did not produce a device-backed DirectIoRegion";
         }
@@ -729,7 +729,7 @@ def main(args: Array<string>) -> int {
         // anywhere near a cost measurement. (writeback=none elides the
         // instruction inside the timing provider instead, and is labelled in
         // the log and on the last line so no cost figure can absorb it.)
-        if (ElidedWritebackOperations.?(region.backendRegion.persistentOperations())) {
+        if (ElidedWriteBackProvider.?(region.backendRegion.provider())) {
                 region.deallocate();
                 return fail("an elided-writeback provider is installed; this must be an ordinary build");
         }
@@ -790,7 +790,7 @@ def main(args: Array<string>) -> int {
         region.deallocate();
         if (BenchConfig.backend == BenchBackend.DIRECT_DEVICE) {
                 // The device keeps the region; there is no file of ours to remove.
-        } else if (!RegionFileIO.unlink(BenchConfig.path)) {
+        } else if (!BackingFile.unlink(BenchConfig.path)) {
                 System.puts("Could not remove the region file printed above.\n");
                 return 2;
         }
@@ -811,9 +811,9 @@ def parseKeyword(arg: string) -> bool {
         }
         if (Strings.startsWith(arg, "boundary=")) {
                 def name = Arrays.range(arg, 9, arg.length);
-                if (Strings.equal(name, FileBoundary.FDATASYNC.arg)) BenchConfig.boundary = FileBoundary.FDATASYNC;
-                else if (Strings.equal(name, FileBoundary.MSYNC.arg)) BenchConfig.boundary = FileBoundary.MSYNC;
-                else if (Strings.equal(name, FileBoundary.LEGACY.arg)) BenchConfig.boundary = FileBoundary.LEGACY;
+                if (Strings.equal(name, MappedFileSync.FDATASYNC_ONCE.arg)) BenchConfig.boundary = MappedFileSync.FDATASYNC_ONCE;
+                else if (Strings.equal(name, MappedFileSync.MSYNC_PER_RUN.arg)) BenchConfig.boundary = MappedFileSync.MSYNC_PER_RUN;
+                else if (Strings.equal(name, MappedFileSync.LEGACY_RANGE_MSYNC.arg)) BenchConfig.boundary = MappedFileSync.LEGACY_RANGE_MSYNC;
                 else return false;
                 return true;
         }
@@ -841,7 +841,7 @@ def unsupportedWriteback() -> string {
         return null;
 }
 
-// What MmapRegionUtils.flushCacheLine() resolves to here, in its order.
+// What X86_64CacheControl.writeBackLine() resolves to here, in its order.
 def cpuidWriteback() -> string {
         if (Target.supportsClwb()) return "CLWB";
         if (Target.supportsClflushOpt()) return "CLFLUSHOPT";

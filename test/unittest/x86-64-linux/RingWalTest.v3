@@ -1,7 +1,7 @@
-// MultiTxnWal Tests
+// RingWal Tests
 // Tests the persistent multi-transaction redo log and recovery flow.
 
-def MTW = UnitTests.registerT("multi_wal:", _, MultiTxnWalTester.new, _);
+def MTW = UnitTests.registerT("ring_wal:", _, RingWalTester.new, _);
 def MTWX = [
 	MTW("fresh_superblocks", test_multi_fresh_superblocks),
 	MTW("fresh_superblock_persist_failure_rejected", test_multi_fresh_superblock_persist_failure_rejected),
@@ -34,13 +34,13 @@ def MTWX = [
 	()
 ];
 
-class MultiTxnWalTestBackend extends TxnRegionBackend {
+class RingWalTestBackend extends StorageBackend {
 	def range: Range<byte>;
 
 	new(range) { }
 
-	def create(size: u64, prot: int, fresh: bool) -> BackendRegion {
-		return MultiTxnWalTestRegion.new(range);
+	def open(size: u64, access: int, mode: OpenMode) -> StorageRegion {
+		return RingWalTestRegion.new(range);
 	}
 
 	def isPersistent() -> bool {
@@ -52,60 +52,60 @@ class MultiTxnWalTestBackend extends TxnRegionBackend {
 	}
 }
 
-class MultiTxnWalTestRegion extends BackendRegion {
+class RingWalTestRegion extends StorageRegion {
 	new(range: Range<byte>) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
+	def persist(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistChanges() -> bool {
+	def drain() -> bool {
 		return true;
 	}
 }
 
-// A region that can fail the next persistRange on demand, to exercise the
+// A region that can fail the next persist on demand, to exercise the
 // failed-commit-point path in appendCommittedRecord.
-class FailingRegion extends BackendRegion {
-	var failNextPersistRange = false;
-	var failNextPersistChanges = false;
-	var persistRangeCalls = 0;
-	var persistChangesCalls = 0;
-	var failPersistRangeCall = 0;
-	var failPersistRangeCallsRemaining = 0;
+class FailingRegion extends StorageRegion {
+	var failNextPersist = false;
+	var failNextDrain = false;
+	var persistCalls = 0;
+	var drainCalls = 0;
+	var failPersistCall = 0;
+	var failPersistCallsRemaining = 0;
 
 	new(range: Range<byte>) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
-		persistRangeCalls++;
-		if (persistRangeCalls == failPersistRangeCall) return false;
-		if (failPersistRangeCallsRemaining > 0) {
-			failPersistRangeCallsRemaining--;
+	def persist(offset: u64, size: u64) -> bool {
+		persistCalls++;
+		if (persistCalls == failPersistCall) return false;
+		if (failPersistCallsRemaining > 0) {
+			failPersistCallsRemaining--;
 			return false;
 		}
-		if (failNextPersistRange) {
-			failNextPersistRange = false;
+		if (failNextPersist) {
+			failNextPersist = false;
 			return false;
 		}
 		return true;
 	}
 
-	def persistChanges() -> bool {
-		persistChangesCalls++;
-		if (failNextPersistChanges) {
-			failNextPersistChanges = false;
+	def drain() -> bool {
+		drainCalls++;
+		if (failNextDrain) {
+			failNextDrain = false;
 			return false;
 		}
 		return true;
@@ -114,22 +114,22 @@ class FailingRegion extends BackendRegion {
 
 // A region whose checkpoint cost class is configurable, so the per-backend
 // threshold wiring in configureCheckpointPolicy() can be exercised directly.
-class CostRegion extends BackendRegion {
+class CostRegion extends StorageRegion {
 	def cost: CheckpointCost;
 
 	new(range: Range<byte>, cost) super(range) { }
 
-	def destroy() { }
+	def close() { }
 
-	def prepareChangedRange(offset: u64, size: u64) -> bool {
+	def writeBack(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistRange(offset: u64, size: u64) -> bool {
+	def persist(offset: u64, size: u64) -> bool {
 		return true;
 	}
 
-	def persistChanges() -> bool {
+	def drain() -> bool {
 		return true;
 	}
 
@@ -138,11 +138,11 @@ class CostRegion extends BackendRegion {
 	}
 }
 
-class MultiTxnWalTester(t: Tester) {
+class RingWalTester(t: Tester) {
 	var data: Array<byte>;
-	var backend: MultiTxnWalTestBackend;
-	var backendRegion: BackendRegion;
-	var wal: MultiTxnWal;
+	var backend: RingWalTestBackend;
+	var backendRegion: StorageRegion;
+	var wal: RingWal;
 	var regionStart: u64;
 	var logAddr: u64;
 
@@ -151,13 +151,13 @@ class MultiTxnWalTester(t: Tester) {
 		for (i < data.length) data[i] = 0u8;
 		regionStart = u64.view(Pointer.atElement(data, 0));
 		logAddr = regionStart + 1024u64;
-		backend = MultiTxnWalTestBackend.new(data[0 ..+ data.length]);
-		backendRegion = backend.create(u64.!(data.length), BackendProt.READ.mask | BackendProt.WRITE.mask, true);
-		wal = MultiTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, true);
+		backend = RingWalTestBackend.new(data[0 ..+ data.length]);
+		backendRegion = backend.open(u64.!(data.length), BackendProt.READ.mask | BackendProt.WRITE.mask, OpenMode.FORMAT);
+		wal = RingWal.new(regionStart, logAddr, 1024u64, backendRegion, OpenMode.FORMAT);
 	}
 
-	def reopen() -> MultiTxnWal {
-		return MultiTxnWal.new(regionStart, logAddr, 1024u64, backendRegion, false);
+	def reopen() -> RingWal {
+		return RingWal.new(regionStart, logAddr, 1024u64, backendRegion, OpenMode.ATTACH);
 	}
 
 	def writeTxn(offset: u64, value: u64, width: u8) -> u64 {
@@ -165,7 +165,7 @@ class MultiTxnWalTester(t: Tester) {
 		return wal.commit();
 	}
 
-	// Commit one transaction and mark it applied, exactly as RegionTransaction
+	// Commit one transaction and mark it applied, exactly as TransactionCache
 	// does (commit -> noteApplied). Without noteApplied, appliedSeqVolatile never
 	// advances and a lazy checkpoint could not reclaim anything.
 	def writeAndApply(offset: u64, value: u64, width: u8) -> u64 {
@@ -177,18 +177,18 @@ class MultiTxnWalTester(t: Tester) {
 
 	def checksumAddrFor(seqOffset: u64) -> u64 {
 		def start = wal.ringBase + seqOffset;
-		def entryCount = PWRegionUtils.pointerFromU64(start + u64.view(TxnRecordHeader.entryCount.offset)).load<u32>();
-		return start + u64.!(TxnRecordHeader.size) + u64.view(entryCount) * u64.!(LogEntry.size) + u64.view(TxnCommitTrailer.checksum.offset);
+		def entryCount = RegionUtils.pointerFromU64(start + u64.view(WalRecordHeader.entryCount.offset)).load<u32>();
+		return start + u64.!(WalRecordHeader.size) + u64.view(entryCount) * u64.!(WalEntry.size) + u64.view(WalRecordTrailer.checksum.offset);
 	}
 
 	def corruptChecksumAt(recordOffset: u64) {
 		def addr = checksumAddrFor(recordOffset);
-		def old = PWRegionUtils.pointerFromU64(addr).load<u64>();
-		PWRegionUtils.pointerFromU64(addr).store<u64>(old + 1u64);
+		def old = RegionUtils.pointerFromU64(addr).load<u64>();
+		RegionUtils.pointerFromU64(addr).store<u64>(old + 1u64);
 	}
 }
 
-def test_multi_fresh_superblocks(tc: MultiTxnWalTester) {
+def test_multi_fresh_superblocks(tc: RingWalTester) {
 	tc.t.assertz(true, tc.wal.validateSuperblock(0));
 	tc.t.assertz(true, tc.wal.validateSuperblock(1));
 	tc.t.assert_eq(1u64, tc.wal.logEpoch);
@@ -199,29 +199,29 @@ def test_multi_fresh_superblocks(tc: MultiTxnWalTester) {
 // persistence boundaries. A failure of either copy leaves the current WAL
 // unusable rather than allowing transactions on an indeterminately formatted
 // log.
-def test_multi_fresh_superblock_persist_failure_rejected(tc: MultiTxnWalTester) {
+def test_multi_fresh_superblock_persist_failure_rejected(tc: RingWalTester) {
 	def firstData = Array<byte>.new(4096);
 	def firstStart = u64.view(Pointer.atElement(firstData, 0));
 	def firstRegion = FailingRegion.new(firstData[0 ..+ firstData.length]);
-	firstRegion.failPersistRangeCall = 1;
-	def firstWal = MultiTxnWal.new(firstStart, firstStart + 1024u64, 1024u64, firstRegion, true);
+	firstRegion.failPersistCall = 1;
+	def firstWal = RingWal.new(firstStart, firstStart + 1024u64, 1024u64, firstRegion, OpenMode.FORMAT);
 	tc.t.assertz(false, firstWal.openOk);
 	tc.t.assertz(false, firstWal.append(200u64, 0x55u64, 1u8));
 	tc.t.assert_eq(0u64, firstWal.commit());
-	tc.t.assertz(true, firstWal.recover() == MultiWalRecovery.CORRUPT);
+	tc.t.assertz(true, firstWal.recover() == RingWalRecovery.CORRUPT);
 
 	def secondData = Array<byte>.new(4096);
 	def secondStart = u64.view(Pointer.atElement(secondData, 0));
 	def secondRegion = FailingRegion.new(secondData[0 ..+ secondData.length]);
-	secondRegion.failPersistRangeCall = 2;
-	def secondWal = MultiTxnWal.new(secondStart, secondStart + 1024u64, 1024u64, secondRegion, true);
+	secondRegion.failPersistCall = 2;
+	def secondWal = RingWal.new(secondStart, secondStart + 1024u64, 1024u64, secondRegion, OpenMode.FORMAT);
 	tc.t.assertz(false, secondWal.openOk);
 	tc.t.assertz(false, secondWal.append(200u64, 0x55u64, 1u8));
 	tc.t.assert_eq(0u64, secondWal.commit());
-	tc.t.assertz(true, secondWal.recover() == MultiWalRecovery.CORRUPT);
+	tc.t.assertz(true, secondWal.recover() == RingWalRecovery.CORRUPT);
 }
 
-def test_multi_selects_newest_superblock(tc: MultiTxnWalTester) {
+def test_multi_selects_newest_superblock(tc: RingWalTester) {
 	tc.writeTxn(200u64, 0x55u64, 1u8);
 	tc.wal.noteApplied(1u64);
 	tc.t.assertz(true, tc.wal.checkpoint(1u64));
@@ -230,7 +230,7 @@ def test_multi_selects_newest_superblock(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(1u64, reopened.logEpoch);
 }
 
-def test_multi_ignores_corrupt_newer_superblock(tc: MultiTxnWalTester) {
+def test_multi_ignores_corrupt_newer_superblock(tc: RingWalTester) {
 	tc.writeTxn(200u64, 0x55u64, 1u8);
 	tc.wal.noteApplied(1u64);
 	tc.t.assertz(true, tc.wal.checkpoint(1u64));
@@ -240,31 +240,31 @@ def test_multi_ignores_corrupt_newer_superblock(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(2u64, reopened.currentGeneration);
 }
 
-def test_multi_corrupt_superblocks_reported(tc: MultiTxnWalTester) {
-	PWRegionUtils.pointerFromU64(tc.logAddr).store<u64>(0u64);
-	PWRegionUtils.pointerFromU64(tc.logAddr + u64.!(WalSuperblock.size)).store<u64>(0u64);
+def test_multi_corrupt_superblocks_reported(tc: RingWalTester) {
+	RegionUtils.pointerFromU64(tc.logAddr).store<u64>(0u64);
+	RegionUtils.pointerFromU64(tc.logAddr + u64.!(WalSuperblock.size)).store<u64>(0u64);
 	def reopened = tc.reopen();
 	tc.t.assertz(false, reopened.openOk);
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CORRUPT);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.CORRUPT);
 }
 
-def test_multi_recovers_persisted_record(tc: MultiTxnWalTester) {
+def test_multi_recovers_persisted_record(tc: RingWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, tc.data[200]);
 	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
 }
 
-def test_multi_invalid_checksum_ignored(tc: MultiTxnWalTester) {
+def test_multi_invalid_checksum_ignored(tc: RingWalTester) {
 	tc.writeTxn(200u64, 0x55u64, 1u8);
 	tc.corruptChecksumAt(0u64);
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 }
 
-def test_multi_invalid_width_rejected(tc: MultiTxnWalTester) {
+def test_multi_invalid_width_rejected(tc: RingWalTester) {
 	tc.t.assertz(false, tc.wal.append(200u64, 0x55u64, 3u8));
 	tc.t.assert_eq(0u64, tc.wal.commit());
 	tc.t.assert_eq(0, tc.wal.activeRecords.length);
@@ -272,19 +272,19 @@ def test_multi_invalid_width_rejected(tc: MultiTxnWalTester) {
 
 // Empty commits are real zero-entry records. They consume a sequence number so
 // success can never collide with commit()'s zero failure sentinel.
-def test_multi_empty_commit_has_sequence(tc: MultiTxnWalTester) {
+def test_multi_empty_commit_has_sequence(tc: RingWalTester) {
 	tc.t.assert_eq(1u64, tc.wal.commit());
 	tc.t.assert_eq(1, tc.wal.activeRecords.length);
 	tc.t.assert_eq(0u32, tc.wal.activeRecords[0].entryCount);
 	def reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
 }
 
 // Once any append fails validation, the pending transaction must fail as a
 // whole. commit() clears the poison and buffered entries so a later transaction
 // can proceed normally without inheriting a partial write set.
-def test_multi_invalid_append_poisons_transaction(tc: MultiTxnWalTester) {
+def test_multi_invalid_append_poisons_transaction(tc: RingWalTester) {
 	tc.t.assertz(true, tc.wal.append(200u64, 0x11u64, 1u8));
 	tc.t.assertz(false, tc.wal.append(201u64, 0x22u64, 3u8));
 	tc.t.assert_eq(0u64, tc.wal.commit());
@@ -294,58 +294,58 @@ def test_multi_invalid_append_poisons_transaction(tc: MultiTxnWalTester) {
 	tc.t.assertz(true, tc.wal.append(202u64, 0x33u64, 1u8));
 	tc.t.assert_eq(1u64, tc.wal.commit());
 	def reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(0x33u8, tc.data[202]);
 }
 
-// MultiTxnWal requires a real backend: accepting null made persistence methods
+// RingWal requires a real backend: accepting null made persistence methods
 // act as no-ops while entry validation dereferenced the missing region.
-def test_multi_null_backend_rejected(tc: MultiTxnWalTester) {
-	def wal = MultiTxnWal.new(tc.regionStart, tc.logAddr, 1024u64, null, true);
+def test_multi_null_backend_rejected(tc: RingWalTester) {
+	def wal = RingWal.new(tc.regionStart, tc.logAddr, 1024u64, null, OpenMode.FORMAT);
 	tc.t.assertz(false, wal.openOk);
 	tc.t.assertz(false, wal.maybeCheckpoint());
-	tc.t.assertz(true, wal.recover() == MultiWalRecovery.CORRUPT);
+	tc.t.assertz(true, wal.recover() == RingWalRecovery.CORRUPT);
 }
 
 // Recovery reports a failed data durability boundary distinctly. The record
 // remains replayable, so retrying recovery can finish and publish it.
-def test_multi_recovery_persist_failure_reported(tc: MultiTxnWalTester) {
+def test_multi_recovery_persist_failure_reported(tc: RingWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
 	def region = FailingRegion.new(tc.data[0 ..+ tc.data.length]);
-	def reopened = MultiTxnWal.new(tc.regionStart, tc.logAddr, 1024u64, region, false);
-	region.failNextPersistChanges = true;
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.PERSIST_FAILED);
+	def reopened = RingWal.new(tc.regionStart, tc.logAddr, 1024u64, region, OpenMode.ATTACH);
+	region.failNextDrain = true;
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.PERSIST_FAILED);
 	tc.t.assert_eq(0x55u8, tc.data[200]);
 	tc.t.assert_eq(0u64, reopened.durableAppliedSeq);
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
 }
 
 // The no-prefix path also publishes an epoch bump to abandon valid records
 // after a sequence gap. Failure of that superblock persist must not be reported
 // as an ordinary clean mount.
-def test_multi_gap_abandon_persist_failure_reported(tc: MultiTxnWalTester) {
+def test_multi_gap_abandon_persist_failure_reported(tc: RingWalTester) {
 	tc.writeTxn(200u64, 0x11u64, 1u8);
 	tc.writeTxn(201u64, 0x22u64, 1u8);
 	tc.corruptChecksumAt(0u64);                    // seq 2 survives after a gap
 	def region = FailingRegion.new(tc.data[0 ..+ tc.data.length]);
-	def reopened = MultiTxnWal.new(tc.regionStart, tc.logAddr, 1024u64, region, false);
-	region.failNextPersistRange = true;
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.PERSIST_FAILED);
+	def reopened = RingWal.new(tc.regionStart, tc.logAddr, 1024u64, region, OpenMode.ATTACH);
+	region.failNextPersist = true;
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.PERSIST_FAILED);
 	tc.t.assert_eq(1u64, reopened.logEpoch);       // failed publication was not adopted
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.CLEAN);
 	tc.t.assert_eq(2u64, reopened.logEpoch);
 	tc.t.assert_eq(0u8, tc.data[201]);
 }
 
-def test_multi_contiguous_prefix_only(tc: MultiTxnWalTester) {
+def test_multi_contiguous_prefix_only(tc: RingWalTester) {
 	tc.writeTxn(200u64, 0x11u64, 1u8);
 	def secondOffset = tc.wal.headOffset;
 	tc.writeTxn(201u64, 0x22u64, 1u8);
 	tc.corruptChecksumAt(0u64);
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.CLEAN);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.CLEAN);
 	tc.t.assert_eq(0u8, tc.data[200]);
 	tc.t.assert_eq(0u8, tc.data[201]);
 	tc.t.assertz(true, secondOffset > 0u64);
@@ -355,7 +355,7 @@ def test_multi_contiguous_prefix_only(tc: MultiTxnWalTester) {
 // past durableAppliedSeq must still be ignored once its epoch no longer matches
 // the current WAL incarnation. This isolates the `recordEpoch != logEpoch` guard
 // from the `txnSeq <= durableAppliedSeq` guard.
-def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
+def test_multi_epoch_stale_rejected(tc: RingWalTester) {
 	// Two epoch-1 records. Corrupt the first so seq 2 becomes a stray valid
 	// record sitting after a sequence gap.
 	tc.writeTxn(200u64, 0x11u64, 1u8);              // seq 1 at ring offset 0
@@ -366,7 +366,7 @@ def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
 	// First recovery finds no contiguous prefix (seq 1 invalid) but sees the
 	// stray seq 2, so it abandons it by bumping the epoch and republishing.
 	var r1 = tc.reopen();
-	tc.t.assertz(true, r1.recover() == MultiWalRecovery.CLEAN);
+	tc.t.assertz(true, r1.recover() == RingWalRecovery.CLEAN);
 
 	// Reopen reads the persisted, freshly bumped epoch. The stray seq 2 record
 	// is still physically present, still checksum-valid, and its txnSeq (2) is
@@ -375,7 +375,7 @@ def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
 	var r2 = tc.reopen();
 	tc.t.assert_eq(2u64, r2.logEpoch);              // bumped from the original 1
 	tc.t.assert_eq(0u64, r2.durableAppliedSeq);     // nothing was ever committed durably
-	tc.t.assertz(true, r2.recover() == MultiWalRecovery.CLEAN); // stray epoch-1 record rejected
+	tc.t.assertz(true, r2.recover() == RingWalRecovery.CLEAN); // stray epoch-1 record rejected
 	tc.t.assert_eq(0u8, tc.data[201]);              // and never applied
 	tc.t.assertz(true, strayOffset > 0u64);
 }
@@ -384,7 +384,7 @@ def test_multi_epoch_stale_rejected(tc: MultiTxnWalTester) {
 // commit cannot fit, forcing reserveRecord to lazily checkpoint the applied
 // tail, reclaim now-durable records, and retry the reservation at the wrapped
 // (offset 0) slot. Every commit must still succeed and the ring must wrap.
-def test_multi_wraparound_checkpoint_reserve(tc: MultiTxnWalTester) {
+def test_multi_wraparound_checkpoint_reserve(tc: RingWalTester) {
 	// ringBytes = 1024 - 2*64 = 896; a 1-entry record is align64(64+48+32) = 192,
 	// so 4 records fit and the 5th must wrap. Bound the loop well above that.
 	def maxRecords = 64;
@@ -414,13 +414,13 @@ def test_multi_wraparound_checkpoint_reserve(tc: MultiTxnWalTester) {
 
 // Multi-record recovery: a run of committed transactions must all be replayed
 // in order on remount, with durableAppliedSeq advanced to the last one.
-def test_multi_recovers_multiple_records(tc: MultiTxnWalTester) {
+def test_multi_recovers_multiple_records(tc: RingWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x11u64, 1u8));
 	tc.t.assert_eq(2u64, tc.writeTxn(201u64, 0x22u64, 1u8));
 	tc.t.assert_eq(3u64, tc.writeTxn(202u64, 0x33u64, 1u8));
 
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x11u8, tc.data[200]);
 	tc.t.assert_eq(0x22u8, tc.data[201]);
 	tc.t.assert_eq(0x33u8, tc.data[202]);
@@ -432,7 +432,7 @@ def test_multi_recovers_multiple_records(tc: MultiTxnWalTester) {
 // partially durable (its checksum never settled). Recovery must replay the
 // contiguous committed prefix and stop at the torn tail -- the partial record
 // and anything after it are not applied.
-def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
+def test_multi_crash_mid_log_recovery(tc: RingWalTester) {
 	tc.writeTxn(200u64, 0x11u64, 1u8);              // seq 1 at ring offset 0
 	tc.writeTxn(201u64, 0x22u64, 1u8);              // seq 2
 	def tornOffset = tc.wal.headOffset;             // where seq 3 lands
@@ -443,7 +443,7 @@ def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
 	tc.corruptChecksumAt(tornOffset);
 
 	var reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED); // committed prefix still replays
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED); // committed prefix still replays
 	tc.t.assert_eq(0x11u8, tc.data[200]);           // seq 1 applied
 	tc.t.assert_eq(0x22u8, tc.data[201]);           // seq 2 applied
 	tc.t.assert_eq(0u8, tc.data[202]);              // torn seq 3 NOT applied
@@ -456,12 +456,12 @@ def test_multi_crash_mid_log_recovery(tc: MultiTxnWalTester) {
 // committed after a recovery are stamped with that epoch; if the copies ever
 // disagree, a crash before the next checkpoint silently loses those commits on
 // the following mount.
-def test_multi_commit_after_recovery_survives(tc: MultiTxnWalTester) {
+def test_multi_commit_after_recovery_survives(tc: RingWalTester) {
 	tc.t.assert_eq(1u64, tc.writeTxn(200u64, 0x55u64, 1u8));
 
 	// First crash + recovery: replays seq 1 and publishes epoch 2.
 	var recovered = tc.reopen();
-	tc.t.assertz(true, recovered.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, recovered.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(2u64, recovered.logEpoch);       // in-memory epoch == published epoch
 
 	// Commit seq 2 on the recovered WAL, then crash again before any checkpoint.
@@ -472,39 +472,39 @@ def test_multi_commit_after_recovery_survives(tc: MultiTxnWalTester) {
 	// stale-epoch.
 	var reopened = tc.reopen();
 	tc.t.assert_eq(2u64, reopened.logEpoch);
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x66u8, tc.data[210]);
 	tc.t.assert_eq(2u64, reopened.durableAppliedSeq);
 }
 
-// Failed commit point: when the record's persistRange fails, the fully-written
+// Failed commit point: when the record's persist fails, the fully-written
 // record must be scrubbed and the head rolled back, so a retried commit reuses
 // both the same txnSeq (a skipped seq would gap the committed prefix and
 // abandon later acked commits) and the same ring slot. Otherwise two valid
 // records with the same sequence can coexist and recovery may replay the
 // failed attempt's contents instead of the acknowledged retry's.
-def test_multi_failed_persist_no_duplicate(tc: MultiTxnWalTester) {
+def test_multi_failed_persist_no_duplicate(tc: RingWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def log = base + 1024u64;
 	def region = FailingRegion.new(data[0 ..+ data.length]);
-	def wal = MultiTxnWal.new(base, log, 1024u64, region, true);
+	def wal = RingWal.new(base, log, 1024u64, region, OpenMode.FORMAT);
 
 	wal.append(200u64, 0x55u64, 1u8);
 	tc.t.assert_eq(1u64, wal.commit());             // seq 1 committed normally
 	def headBefore = wal.headOffset;                // where seq 2 will land
 
 	// Commit seq 2 with a failing commit point.
-	region.failNextPersistRange = true;
+	region.failNextPersist = true;
 	wal.append(210u64, 0x11u64, 1u8);
 	tc.t.assert_eq(0u64, wal.commit());
 	tc.t.assert_eq(2u64, wal.nextTxnSeq);           // seq NOT burned
 	tc.t.assert_eq(headBefore, wal.headOffset);     // head rolled back to the slot
 	// The failed record's header magic is scrubbed -- it can never validate.
-	tc.t.assert_eq(0u64, PWRegionUtils.pointerFromU64(wal.ringBase + headBefore).load<u64>());
+	tc.t.assert_eq(0u64, RegionUtils.pointerFromU64(wal.ringBase + headBefore).load<u64>());
 
-	// Retry with different contents, as RegionTransaction does when its dirty
+	// Retry with different contents, as TransactionCache does when its dirty
 	// cache accumulated more writes between the failure and the retry.
 	wal.append(210u64, 0x22u64, 1u8);
 	wal.append(211u64, 0x33u64, 1u8);
@@ -513,8 +513,8 @@ def test_multi_failed_persist_no_duplicate(tc: MultiTxnWalTester) {
 	tc.t.assertz(true, wal.headOffset > headBefore);
 
 	// Crash + recover: only the acknowledged retry's contents are replayed.
-	def reopened = MultiTxnWal.new(base, log, 1024u64, region, false);
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	def reopened = RingWal.new(base, log, 1024u64, region, OpenMode.ATTACH);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, data[200]);              // seq 1
 	tc.t.assert_eq(0x22u8, data[210]);              // retry's value, not 0x11
 	tc.t.assert_eq(0x33u8, data[211]);              // retry's extra entry
@@ -524,27 +524,27 @@ def test_multi_failed_persist_no_duplicate(tc: MultiTxnWalTester) {
 // A failed data boundary must not publish the replay floor or reclaim the WAL
 // records that still make the applied transaction recoverable. Retrying the
 // checkpoint after the transient failure can then publish and reclaim them.
-def test_multi_checkpoint_data_failure_retains_records(tc: MultiTxnWalTester) {
+def test_multi_checkpoint_data_failure_retains_records(tc: RingWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def region = FailingRegion.new(data[0 ..+ data.length]);
-	def wal = MultiTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = RingWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 
 	wal.append(200u64, 0x55u64, 1u8);
 	def seq = wal.commit();
 	tc.t.assert_eq(1u64, seq);
-	wal.applyUpdate(200u64, 0x55u64, 1u8);
+	wal.applyAfterImage(200u64, 0x55u64, 1u8);
 	wal.noteApplied(seq);
 	def bytesBefore = wal.activeBytes;
-	def rangeCallsBefore = region.persistRangeCalls;
+	def rangeCallsBefore = region.persistCalls;
 
-	region.failNextPersistChanges = true;
+	region.failNextDrain = true;
 	tc.t.assertz(false, wal.checkpoint(seq));
 	tc.t.assert_eq(0u64, wal.durableAppliedSeq);
 	tc.t.assert_eq(1, wal.activeRecords.length);
 	tc.t.assert_eq(bytesBefore, wal.activeBytes);
-	tc.t.assert_eq(rangeCallsBefore, region.persistRangeCalls); // no superblock publication attempted
+	tc.t.assert_eq(rangeCallsBefore, region.persistCalls); // no superblock publication attempted
 
 	tc.t.assertz(true, wal.checkpoint(seq));
 	tc.t.assert_eq(1u64, wal.durableAppliedSeq);
@@ -555,21 +555,21 @@ def test_multi_checkpoint_data_failure_retains_records(tc: MultiTxnWalTester) {
 // If the data boundary succeeds but the new superblock copy does not, the
 // in-memory replay floor and record ownership must remain unchanged. A retry
 // rewrites the same generation and only then reclaims the record.
-def test_multi_checkpoint_superblock_failure_retains_records(tc: MultiTxnWalTester) {
+def test_multi_checkpoint_superblock_failure_retains_records(tc: RingWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def region = FailingRegion.new(data[0 ..+ data.length]);
-	def wal = MultiTxnWal.new(base, base + 1024u64, 1024u64, region, true);
+	def wal = RingWal.new(base, base + 1024u64, 1024u64, region, OpenMode.FORMAT);
 
 	wal.append(200u64, 0x66u64, 1u8);
 	def seq = wal.commit();
 	tc.t.assert_eq(1u64, seq);
-	wal.applyUpdate(200u64, 0x66u64, 1u8);
+	wal.applyAfterImage(200u64, 0x66u64, 1u8);
 	wal.noteApplied(seq);
 	def bytesBefore = wal.activeBytes;
 
-	region.failNextPersistRange = true;
+	region.failNextPersist = true;
 	tc.t.assertz(false, wal.checkpoint(seq));
 	tc.t.assert_eq(0u64, wal.durableAppliedSeq);
 	tc.t.assert_eq(2u64, wal.currentGeneration);
@@ -580,13 +580,13 @@ def test_multi_checkpoint_superblock_failure_retains_records(tc: MultiTxnWalTest
 	tc.t.assert_eq(1u64, wal.durableAppliedSeq);
 	tc.t.assert_eq(3u64, wal.currentGeneration);
 	tc.t.assert_eq(0, wal.activeRecords.length);
-	tc.t.assert_eq(2, region.persistChangesCalls);
+	tc.t.assert_eq(2, region.drainCalls);
 }
 
 // A transaction larger than the whole ring fails before reserving or writing
 // a record. commit() clears that rejected transaction, leaving the ring and
 // sequence available for a later valid commit.
-def test_multi_oversize_commit_preserves_ring(tc: MultiTxnWalTester) {
+def test_multi_oversize_commit_preserves_ring(tc: RingWalTester) {
 	for (i < 25) {
 		tc.t.assertz(true, tc.wal.append(200u64 + u64.view(i), u64.view(i), 1u8));
 	}
@@ -604,7 +604,7 @@ def test_multi_oversize_commit_preserves_ring(tc: MultiTxnWalTester) {
 // 896-byte ring. With none marked applied, the lazy checkpoint has no safe
 // replay floor to publish, so the fifth commit must fail without evicting the
 // recoverable prefix.
-def test_multi_ring_full_without_applied_records_fails(tc: MultiTxnWalTester) {
+def test_multi_ring_full_without_applied_records_fails(tc: RingWalTester) {
 	for (i < 4) {
 		tc.t.assertz(true, tc.wal.append(200u64 + u64.view(i), u64.view(i + 1), 1u8));
 		tc.t.assert_eq(u64.view(i + 1), tc.wal.commit());
@@ -620,7 +620,7 @@ def test_multi_ring_full_without_applied_records_fails(tc: MultiTxnWalTester) {
 	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);
 
 	def reopened = tc.reopen();
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	for (i < 4) tc.t.assert_eq(u8.view(i + 1), tc.data[200 + i]);
 	tc.t.assert_eq(4u64, reopened.durableAppliedSeq);
 }
@@ -628,18 +628,18 @@ def test_multi_ring_full_without_applied_records_fails(tc: MultiTxnWalTester) {
 // If both the commit point and its compensating magic scrub fail, the durable
 // slot is indeterminate. The current instance must reject retry; a new WAL can
 // inspect the durable image and recover the earlier acknowledged prefix.
-def test_multi_failed_scrub_requires_reopen(tc: MultiTxnWalTester) {
+def test_multi_failed_scrub_requires_reopen(tc: RingWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def log = base + 1024u64;
 	def region = FailingRegion.new(data[0 ..+ data.length]);
-	def wal = MultiTxnWal.new(base, log, 1024u64, region, true);
+	def wal = RingWal.new(base, log, 1024u64, region, OpenMode.FORMAT);
 
 	wal.append(200u64, 0x55u64, 1u8);
 	tc.t.assert_eq(1u64, wal.commit());
 	def headBefore = wal.headOffset;
-	region.failPersistRangeCallsRemaining = 2; // fail record commit and header scrub
+	region.failPersistCallsRemaining = 2; // fail record commit and header scrub
 	wal.append(210u64, 0x66u64, 1u8);
 	tc.t.assert_eq(0u64, wal.commit());
 	tc.t.assertz(true, wal.openOk);
@@ -650,10 +650,10 @@ def test_multi_failed_scrub_requires_reopen(tc: MultiTxnWalTester) {
 
 	tc.t.assertz(false, wal.append(210u64, 0x77u64, 1u8));
 	tc.t.assert_eq(0u64, wal.commit());
-	tc.t.assertz(true, wal.recover() == MultiWalRecovery.PERSIST_FAILED);
+	tc.t.assertz(true, wal.recover() == RingWalRecovery.PERSIST_FAILED);
 
-	def reopened = MultiTxnWal.new(base, log, 1024u64, region, false);
-	tc.t.assertz(true, reopened.recover() == MultiWalRecovery.REPLAYED);
+	def reopened = RingWal.new(base, log, 1024u64, region, OpenMode.ATTACH);
+	tc.t.assertz(true, reopened.recover() == RingWalRecovery.REPLAYED);
 	tc.t.assert_eq(0x55u8, data[200]);
 	tc.t.assert_eq(0u8, data[210]);
 	tc.t.assert_eq(1u64, reopened.durableAppliedSeq);
@@ -661,34 +661,34 @@ def test_multi_failed_scrub_requires_reopen(tc: MultiTxnWalTester) {
 
 // Per-backend threshold wiring: configureCheckpointPolicy() must map each
 // CheckpointCost class to its constants (free->aggressive, expensive->lazy).
-def test_multi_checkpoint_policy_thresholds(tc: MultiTxnWalTester) {
+def test_multi_checkpoint_policy_thresholds(tc: RingWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def log = base + 1024u64;
 
-	def freeWal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.FREE), true);
-	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_TXN_FREE, freeWal.checkpointTxnThreshold);
-	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_FILL_FREE, freeWal.checkpointFillPercent);
+	def freeWal = RingWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.FREE), OpenMode.FORMAT);
+	tc.t.assert_eq(RingWalLayout.CHECKPOINT_TXN_FREE, freeWal.checkpointTxnThreshold);
+	tc.t.assert_eq(RingWalLayout.CHECKPOINT_FILL_FREE, freeWal.checkpointFillPercent);
 
-	def cheapWal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.CHEAP), false);
-	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_TXN_CHEAP, cheapWal.checkpointTxnThreshold);
-	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_FILL_CHEAP, cheapWal.checkpointFillPercent);
+	def cheapWal = RingWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.CHEAP), OpenMode.ATTACH);
+	tc.t.assert_eq(RingWalLayout.CHECKPOINT_TXN_CHEAP, cheapWal.checkpointTxnThreshold);
+	tc.t.assert_eq(RingWalLayout.CHECKPOINT_FILL_CHEAP, cheapWal.checkpointFillPercent);
 
-	def expWal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.EXPENSIVE), false);
-	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_TXN_EXPENSIVE, expWal.checkpointTxnThreshold);
-	tc.t.assert_eq(MultiTxnWalConstants.CHECKPOINT_FILL_EXPENSIVE, expWal.checkpointFillPercent);
+	def expWal = RingWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.EXPENSIVE), OpenMode.ATTACH);
+	tc.t.assert_eq(RingWalLayout.CHECKPOINT_TXN_EXPENSIVE, expWal.checkpointTxnThreshold);
+	tc.t.assert_eq(RingWalLayout.CHECKPOINT_FILL_EXPENSIVE, expWal.checkpointFillPercent);
 }
 
 // Count-cap path: on a FREE backend (txn threshold 1) a single applied commit
 // is enough for maybeCheckpoint() to publish durability and reclaim the record,
 // well below the occupancy watermark.
-def test_multi_maybe_checkpoint_count(tc: MultiTxnWalTester) {
+def test_multi_maybe_checkpoint_count(tc: RingWalTester) {
 	def data = Array<byte>.new(4096);
 	for (i < data.length) data[i] = 0u8;
 	def base = u64.view(Pointer.atElement(data, 0));
 	def log = base + 1024u64;
-	def wal = MultiTxnWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.FREE), true);
+	def wal = RingWal.new(base, log, 1024u64, CostRegion.new(data[0 ..+ data.length], CheckpointCost.FREE), OpenMode.FORMAT);
 
 	wal.append(200u64, 0x55u64, 1u8);
 	def seq = wal.commit();
@@ -703,7 +703,7 @@ def test_multi_maybe_checkpoint_count(tc: MultiTxnWalTester) {
 // Occupancy-watermark path: on an EXPENSIVE backend the count cap is 64 (never
 // reached here) but the 50% fill watermark fires. ringBytes = 896, each 1-entry
 // record is 192 B, so the watermark (448 B) is crossed at the third record.
-def test_multi_maybe_checkpoint_occupancy(tc: MultiTxnWalTester) {
+def test_multi_maybe_checkpoint_occupancy(tc: RingWalTester) {
 	tc.writeAndApply(200u64, 0x11u64, 1u8);
 	tc.t.assertz(true, tc.wal.maybeCheckpoint());
 	tc.t.assert_eq(0u64, tc.wal.durableAppliedSeq);  // 192 B < 448 B watermark

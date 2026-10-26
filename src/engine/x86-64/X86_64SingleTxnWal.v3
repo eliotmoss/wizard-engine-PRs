@@ -1,23 +1,23 @@
 // SingleTxnWal -- the original single-transaction, in-region redo WAL.
 //
-// SUPERSEDED and no longer wired in: PWRegion / RegionTransaction now drive the
-// multi-transaction ring log (MultiTxnWal, X86_64MultiTxnWal.v3). This class is
+// SUPERSEDED and no longer wired in: RegionAllocator / TransactionCache now drive the
+// multi-transaction ring log (RingWal, X86_64RingWal.v3). This class is
 // retained as a reference point for comparing the single-transaction design
 // against the multi-transaction ring. See docs/wal-comparison.md.
 //
 // Design: the log lives in block 1 of the mapped region. A single LogHeader
-// (numEntries / status / checksum) precedes a flat LogEntry[] array. commit()
+// (numEntries / status / checksum) precedes a flat WalEntry[] array. commit()
 // persists the entries, then sets status=1; recovery replays the entries when
 // status==1 and the checksum matches, then clears status. Only one in-flight
 // transaction -- there is no ring, epoch, superblock, or checkpoint machinery.
-// All I/O is via Pointer.store/Pointer.load + BackendRegion-provided flush/fence.
+// All I/O is via Pointer.store/Pointer.load + StorageRegion-provided flush/fence.
 
 class SingleTxnWal {
         def regionStart: u64;              // absolute address of region byte 0
-        def logChunkAddr: u64;             // absolute address of the log chunk (block 1)
-        def backendRegion: BackendRegion;
+        def logBlockAddr: u64;             // absolute address of the log block (block 1)
+        def backendRegion: StorageRegion;
 
-        // Log header and entry base (derived from logChunkAddr)
+        // Log header and entry base (derived from logBlockAddr)
         def var header: Ref<LogHeader>;
         def var entryBase: u64;
         def var maxEntries: u32;
@@ -25,22 +25,22 @@ class SingleTxnWal {
         // Local counter for the current transaction
         def var currentEntryIndex: u32 = 0;
 
-        new(regionStart, logChunkAddr, blockSize: u64, backendRegion) {
-                header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(logChunkAddr), LogHeader.size));
-                entryBase = logChunkAddr + u64.!(LogHeader.size);
-                maxEntries = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(LogEntry.size));
+        new(regionStart, logBlockAddr, blockSize: u64, backendRegion) {
+                header = Ref<LogHeader>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(logBlockAddr), LogHeader.size));
+                entryBase = logBlockAddr + u64.!(LogHeader.size);
+                maxEntries = u32.!((blockSize - u64.!(LogHeader.size)) / u64.!(WalEntry.size));
         }
 
         // --- WAL operations ---
 
         def append(offset: u64, value: u64, width: u8) {
                 if (currentEntryIndex >= maxEntries) {
-                        // Log chunk is full; cannot record this entry.
+                        // Log block is full; cannot record this entry.
                         // TODO: return error instead of silently dropping
                         return;
                 }
-                def entryAddr = entryBase + u64.view(currentEntryIndex * u32.!(LogEntry.size));
-                var entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(entryAddr), LogEntry.size));
+                def entryAddr = entryBase + u64.view(currentEntryIndex * u32.!(WalEntry.size));
+                var entry = Ref<WalEntry>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(entryAddr), WalEntry.size));
 
                 entry.offset = offset;
                 entry.value = value;
@@ -51,19 +51,19 @@ class SingleTxnWal {
 
         def commit() {
                 header.numEntries = currentEntryIndex;
-                header.checksum = PWRegionUtils.calculateLogChecksum(entryBase, currentEntryIndex);
+                header.checksum = RegionUtils.calculateLogChecksum(entryBase, currentEntryIndex);
 
                 // Flush log entries to persistent storage
                 if (backendRegion != null) {
-                        def entryBytes = u64.view(currentEntryIndex) * u64.!(LogEntry.size);
-                        backendRegion.persistRange(entryBase - regionStart, entryBytes);
+                        def entryBytes = u64.view(currentEntryIndex) * u64.!(WalEntry.size);
+                        backendRegion.persist(entryBase - regionStart, entryBytes);
                 }
 
                 header.status = 1;
 
                 // Flush the header
                 if (backendRegion != null) {
-                        backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                        backendRegion.persist(logBlockAddr - regionStart, u64.!(LogHeader.size));
                 }
         }
 
@@ -72,15 +72,15 @@ class SingleTxnWal {
                 header.status = 0;
                 header.checksum = 0u64;
                 if (backendRegion != null) {
-                        backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                        backendRegion.persist(logBlockAddr - regionStart, u64.!(LogHeader.size));
                 }
                 currentEntryIndex = 0;
         }
 
         // --- Data application ---
 
-        def applyUpdate(offset: u64, value: u64, width: u8) {
-                def addr = PWRegionUtils.pointerFromU64(regionStart + offset);
+        def applyAfterImage(offset: u64, value: u64, width: u8) {
+                def addr = RegionUtils.pointerFromU64(regionStart + offset);
                 match (width) {
                         1 => addr.store<u8>(u8.view(value));
                         2 => addr.store<u16>(u16.view(value));
@@ -89,32 +89,32 @@ class SingleTxnWal {
                         _ => ;
                 }
                 if (backendRegion != null) {
-                        backendRegion.prepareChangedRange(offset, u64.view(width));
+                        backendRegion.writeBack(offset, u64.view(width));
                 }
         }
 
         def fenceAppliedUpdates() {
                 if (backendRegion != null) {
-                        backendRegion.persistChanges();
+                        backendRegion.drain();
                 }
         }
 
         // --- Read (cache-miss fallthrough) ---
 
         def readU8(offset: u64) -> u8 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u8>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<u8>();
         }
 
         def readI16(offset: u64) -> i16 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i16>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<i16>();
         }
 
         def readU64(offset: u64) -> u64 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<u64>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<u64>();
         }
 
         def readI64(offset: u64) -> i64 {
-                return PWRegionUtils.pointerFromU64(regionStart + offset).load<i64>();
+                return RegionUtils.pointerFromU64(regionStart + offset).load<i64>();
         }
 
         // --- Recovery ---
@@ -123,30 +123,30 @@ class SingleTxnWal {
                 if (header.status != 1) return false;
 
                 def expected = header.checksum;
-                def actual = PWRegionUtils.calculateLogChecksum(entryBase, header.numEntries);
+                def actual = RegionUtils.calculateLogChecksum(entryBase, header.numEntries);
 
                 if (expected != actual) {
                         // Checksum mismatch -- clear the committed bit so future mounts
                         // do not retry a corrupt log.
                         header.status = 0;
                         if (backendRegion != null) {
-                                backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                                backendRegion.persist(logBlockAddr - regionStart, u64.!(LogHeader.size));
                         }
                         return false;
                 }
 
                 var entryAddr = entryBase;
                 for (i < header.numEntries) {
-                        def entry = Ref<LogEntry>.of(CiRuntime.forgeRange<byte>(PWRegionUtils.pointerFromU64(entryAddr), LogEntry.size));
-                        applyUpdate(entry.offset, entry.value, entry.width);
-                        entryAddr = entryAddr + u64.!(LogEntry.size);
+                        def entry = Ref<WalEntry>.of(CiRuntime.forgeRange<byte>(RegionUtils.pointerFromU64(entryAddr), WalEntry.size));
+                        applyAfterImage(entry.offset, entry.value, entry.width);
+                        entryAddr = entryAddr + u64.!(WalEntry.size);
                 }
 
                 fenceAppliedUpdates();
 
                 header.status = 0;
                 if (backendRegion != null) {
-                        backendRegion.persistRange(logChunkAddr - regionStart, u64.!(LogHeader.size));
+                        backendRegion.persist(logBlockAddr - regionStart, u64.!(LogHeader.size));
                 }
                 return true;
         }
@@ -154,6 +154,6 @@ class SingleTxnWal {
         // --- Lifecycle ---
 
         def close() {
-                // No-op: memory is managed by BackendRegion
+                // No-op: memory is managed by StorageRegion
         }
 }

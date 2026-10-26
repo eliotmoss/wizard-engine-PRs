@@ -26,7 +26,7 @@ PMEM persistence explorer:
    WAL or allocator scenario.
 3. Explore every distinct durable image allowed by the declared PMEM model at
    each selected crash point.
-4. Materialize each image and run the real `DualTxnWal`/`PWRegion` recovery
+4. Materialize each image and run the real `TwoSlotWal`/`RegionAllocator` recovery
    implementation against it.
 5. Check WAL outcomes and allocator invariants after recovery.
 
@@ -41,7 +41,7 @@ checksums, and recovery code.
 
 | Test mechanism | What it establishes | What it does not establish |
 |---|---|---|
-| `ShadowDurableRegion` | WAL correctness at the `BackendRegion` boundary; live/durable separation; fail-before-copy, copy-then-fail, and one deterministic partial-copy outcome | Spontaneous cache eviction, asynchronous per-line `CLWB` completion, arbitrary subsets of durable lines, or fence semantics |
+| `ShadowDurableRegion` | WAL correctness at the `StorageRegion` boundary; live/durable separation; fail-before-copy, copy-then-fail, and one deterministic partial-copy outcome | Spontaneous cache eviction, asynchronous per-line `CLWB` completion, arbitrary subsets of durable lines, or fence semantics |
 | Counting backends | Number of prepares and persistence boundaries per commit | Which bytes survive a crash or whether the native instruction ordering is correct |
 | Abrupt file-backed child tests | Real mmap/file integration and recovery without `deallocate()`/`close()` at commit-before-apply and apply-before-next-boundary windows | Controlled cache loss, exhaustive crash images, host crash, or power loss; the verifier shares the kernel page cache |
 | Opt-in DAX integration | `MAP_SYNC` and the completed PMEM backend operate against fsdax | Exhaustive persistence schedules or physical power-loss durability |
@@ -51,12 +51,12 @@ The current shadow model is intentionally operation-level:
 
 ```text
 ordinary store              changes live bytes only
-prepareChangedRange         queues a whole range
-persistChanges              copies queued ranges to durable bytes
+writeBack         queues a whole range
+drain              copies queued ranges to durable bytes
 crash                       restores live bytes from durable bytes
 ```
 
-This is a useful executable model of `BackendRegion`, especially for API
+This is a useful executable model of `StorageRegion`, especially for API
 failure propagation. It under-approximates PMEM behaviour because ordinary
 dirty lines never become durable early and a prepared range becomes durable
 only at the simulated boundary. Its partial outcome copies a fixed prefix; it
@@ -179,7 +179,7 @@ abstract crash and persistence semantics.
 
 ## Instrumentation seam
 
-Milestone 2 implements a per-region `PersistentOperations` provider with this
+Milestone 2 implements a per-region `PersistenceProvider` provider with this
 interface:
 
 ```text
@@ -188,28 +188,28 @@ storeU16(offset, value)
 storeU32(offset, value)
 storeU64(offset, value)
 clwb(cacheLine)
-sfence()
+fence()
 ```
 
-`BackendRegion` owns the provider, so dependency injection is explicit and
-there is no global trace state. `DualTxnWal` and `PWRegion` both obtain that
+`StorageRegion` owns the provider, so dependency injection is explicit and
+there is no global trace state. `TwoSlotWal` and `RegionAllocator` both obtain that
 exact provider from the backend region through
-`X86_64PersistentOps.ensureFor()`. `PmemMmapRegion` uses the same object while
-translating `prepareChangedRange()` and persistence boundaries, which gives one
+`NativeProviders.installIfAbsent()`. `PmemRegion` uses the same object while
+translating `writeBack()` and persistence boundaries, which gives one
 total order across all three event kinds. Sharing a single provider object per
 region is what makes that order total: a second, uninstalled provider would
 produce events interleaved with, but not ordered against, the writeback and
 fence stream.
 
-`X86_64PersistentOperations` is the production implementation. Scalar methods
+`NativeProvider` is the production implementation. Scalar methods
 perform the same `Pointer.store` operations as before; x86-64 supplies the
-little-endian byte order. `clwb(cacheLine)` and `sfence()` reach
-`MmapRegionUtils.flushCacheLine()` and `storeFence()`. Those hooks now reach
+little-endian byte order. `clwb(cacheLine)` and `fence()` reach
+`X86_64CacheControl.writeBackLine()` and `fence()`. Those hooks now reach
 CPUID-selected `CLWB`/`CLFLUSHOPT`/`CLFLUSH` and `SFENCE` native stubs. This
 connects the production seam, while physical PMEM crash testing remains
 necessary for a hardware durability claim.
 
-`RecordingPersistentOperations` works on an ordinary byte range. It executes
+`RecordingProvider` works on an ordinary byte range. It executes
 the same checked scalar stores against the live image, then appends a typed
 event with a monotonically increasing sequence number. It records region-
 relative, 64-byte-aligned cache-line starts and every fence requested by the
@@ -222,12 +222,12 @@ CLWB(seq=N, cacheLine=L)
 SFENCE(seq=N)
 ```
 
-The structured representation is `PersistentTraceEvent(seq, kind, offset,
+The structured representation is `PersistenceEvent(seq, kind, offset,
 width, value)`: `STORE` uses all fields, `CLWB` uses `offset` as the cache-line
 start with zero width/value, and `SFENCE` uses only `seq`. Tests inspect these
 fields rather than parsing the rendering.
 
-The active `DualTxnWal` now routes fresh header creation, byte-wise record and
+The active `TwoSlotWal` now routes fresh header creation, byte-wise record and
 slot zeroing, every record/header/entry/trailer/checksum store, after-image
 application, recovery replay, and durable-slot scrubbing through this provider.
 Since 2026-10-19 its loads go through a reader over the same provider too (see
@@ -235,57 +235,57 @@ Since 2026-10-19 its loads go through a reader over the same provider too (see
 checked before recording, so an invalid internal layout store fails immediately
 instead of entering a trace.
 
-The seam now covers the whole active path. `PWRegion.format()` writes the region
+The seam now covers the whole active path. `RegionAllocator.format()` writes the region
 header, sentinels, block table, and metadata descriptors through a
-`DirectRegionWriter` — a non-transactional writer over the same provider —
-before its whole-region `persistRange` (since 2026-10-19 all but the magic,
+`UnloggedWriter` — a non-transactional writer over the same provider —
+before its whole-region `persist` (since 2026-10-19 all but the magic,
 which it stores after that persist and persists under a fence of its own), and
-the non-cached `BlockEntryHandle` and `ChunkHandle` setters take that writer as
+the non-cached `BlockTableEntryHandle` and `ChunkHandle` setters take that writer as
 an explicit parameter. The
-provider is resolved once in the `PWRegion` constructor via
-`X86_64PersistentOps.ensureFor()`, which installs the production provider on
+provider is resolved once in the `RegionAllocator` constructor via
+`NativeProviders.installIfAbsent()`, which installs the production provider on
 regions that lack one (notably `VolatileRegion`) so that one object serves the
-whole region; `DualTxnWal` uses the same helper. Normal allocator transactions
-continue through `RegionTransaction` to the instrumented `DualTxnWal` for both
+whole region; `TwoSlotWal` uses the same helper. Normal allocator transactions
+continue through `TransactionCache` to the instrumented `TwoSlotWal` for both
 their records and their applied after-images.
 
 One category remains outside the seam, deliberately:
 
-- **`SingleTxnWal` and `MultiTxnWal`** are retained comparison implementations
+- **`SingleTxnWal` and `RingWal`** are retained comparison implementations
   that are not wired into the commit path, so their stores can never appear in
   a trace of a running region.
 
-**Immix line marks** (`LineMarkHandle.setMark`, `resetAllLineMarks`) cross the
+**Immix line marks** (`LineMarkHandle.setMarkUnlogged`, `resetAllLineMarks`) cross the
 seam but are still transient. Until 2026-10-19 they were stored through a
 forged `Ref<LineMark>`, the last direct stores in the allocator; since then
-`setMark` takes the region's `DirectRegionWriter`, like the other non-cached
+`setMarkUnlogged` takes the region's `UnloggedWriter`, like the other non-cached
 setters, so every mark store is a 1-byte `STORE` in the trace. They still
 bypass the WAL and the persistence boundaries by design: marking and resetting
 issue no `CLWB` or `SFENCE`, and the marks must be rebuilt after a crash, so
 they are not persistent state the explorer should model. In the model a mark
 store becomes durable only if its line is written back for another reason:
 background eviction, or a writeback of other bytes on the same line.
-`persistent_ops:immix_line_marks_cross_the_seam` pins one store per mark, at
+`provider:immix_line_marks_cross_the_seam` pins one store per mark, at
 the mark's region-relative offset with the reset value, and no `CLWB` or
 `SFENCE`.
 
-Keeping the direct writer and `RegionTransaction` as separate types with
-distinct setter names (`setUsed(w, …)` versus `setUsedCached(txn, …)`) is a
+Keeping the direct writer and `TransactionCache` as separate types with
+distinct setter names (`setUsedUnlogged(w, …)` versus `setUsed(txn, …)`) is a
 safety property, not just style: passing the transaction cache to a direct
 setter fails to compile, so a mutation written against the cache cannot
 bypass the WAL by accident. It does not stop a mutation that calls a direct
-setter with the writer: `PWRegion` keeps the writer in a private field that
-all its methods reach (`writer`, `X86_64TxnPWRegion.v3`), and such a call
+setter with the writer: `RegionAllocator` keeps the writer in a private field that
+all its methods reach (`writer`, `X86_64RegionAllocator.v3`), and such a call
 compiles. (Corrected 2026-10-25: this paragraph said any accidental bypass
 would fail to compile.)
 
-`PWRegion` validates its geometry before formatting, because the provider
+`RegionAllocator` validates its geometry before formatting, because the provider
 rejects a misaligned or out-of-range store by aborting the process rather than
 returning an error. A block size that is not a multiple of 8 (which would
-misalign the block table) and a region too small to hold the header, log chunk,
+misalign the block table) and a region too small to hold the header, log block,
 metadata and one free block are both refused up front.
 
-Tracing only `prepareChangedRange()` is not enough: it occurs after the stores,
+Tracing only `writeBack()` is not enough: it occurs after the stores,
 aggregates ranges, and cannot represent a partially constructed record that
 was written back by ordinary cache eviction before its explicit flush.
 
@@ -295,27 +295,27 @@ Until 2026-10-19 loads were direct `Pointer.load`s and the seam saw none of
 them, so nothing could tell which bytes of a crash image recovery depends on.
 A search that branches only on what recovery reads (Jaaru's constraint
 refinement) needs exactly that, so loads now have a seam of their own. It is
-not on `PersistentOperations`' list of operations: a production load is still
+not on `PersistenceProvider`' list of operations: a production load is still
 the same `Pointer.load`. What changed is who issues it.
 
-- **The observer.** `PersistentLoadObserver` (`src/engine/TxnBackend.v3`) has
-  one method, `observe(offset, length)`, and `PersistentOperations` carries a
+- **The observer.** `LoadObserver` (`src/engine/StorageRegion.v3`) has
+  one method, `beforeLoad(offset, length)`, and `PersistenceProvider` carries a
   nullable `loadObserver`, null in production. Offsets are region-relative, as
-  a store's are. The contract: `observe()` is called *before* the bytes
+  a store's are. The contract: `beforeLoad()` is called *before* the bytes
   `[offset, offset + length)` are loaded, so the observer may rewrite them in
   the region's mapping and the code loads what it wrote; one call may cover a
   whole layout or a byte loop's range, which the code may then load directly
   and more than once; and a load of bytes the running code stored itself is
   observed like any other, since telling the two apart is the observer's
   business.
-- **The reader.** `DirectRegionReader` (`X86_64TxnPWRegion.v3`) is
-  `DirectRegionWriter`'s counterpart: it holds the region's provider and its
+- **The reader.** `RegionReader` (`X86_64RegionAllocator.v3`) is
+  `UnloggedWriter`'s counterpart: it holds the region's provider and its
   start, takes absolute addresses as the writer does, and offers
   `loadU8/U16/U32/U64/I16/I64(addr)` and `loadOffsetU64(offset)`, each of which
-  calls `observe()` when an observer is installed and then loads;
-  `observe(addr, length)`, for byte loops; and one `forge*` helper per layout
-  (`BlockEntry`, `ChunkHeader`, `LineMark`, `MetaDataDesc`, `DualWalHeader`,
-  `TxnRecordHeader`, `TxnCommitTrailer`, `LogEntry`), which observes the
+  calls `beforeLoad()` when an observer is installed and then loads;
+  `beforeLoad(addr, length)`, for byte loops; and one `forge*` helper per layout
+  (`BlockTableEntry`, `ChunkHeader`, `LineMark`, `MetadataDescriptor`, `WalHeader`,
+  `WalRecordHeader`, `WalRecordTrailer`, `WalEntry`), which observes the
   layout's whole byte range and then forges the `Ref`. Every reader of a region
   shares its provider, so an observer installed on the provider before a mount
   sees the mount's first load.
@@ -323,13 +323,13 @@ the same `Pointer.load`. What changed is who issues it.
   the block size, block count, sentinels, block table and log-chunk offset,
   one field at a time (until then both copied the whole 88-byte header into a
   heap array); `getHeader()` observes all 88 bytes before its copy, and
-  `getMetaDataDesc()` and the Immix descriptor scan read `metaDataDescs` and
-  `numDescs` alone. The `BlockEntryHandle`, `ChunkHandle` and `LineMarkHandle`
-  getters take the reader, `getUsed(r)` as `setUsed(w, …)` takes the writer.
-  `DualTxnWal`: header and slot validation, replay, its four `Ref` helpers,
-  the transaction's cache misses (`readU8/I16/U64/I64`, so `RegionTransaction`'s
+  `getMetadataDescriptor()` and the Immix descriptor scan read `metadataDescriptors` and
+  `numDescs` alone. The `BlockTableEntryHandle`, `ChunkHandle` and `LineMarkHandle`
+  getters take the reader, `getUsedInRegion(r)` as `setUsedUnlogged(w, …)` takes the writer.
+  `TwoSlotWal`: header and slot validation, replay, its four `Ref` helpers,
+  the transaction's cache misses (`readU8/I16/U64/I64`, so `TransactionCache`'s
   miss path), and the checksum loop, which observes the two ranges on either
-  side of the checksum field it skips. `PersistentAllocatorInvariants` walks
+  side of the checksum field it skips. `AllocatorInvariants` walks
   through `region.reader()`. The workloads: `PWSieve` observes a bitmap before
   its byte loop, and `PWBTree` fetches each node it reaches (in the descents
   of `put()` and `get()`, in `nodeError()`, which both walks call before
@@ -338,21 +338,21 @@ the same `Pointer.load`. What changed is who issues it.
   loads its words directly.
   Every `Ref` forged over region memory on the active path comes from a
   reader's `forge*`.
-- **What stays raw, deliberately.** `PersistentImageMount.freeze()` and the
+- **What stays raw, deliberately.** `CrashImageMount.freeze()` and the
   copies taken after an allocator check: they run after the code under test,
   and properties read the frozen copy, not the mount.
-  `PWRegionUtils.calculateLogChecksum` and the rest of `SingleTxnWal` and
-  `MultiTxnWal`, which are not wired in. The backends' own I/O (the direct
-  backend reading its file at `create()`, the kernel writing pages back), which
+  `RegionUtils.calculateLogChecksum` and the rest of `SingleTxnWal` and
+  `RingWal`, which are not wired in. The backends' own I/O (the direct
+  backend reading its file at `open()`, the kernel writing pages back), which
   is not a load the program's logic depends on. And test code that inspects a
   region after the fact.
-- **Recording.** `RecordingPersistentOperations.recordLoads()` installs a
+- **Recording.** `RecordingProvider.recordLoads()` installs a
   `RecordingLoadObserver` in front of any observer already installed, calling
   it first, and returns it. Each load becomes a
-  `PersistentLoadEvent(afterEvents, offset, length, bytes)`: the bytes as the
+  `LoadEvent(afterEvents, offset, length, bytes)`: the bytes as the
   code was about to load them, and the number of `STORE`/`CLWB`/`SFENCE`
   events recorded before it, which places it in the same total order. Loads
-  are kept in that list and are never `PersistentTraceEvent`s. *Why a separate
+  are kept in that list and are never `PersistenceEvent`s. *Why a separate
   list:* a trace is the crash machine's input, and a `LOAD` kind would have to
   be handled, or skipped, by `validate()`, `digest()`, `render()`, the crash
   machine's `step()` and the explorer, and would renumber and re-digest every
@@ -360,28 +360,28 @@ the same `Pointer.load`. What changed is who issues it.
   or not loads were recorded, and nothing that consumes traces can see one.
   `clear()` empties both lists.
 
-The audit has five parts, in `PersistentOperationsTest.v3`:
+The audit has five parts, in `ProviderTest.v3`:
 
-- `persistent_ops:reader_matches_raw`: with no observer, every reader load
+- `provider:reader_matches_raw`: with no observer, every reader load
   equals the raw load, at every naturally aligned offset of a page for each
   width, and so do fields of every forged layout and of the handles' getters.
-- `persistent_ops:load_observer_runs_before_the_load`: an observer that
+- `provider:load_observer_runs_before_the_load`: an observer that
   rewrites what it is shown changes what a load, and a forged layout's field,
   returns; a recorder in front of it records the rewritten bytes and the
   position after the stores already made; no load enters the trace.
-- `persistent_ops:load_audit_covers_fields`, the counterpart of the store
+- `provider:load_audit_covers_fields`, the counterpart of the store
   audit: format a region, allocate twice and free once, and take its bytes
   without `close()`, so both slots hold records to replay; mount that image
   with loads recorded, recover and walk the invariants. The first load is the
   magic, before any store. Structurally: the header fields mount reads are
-  observed and the four it does not (`numBytes`, `numDescs`, `metaData`,
-  `metaDataDescs`) are not, nor `userRoot` until `getUserRoot()` misses the
+  observed and the four it does not (`numBytes`, `numDescs`, `metadata`,
+  `metadataDescriptors`) are not, nor `userRoot` until `getUserRoot()` misses the
   transaction's cache and reads it; the WAL header and both records are
   observed whole, and the 64 bytes past either record are not; every block
   entry in memory order is observed but for its padding, as are both free-list
   heads. Every load lies in the region and in the store order, and the trace
   still validates.
-- `persistent_ops:load_audit_unobserved_bytes_inert`, and the same for the
+- `provider:load_audit_unobserved_bytes_inert`, and the same for the
   sieve's and the B+Tree's reattach (`load_audit_sieve_reattach_inert`,
   `load_audit_btree_reattach_inert`): mount a crash image, recover and run the
   check with loads recorded, then three times more with every byte the run
@@ -395,7 +395,7 @@ The audit has five parts, in `PersistentOperationsTest.v3`:
   2,968 cuts, 1,486 images, through `PWBTree.open()` and its invariants).
   On average 96 % of an allocator image and 92 % of a sieve image is neither
   observed nor stored, and so varied (at least 90 % and 78 %).
-- `persistent_ops:load_audit_btree_descents_fetch_the_path`: the B+Tree's
+- `provider:load_audit_btree_descents_fetch_the_path`: the B+Tree's
   descents, which no reattach can exercise, since `open()` has walked, and so
   observed, every node before `get()` or `put()` could run. On a tree of
   height 3 with loads recorded from then on, a lookup observes exactly three
@@ -406,7 +406,7 @@ Neither half alone would do. The structural test names fields, so a load it
 does not name can escape; the inert test catches an escape only if the bytes
 behind it change what the run does on these scenarios, and only if nothing
 else in the run observed those bytes, at any point. Nine planted escapes were
-each caught: a raw `getUsed()`, an unobserved checksum loop and a raw
+each caught: a raw `getUsedInRegion()`, an unobserved checksum loop and a raw
 record-field load by the field audit and all three inert-bytes audits; a raw
 cache-miss read by the field audit and the sieve's and the B+Tree's (the
 allocator's walk never misses the transaction's cache); an unobserved sieve
@@ -428,7 +428,7 @@ words are then read, and a checksum loop all of its record but the checksum
 field. The inert-bytes audits show that every byte loaded was observed at
 some point in the run, not that it was observed before it was loaded. That
 order is tested for the reader itself (`load_observer_runs_before_the_load`),
-and since 2026-10-20 for the scenarios `persistent_lazy:representatives_agree`
+and since 2026-10-20 for the scenarios `read_driven:representatives_agree`
 runs (see the lazy search); elsewhere it rests on the code's shape: the
 reader's loads and `forge*` helpers observe first, a byte loop is observed
 before it starts, and a B+Tree fetch returns the node only after observing it.
@@ -455,12 +455,12 @@ performance core, and then to CPU 20, an efficiency core; against pwregions at
   within the spread.
 
 *Inference:* code placement, not the seam, sets the allocator's difference.
-Adding one statement that never runs to the top of `PWRegion.deallocate()`,
+Adding one statement that never runs to the top of `RegionAllocator.deallocate()`,
 which moves all the code placed after it, made the old code's one-block
 allocation 5.7 % faster on CPU 2; adding two made it 1.9 % slower. With the
 same additions, the branch was 4.7 % and 0.5 % slower than the old code.
-Builds of the branch that drop the checksum loop's two `observe()` calls, or
-that replace `DualTxnWal`'s reader calls with an inline check of the observer,
+Builds of the branch that drop the checksum loop's two `beforeLoad()` calls, or
+that replace `TwoSlotWal`'s reader calls with an inline check of the observer,
 measured within 2 % of the old code on both cores. Two calls per commit cannot
 cost 100–155 ns. Virgil's `#inline` hint on the reader's methods changes
 nothing: the build with it is byte-identical, since `build.sh` does not turn on
@@ -473,11 +473,11 @@ is not yet measured.
 ## Scenario capture and artifacts
 
 The recorder's event vector is live and grows for as long as the region is in
-use, so it is not itself a scenario. `PersistentTrace`
-(`src/engine/x86-64/X86_64PersistentTrace.v3`) is the frozen form:
-`RecordingPersistentOperations.snapshot(name)` copies the events recorded so far
+use, so it is not itself a scenario. `PersistenceTrace`
+(`src/engine/x86-64/X86_64PersistenceTrace.v3`) is the frozen form:
+`RecordingProvider.snapshot(name)` copies the events recorded so far
 into an immutable, named artifact with the region size, and
-`PersistentTraces.capture(recorder, name, run)` clears the recorder first so a
+`PersistenceTraces.capture(recorder, name, run)` clears the recorder first so a
 captured scenario contains exactly its own events, with sequence numbers
 restarting at one, even on a region that was already written to.
 
@@ -519,7 +519,7 @@ SFENCE(seq=3)
 --- end pmem-trace demo
 ```
 
-`PersistentCounterexample` wraps that with the scenario name, the property that
+`CrashCounterexample` wraps that with the scenario name, the property that
 failed, a detail line, and the crash cut, and renders the cut trace inside:
 
 ```text
@@ -547,19 +547,19 @@ durable-window: offset=0 length=16
 
 A counterexample with no image renders exactly as it did before durable images
 existed. `validate()` is also the single definition of the scalar-atomicity
-baseline — the store-audit tests over `PWRegion` check the frozen trace through
+baseline — the store-audit tests over `RegionAllocator` check the frozen trace through
 it rather than restating the rules.
 
 ---
 
 ## Durable images and cache-line state
 
-`PersistentTrace` says what a scenario stored, flushed and fenced;
-`src/engine/x86-64/X86_64PersistentImage.v3` says what that means for
+`PersistenceTrace` says what a scenario stored, flushed and fenced;
+`src/engine/x86-64/X86_64CrashModel.v3` says what that means for
 durability. It is the transition system the explorer will search, implemented
 and testable before any search exists.
 
-`PersistentCrashMachine` replays a validated trace against volatile per-line
+`CrashModel` replays a validated trace against volatile per-line
 state. Each touched line (exactly `touchedLines()`, so a `CLWB` of a line
 nothing wrote carries no state) holds its stores in program order plus two
 indices into that list: how many have reached the persistence domain, and how
@@ -587,19 +587,19 @@ order. A store issued after a `CLWB` and before the fence stays volatile even
 though its line is dirty, while `evictAll()` may still make it durable — the
 asymmetry the piggybacked commit boundary relies on.
 
-`PersistentDurableImage` is the resulting immutable byte image, with a
+`CrashImage` is the resulting immutable byte image, with a
 little-endian `read()` for assertions, a `digest()` for state deduplication, and
 `sameBytes()`/`firstDifference()` for comparing two schedules' outcomes. A
 machine starts from the region's prior durable content, so a scenario can be
 explored on an already-formatted region rather than only on a blank one.
 
-`PersistentImages.lazyCrash()` and `eagerCrash()` are the two extremal
+`CrashImages.lazyCrash()` and `eagerCrash()` are the two extremal
 schedules — nothing durable but what a fence obliged, and every dirty line
 evicted at every boundary. They bracket every image the model permits at a cut,
 and where they agree the cut has exactly one image: after a scenario has
 flushed and fenced every line it touched, the schedule no longer matters.
-`persistent_image:real_wal_after_image_needs_its_flush` pins that on a recorded
-production `DualTxnWal` commit/apply/flush trace.
+`crash_model:real_wal_after_image_needs_its_flush` pins that on a recorded
+production `TwoSlotWal` commit/apply/flush trace.
 
 Still absent, and the remainder of milestone 4: enumerating the permitted
 schedules between those two extremes, deduplicating the states they reach, and
@@ -610,7 +610,7 @@ therefore still carry the schedule prefix rather than the bytes it produced.
 
 ## Enumerating schedules
 
-`src/engine/x86-64/X86_64PersistentExplorer.v3` searches the machine's
+`src/engine/x86-64/X86_64CrashExplorer.v3` searches the machine's
 transitions for the durable images one crash cut can produce.
 
 A search state is the machine's trace position plus the two per-line prefix
@@ -645,11 +645,11 @@ profile because
 
 The reachable images at a cut are therefore exactly the images of the product
 of the per-line prefix ranges above the floor. That is an argument, so
-`persistent_explore:reduction_agrees_with_full_search` checks it executably
+`crash_explorer:reduction_agrees_with_full_search` checks it executably
 instead: at every cut of four traces, the two searches must produce the same
 image set, compared byte for byte. The traces are hand-written, not recorded
 from production code: 5, 7, 4 and 10 events on one, two, one and three cache
-lines (`reductionTraces()` in `PersistentExplorerTest.v3`). The fourth, added
+lines (`reductionTraces()` in `CrashExplorerTest.v3`). The fourth, added
 on 2026-10-19, rewrites bytes its lines already hold, so on it the two counts
 below differ.
 
@@ -659,21 +659,21 @@ holds adds a prefix but no content. A validated store never leaves its cache
 line, so a line's durable bytes depend on its own prefix length alone, and lines
 are disjoint; two prefix vectors give the same image exactly when they give
 every line the same 64 bytes. The reduced search therefore groups each line's
-prefixes by exact content (`PersistentLineClasses`, from `lineClasses()`; a hash
+prefixes by exact content (`CrashLineClasses`, from `lineClasses()`; a hash
 is only the bucket key), represents each content by the least prefix that gives
 it, and takes one content per line, so every state it visits is a distinct image.
 Each exploration reports both sizes of its cut: `product`, the prefix vectors,
 and `classProduct`, the distinct images; both saturate at 2^62. In the one-commit
-WAL trace of `persistent_recovery:` the commit's first 192 stores zero its
+WAL trace of `crash_recovery:` the commit's first 192 stores zero its
 record slot one byte at a time over bytes that are already zero, so its 215 cuts
 admit 15,969,521 prefix vectors but 1,404 distinct images, and cut 192 alone
 has 274,625 vectors and one image. Until 2026-10-19 the search enumerated the
 prefix vectors themselves, least significant line first, and kept an image
 once by its 64-bit digest, so a budget counted vectors and not images: at
 budgets 12 and 24 that sweep checked 215 distinct images, one per cut.
-`persistent_explore:line_classes_equal_distinct_images` keeps that enumeration
+`crash_explorer:line_classes_equal_distinct_images` keeps that enumeration
 as a reference and requires the same images, byte for byte, each once, at every
-cut of the small traces and at sampled cuts of a recorded `DualTxnWal` commit.
+cut of the small traces and at sampled cuts of a recorded `TwoSlotWal` commit.
 
 **Budgets, and what an over-budget cut checks (2026-10-19).** A budget counts
 distinct images. A cut whose distinct images number at most the budget is
@@ -704,21 +704,21 @@ The extremes come first because a single line at one end of its range with the
 rest at the other is a corner the prefix odometer reached only when the budget
 covered the whole range of every lower line: it varied the lowest line first,
 so a small budget left every higher line at its floor.
-`persistent_explore:over_budget_selection_takes_extremes_then_seeded_random`
+`crash_explorer:over_budget_selection_takes_extremes_then_seeded_random`
 pins the order, the dedupe, and the replay from a seed.
 
 **A recovery that skips the record checksum (2026-10-19).** The flag
-`DualTxnWalMutants.skipRecordChecksum`, which only a test sets, makes
+`WalFaultInjection.skipRecordChecksum`, which only a test sets, makes
 `validateSlot()` accept a record whose stored checksum does not match its bytes,
 so recovery replays a torn record whose header, trailer and entries happen to be
-well formed. `persistent_sieve:unchecked_record_checksum_is_caught` sweeps every
+well formed. `sieve_crash:unchecked_record_checksum_is_caught` sweeps every
 cut of a sieve step at 12 images per cut with the flag set and must fail. The
 first failing image is at cut 385, one of its 4,147,200 distinct images: the
 ninth the selection takes there, with the line at offset 3456 of the WAL's log
 block alone at its last content and the cut's six other changeable lines at
 their floor. It mounts, and the allocator's structural walk,
 which the sieve property runs next, reports `used block is linked into a free
-list (block 2)` (`X86_64PersistentRecovery.v3`, the walk's only site of that
+list (block 2)` (`X86_64CrashRecovery.v3`, the walk's only site of that
 message; until 2026-10-26 this said "Its mount reports"). With the checksum compared, that image recovers into a consistent sieve,
 and the sweep passes over cuts 0 to 385. The catch depends on the budget. On
 2026-10-19 the same sweep passed at 2, 3 and 4 images per cut, and 4 was the
@@ -741,7 +741,7 @@ extremes the selection is fixed; wherever a sweep checked a random draw, it was
 rerun under nine more seeds, a salt XORed into the per-cut seed derivation (salt
 0 is the suite's seed). Two mutants from the 2026-10-19 selection study were
 ported as test-only flags onto the split allocation, the only planted bugs on
-an allocator scenario: `RegionTransaction` storing and preparing its
+an allocator scenario: `TransactionCache` storing and preparing its
 after-images before `wal.commit()`, and its 8-byte link fields stored in place,
 unlogged. Both still fail on this code. The smallest budget that catches each
 bug, under all ten seeds where seeds apply:
@@ -797,12 +797,12 @@ rather than being decided together, and program order within a line holds in
 every image, so a partially constructed record is a state the search produces
 rather than one it collapses away.
 
-`checkImages()` runs a `PersistentImageProperty` over every image a cut permits
-and turns the first failure into a stored `PersistentCounterexample` carrying
+`checkImages()` runs a `CrashImageProperty` over every image a cut permits
+and turns the first failure into a stored `CrashCounterexample` carrying
 those bytes; `checkAllCuts()` sweeps every cut and reports the earliest failing
 one. A property returns `null` when it holds and a detail string when it does
 not, so the artifact says what went wrong rather than only that something did,
-and it names the window of the region worth printing. `PersistentCheckResult`
+and it names the window of the region worth printing. `CrashCheckResult`
 keeps truncation beside the verdict: `exhaustive()` requires both that the
 property held on every image and that the search which produced them completed,
 because a budget-limited search that found nothing has not shown that nothing is
@@ -825,7 +825,7 @@ durable.
 For every distinct crash image:
 
 1. Copy the durable bytes into a fresh simulated region or ordinary file.
-2. Construct a new `DualTxnWal`/`PWRegion` instance.
+2. Construct a new `TwoSlotWal`/`RegionAllocator` instance.
 3. Invoke the production recovery path.
 4. Check the expected acknowledgement contract and structural invariants.
 5. Optionally record recovery's own stores, `CLWB`s, and fences and repeat the
@@ -845,16 +845,16 @@ is still required later to test `MAP_SYNC` and the native backend translation.
 
 ## Running real recovery over an image
 
-`src/engine/x86-64/X86_64PersistentRecovery.v3` closes the loop: it mounts an
-enumerated durable image and runs the production `DualTxnWal` recovery path over
-it. `PersistentRecoveries.runDualWal()` copies the image into a fresh region, opens
+`src/engine/x86-64/X86_64CrashRecovery.v3` closes the loop: it mounts an
+enumerated durable image and runs the production `TwoSlotWal` recovery path over
+it. `CrashRecoveries.runTwoSlotWal()` copies the image into a fresh region, opens
 a WAL over it *without* fresh initialization (this is a remount, not a format),
 calls `recover()`, and freezes the resulting bytes back into an image before
 releasing the region. The run reports what recovery said — its
-`DualWalRecovery` outcome, whether it latched recovery-required, and the
+`WalRecovery` outcome, whether it latched recovery-required, and the
 sequence numbers it adopted — alongside the bytes it produced.
 
-`PersistentWalRecoveryProperty` expresses the acknowledgement contract as a
+`WalRecoveryProperty` expresses the acknowledgement contract as a
 property the explorer can check over every image a cut permits:
 
 - every image must mount and recover without reporting `PERSIST_FAILED` or
@@ -870,7 +870,7 @@ property the explorer can check over every image a cut permits:
 A scenario starts from the region as it already stood: the trace records only
 the commit, and the bytes left by the formatted, WAL-initialized mount are the
 model's starting durable image. Capturing the fresh initialization inside the
-trace instead would add its byte-wise zeroing of the whole log chunk to the
+trace instead would add its byte-wise zeroing of the whole log block to the
 state space for no modelling benefit — those bytes were durable before the
 scenario began.
 
@@ -884,7 +884,7 @@ images in all: one at each of cuts 0 to 192 and at the commit point, and 1,210
 over the 21 cuts that catch the record partly written, at most 168 at one cut.
 The committed-boundary cut has exactly one image, since every line the record
 touched has been flushed and fenced, and
-`persistent_recovery:commit_boundary_survives_every_schedule` checks the
+`crash_recovery:commit_boundary_survives_every_schedule` checks the
 must-survive half of the contract there. Since 2026-10-19 the sweep over every
 cut (`torn_record_images_never_invent_state`) mounts every one of the 1,404
 images and asserts that it is exhaustive; until then it ran under a budget of 24
@@ -901,18 +901,18 @@ boundary — which is what the overwrite guard in `appendCommittedRecord()`
 verifies before it zeroes the slot. Two transactions can never reach that state,
 so the scenario needs a third.
 
-`PersistentWalHistoryProperty` is the same acknowledgement contract stated over
+`WalHistoryProperty` is the same acknowledgement contract stated over
 several after-images at once, each one marked acknowledged or not
-(`PersistentWalAfterImage`). It mounts each image once for the whole history
+(`WalAfterImage`). It mounts each image once for the whole history
 rather than once per after-image, which is what makes it affordable in a sweep.
 
 The claim is a suffix claim: transactions 1 and 2 are acknowledged only from the
-third commit's first event onward, so `PersistentExplorer.checkCutRange()`
+third commit's first event onward, so `CrashExplorer.checkCutRange()`
 checks exactly those cuts instead of weakening the property to one that every
 cut of the whole history can satisfy. Over that range — including the cuts that
 catch slot 1 zeroed, where transaction 1 exists nowhere in the log at all —
 production recovery must still produce both after-images.
-`persistent_recovery:overwrite_guard_keeps_acknowledged_data` runs that sweep
+`crash_recovery:overwrite_guard_keeps_acknowledged_data` runs that sweep
 over every distinct image of every cut in the range, 597,079 of them (exhaustive
 since 2026-10-19; until then it was budgeted), checks that the same property
 *fails* when the
@@ -931,7 +931,7 @@ budget both sweeps take, so a WAL change that let a cut leave more would make
 them report truncation. On sean-tan-PC (2026-10-19) the range sweep took 15.4 s
 and the whole-history sweep 15.7 s, the test 31.0–31.3 s.
 
-The batched-apply history (`persistent_recovery:batched_apply_keeps_acknowledged_data`)
+The batched-apply history (`crash_recovery:batched_apply_keeps_acknowledged_data`)
 is exhaustive in the same way since 2026-10-19: its 728 cuts admit 393,342
 distinct images, at most 10,868 at one cut (721). Its sweeps take 63 images over
 the batched apply's cuts, 16,841 over the second commit, 353,649 over the
@@ -940,7 +940,7 @@ on sean-tan-PC they took 5 ms, 0.48 s, 9.2 s and 10.1 s, the test 20.1–21.0 s.
 Before, the last three ran under budgets of 8, 8 and 4 prefix vectors per cut.
 
 The two-crash profile runs over the same history in
-`persistent_recovery:crash_during_three_commit_recovery_recovers`: crash at the
+`crash_recovery:crash_during_three_commit_recovery_recovers`: crash at the
 history's final cut (its lazy image), then crash again anywhere during the
 mount that recovers it. The test asserts that second-crash sweep exhaustive:
 replay writes two after-images and publishes them with one boundary.
@@ -949,7 +949,7 @@ replay writes two after-images and publishes them with one boundary.
 
 ## The lazy search (2026-10-20)
 
-`src/engine/x86-64/X86_64PersistentLazyExplorer.v3` runs a property once for
+`src/engine/x86-64/X86_64ReadDrivenExplorer.v3` runs a property once for
 each set of crash images it cannot tell apart, and branches only on the bytes
 recovery and the property actually load. It is Jaaru's constraint refinement
 (Gorjiara et al., ASPLOS '21: BuildMayReadFrom, Fig. 9; DoRead, Fig. 10;
@@ -957,14 +957,14 @@ Explore, Fig. 11) over the line classes of the reduced search, by re-execution
 rather than by fork.
 
 **The algorithm.** At a cut, each line the trace wrote can hold any of its
-distinct contents (`PersistentLineClasses`, see
+distinct contents (`CrashLineClasses`, see
 [Enumerating schedules](#enumerating-schedules)), independently of the other
-lines. `PersistentLazySearch` keeps, for each such line i, the set S_i of
+lines. `ReadDrivenSearch` keeps, for each such line i, the set S_i of
 classes it may still hold, initially all of them, and one reused mapping that
 starts each execution holding the lazy image (class 0 everywhere). The crash
-image's mount gets a provider (`PersistentLazyOperations`) that performs and
+image's mount gets a provider (`ReadDrivenProvider`) that performs and
 records its stores and marks every byte a store covers, and a
-`PersistentLoadObserver` installed before anything is constructed over it.
+`LoadObserver` installed before anything is constructed over it.
 When the code under test is about to load `[offset, offset + length)`, the
 observer splits the range by line and, for each line with |S_i| > 1, takes
 the bytes this execution has not stored and on which S_i's classes are not
@@ -977,17 +977,17 @@ execution's own stores never branches. The search is depth-first over
 decision prefixes: an execution replays the prefix, takes group 0 at each new
 decision and records it, and the next execution takes the next untried group
 at the deepest decision that has one. Replaying checks that each decision
-falls on the same line with the same partition (`PersistentLazyDecision`); if
+falls on the same line with the same partition (`ReadDrivenDecision`); if
 not, the search stops and reports the property nondeterministic. An execution
-that ends is a leaf (`PersistentLazyLeaf`), and stands for every image whose
+that ends is a leaf (`ReadDrivenLeaf`), and stands for every image whose
 line i holds a class in its final S_i, for every i: ∏|S_i| images.
 
 **Frozen copies.** The WAL properties freeze the mount after recovery and
 read the frozen copy, and the idempotence check mounts that copy and recovers
-it again. On a lazy mount `snapshot()` returns a `PersistentLazySnapshot`
+it again. On a lazy mount `snapshot()` returns a `ReadDrivenSnapshot`
 that keeps every byte recovery neither stored nor loaded, and the crash image
 has not decided, as a mark standing for the crash image's byte at the same
-offset. `PersistentImageView` is the interface both kinds of image share:
+offset. `CrashImageView` is the interface both kinds of image share:
 `read()` decides the marked bytes it reads (which can branch), and
 `sameBytes()`/`firstDifference()` treat two marks at one offset, from one
 execution, as the same byte, so comparing two snapshots decides only bytes
@@ -997,24 +997,24 @@ view did not know from the crash image when it is first loaded. `freeze()`
 on a lazy mount decides every byte: correct, but it branches on all of them.
 
 **Lazy-safe properties.** A property runs lazily only as a
-`PersistentLazyProperty`, a function of an image view and a
-`PersistentImageMounter`: it mounts only through the mounter and reads frozen
-copies only through the view. A `PersistentImageProperty` cannot be passed by
+`ReadDrivenProperty`, a function of an image view and a
+`CrashImageMounter`: it mounts only through the mounter and reads frozen
+copies only through the view. A `CrashImageProperty` cannot be passed by
 mistake. The same function, given a durable image and the eager mounter
-(`PersistentImageMounters.EAGER`, `openMapped()` per image, as `runDualWal()`
+(`CrashImageMounters.EAGER`, `openMapped()` per image, as `runTwoSlotWal()`
 always mounted), is the property's eager form, so the eager and lazy checks
-run one body of code. `PersistentWalHistoryProperty.checkOn()` and
-`PersistentWalRecoveryProperty`, idempotence included, are lazy-safe
-(`lazy()`); `runDualWalOn()` runs recovery over whatever the mounter gives,
-and `PersistentRecoveryRun.left` is the snapshot (`recovered` stays the
+run one body of code. `WalHistoryProperty.checkOn()` and
+`WalRecoveryProperty`, idempotence included, are lazy-safe
+(`lazy()`); `runTwoSlotWalOn()` runs recovery over whatever the mounter gives,
+and `CrashRecoveryRun.left` is the snapshot (`recovered` stays the
 durable image for an eager run). The failure-injection and two-crash
 properties, the allocator, format, sieve and B+Tree properties stay on the
 reduced search.
 
-**Entry points and results.** `PersistentLazyExplorer.checkImagesLazily()`,
+**Entry points and results.** `ReadDrivenExplorer.checkImagesLazily()`,
 `checkCutRangeLazily()` and `checkAllCutsLazily()` mirror the eager ones; the
 budget counts leaves per cut, and a cut is truncated when the budget is spent
-with alternatives left. `PersistentLazyCheckResult` reports `leaves`,
+with alternatives left. `ReadDrivenCheckResult` reports `leaves`,
 `represented` (the distinct images the leaves stand for, ∏|S_i| summed over
 leaves and saturating at 2^62), `classProduct` and `product`, rendered as
 "L leaves cover R of Y distinct images (Z prefix states)"; `exhaustive()` is
@@ -1035,7 +1035,7 @@ made them agree on, and S_i only narrows, so a byte once agreed on stays
 agreed on. The leaves partition the cut's images: the groups at a decision
 partition S_i, two leaves part at their first differing decision, and
 depth-first search takes every group. Three things this rests on are
-checked, in `persistent_lazy:` (`test/unittest/x86-64-linux/PersistentLazyExplorerTest.v3`),
+checked, in `read_driven:` (`test/unittest/x86-64-linux/ReadDrivenExplorerTest.v3`),
 rather than assumed:
 
 - *The leaves partition the images.* `leaves_partition_classes`: at every cut
@@ -1098,12 +1098,12 @@ Every lazy sweep is exhaustive and its leaves cover exactly the distinct
 images. Recovery's checksum loop, which reads a whole record, runs only once
 the record's header and trailer fields are well formed (`validateSlot()`), and
 *we infer* that replay storing each after-image before anything reads it is why
-the batched apply's own cuts are one leaf each. `persistent_lazy:wal_sweeps_are_exhaustive` runs
+the batched apply's own cuts are one leaf each. `read_driven:wal_sweeps_are_exhaustive` runs
 the first, second, third, sixth and seventh rows in 2.1 s. The suite keeps the
-eager sweeps in `persistent_recovery:` as they were; switching them is a later
+eager sweeps in `crash_recovery:` as they were; switching them is a later
 stage.
 
-**The planted bugs.** `DualTxnWalMutants.skipRecordChecksum` is harmless over
+**The planted bugs.** `WalFaultInjection.skipRecordChecksum` is harmless over
 one commit into an empty slot, and both searches say so (373 leaves, and 1,404
 images): a record validates only once every field but the checksum is
 durable, and then it is the committed record. Over a reused slot it is not.
@@ -1117,7 +1117,7 @@ the contract holds. With it skipped, the lazy search fails at cut 640 after
 4,797 leaves, in 0.24 s, with "acknowledged after-image absent after recovery
 ... durable=0x8877665544332211", and the eager re-check gives the same detail;
 Stage A's sweep fails at the same cut after 525,837 images, in 13.2 s
-(`measure-mutants.txt`). `DualTxnWalMutants.recordLastLineUnflushed` (new,
+(`measure-mutants.txt`). `WalFaultInjection.recordLastLineUnflushed` (new,
 test-only) leaves the record's last line out of the commit-point fence; a
 commit recorded with it fails `unflushed_record_line_is_caught` at the commit
 point in the first leaf, the lazy image, with recovery `CLEAN`, confirmed
@@ -1133,7 +1133,7 @@ leaves. At 2,000 leaves per cut the whole sweep's 27,131 leaves cover
 2,190,532,385 of its 2,263,112,768 images. The sieve step's cut 385 does not
 prune at all: each of 200,000 leaves is one of its 4,147,200 images. Yet with
 the checksum skipped the lazy search reaches the image
-`persistent_sieve:unchecked_record_checksum_is_caught` finds there in its
+`sieve_crash:unchecked_record_checksum_is_caught` finds there in its
 second leaf, confirmed eagerly. Its busiest cut (870, at least 2^62 images) is
 one leaf. `representatives_agree`'s check passes at allocator cuts 685, 700,
 720 and 736 and sieve cuts 870, 1,000 and 1,456. The format property reads its
@@ -1205,43 +1205,43 @@ outcomes and invariants for many of these scenarios.
 
 ### Which container an image is mounted in
 
-`PersistentImageMounts` offers three; the choice is a modelling decision
+`CrashImageMounts` offers three; the choice is a modelling decision
 rather than an implementation detail:
 
 | Mount | Container | Boundaries | Use |
 |---|---|---|---|
 | `openArray()` | anonymous mapping (`AnonMappedRegion`), which does not move; until 2026-10-19 a byte array on Virgil's heap, which the collector moves (below) | succeed without reaching the writeback/fence hooks | only recovery's effect on the bytes matters; costs an `mmap` and a `munmap` per image |
 | `openFailing(failAt)` (2026-10-19) | the same mapping (`InjectedFailureRegion`) | as `openArray()`'s, except that boundary number `failAt` fails | a persistence failure during the mount (below) |
-| `openMapped(record)` | `PmemMmapRegion` | translate into cache-line writebacks and fences on the region's provider | the mounted run must itself be modelled; with `record` set, its stores, `CLWB`s and fences are captured as a trace |
+| `openMapped(record)` | `PmemRegion` | translate into cache-line writebacks and fences on the region's provider | the mounted run must itself be modelled; with `record` set, its stores, `CLWB`s and fences are captured as a trace |
 
-The tests' `PersistentAnonMounts.openRegion()` opens an image through
-`PersistentImageBackend`, that is `openArray()`; until that moved, it opened
+The tests' `CrashAnonMounts.openRegion()` opens an image through
+`CrashImageBackend`, that is `openArray()`; until that moved, it opened
 it in the tree explorer's mapping (`PWBTreeAnonRegion`).
 
 **The array moves (2026-10-19).** `openArray()`'s byte array was an ordinary
-heap object, and Virgil's semispace collector moves it, while `PWRegion` and
-`DualTxnWal` keep the region's start as a raw address. A collection during a
+heap object, and Virgil's semispace collector moves it, while `RegionAllocator` and
+`TwoSlotWal` keep the region's start as a raw address. A collection during a
 mount leaves them reading the old copy, while their stores, which go through
 the region's range, reach the moved one; the next collection reuses the old
 copy's memory. The same hazard, in the volatile backend's array, aborted a
 full test run in `pwbtree:` on 2026-10-14 (`docs/ROADMAP.md`,
 `PWBTreeTest.v3`). The tree's explorer mounted its images
 in an anonymous mapping from the start, and
-since 2026-10-19 so do the sieve's (`persistent_sieve:`, and
-`persistent_control:` through the same property) and the format scenario
-(`persistent_alloc:crash_during_format_opens_consistent`). The mapping's
+since 2026-10-19 so do the sieve's (`sieve_crash:`, and
+`crash_control:` through the same property) and the format scenario
+(`allocator_crash:crash_during_format_opens_consistent`). The mapping's
 boundaries are the array's, so what a check concludes is unchanged; it costs
-an `mmap` and a `munmap` per image, which took the six `persistent_sieve:`
+an `mmap` and a `munmap` per image, which took the six `sieve_crash:`
 tests it had before (19,394 images) from 3.08 s to 3.23 s, medians of nine
-interleaved runs on sean-tan-PC. `persistent_sieve:mounted_image_survives_a_collection`
+interleaved runs on sean-tan-PC. `sieve_crash:mounted_image_survives_a_collection`
 forces a collection under a mounted image, and fails on the array. Later the
 same day `openArray()` itself moved to an anonymous mapping, and
 `InjectedFailureRegion` with it (`openFailing()`), so neither
-`PersistentImageBackend`, and with it `PersistentAllocatorProperty` and every
-`persistent_alloc:` sweep, nor `runDualWalWithFailure()` and
-`runPWRegionWithFailure()` mount an image in a heap array any more.
-`persistent_alloc:mounted_image_survives_a_collection` and
-`persistent_recovery:failing_mount_survives_a_collection` force a collection
+`CrashImageBackend`, and with it `AllocatorProperty` and every
+`allocator_crash:` sweep, nor `runTwoSlotWalWithFailure()` and
+`runAllocatorWithFailure()` mount an image in a heap array any more.
+`allocator_crash:mounted_image_survives_a_collection` and
+`crash_recovery:failing_mount_survives_a_collection` force a collection
 under each, and fail on the array. Without their address check, over the
 array, two allocations made after the collection returned the same block, so
 the image handed on held one used chunk too few, while the invariant walk,
@@ -1249,12 +1249,12 @@ which reads through `regionStart`, found nothing wrong; and a complete record
 written after the collection did not replay on a remount, because the WAL
 computes its checksum by reading the record back through the raw address. The move gives
 an `mmap` and a `munmap` to each of the 9,594 images the twelve
-`persistent_alloc:` tests it had before mounted in heap arrays, which took them
-from 2.03 s to 2.15 s, and to the 218 the thirteen `persistent_recovery:`
-tests mounted in them, which stayed at 0.59 s; `persistent_sieve:` and
-`persistent_control:`, already on mappings, did not change (medians of nine
+`allocator_crash:` tests it had before mounted in heap arrays, which took them
+from 2.03 s to 2.15 s, and to the 218 the thirteen `crash_recovery:`
+tests mounted in them, which stayed at 0.59 s; `sieve_crash:` and
+`crash_control:`, already on mappings, did not change (medians of nine
 interleaved runs pinned to one core of sean-tan-PC). No crash-image property
-mounts an image in a heap array now; `pwsieve:` and the `pwregion:` groups
+mounts an image in a heap array now; `pwsieve:` and the `allocator:` groups
 still run on the volatile backend's (`docs/ROADMAP.md`).
 
 The plain mount is sound for a recovery whose *result* is being checked: the
@@ -1267,7 +1267,7 @@ boundaries that fail once, at a chosen call.
 
 ## Crash during recovery
 
-`recordDualWalRecovery()` mounts an image through the recording PMEM container
+`recordWalRecovery()` mounts an image through the recording PMEM container
 and runs production recovery on it, returning both the outcome and the trace of
 what recovery made durable. That trace, started from the image recovery was
 handed, is a persistent scenario like any other — so a second crash is explored
@@ -1275,10 +1275,10 @@ with the same machinery, and `checkCrashDuringRecovery()` is the two-crash
 profile: crash once wherever the first exploration says, then crash anywhere
 during the recovery that follows.
 
-Recording through the production `PmemMmapRegion` rather than a copy of its
+Recording through the production `PmemRegion` rather than a copy of its
 translation is what keeps this evidence about the real seam.
-`recordPWRegionRecovery()` does the same for an allocator mount, handing the
-recording container to `PWRegion` through `PreparedRegionBackend`, so the whole
+`recordAllocatorRecovery()` does the same for an allocator mount, handing the
+recording container to `RegionAllocator` through `PreparedStorageBackend`, so the whole
 mount — WAL recovery plus whatever the allocator publishes — is one trace.
 
 For the canonical case — a commit-boundary crash — replay writes one after-image
@@ -1292,8 +1292,8 @@ its property.
 
 ### Recovery that cannot persist
 
-`runDualWalWithFailure()` mounts an image in the failure-injecting container and
-fails one recovery boundary. `PersistentRecoveryFailureProperty` states what
+`runTwoSlotWalWithFailure()` mounts an image in the failure-injecting container and
+fails one recovery boundary. `CrashRecoveryFailureProperty` states what
 must then hold, over every image a cut permits:
 
 - a `PERSIST_FAILED` outcome and a latched mount imply each other — recovery may
@@ -1304,13 +1304,13 @@ must then hold, over every image a cut permits:
 The second clause is the one with teeth. A recovery that reclaimed or scrubbed a
 record it had not durably replayed would return an honest-looking
 `PERSIST_FAILED` and still have destroyed the only durable copy of an
-acknowledged transaction. `persistent_recovery:failed_replay_persist_never_loses_a_record`
+acknowledged transaction. `crash_recovery:failed_replay_persist_never_loses_a_record`
 checks it over all 1,404 distinct images of the one-commit trace's 215 cuts and
 asserts the sweep exhaustive (since 2026-10-19; before, a budget of 12 prefix
 vectors per cut reached 215 of them); on sean-tan-PC it takes 0.06–0.07 s.
 
-The allocator has the same shape in `runPWRegionWithFailure()` /
-`PersistentAllocatorFailureProperty`, with one extra distinction. The invariant
+The allocator has the same shape in `runAllocatorWithFailure()` /
+`AllocatorFailureProperty`, with one extra distinction. The invariant
 walk is split: `checkStructure()` is the on-region structure alone, and
 `check()` adds the mount-state clauses (not recovery-required, no buffered
 writes). A mount whose boundary failed is *expected* to be latched, but its
@@ -1322,22 +1322,22 @@ must produce a fully consistent allocator that has the allocation.
 
 ## Allocator scenarios
 
-The same pipeline runs over a whole allocator transaction. `PWRegion` is
+The same pipeline runs over a whole allocator transaction. `RegionAllocator` is
 formatted on a trace-recording PMEM region, the recorder is cleared, and one
 `allocChunk()`/`freeChunk()` is recorded: its WAL record, its commit boundary,
 and the after-images it applies afterwards. Every image a crash can leave is
-then mounted through `PersistentAllocatorProperty`, which builds a `PWRegion`
-over the image (`PersistentImageBackend`, no fresh format), lets the production
+then mounted through `AllocatorProperty`, which builds a `RegionAllocator`
+over the image (`CrashImageBackend`, no fresh format), lets the production
 mount path run WAL recovery, and walks the resulting structure.
 
-`PersistentAllocatorInvariants.check()` is that walk, returning the first
+`AllocatorInvariants.check()` is that walk, returning the first
 violation as a string rather than asserting, so one implementation serves both
 a unit test and a crash-model property. It requires the memory-order chain to be
 acyclic, index-increasing and doubly linked through to the region marker; every
 free chunk to be classified by its actual span and to appear exactly once on the
 matching free list; free chunks never to be adjacent; a used entry to be on no
 list; and the mount to be neither recovery-required nor left with buffered
-writes. `persistent_alloc:walker_detects_a_broken_chain` corrupts one byte of a
+writes. `allocator_crash:walker_detects_a_broken_chain` corrupts one byte of a
 durable block table and requires the walk to report it — a walk that cannot fail
 would make every other allocator check vacuous.
 
@@ -1351,17 +1351,17 @@ because `VolatileRegion`'s persistence boundaries are no-ops. The model then
 concludes — correctly, for what it was shown — that nothing the allocator wrote
 was ever made durable, and the exploration reports genuine inconsistencies:
 after-images evicted without a durable record to replay them. Allocator
-scenarios are therefore recorded over a `PmemMmapRegion`, whose
-`prepareChangedRange`/`persistChanges` translate into writebacks and fences on
+scenarios are therefore recorded over a `PmemRegion`, whose
+`writeBack`/`drain` translate into writebacks and fences on
 the same provider. Mounting an image for recovery can still use an ordinary
 byte-array region, since the simulator, not the backend, decides which bytes
 survived.
 
 ### The file-backed model is simpler, but not trivial
 
-This document models PMEM. The same seam also carries `FileMmapRegion`, whose
+This document models PMEM. The same seam also carries `MappedFileRegion`, whose
 boundaries reach the file as `fdatasync` (until 2026-10-13 also as `msync` of a
-`persistRange`'s own pages), so the question of what a crash can leave behind
+`persist`'s own pages), so the question of what a crash can leave behind
 has a second answer that the thesis has to state.
 
 It is tempting to claim the file backend admits only two images at any cut —
@@ -1408,7 +1408,7 @@ true; the restriction shows that set is inside the model's.
 The direct-I/O backend (`DirectIoRegion`, see
 [Persistent Backends](persistent-backends.md#the-direct-io-backend-added-2026-09-24-measured-2026-09-27))
 keeps the region in a private DRAM staging buffer and writes it back itself:
-the provider's `clwb()` marks the line's 4 KiB unit, and at each fence the
+the provider's `writeBackLine()` marks the line's 4 KiB unit, and at each fence the
 region `pwrite`s every marked unit from the staging buffer on an `O_DIRECT`
 descriptor and then calls `fdatasync`. Its trace is the PMEM backend's for the
 same history (`direct_io:trace_matches_pmem_region`), so the question is only
@@ -1476,17 +1476,17 @@ know the device's write unit to rule it out.
 
 ### The file backend is a restriction of the PMEM model, on block storage only conditionally
 
-Since 2026-10-13 the mapped-file backend (`FileMmapRegion`, see
+Since 2026-10-13 the mapped-file backend (`MappedFileRegion`, see
 [Persistent Backends](persistent-backends.md#implementations)) sits on the seam
-as the direct backend does. `prepareChangedRange` issues one `clwb()` per
+as the direct backend does. `writeBack` issues one `writeBackLine()` per
 64-byte line through the region's provider, which is the direct backend's
-`DirectIoOperations` and marks the line's 4 KiB page instead of executing
-`CLWB`; `persistChanges` and `persistRange` issue one `sfence()` and then sync
+`MarkingProvider` and marks the line's 4 KiB page instead of executing
+`CLWB`; `drain` and `persist` issue one `fence()` and then sync
 every marked page, with one `fdatasync` of the file when any page is marked and
-nothing otherwise. `persistRange` syncs every marked page, not only its own,
-because the `SFENCE` that ends a PMEM `persistRange` completes every
+nothing otherwise. `persist` syncs every marked page, not only its own,
+because the `SFENCE` that ends a PMEM `persist` completes every
 outstanding `CLWB`. Its trace is the PMEM backend's for the same history
-(`file_mmap:trace_matches_pmem_region`), so, as for the direct backend, the
+(`mapped_file:trace_matches_pmem_region`), so, as for the direct backend, the
 question is only which durable images each admits. Before the change the file
 backend issued no writeback request at all, so its trace said nothing was ever
 made durable and the model could not speak for it.
@@ -1545,7 +1545,7 @@ model's fence, the backend needs:
 
 | | Assumption | Status |
 |---|---|---|
-| B1 | One writer, and every persistent store through the provider | Checked: the store audit (milestone 2), and the file after every sync is the trace's full image (`file_mmap:boundary_images_are_model_images`) |
+| B1 | One writer, and every persistent store through the provider | Checked: the store audit (milestone 2), and the file after every sync is the trace's full image (`mapped_file:boundary_images_are_model_images`) |
 | B2 | Each 64-byte line the device receives holds the line as it stood at one instant | **Argued only; not guaranteed.** Below |
 | B3 | Each naturally aligned 512-byte sector holds, after a crash, the data of one write issued to it or its earlier content: never a mixture, never unreadable | A device property, reported and not checked: sean-tan-PC's NVMe gives `atomic_write_unit_max_bytes` 512 |
 | B4 | A completed flush, or FUA write, makes durable what a read would then return, and the filesystem issues one in every `fdatasync` | The filesystem's half observed on sean-tan-PC (2026-10-21): a cache flush followed every boundary's writes to the NVMe, on the file and direct backends, one write and one flush a boundary in the steady state ([trace](persistent-backends.md#fdatasync-sends-the-nvme-a-cache-flush-observed)). The device's half, durability through power loss, not checked. ext4 issues one per call (`ext4_sync_file()` → `blkdev_issue_flush()`); a write-through device, such as Magpie's `sda` (a disk its controller passes through with the drive's own write cache disabled), is sent none, and its acknowledgement, which a component not yet identified gives before the platter can have the write, is the boundary ([root sitting](persistent-backends.md#what-acknowledges-a-write-on-home), 2026-10-16; until 2026-10-25 this cell said "such as Magpie's controller") |
@@ -1556,7 +1556,7 @@ second also checked: a page is never written twice at once (background
 writeback skips a page under writeback, and `fdatasync` waits for it, so a
 background write already in flight also completes before `fdatasync`
 returns); and `fdatasync` writes back every page of the file that is dirty
-when it is called (`file_mmap:synced_pages_reach_the_device`).
+when it is called (`mapped_file:synced_pages_reach_the_device`).
 
 *Can a page be written back while the program is still storing to it?* Yes,
 unless the filesystem requires stable writes. Writeback write-protects the page
@@ -1631,17 +1631,17 @@ page. `fdatasync` commits the conversion, because it is metadata needed to read
 the data (ext4 advances `i_datasync_tid` for it). `fallocate`'s unwritten
 extents behave the same way.
 
-**Checked, not only argued.** `FileMmapRegionTest.v3` records a format, an
-allocation, user data made durable with `persistRange` while that allocation's
+**Checked, not only argued.** `MappedFileRegionTest.v3` records a format, an
+allocation, user data made durable with `persist` while that allocation's
 after-images still wait (the sieve's step, and the one place a fence must
 drain more than its own range), a second allocation, a free and a clean close,
 over a real file, with both fences, at 2 KiB and 4 KiB blocks:
 
-- `file_mmap:fences_sync_every_requested_page` replays the trace alone, not the
+- `mapped_file:fences_sync_every_requested_page` replays the trace alone, not the
   region's marks: every page holding a line written back before a fence must be
   covered by the syncs that fence issues, and every sync must follow an
   `SFENCE`.
-- `file_mmap:boundary_images_are_model_images` checks, after each fence, two
+- `mapped_file:boundary_images_are_model_images` checks, after each fence, two
   images with the direct backend's exact check (`dioAdmittedAt()`): the file as
   the page cache holds it, which is every page written back (the eager
   extreme), and the *marked-only* image, the initial file overwritten at each
@@ -1649,7 +1649,7 @@ over a real file, with both fences, at 2 KiB and 4 KiB blocks:
   (the lazy extreme). Any page the kernel writes beyond that holds each line's
   full prefix, admitted line by line. Every image during a fence is checked at
   the cut just before its `SFENCE`.
-- `file_mmap:synced_pages_reach_the_device` re-reads each synced range with
+- `mapped_file:synced_pages_reach_the_device` re-reads each synced range with
   `O_DIRECT` right after the sync and requires the page cache's bytes. The
   range is clean, so the read writes nothing back first. This checks, on the
   test host's filesystem and device, that a fence's sync wrote what it was
@@ -1658,8 +1658,8 @@ over a real file, with both fences, at 2 KiB and 4 KiB blocks:
 
 The checks can fail. A deliberately broken `msync` fence that syncs only its
 first run of pages fails both the coverage and the image check. As mutations
-of production code, run once and reverted: a `persistRange` that syncs only its
-own pages fails both, and a `persistRange` without its writeback requests fails
+of production code, run once and reverted: a `persist` that syncs only its
+own pages fails both, and a `persist` without its writeback requests fails
 the trace check.
 
 **What remains argued.** The device's image *between* fences. Reading the file
@@ -1767,22 +1767,22 @@ second representation of the protocol.
    assumptions above.
 2. **Completed 2026-08-13:** introduce the per-region instrumentable persistent
    store/flush/fence interface, its x86-64 production provider, and the typed
-   in-memory provider used to pin active-WAL ordering. All active `DualTxnWal`
+   in-memory provider used to pin active-WAL ordering. All active `TwoSlotWal`
    persistent stores and PMEM writeback/fence requests share this seam.
-   **Store audit completed 2026-08-14:** `PWRegion.format()` and the non-cached
+   **Store audit completed 2026-08-14:** `RegionAllocator.format()` and the non-cached
    allocator handle setters now route through the same provider, so a recorded
    trace is a complete description of the active path's persistent writes.
 3. **Completed 2026-08-19:** integrate recorded events into deterministic
-   counterexample artifacts and scenario capture. `PersistentTrace` freezes a
+   counterexample artifacts and scenario capture. `PersistenceTrace` freezes a
    named snapshot, cuts it at a crash point, validates it against the baseline
    profile, digests it for deduplication, and renders it; the recorder feeds it
-   via `snapshot()`/`PersistentTraces.capture()`, and
-   `PersistentCounterexample` is the stored form of a failing exploration. No
+   via `snapshot()`/`PersistenceTraces.capture()`, and
+   `CrashCounterexample` is the stored form of a failing exploration. No
    explorer emits those counterexamples yet, and they do not yet carry a
    durable image, because nothing models durable bytes before milestone 4.
 4. **First slice completed 2026-08-19:** cache-line state, asynchronous
    writeback completion, fence obligations, background eviction, and crash-image
-   generation, in `PersistentCrashMachine`/`PersistentDurableImage`, with the
+   generation, in `CrashModel`/`CrashImage`, with the
    lazy/eager extremal schedules and an image digest for deduplication (see
    "Durable images and cache-line state" above). **Second slice completed
    2026-08-19:** the full branching search with state deduplication and a
@@ -1798,26 +1798,26 @@ second representation of the protocol.
    (see "Enumerating schedules" above); the one-commit, three-commit and
    batched-apply WAL sweeps are exhaustive at every cut.
 5. **First slice completed 2026-08-20:** mount an enumerated image and run the
-   production `DualTxnWal` recovery over it, with the acknowledgement contract
+   production `TwoSlotWal` recovery over it, with the acknowledgement contract
    (survival, no invented state, no latch, idempotence) as a checkable property
    (see "Running real recovery over an image" above). **Remaining:** allocator
    scenarios beyond a single WAL commit, and the wider scenario matrix.
 6. **First slice completed 2026-08-20:** a direct allocator invariant walker
-   (`PersistentAllocatorInvariants`) and image mounting for `PWRegion`
-   (`PersistentImageBackend`, `PersistentAllocatorProperty`), driven by recorded
+   (`AllocatorInvariants`) and image mounting for `RegionAllocator`
+   (`CrashImageBackend`, `AllocatorProperty`), driven by recorded
    split-allocation and coalescing-free transactions (see "Allocator scenarios"
    above). **Remaining:** the rest of the initial scenario matrix.
 7. **First slice completed 2026-08-20:** bounded crash-during-recovery
-   exploration — `recordDualWalRecovery()` captures recovery's own stores,
+   exploration — `recordWalRecovery()` captures recovery's own stores,
    writebacks and fences, and `checkCrashDuringRecovery()` explores a second
    crash over that trace, the same profile for an allocator mount
-   (`recordPWRegionRecovery()`), and recovery-persistence failure injection
-   (`InjectedFailureRegion`, `PersistentRecoveryFailureProperty`) — see "Crash
+   (`recordAllocatorRecovery()`), and recovery-persistence failure injection
+   (`InjectedFailureRegion`, `CrashRecoveryFailureProperty`) — see "Crash
    during recovery" above. **Later slices completed 2026-08-20:** failure
-   injection during an allocator mount (`runPWRegionWithFailure()`,
-   `PersistentAllocatorFailureProperty`), a two-transaction allocator scenario,
+   injection during an allocator mount (`runAllocatorWithFailure()`,
+   `AllocatorFailureProperty`), a two-transaction allocator scenario,
    and the three-transaction history whose third commit reclaims the first
-   transaction's slot (`PersistentWalHistoryProperty`, `checkCutRange()`; see
+   transaction's slot (`WalHistoryProperty`, `checkCutRange()`; see
    "Histories, and the slot that gets reclaimed" above). **Remaining:** the
    explicit-flush and clean-close scrub scenarios.
 8. Retain exhaustive short tests in the regular suite; run longer seeded
