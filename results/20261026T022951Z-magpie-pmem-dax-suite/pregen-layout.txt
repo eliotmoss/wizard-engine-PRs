@@ -1,0 +1,1 @@
+pregen_buffer at 0x82bef78 (page offset 3960); code from page boundary 2 (0x82c0000); mprotect to 0x82d7000; buffer to 0x82d7f78: inside the buffer

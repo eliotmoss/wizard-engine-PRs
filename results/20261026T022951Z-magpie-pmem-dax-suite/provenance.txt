@@ -1,0 +1,20 @@
+---- revision
+commit   8b4dc856e49ef2dbe700a13f2b28170bce8f0549
+subject  fix(x86-64): pregen buffer two pages longer than the code, so the stubs' mprotect stays inside it
+branch   pwregions
+dirty    0 changed files outside results/
+code     against 8593399a:  1 file changed, 6 insertions(+), 1 deletion(-)
+---- host
+hostname magpie
+kernel   Linux 6.8.0-137-generic #137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 20:28:23 UTC 2026 x86_64
+boot_id  deb3203e-ef90-4ba8-b37a-f0ff7ed33aaf
+started  2026-10-26T02:29:51+00:00
+load     0.00 0.00 0.00
+---- dax
+dir      /mnt/pmem0.0/sean
+/dev/pmem0 /mnt/pmem0.0 ext4   rw,relatime,dax=always
+---- toolchain
+v3c      /home/users/u7599095/virgil-titzer/bin/v3c-x86-64-linux
+virgil   47be87e81a88f94a744119835eaf4877885f54e7 2026-08-27
+65acbc7359688a2b441be02a61c437024e1cde2dc48b7f9aa830a7a3c2565e6e  bin/pmemtest.x86-64-linux
+finished 2026-10-26T02:29:51+00:00
