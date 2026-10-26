@@ -9,7 +9,12 @@ def PREGEN_CODE_MARKER = 0x7FAACCEE;
 def INL_SIZE = 88 * 1024;
 def OOL_SIZE = 4 * 1024;
 def TOTAL_SIZE = INL_SIZE + OOL_SIZE;
-def pregen_buffer = Array<byte>.new(TOTAL_SIZE + PAGE_SIZE_i);
+// Two pages of slack, not one: the code starts at the first page boundary after
+// the header, which is the buffer's second boundary when the buffer starts
+// within a header's length of a page end, and deserializeOrGenerateCode()'s
+// mprotect rounds the code's end up to a page. With one page that rounded end
+// could pass the buffer's end and make the statics after it read-only.
+def pregen_buffer = Array<byte>.new(TOTAL_SIZE + 2 * PAGE_SIZE_i);
 def pregen_header = Ref<X86_64PreGenHeader>.at(pregen_buffer, 0);
 var pregen_header_size = X86_64PreGenHeader.size;
 var global_stub_list: List<X86_64PreGenStub>;
