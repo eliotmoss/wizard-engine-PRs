@@ -3683,11 +3683,44 @@ compiler. The globs expand in the locale's collation order (`en_US.UTF-8` on
 sean-tan-PC). That order fixes the order of the sources, and so the order of
 the unit tests, which differs under `C` (see [ROADMAP](ROADMAP.md#tests)).
 
-**Magpie: open.** Magpie's 31 directories under `results/` (2026-09-18 to
-2026-10-16) record no Virgil revision either, and the location of its clone is
-not documented. These commands only read, and they
-establish the revision afterwards. Run them on Magpie as `u7599095`, in the
-kind of shell the campaigns ran from, so that `PATH` is the same:
+**Magpie: observed on 2026-10-26.** Magpie's 31 directories under `results/`
+(2026-09-18 to 2026-10-16) record no Virgil revision either. Sean ran the
+commands below as `u7599095` in a login shell; the output is
+`~/virgil-revision-2026-10-26.txt` on Magpie, copied to
+`thesis-reviews/2026-10-26/magpie-virgil-revision.txt`.
+
+- **Which compiler.** `v3c` resolves to
+  `/home/users/u7599095/virgil-titzer/bin/v3c`, which points to
+  `bin/current/x86-linux/Aeneas`, and `v3c-x86-64-linux` is the same clone's
+  wrapper. As on sean-tan-PC it is the clone's own bootstrapped build:
+  `bin/bootstrap/x86-linux/Aeneas` at 01:07:57, then
+  `bin/current/x86-linux/Aeneas` at 01:07:58 (2026-08-31, +1000).
+- **Version.** `v3c -version` reports `Aeneas III-11.1968`, `Build Data:
+  x86-linux 2026-08-31 01:07:57 by u7599095@`, and `Version.v3` says the same.
+- **Revision.** HEAD `47be87e81a88f94a744119835eaf4877885f54e7` ("[AnyRef]
+  AnyRefType Implementation (#637)", committed 2026-08-27), on `master` level
+  with `origin/master` (`https://github.com/titzer/virgil.git`). The working
+  tree is clean, with no stash and no local commit.
+- **History.** The reflog has one entry, `HEAD@{2026-08-31 01:03:43 +1000}:
+  clone`, and `origin/master`'s reflog is empty. The nine files newer than
+  the compiler binary are build outputs: `bin/current/x86-64-linux/Aeneas`,
+  `bin/current/jar/Aeneas` and `Aeneas.jar`, five tools in `bin/utils/`, and
+  `TAGS`. None is under `lib/` or `rt/`, the sources a compile reads from the
+  clone.
+- **Which campaigns.** All 31 directories are later than the clone. Inferred,
+  not observed, as for sean-tan-PC: every Magpie campaign was compiled by this
+  binary with this revision's `lib/` and `rt/`.
+- **The two hosts' compilers differ.** Magpie's revision is an ancestor of
+  sean-tan-PC's, 12 commits older (`git log 47be87e8..eb52db97` in
+  sean-tan-PC's clone, 2026-09-01 to 2026-09-11). Between them 25 files
+  change under `aeneas/src` (among them normalisation, reachability, SSA
+  generation and machine lowering) and `rt/gc/RiGc.v3`; nothing under `lib/`
+  and nothing under `aeneas/src/x86-64/` changes. A comparison between the
+  hosts therefore also spans two compiler revisions; what that changes in the
+  emitted code is not measured.
+
+The commands only read. Run them in the kind of shell the campaigns ran from,
+so that `PATH` is the same:
 
 ```
 V3C=$(command -v v3c); echo "v3c $V3C -> $(readlink -f "$V3C")"
