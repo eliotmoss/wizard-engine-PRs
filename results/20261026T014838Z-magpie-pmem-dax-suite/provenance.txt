@@ -1,0 +1,20 @@
+---- revision
+commit   de6e9c388a94ea869ecfd6196a60313b67a1210d
+subject  docs: a failed write-back without the engine: EIO once, a retry that writes nothing
+branch   pwregions
+dirty    0 changed files outside results/
+code     src/ and test/ identical to 8593399a
+---- host
+hostname magpie
+kernel   Linux 6.8.0-137-generic #137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 20:28:23 UTC 2026 x86_64
+boot_id  deb3203e-ef90-4ba8-b37a-f0ff7ed33aaf
+started  2026-10-26T01:48:39+00:00
+load     0.00 0.00 0.00
+---- dax
+dir      /mnt/pmem0.0/sean
+/dev/pmem0 /mnt/pmem0.0 ext4   rw,relatime,dax=always
+---- toolchain
+v3c      /home/users/u7599095/virgil-titzer/bin/v3c-x86-64-linux
+virgil   47be87e81a88f94a744119835eaf4877885f54e7 2026-08-27
+8c1e37e699a00e2a92ab0d3a4fd15f2b1a290176dad1a9434d64702235220938  bin/pmemtest.x86-64-linux
+finished 2026-10-26T01:48:39+00:00
