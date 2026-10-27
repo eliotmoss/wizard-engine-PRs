@@ -1,0 +1,30 @@
+Full x86-64-linux unit suite, engine 5e3f6219 (pwregions), sean-tan-PC, 2026-10-27
+
+The first run after 5e3f6219, which makes the B+Tree's inert-bytes audit
+(provider:load_audit_btree_reattach_inert) check the lazy and the eager image
+at every cut of its update (2,968 cuts, 5,936 images) instead of every fourth
+(743 cuts, 1,486 images); the other two inert-bytes audits already checked
+every cut. The persistence code is 95e055fa's. Outcome, read from unit.log:
+
+  registered and run   2,089  (2,089 "##+" starts, 2,089 "##-" results)
+  passed               2,082
+  expected failures        7  exactly the 7 names in test/unittest.failures.x86-64-linux:
+                              jit:invalid, lazy:invalid, probe:insert_g1,
+                              jit:dyn_probe_insert_osr, lazy:dyn_probe_insert_osr,
+                              lazy:call_indirect_subtype, lazy:rcall_indirect
+  unexpected failures      0
+  skipped                  0  (the harness cannot skip)
+
+Against 20261026T120025Z (engine 95e055fa): the same 2,089 test names, the
+same outcome for every test, the same registrations (registrations.txt), and
+an identical per-file summary (summarise-out.txt): 378 persistence tests in
+twenty files, all run and all passed.
+
+The B+Tree audit's counts at every cut, printed by a temporary line in
+LoadAudits.sweepInert in a scratch worktree (not committed): events 2,967,
+cuts 2,968, images 5,936, and for the other two audits 1,471 cuts and 2,942
+images (two allocations) and 1,457 cuts and 2,914 images (one sieve step),
+as docs/pmem-crash-model.md records. Time for that test on this host: 8.6 s
+against 2.2 s at every fourth cut.
+
+The DAX suite was not run here (pmem-integration.txt).

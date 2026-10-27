@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run the full x86-64-linux unit suite and the opt-in PMEM DAX suite on Magpie
 # at one engine revision, the revision of the desktop's unit-suite run
-# (results/20261026T120025Z-sean-tan-PC-unit-suite), and record both in one
-# results directory.
+# (results/20261027T104232Z-sean-tan-PC-unit-suite, at 5e3f6219), and record
+# both in one results directory. Each results directory keeps the copy of this
+# script that made it; results/20261027T034400Z-magpie-test-suites ran at
+# 95e055fa against results/20261026T120025Z-sean-tan-PC-unit-suite.
 #
 # Usage, on Magpie, from a clean pwregions checkout:
 #   bash scripts/magpie-test-suites.sh [DAX_DIR]      (default /mnt/pmem0.0/sean)
@@ -13,14 +15,15 @@
 #
 # Environment overrides, for testing the script elsewhere:
 #   REPO=<checkout> (default: this script's repository), SKIP_DAX=1,
+#   REV=<full hash> with DESKTOP_RUN=<the desktop's run at it>,
 #   SYNC=0 to skip fetching origin and fast-forwarding pwregions (for a host
 #   that cannot reach GitHub, whose checkout was brought up to date otherwise).
 set -euo pipefail
 
-REV=95e055faff802e8c179c608ef775a02c99072c09
+REV=${REV:-5e3f62197cff67b857d45b1d05158db9a43f1829}
 SCRIPT=$(readlink -f "${BASH_SOURCE[0]}")
 PREGEN_FIX=8b4dc856      # the pregen buffer's fix must be in REV
-DESKTOP_RUN=results/20261026T120025Z-sean-tan-PC-unit-suite
+DESKTOP_RUN=${DESKTOP_RUN:-results/20261027T104232Z-sean-tan-PC-unit-suite}
 DAX_DIR=${1:-/mnt/pmem0.0/sean}
 REPO=${REPO:-$(cd "$(dirname "$SCRIPT")/.." && pwd)}
 SKIP_DAX=${SKIP_DAX:-0}

@@ -1,0 +1,4 @@
+The PMEM DAX integration suite (two tests outside the unit binary) was not run
+here; its run at 5e3f6219 is Magpie's (scripts/magpie-test-suites.sh). This
+boot has /dev/pmem0 (memmap=1G!8G, emulated on reserved DRAM), but the thesis
+cites the suite on Magpie's persistent memory.

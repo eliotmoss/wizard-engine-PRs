@@ -1,0 +1,36 @@
+---- revision
+commit   5e3f62197cff67b857d45b1d05158db9a43f1829
+subject  test(pmem): the B+Tree inert-bytes audit at every cut, as the other two run
+branch   pwregions (= origin/pwregions); run in a detached worktree ~/research/wizard-engine-wt-suite at that commit
+dirty    no (git status --short before the build, after it and after the run: empty; bin/ is ignored)
+build    bin/Build-x86-64-linux.v3: Version.buildData = "x86-64-linux 2026-10-27 21:42:32 by sean-tan@", Version.minorVersion = 3317 (git rev-list --count HEAD)
+code     95e055fa's persistence code; 5e3f6219 changes one test's stride (load_audit_btree_reattach_inert, every fourth cut -> every cut) and four doc lines
+---- host
+hostname pc-ubuntu (results tag sean-tan-PC, as in the other desktop directories)
+kernel   Linux pc-ubuntu 7.0.0-38-generic x86_64 GNU/Linux
+boot_id  c0af060c-717a-475a-a62c-1f67822210b4
+cmdline  BOOT_IMAGE=/boot/vmlinuz-7.0.0-38-generic root=UUID=ad952be1-acba-4c89-9785-7231c3c6d814 ro quiet splash memmap=1G!8G
+cpu      Intel(R) Core(TM) i7-14700KF, 28 CPUs; cpu0 governor powersave; no_turbo 0
+load     0.25 0.20 0.13 (/proc/loadavg, 2026-10-27T10:42:32+00:00, before the build)
+user     sean-tan (no root in this run)
+cwd      /home/sean-tan/research/wizard-engine-wt-suite on /dev/nvme1n1p3 ext4
+/tmp     tmpfs (the backend's O_DIRECT probe refuses it, so the O_DIRECT tests' region files fall back to bin/, on the ext4 above)
+---- toolchain
+v3c        /home/sean-tan/research/virgil-titzer/bin/v3c (Aeneas III-11.1975), the binary of 20261026T120025Z
+virgil     /home/sean-tan/research/virgil-titzer: HEAD eb52db9784036b89c22edd2c1c9019404709bedb, git status clean, no commits ahead of origin/master
+---- build
+started  2026-10-27T10:42:32+00:00
+finished 2026-10-27T10:42:33+00:00 (exit 0)
+command  env SHELLOPTS=xtrace make bin/unittest.x86-64-linux   (trace in build.log)
+binary   cbca2101939c8e94826a9688d31d1861498504ce4ff24d365fbdb1fafe4a2517  bin/unittest.x86-64-linux
+---- run
+started  2026-10-27T10:42:33+00:00
+command  /usr/bin/time -v env TEST_TARGET=x86-64-linux test/unit.sh   (cwd: the worktree root; WIZENG_OPTS unset)
+output   unit.log (unit.sh's tee of the harness's raw output); time.txt (/usr/bin/time's report)
+status   unit.sh exited 0, which is tee's status; the outcome is read from unit.log (summary.txt)
+finished 2026-10-27T10:44:27+00:00 (wall 1:53.82, max RSS 730884 KiB, /usr/bin/time -v)
+---- summaries
+registrations.txt  python3 count_regs.py <engine repo> 5e3f6219
+summarise-out.txt  python3 summarise.py unit.log <(grep -v '^#' registrations.txt)
+---- PMEM DAX
+not run here: see pmem-integration.txt
