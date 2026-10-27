@@ -1329,8 +1329,8 @@ def test_persistent_load_audit_sieve_reattach_inert(tc: ProviderTester) {
 
 // And over the B+Tree's reattach: recovery, the allocator walk, PWBTree.open()
 // (its invariants and leak sweep) and checkInvariants(), over the images of an
-// update at height 3, at every fourth cut (the trace has about 3,000 cuts and
-// each image is mounted four times).
+// update at height 3, at every cut, as the other two audits run (2,968 cuts,
+// 5,936 images, each mounted four times; every fourth cut until 2026-10-27).
 def test_persistent_load_audit_btree_reattach_inert(tc: ProviderTester) {
 	def bt = BTreeCrashTester.new(tc.t);
 	def trace = bt.recordUpdate("load_audit_btree_update");
@@ -1339,7 +1339,7 @@ def test_persistent_load_audit_btree_reattach_inert(tc: ProviderTester) {
 	if (trace == null) return;
 	def checks = LoadAuditChecks.new(bt.CAPACITY, 0u64);
 	def outcomes = LoadAudits.sweepInert(tc.t, trace, mounted, bt.BLOCKS,
-		bt.BLOCK_SIZE, 4, checks.btree);
+		bt.BLOCK_SIZE, 1, checks.btree);
 	tc.t.assertz(true, outcomes[WalRecovery.REPLAYED.tag] > 0);
 }
 

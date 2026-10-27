@@ -391,8 +391,10 @@ The audit has five parts, in `ProviderTest.v3`:
   are the lazy and the eager one at every cut of a two-allocation scenario
   (1,471 cuts, 2,942 images, both `CLEAN` and `REPLAYED` recoveries) and of
   one sieve step (1,457 cuts, 2,914 images, through `PWSieve.open()` and its
-  invariants), and at every fourth cut of a B+Tree update at height 3 (743 of
-  2,968 cuts, 1,486 images, through `PWBTree.open()` and its invariants).
+  invariants), and of a B+Tree update at height 3 (2,968 cuts, 5,936 images,
+  through `PWBTree.open()` and its invariants; until 2026-10-27 every fourth
+  cut, 743 cuts and 1,486 images, a limit set for time alone: every cut takes
+  8.6 s against 2.2 s on sean-tan-PC).
   On average 96 % of an allocator image and 92 % of a sieve image is neither
   observed nor stored, and so varied (at least 90 % and 78 %).
 - `provider:load_audit_btree_descents_fetch_the_path`: the B+Tree's
