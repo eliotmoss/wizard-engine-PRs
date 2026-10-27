@@ -481,9 +481,11 @@ Run from a clean tree at the commit under test; each campaign interleaves its
 configurations and pins to the DAX namespace's node.
 
 ```
-# Unit tests: the full binary (at 95e055fa on sean-tan-PC, 2,082 of 2,089 pass
-# and the 7 known failures fail; results/20261026T120025Z-sean-tan-PC-unit-suite;
-# the same on Magpie, results/20261027T034400Z-magpie-test-suites;
+# Unit tests: the full binary (at 5e3f6219 on sean-tan-PC, 2,082 of 2,089 pass
+# and the 7 known failures fail; results/20261027T104232Z-sean-tan-PC-unit-suite;
+# the same on Magpie, results/20261027T104553Z-magpie-test-suites; the same at
+# 95e055fa, results/20261026T120025Z-sean-tan-PC-unit-suite and
+# results/20261027T034400Z-magpie-test-suites;
 # 2,081 of 2,088 at 8593399a, results/20261025T112614Z-sean-tan-PC-unit-suite;
 # 2,031 of 2,038 on 2026-10-14), then the file backend's restriction
 # checks on their own, then the
@@ -491,7 +493,7 @@ configurations and pins to the DAX namespace's node.
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
 bin/unittest.x86-64-linux 'mapped_file:*'
 PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
-# Or both suites at 95e055fa in one results directory, compared test by test
+# Or both suites at 5e3f6219 in one results directory, compared test by test
 # with sean-tan-PC's run: bash scripts/magpie-test-suites.sh
 
 # B2 without root: stable pages requested, and whether any layer is dm-crypt
@@ -3704,7 +3706,8 @@ one medium is not wrong on the other, merely pointless.
 ## Every campaign again at `95e055fa` (2026-10-27)
 
 Every timing campaign, kill loop and control the thesis cites was rerun on
-2026-10-27 at `95e055fa`, the revision of both test suites, with each
+2026-10-27 at `95e055fa`, whose code differs from the test suites' revision,
+`5e3f6219`, only in one test's stride, with each
 campaign's original parameters and placement: on Magpie by
 `scripts/magpie-campaigns.sh`, and on sean-tan-PC by
 `scripts/desktop-sitting.sh` (as root: the emulated PMEM device under
@@ -4688,7 +4691,11 @@ makes every backend refuse a region of 2 GiB or more before opening it, the
 twenty files register 378, all passing, and the full binary 2,089, of which
 2,082 pass and the same 7 fail (`results/20261026T120025Z-sean-tan-PC-unit-suite`); on Magpie
 (2026-10-27) every test has the same outcome
-(`results/20261027T034400Z-magpie-test-suites`). The table below lists twelve of the
+(`results/20261027T034400Z-magpie-test-suites`). At `5e3f6219`, which makes the
+B+Tree's inert-bytes audit check every cut instead of every fourth, the counts
+and outcomes are the same on both hosts
+(`results/20261027T104232Z-sean-tan-PC-unit-suite`,
+`results/20261027T104553Z-magpie-test-suites`). The table below lists twelve of the
 twenty files. The other eight are `DirectIoRegionTest.v3` (23),
 `CrashExplorerTest.v3` (16), `CrashRecoveryTest.v3` (14),
 `AllocatorCrashTest.v3` (13), `ReadDrivenExplorerTest.v3` (11),

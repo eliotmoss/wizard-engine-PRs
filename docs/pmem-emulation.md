@@ -733,6 +733,17 @@ test as on sean-tan-PC; all 378 implementation-specific tests passed. Its
 and the code from its second page boundary, the case that crashed at
 `8593399a`'s code, guarded.
 
+**2026-10-27: both suites again at `5e3f6219`.** `5e3f6219` makes the B+Tree's
+inert-bytes audit check every cut of its update instead of every fourth
+([pmem-crash-model.md](pmem-crash-model.md)); the persistence code is
+`95e055fa`'s. The same script ran both suites on Magpie at it
+(`results/20261027T104553Z-magpie-test-suites`), against sean-tan-PC's run at
+the same revision (`results/20261027T104232Z-sean-tan-PC-unit-suite`). Both DAX
+tests passed; the unit binary ran 2,089 tests, 2,082 passed and the 7 expected
+failures failed, with the same names and outcomes as on sean-tan-PC, and all
+378 implementation-specific tests passed. The stub layout is the guarded case
+above.
+
 The target builds a separate `bin/pmemtest.x86-64-linux` binary. Its two tests
 are not registered in the default unit suite or run by CI. The runner never
 unlinks a caller-selected filename: it atomically reserves a new `0600` file in

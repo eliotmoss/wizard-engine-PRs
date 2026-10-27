@@ -1,0 +1,2 @@
+unittest.x86-64-linux: pregen_buffer at 0x8442a58 (page offset 2648); code from page boundary 1 (0x8443000); mprotect to 0x845a000; buffer to 0x845ba58: inside the buffer
+pmemtest.x86-64-linux: pregen_buffer at 0x82befc8 (page offset 4040); code from page boundary 2 (0x82c0000); mprotect to 0x82d7000; buffer to 0x82d7fc8: inside the buffer

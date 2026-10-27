@@ -1,0 +1,33 @@
+---- revision
+commit   5e3f62197cff67b857d45b1d05158db9a43f1829
+subject  test(pmem): the B+Tree inert-bytes audit at every cut, as the other two run
+run in   a detached worktree /home/users/u7599095/wizard-engine-wt-5e3f6219 at that commit; the checkout /home/users/u7599095/wizard-engine-PRs is at b910a336 (pwregions)
+dirty    0 changed files in the worktree before the build
+same as  the desktop run results/20261027T104232Z-sean-tan-PC-unit-suite (revision 5e3f62197cff67b857d45b1d05158db9a43f1829)
+---- host
+hostname magpie
+kernel   Linux 6.8.0-137-generic #137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 20:28:23 UTC 2026 x86_64
+boot_id  deb3203e-ef90-4ba8-b37a-f0ff7ed33aaf
+cmdline  BOOT_IMAGE=/boot/vmlinuz-6.8.0-137-generic root=/dev/mapper/ubuntu--vg-ubuntu--lv ro
+cpu      Intel(R) Xeon(R) Gold 6252N CPU @ 2.30GHz, 96 CPUs online
+user     u7599095; sudo -n: sudo: a password is required
+load     0.00 0.00 0.00 1/997 274943 (2026-10-27T10:45:54+00:00, before the builds)
+/tmp     ext4   /dev/mapper/ubuntu--vg-ubuntu--lv
+bin      ext4   /dev/mapper/ubuntu--vg-lv--home (the worktree, whose bin/ the O_DIRECT tests use if the backend refuses /tmp)
+dax      /mnt/pmem0.0/sean on /dev/pmem0 /mnt/pmem0.0 ext4   rw,relatime,dax=always
+---- toolchain
+v3c      /home/users/u7599095/virgil-titzer/bin/v3c-x86-64-linux
+virgil   /home/users/u7599095/virgil-titzer: 47be87e81a88f94a744119835eaf4877885f54e7 2026-08-27 
+version  Aeneas III-11.1968
+tools    GNU Make 4.3; GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu); git version 2.43.0; Python 3.12.3
+---- unit suite
+build    started 2026-10-27T10:45:54+00:00
+build    finished 2026-10-27T10:45:56+00:00, exit 0
+ba453bad4bf7c3c5e5cdc64a701e0ed2671c961547d122949d0188181b4af66e  bin/unittest.x86-64-linux
+run      started 2026-10-27T10:45:56+00:00: env TEST_TARGET=x86-64-linux test/unit.sh
+run      finished 2026-10-27T10:52:38+00:00, unit.sh exit 0 (tee's status; the outcome is read from unit.log)
+dirty    0 changed files in the worktree after the unit run
+---- DAX suite
+1b07e48231af85b2f4c4f3648a6c6c2ff165eb5db9c7411ff95a72757ba6e725  bin/pmemtest.x86-64-linux
+run      started 2026-10-27T10:52:39+00:00: PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
+run      finished 2026-10-27T10:52:39+00:00, exit 0
