@@ -722,6 +722,17 @@ expected failures). With it both tests passed on Magpie on 2026-10-26
 shows the case that crashed, guarded: the buffer 3,960 bytes into its page,
 the code from its second page boundary, and the protection inside the buffer.
 
+**2026-10-27: both suites at `95e055fa`.** `scripts/magpie-test-suites.sh`
+ran the full unit binary and this DAX suite on Magpie at `95e055fa`, the
+revision of sean-tan-PC's unit-suite run, so that every test run is at one
+revision (`results/20261027T034400Z-magpie-test-suites`). Both DAX tests
+passed. The unit binary ran 2,089 tests, of which 2,082 passed and the 7
+expected failures failed, with the same names and the same outcome for every
+test as on sean-tan-PC; all 378 implementation-specific tests passed. Its
+`pregen-layout.txt` shows the DAX binary's buffer 4,040 bytes into its page
+and the code from its second page boundary, the case that crashed at
+`8593399a`'s code, guarded.
+
 The target builds a separate `bin/pmemtest.x86-64-linux` binary. Its two tests
 are not registered in the default unit suite or run by CI. The runner never
 unlinks a caller-selected filename: it atomically reserves a new `0600` file in

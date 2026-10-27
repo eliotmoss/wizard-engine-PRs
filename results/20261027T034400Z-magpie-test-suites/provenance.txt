@@ -1,0 +1,33 @@
+---- revision
+commit   95e055faff802e8c179c608ef775a02c99072c09
+subject  fix(persistence): every backend refuses a region of 2 GiB or more before opening it
+run in   a detached worktree /home/users/u7599095/wizard-engine-wt-95e055fa at that commit; the checkout /home/users/u7599095/wizard-engine-PRs is at ad430d31 (pwregions)
+dirty    0 changed files in the worktree before the build
+same as  the desktop run results/20261026T120025Z-sean-tan-PC-unit-suite (revision 95e055faff802e8c179c608ef775a02c99072c09)
+---- host
+hostname magpie
+kernel   Linux 6.8.0-137-generic #137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 20:28:23 UTC 2026 x86_64
+boot_id  deb3203e-ef90-4ba8-b37a-f0ff7ed33aaf
+cmdline  BOOT_IMAGE=/boot/vmlinuz-6.8.0-137-generic root=/dev/mapper/ubuntu--vg-ubuntu--lv ro
+cpu      Intel(R) Xeon(R) Gold 6252N CPU @ 2.30GHz, 96 CPUs online
+user     u7599095; sudo -n: sudo: a password is required
+load     0.00 0.00 0.00 1/1003 254058 (2026-10-27T03:44:01+00:00, before the builds)
+/tmp     ext4   /dev/mapper/ubuntu--vg-ubuntu--lv
+bin      ext4   /dev/mapper/ubuntu--vg-lv--home (the worktree, whose bin/ the O_DIRECT tests use if the backend refuses /tmp)
+dax      /mnt/pmem0.0/sean on /dev/pmem0 /mnt/pmem0.0 ext4   rw,relatime,dax=always
+---- toolchain
+v3c      /home/users/u7599095/virgil-titzer/bin/v3c-x86-64-linux
+virgil   /home/users/u7599095/virgil-titzer: 47be87e81a88f94a744119835eaf4877885f54e7 2026-08-27 
+version  Aeneas III-11.1968
+tools    GNU Make 4.3; GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu); git version 2.43.0; Python 3.12.3
+---- unit suite
+build    started 2026-10-27T03:44:01+00:00
+build    finished 2026-10-27T03:44:04+00:00, exit 0
+543fe37f999947b0050085e6d0f20b0c7d32ff411bee22d73a14298aac504306  bin/unittest.x86-64-linux
+run      started 2026-10-27T03:44:04+00:00: env TEST_TARGET=x86-64-linux test/unit.sh
+run      finished 2026-10-27T03:50:23+00:00, unit.sh exit 0 (tee's status; the outcome is read from unit.log)
+dirty    0 changed files in the worktree after the unit run
+---- DAX suite
+1b07e48231af85b2f4c4f3648a6c6c2ff165eb5db9c7411ff95a72757ba6e725  bin/pmemtest.x86-64-linux
+run      started 2026-10-27T03:50:24+00:00: PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
+run      finished 2026-10-27T03:50:24+00:00, exit 0

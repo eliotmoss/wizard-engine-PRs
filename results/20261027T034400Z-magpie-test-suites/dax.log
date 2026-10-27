@@ -1,0 +1,8 @@
+bin/pmemtest.x86-64-linux "/mnt/pmem0.0/sean"
+Using temporary PMEM region: /mnt/pmem0.0/sean/wizard-pmem-u7599095-p254286-0.region
+##>2 unit tests
+##+pmem_dax:backend_accepts_map_sync
+##-ok
+##+pmem_dax:clean_remount_and_wal_replay
+##-ok
+exit 0

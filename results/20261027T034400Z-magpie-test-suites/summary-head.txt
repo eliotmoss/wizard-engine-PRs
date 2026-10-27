@@ -1,0 +1,14 @@
+
+==== outcome (/home/users/u7599095/wizard-engine-PRs/results/20261027T034400Z-magpie-test-suites)
+##>2089 unit tests
+persistence files: 20, static registrations 378, ran 378, pass 378, expected-fail 0, fail 0
+whole binary: ran 2089, pass 2082, expected-fail 7, fail 0
+names vs desktop: identical
+tests whose result differs from the desktop run: 0
+unittest.x86-64-linux: pregen_buffer at 0x8442a58 (page offset 2648); code from page boundary 1 (0x8443000); mprotect to 0x845a000; buffer to 0x845ba58: inside the buffer
+pmemtest.x86-64-linux: pregen_buffer at 0x82befc8 (page offset 4040); code from page boundary 2 (0x82c0000); mprotect to 0x82d7000; buffer to 0x82d7fc8: inside the buffer
+##+pmem_dax:backend_accepts_map_sync
+##-ok
+##+pmem_dax:clean_remount_and_wal_replay
+##-ok
+exit 0

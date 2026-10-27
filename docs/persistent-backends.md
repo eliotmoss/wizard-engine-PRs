@@ -483,6 +483,7 @@ configurations and pins to the DAX namespace's node.
 ```
 # Unit tests: the full binary (at 95e055fa on sean-tan-PC, 2,082 of 2,089 pass
 # and the 7 known failures fail; results/20261026T120025Z-sean-tan-PC-unit-suite;
+# the same on Magpie, results/20261027T034400Z-magpie-test-suites;
 # 2,081 of 2,088 at 8593399a, results/20261025T112614Z-sean-tan-PC-unit-suite;
 # 2,031 of 2,038 on 2026-10-14), then the file backend's restriction
 # checks on their own, then the
@@ -490,6 +491,8 @@ configurations and pins to the DAX namespace's node.
 make -j bin/unittest.x86-64-linux && bin/unittest.x86-64-linux
 bin/unittest.x86-64-linux 'mapped_file:*'
 PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean make pmem-integration
+# Or both suites at 95e055fa in one results directory, compared test by test
+# with sean-tan-PC's run: bash scripts/magpie-test-suites.sh
 
 # B2 without root: stable pages requested, and whether any layer is dm-crypt
 cat /sys/block/*/queue/stable_writes
@@ -4580,7 +4583,9 @@ spec-parser coverage, of which 2,081 pass and the 7 listed in
 the per-file counts and what was counted). At `95e055fa` (2026-10-26), which
 makes every backend refuse a region of 2 GiB or more before opening it, the
 twenty files register 378, all passing, and the full binary 2,089, of which
-2,082 pass and the same 7 fail (`results/20261026T120025Z-sean-tan-PC-unit-suite`). The table below lists twelve of the
+2,082 pass and the same 7 fail (`results/20261026T120025Z-sean-tan-PC-unit-suite`); on Magpie
+(2026-10-27) every test has the same outcome
+(`results/20261027T034400Z-magpie-test-suites`). The table below lists twelve of the
 twenty files. The other eight are `DirectIoRegionTest.v3` (23),
 `CrashExplorerTest.v3` (16), `CrashRecoveryTest.v3` (14),
 `AllocatorCrashTest.v3` (13), `ReadDrivenExplorerTest.v3` (11),

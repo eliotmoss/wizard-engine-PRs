@@ -1,0 +1,41 @@
+Full x86-64-linux unit suite and the opt-in PMEM DAX suite, engine 95e055fa, magpie, 2026-10-27
+
+Both suites at the revision of the desktop's unit run
+(results/20261026T120025Z-sean-tan-PC-unit-suite), so that every test run the
+thesis cites is at one revision. Run by scripts/magpie-test-suites.sh (a copy
+is in this directory) in a detached worktree at 95e055fa, from sean-tan-PC over
+SSH (through the Mac and bulwark). Magpie's checkout was brought to ad430d31
+by a push from sean-tan-PC, since Magpie reaches GitHub only through a
+forwarded agent; the script ran with SYNC=0 and committed nothing.
+
+Unit suite (unit.log; summarise-out.txt per file):
+
+  registered and run   2,089  ("##>2089 unit tests")
+  passed               2,082
+  expected failures        7  the names in test/unittest.failures.x86-64-linux
+  unexpected failures      0
+  persistence tests      378  in twenty files; all ran and all passed
+
+  The same test names as the desktop run (names-vs-desktop.diff is empty) and
+  the same outcome for every test (outcomes-vs-desktop.txt: 0 differ).
+  Wall time 6:18 (unit-time.txt), against 1:48 on the desktop.
+
+  Magpie's /tmp is ext4 on LVM, so the direct-I/O tests used /tmp; neither
+  /tmp nor the worktree is on a DAX mount, so the platform factories' PMEM
+  tests took their path without MAP_SYNC, as on the desktop.
+
+DAX suite (dax.log), PWASM_PMEM_TEST_DIR=/mnt/pmem0.0/sean (/dev/pmem0, ext4,
+dax=always):
+
+  pmem_dax:backend_accepts_map_sync       ok
+  pmem_dax:clean_remount_and_wal_replay   ok
+  exit 0; the runner removed its region file.
+
+Stub layout (pregen-layout.txt): in both binaries the stubs' protected range
+ends inside pregen_buffer. The DAX binary's buffer starts 4,040 bytes into its
+page, so its code starts at the second page boundary: the layout that crashed
+at 8593399a's code (results/20261026T014838Z-magpie-pmem-dax-suite), guarded
+by 8b4dc856's two pages of slack, which 95e055fa includes.
+
+Toolchain: Virgil III-11.1968 at 47be87e8, Magpie's compiler, as in the
+earlier Magpie runs (provenance.txt).
