@@ -1,0 +1,24 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /mnt/pmem0.0/sean
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+tsc kHz 2294601
+wall ns per step 582582
+step ns: mean 582522
+step ns: min 536271 median 583195 p90 599906
+step ns: p99 631816 max 1509790
+phase compute ns per step 482739
+phase alloc ns per step 30760
+phase bitmap ns per step 27315
+phase publish ns per step 16505
+phase retire ns per step 25156
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12809
+OK

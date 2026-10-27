@@ -1,0 +1,22 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+region file /home/users/u7599095/wizard-pwbench-u7599095-p258738-0.region
+region 512 blocks of 4096 bytes, scratch 1 blocks
+entry stride 8 bytes
+apply batch
+commits measured 20000, entries per commit 8
+persist boundaries 20000, prepare calls 40000
+boundaries per commit x1000 1000, clwb lines 0
+tsc cycles per microsecond 2294
+tsc kHz 2294601
+boundary cycles: min 302878 median 323228 p90 372432
+boundary cycles: p99 1624562 max 56859488
+boundary ns: min 131995 median 140864 p90 162307
+boundary ns: p99 707993 max 24779684
+total boundary cycles 7360294062
+total prepare cycles 0
+measured wall ns 3869060819, boundary share x1000 829
+wall ns per commit 193453
+minor faults 1642 during the measured commits
+direct io: writes 20000, bytes 163840000, syncs 20000
+direct io: write cycles 7274445128, sync cycles 85848934
+OK

@@ -1,0 +1,20 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+directory /mnt/pmem0.0/sean
+writeback none -- no writeback, fence kept, approximates eADR timing, the region is NOT durable, CPUID selects CLWB
+tsc cycles per microsecond 2294
+tsc kHz 2294605
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 14228 median_ns 14761 p90_ns 16152 p99_ns 17378 max_ns 158716 mean_ns 14985 boundaries 1 prepares 0 lines 15
+op free-1 samples 50000 entries 10 min_ns 9886 median_ns 10266 p90_ns 11656 p99_ns 12113 max_ns 152875 mean_ns 10419 boundaries 1 prepares 0 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 14288 median_ns 14826 p90_ns 16219 p99_ns 17434 max_ns 701076 mean_ns 15058 boundaries 1 prepares 0 lines 17
+op free-8 samples 50000 entries 10 min_ns 9952 median_ns 10292 p90_ns 11682 p99_ns 12168 max_ns 93928 mean_ns 10457 boundaries 1 prepares 0 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 14268 median_ns 14844 p90_ns 16214 p99_ns 17476 max_ns 190947 mean_ns 15084 boundaries 1 prepares 0 lines 17
+op free-64 samples 50000 entries 10 min_ns 9892 median_ns 10307 p90_ns 11683 p99_ns 12467 max_ns 1101419 mean_ns 10492 boundaries 1 prepares 0 lines 13
+op commit-empty samples 50000 entries 0 min_ns 21 median_ns 22 p90_ns 24 p99_ns 24 max_ns 1513 mean_ns 22 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 16 median_ns 18 p90_ns 19 p99_ns 19 max_ns 15920 mean_ns 18 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 8461 median_ns 8699 p90_ns 10420 p99_ns 11997 max_ns 12460 mean_ns 9249 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 14222 median_ns 14589 p90_ns 16369 p99_ns 18335 max_ns 67011 mean_ns 15386 boundaries 1 prepares 0 lines 8
+op recover-24 samples 200 entries 24 min_ns 19911 median_ns 20286 p90_ns 22046 p99_ns 24249 max_ns 42069 mean_ns 20950 boundaries 1 prepares 0 lines 24
+op mount-64mib samples 200 entries 0 min_ns 4979 median_ns 5326 p90_ns 7073 p99_ns 10760 max_ns 23108 mean_ns 5911 boundaries 0 prepares 0 lines 0
+OK timing-only: writeback=none, the region was never durable

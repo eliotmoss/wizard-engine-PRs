@@ -1,0 +1,8 @@
+---- median boundary ns, median over 1 repetitions
+config             geometry  entries    boundary_ns
+direct-block       512x4096        8         133422
+file-block         512x4096        8         142036
+file-dax           512x4096        8         927707
+pmem-dax           512x4096        8             11
+---- boundaries per commit x1000 by configuration (must be 1000, except on file-*-msync, where it counts syncs; a higher value elsewhere means the overwrite guard fired)
+direct-block=1000 file-block=1000 file-dax=1000 pmem-dax=1000 

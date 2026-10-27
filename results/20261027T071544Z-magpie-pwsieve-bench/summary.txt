@@ -1,0 +1,28 @@
+---- per step, median over repetitions (ns unless noted; steps per run in the log)
+config                  reps      wall    wall range    median  compute    alloc   bitmap  publish   retire  persist  bound   lines faults
+pmem-auto                  5    536174 536042-537139    537429   481720    12733    20140     9244    12235    54352   4.00    94.6   2.14
+pmem-clflushopt            5    534482 534045-535051    535654   482042    12484    18830     9053    12039    52406   4.00    94.6   2.14
+pmem-none                  5    531258 530744-534531    532218   482090    11270    18367     8695    10787    49119   4.00    94.6   2.14
+file-dax                   5    582190 581681-582635    582686   482472    30700    27245    16501    25199    99645   4.00     0.0  12.81
+file-block                 5   2705695 2704005-2714718   2687769  1180181   449029   610094   229430   236984  1525537   4.00     0.0  12.81
+direct-block               5   2861739 2849025-2885648   2828129  1262968   498643   665994   205885   219583  1590105   4.00     0.0   2.14
+file-block-legacy          5   2622593 2601752-2639603   2610535  1204340   452640   251147   448393   268439  1420619   4.00     0.0  12.81
+
+---- shares
+pmem-auto               persistence phases (alloc+bitmap+publish+retire)  10.1 % of a step
+pmem-clflushopt         persistence phases (alloc+bitmap+publish+retire)   9.8 % of a step
+pmem-none               persistence phases (alloc+bitmap+publish+retire)   9.2 % of a step
+file-dax                persistence phases (alloc+bitmap+publish+retire)  17.1 % of a step
+file-block              persistence phases (alloc+bitmap+publish+retire)  56.4 % of a step
+direct-block            persistence phases (alloc+bitmap+publish+retire)  55.6 % of a step
+file-block-legacy       persistence phases (alloc+bitmap+publish+retire)  54.2 % of a step
+writebacks by removal: pmem-auto - pmem-none = 4916 ns per step (0.9 % of pmem-auto)
+  (pmem-none issues no writeback instruction, but its dirty lines still reach memory when they
+  are evicted, possibly during another phase: this is the instructions' cost, not the traffic's)
+instruction: pmem-clflushopt - pmem-auto = -1692 ns per step (-0.3 %)
+
+Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median
+step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence
+boundaries per step (syncs per step on file-*-msync, one per run of marked pages); lines =
+cache-line writebacks per step (pmem only); faults = minor faults per step. A difference of a
+few percent is real only outside the wall range of both.

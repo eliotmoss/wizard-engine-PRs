@@ -1,0 +1,15 @@
+backend pmem (MAP_SYNC + CLWB/SFENCE)
+directory /mnt/pmem0.0/sean
+writeback none -- no writeback, fence kept, approximates eADR timing, the region is NOT durable, CPUID selects CLWB
+region 256 blocks of 4096 bytes, rounds 3 measured after 1 audited
+workload per round: load 5000 keys, then 5000 operations, half lookups and half updates, seed 1
+tree capacity 252 keys per node, 508 words per node
+after the load: 5000 keys, height 2, 33 nodes
+round 0 audited 10000 operations: every commit's lines matched its record, every WRITE its nodes; 5000 keys match the reference
+tsc cycles per microsecond 2294
+op insert samples 15000 min_ns 23458 median_ns 50490 p90_ns 55152 p99_ns 170861 max_ns 442705 mean_ns 52448 compute_ns 3504 alloc_ns 22525 write_ns 6333 publish_ns 12851 free_ns 7121 boundaries_x1000 4905 prepares_x1000 0 lines_x1000 94876 boundaries_min 3 boundaries_max 6 splits 93
+op update samples 7539 min_ns 47590 median_ns 50183 p90_ns 52443 p99_ns 57367 max_ns 98299 mean_ns 50541 compute_ns 3416 alloc_ns 21161 write_ns 6096 publish_ns 12568 free_ns 7189 boundaries_x1000 5000 prepares_x1000 0 lines_x1000 94660 boundaries_min 5 boundaries_max 5 splits 0
+op lookup samples 7461 min_ns 191 median_ns 278 p90_ns 312 p99_ns 340 max_ns 10938 mean_ns 282 compute_ns 277 alloc_ns 0 write_ns 0 publish_ns 0 free_ns 0 boundaries_x1000 0 prepares_x1000 0 lines_x1000 0 boundaries_min 0 boundaries_max 0 splits 0
+wall ns per insert (load) 52804, per operation (mix) 25822
+minor faults x1000 per insert (load) 401, per operation (mix) 194
+OK timing-only: writeback=none, the region was never durable

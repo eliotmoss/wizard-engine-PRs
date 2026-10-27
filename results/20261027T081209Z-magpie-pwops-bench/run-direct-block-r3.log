@@ -1,0 +1,19 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/users/u7599095
+tsc cycles per microsecond 2294
+tsc kHz 2294614
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 482298 median_ns 557359 p90_ns 1036430 p99_ns 1289634 max_ns 65720041 mean_ns 649903 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 460769 median_ns 536405 p90_ns 1025431 p99_ns 1280843 max_ns 51994010 mean_ns 632984 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 478698 median_ns 557924 p90_ns 1038442 p99_ns 1288804 max_ns 69696365 mean_ns 653964 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 460708 median_ns 536478 p90_ns 1024812 p99_ns 1277804 max_ns 147022202 mean_ns 637094 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 338688 median_ns 367111 p90_ns 548409 p99_ns 1063530 max_ns 25206717 mean_ns 418128 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 326851 median_ns 352896 p90_ns 551393 p99_ns 1057256 max_ns 45147685 mean_ns 405287 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 21 median_ns 22 p90_ns 24 p99_ns 24 max_ns 32 mean_ns 22 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 16 median_ns 18 p90_ns 19 p99_ns 19 max_ns 1564 mean_ns 18 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 24288701 median_ns 24406640 p90_ns 24431933 p99_ns 24458016 max_ns 48696263 mean_ns 24556094 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 21697299 median_ns 21762662 p90_ns 21838178 p99_ns 46710894 max_ns 55020835 mean_ns 22578333 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 24761134 median_ns 24805080 p90_ns 24827550 p99_ns 24893213 max_ns 26920217 mean_ns 24817040 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 496739594 median_ns 550528532 p90_ns 567413578 p99_ns 616895921 max_ns 651876725 mean_ns 555799481 boundaries 0 prepares 0 lines 0
+OK

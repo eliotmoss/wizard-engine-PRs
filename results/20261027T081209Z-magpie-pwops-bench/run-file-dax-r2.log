@@ -1,0 +1,20 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /mnt/pmem0.0/sean
+tsc cycles per microsecond 2294
+tsc kHz 2294607
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 33257 median_ns 34762 p90_ns 36745 p99_ns 38933 max_ns 3099123 mean_ns 35189 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 29318 median_ns 30695 p90_ns 32316 p99_ns 34189 max_ns 2995687 mean_ns 31014 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 33678 median_ns 35146 p90_ns 37107 p99_ns 38884 max_ns 138967 mean_ns 35511 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 29653 median_ns 31088 p90_ns 32768 p99_ns 34360 max_ns 138223 mean_ns 31356 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 37093 median_ns 38769 p90_ns 40761 p99_ns 42483 max_ns 146690 mean_ns 39132 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 33156 median_ns 34739 p90_ns 36491 p99_ns 38163 max_ns 1254552 mean_ns 35030 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 21 median_ns 22 p90_ns 24 p99_ns 24 max_ns 31 mean_ns 22 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 16 median_ns 17 p90_ns 18 p99_ns 18 max_ns 4881 mean_ns 17 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 9111 median_ns 9554 p90_ns 11243 p99_ns 13216 max_ns 13362 mean_ns 10067 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 19057 median_ns 19592 p90_ns 21416 p99_ns 22670 max_ns 77200 mean_ns 20369 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 25741 median_ns 26662 p90_ns 28532 p99_ns 33296 max_ns 91325 mean_ns 27793 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 5261 median_ns 7054 p90_ns 7249 p99_ns 8837 max_ns 11395 mean_ns 6822 boundaries 0 prepares 0 lines 0
+OK

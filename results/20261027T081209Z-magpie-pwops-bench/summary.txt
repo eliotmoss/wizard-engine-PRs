@@ -1,0 +1,90 @@
+---- ns per operation; each cell the median over repetitions of a run's statistic
+repetitions: pmem-auto 5 pmem-none 5 file-dax 5 file-block 5 direct-block 5
+
+---- median
+operation              pmem-auto         pmem-none          file-dax        file-block      direct-block
+alloc-1                    16458             14762             34464            573719            574051
+alloc-8                    16858             14836             34706            577018            562296
+alloc-64                   16700             14839             38465            441689            367445
+free-1                     11420             10266             30270            555232            557297
+free-8                     11801             10297             30722            557572            546391
+free-64                    11800             10304             34379            431957            353572
+commit-empty                  22                22                22                22                22
+timer                         17                17                17                18                18
+mount-1mib                  7712              8699              8323             30005          24402114
+mount-64mib                 5270              5326              7097              8346         550528532
+recover-8                  19340             14579             18089            176403          21768418
+recover-24                 36210             20396             25135            197212          24803936
+
+---- p90
+operation              pmem-auto         pmem-none          file-dax        file-block      direct-block
+alloc-1                    17878             16152             36426            870731            904351
+alloc-8                    18294             16235             36658            877361            905817
+alloc-64                   18131             16238             40461            623805            548409
+free-1                     12816             11657             32038            849879            986806
+free-8                     13222             11702             32456            858856            891389
+free-64                    13227             11708             36158            722563            551393
+commit-empty                  24                24                24                24                24
+timer                         18                18                18                19                19
+mount-1mib                  9498             10433             10304             37810          24426810
+mount-64mib                 7025              7073              7364              9153         567413578
+recover-8                  21310             16369             20075            199249          21822405
+recover-24                 38092             22173             27151            226076          24825004
+
+---- spread of the per-run medians, (max - min) / median, %
+operation              pmem-auto         pmem-none          file-dax        file-block      direct-block
+alloc-1                     1.8%              0.9%              1.6%             11.8%             16.3%
+alloc-8                     1.5%              0.9%              2.2%             12.3%             15.9%
+alloc-64                    1.7%              0.9%              1.5%             15.5%             26.5%
+free-1                      1.0%              0.6%              2.0%             12.7%             16.7%
+free-8                      1.0%              0.4%              2.4%             13.3%             16.3%
+free-64                     0.9%              0.4%              1.5%             12.6%             26.7%
+commit-empty                4.5%              4.5%              4.5%              4.5%              0.0%
+timer                       0.0%              5.9%              0.0%             50.0%              0.0%
+mount-1mib                 17.8%             17.0%             15.8%             13.7%              0.4%
+mount-64mib                 2.5%              2.2%              8.4%             47.5%             15.1%
+recover-8                   8.6%             10.4%              9.1%             15.9%              0.2%
+recover-24                  5.3%              8.0%              7.0%             14.6%              0.0%
+
+---- work per operation, checked on every operation: entries / boundaries / lines written back
+operation              pmem-auto         pmem-none          file-dax        file-block      direct-block
+alloc-1              16 / 1 / 15       16 / 1 / 15       16 / 1 / 15       16 / 1 / 15       16 / 1 / 15
+alloc-8              16 / 1 / 17       16 / 1 / 17       16 / 1 / 17       16 / 1 / 17       16 / 1 / 17
+alloc-64             16 / 1 / 17       16 / 1 / 17       16 / 1 / 17       16 / 1 / 17       16 / 1 / 17
+free-1               10 / 1 / 11       10 / 1 / 11       10 / 1 / 11       10 / 1 / 11       10 / 1 / 11
+free-8               10 / 1 / 13       10 / 1 / 13       10 / 1 / 13       10 / 1 / 13       10 / 1 / 13
+free-64              10 / 1 / 13       10 / 1 / 13       10 / 1 / 13       10 / 1 / 13       10 / 1 / 13
+commit-empty           0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+timer                  0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+mount-1mib             0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+mount-64mib            0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0         0 / 0 / 0
+recover-8              8 / 1 / 8         8 / 1 / 8         8 / 1 / 8         8 / 1 / 8         8 / 1 / 8
+recover-24           24 / 1 / 24       24 / 1 / 24       24 / 1 / 24       24 / 1 / 24       24 / 1 / 24
+
+---- derived, from the medians
+operation              pmem-auto         pmem-none          file-dax        file-block      direct-block
+replay-8                   11628              5880              9766            146398          -2633696
+replay-24                  28498             11697             16812            167207            401822
+64mib/1mib                  0.7x              0.6x              0.9x              0.3x             22.6x
+
+---- pmem-auto - pmem-none: what the writeback instructions cost each operation, ns (an eADR approximation)
+alloc-1              1696  ( 10.3 % of pmem-auto)
+alloc-8              2022  ( 12.0 % of pmem-auto)
+alloc-64             1861  ( 11.1 % of pmem-auto)
+free-1               1154  ( 10.1 % of pmem-auto)
+free-8               1504  ( 12.7 % of pmem-auto)
+free-64              1496  ( 12.7 % of pmem-auto)
+commit-empty            0  (  0.0 % of pmem-auto)
+timer                   0  (  0.0 % of pmem-auto)
+mount-1mib           -987  (-12.8 % of pmem-auto)
+mount-64mib           -56  ( -1.1 % of pmem-auto)
+recover-8            4761  ( 24.6 % of pmem-auto)
+recover-24          15814  ( 43.7 % of pmem-auto)
+
+Each operation is its own committed transaction except commit-empty (production commits nothing for
+it: no boundary) and timer (an empty rdtsc window, the floor under every figure). mount-* opens a
+cleanly closed region; recover-k opens a 1 MiB region whose log holds one committed, unapplied
+transaction of k entries, so replay-k = recover-k - mount-1mib. lines counts writeback requests
+(pmem, direct and file; 0 on file-*-legacy, the file boundary before 2026-10-13, which makes none).
+pmem-none drops CLWB and keeps SFENCE: an approximation of eADR timing, never durable. A difference
+is real only outside both spreads.

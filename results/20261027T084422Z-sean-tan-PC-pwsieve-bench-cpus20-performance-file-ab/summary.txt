@@ -1,0 +1,16 @@
+---- per step, median over repetitions (ns unless noted; steps per run in the log)
+config                  reps      wall    wall range    median  compute    alloc   bitmap  publish   retire  persist  bound   lines faults
+file-block                15   1267098 1260239-1273789   1247473   264730   252165   251270   246295   251093  1000823   4.00     0.0  12.81
+file-block-legacy         15   1272657 1265600-1294931   1268631   264553   253456   251741   254167   248165  1007529   4.00     0.0  12.81
+direct-block              15   1259980 1253029-1272293   1245673   265599   257782   260729   241978   235002   995491   4.00     0.0   2.14
+
+---- shares
+file-block              persistence phases (alloc+bitmap+publish+retire)  79.0 % of a step
+file-block-legacy       persistence phases (alloc+bitmap+publish+retire)  79.2 % of a step
+direct-block            persistence phases (alloc+bitmap+publish+retire)  79.0 % of a step
+
+Columns: wall = wall ns per step (clock_gettime over the measured steps); median = the median
+step (rdtsc); the phases are means; persist = the four persistence phases; bound = persistence
+boundaries per step (syncs per step on file-*-msync, one per run of marked pages); lines =
+cache-line writebacks per step (pmem only); faults = minor faults per step. A difference of a
+few percent is real only outside the wall range of both.

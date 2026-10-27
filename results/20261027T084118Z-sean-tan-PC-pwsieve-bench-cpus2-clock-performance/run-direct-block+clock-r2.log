@@ -1,0 +1,33 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block
+region 256 blocks of 4096 bytes, rounds 20
+clock probe on: 4096 dependent single-cycle operations per probe; references busy and after a 250000 ns sleep
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+tsc kHz 3417595
+wall ns per step 1126749
+step ns: mean 1126706
+step ns: min 1060516 median 1102987 p90 1121713
+step ns: p99 1213560 max 11988327
+phase compute ns per step 152698
+phase alloc ns per step 249152
+phase bitmap ns per step 258197
+phase publish ns per step 234314
+phase retire ns per step 232327
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 2209
+clock busy: ticks median 2577 p10 2571 p90 2581, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 1000
+clock after sleep: ticks median 2577 p10 2573 p90 2583, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 1, samples 200
+clock after sieve: ticks median 2577 p10 2571 p90 2583, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after alloc: ticks median 2577 p10 2571 p90 2581, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after bitmap: ticks median 2577 p10 2571 p90 2581, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after count: ticks median 2577 p10 2571 p90 2581, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after publish: ticks median 2577 p10 2571 p90 2581, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock after retire: ticks median 2577 p10 2571 p90 2581, implied MHz 5432, x1000 of busy 1000, first-probe excess ticks 0, samples 3180
+clock probe ns per step 9468 (removed from the figures above)
+OK

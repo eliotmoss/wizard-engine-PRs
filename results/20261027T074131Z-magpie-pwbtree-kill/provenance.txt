@@ -1,0 +1,13 @@
+---- revision
+commit 95e055faff802e8c179c608ef775a02c99072c09
+dirty  no (tracked files)
+---- host
+hostname magpie
+kernel   Linux 6.8.0-137-generic x86_64 GNU/Linux
+started  2026-10-27T07:41:32+00:00
+load     1.01 1.02 0.84
+---- parameters
+args <dir> 50 1 256 4096 <backend> <provider> (max delay 20000 us, capacity 8, key space 600: the defaults)
+dirs pmem /mnt/pmem0.0/sean; file and direct /home/users/u7599095
+unpinned
+finished 2026-10-27T07:41:36+00:00

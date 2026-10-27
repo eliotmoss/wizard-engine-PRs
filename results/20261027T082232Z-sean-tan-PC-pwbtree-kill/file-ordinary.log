@@ -1,0 +1,20 @@
+bin/pwbtree.x86-64-linux "/home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block" 50 1 256 4096 file ordinary
+backend file (mmap + fdatasync)
+region file /home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block/wizard-pwbtree-u1000-p25147-0.region
+region 256 blocks of 4096 bytes, capacity 8 keys per node
+history: keys from [0, 600), seed 1
+kill delay up to 20000 us
+iterations 50 of 50 requested, seed 1
+replayed a record 50, child finished early 0, children confirmed wiring 50
+puts acknowledged by children 26; durable mutations 48
+acknowledged-mutation checks 22, lost 0; the put in flight durable 22, not durable 28
+killed between puts: 0
+killed in a put, before its first mark: 0
+killed after COMPUTE: 16
+killed after ALLOC: 12
+killed after WRITE: 11
+killed after PUBLISH: 11
+killed after FREE: 0
+leaked chunks reclaimed at mount: 63, on 39 mounts
+final tree: 46 keys, height 2 (at most 2 over the run), 9 nodes; matches the reference
+OK

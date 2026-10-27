@@ -1,0 +1,30 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file [MUTANT in the children: cache-line writeback elided]
+region file /home/sean-tan/wizard-pwsieve-u1000-p25439-0.region
+region 512 blocks of 4096 bytes
+segment span 32512, capacity 167 segments
+kill delay up to 20000 us
+iteration 0: LOST acknowledged cursor 325120, durable cursor 0
+iteration 3: LOST acknowledged cursor 1983232, durable cursor 0
+iteration 4: LOST acknowledged cursor 1040384, durable cursor 0
+iteration 5: LOST acknowledged cursor 97536, durable cursor 0
+iteration 6: LOST acknowledged cursor 1137920, durable cursor 0
+iteration 7: LOST acknowledged cursor 292608, durable cursor 0
+iteration 8: LOST acknowledged cursor 1072896, durable cursor 0
+iteration 9: LOST acknowledged cursor 357632, durable cursor 0
+iteration 10: LOST acknowledged cursor 357632, durable cursor 0
+iteration 12: LOST acknowledged cursor 195072, durable cursor 0
+iteration 13: LOST acknowledged cursor 195072, durable cursor 0
+iteration 14: LOST acknowledged cursor 162560, durable cursor 0
+iteration 15: LOST acknowledged cursor 162560, durable cursor 0
+iteration 17: LOST acknowledged cursor 650240, durable cursor 0
+iteration 18: LOST acknowledged cursor 130048, durable cursor 0
+iteration 19: LOST acknowledged cursor 1332992, durable cursor 0
+iterations 20 of 20 requested, seed 1
+advanced 0, replayed a record 0, child finished early 0
+acknowledged-step checks 16, lost 16, children confirmed wiring 20
+steps acknowledged by children 292 over 20 iterations
+leaked extents reclaimed at mount: 0
+final cursor 0, primes 0
+reference check passed: 0 primes
+LOST
+retained region image: /home/sean-tan/wizard-pwsieve-u1000-p25439-0.region

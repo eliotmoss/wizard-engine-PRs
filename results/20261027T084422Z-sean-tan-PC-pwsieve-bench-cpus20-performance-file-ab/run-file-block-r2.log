@@ -1,0 +1,24 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+tsc kHz 3417518
+wall ns per step 1263732
+step ns: mean 1263696
+step ns: min 1194187 median 1247877 p90 1273633
+step ns: p99 1320886 max 7748354
+phase compute ns per step 264055
+phase alloc ns per step 253029
+phase bitmap ns per step 250641
+phase publish ns per step 244469
+phase retire ns per step 251457
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12806
+OK

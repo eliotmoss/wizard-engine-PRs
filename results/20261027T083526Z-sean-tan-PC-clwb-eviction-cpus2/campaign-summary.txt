@@ -1,0 +1,34 @@
+---- steps 2+3: per commit, median over repetitions (commits 20000 and 120000 differenced for counters)
+config            ent   wall_ns  bound_ns   outside  lines
+pmem-auto           1       979        34       945    4.0
+pmem-auto           8      2125        66      2059    8.0
+pmem-auto          24      5228       138      5090   18.0
+pmem-clflushopt     1      1001        33       968    4.0
+pmem-clflushopt     8      2139        65      2073    8.0
+pmem-clflushopt    24      5207       136      5071   18.0
+pmem-none           1      1011        36       974    4.0
+pmem-none           8      2085        59      2026    8.0
+pmem-none          24      5167       123      5044   18.0
+file-dax            1      3613       801      2812    4.0
+file-dax            8      4972       816      4156    8.0
+file-dax           24      8384       858      7526   18.0
+
+---- slope per entry, 1 -> 24 entries
+config             wall_ns  bound_ns   outside
+pmem-auto            184.7       4.5     180.2
+pmem-clflushopt      182.9       4.5     178.4
+pmem-none            180.7       3.8     176.9
+file-dax             207.4       2.5     205.0
+
+(no perf counters in this run: only the timing half of steps 2+3 is available)
+
+---- how to read it (docs/persistent-backends.md: outside-slope ~1440 ns/entry pmem, ~740 file)
+ A. pmem-clflushopt ~ pmem-auto in every column  -> CLWB behaves as an evicting
+    writeback in the real workload (agrees with step 1 if step 1 said EVICTED).
+ B. pmem-none's outside-slope falls toward file-dax's, and its load.local_pmm /
+    rfo.pmm per commit fall toward 0 -> the writebacks' side effect on the next
+    commit is the cause. If B's slope does not fall, the writeback is not the cause.
+ C. file-dax's rfo.pmm / load.local_pmm slope per entry is close to pmem-auto's
+    -> both backends' lines are evicted (the kernel's fdatasync on DAX writes back
+    with CLWB too), so eviction cannot be what separates them, even if B holds.
+ Eviction explains the gap only if A, B and not-C all hold.

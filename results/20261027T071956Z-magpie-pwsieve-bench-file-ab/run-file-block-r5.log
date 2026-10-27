@@ -1,0 +1,24 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /home/users/u7599095
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 2294
+tsc kHz 2294603
+wall ns per step 2745342
+step ns: mean 2745132
+step ns: min 1407159 median 2739877 p90 3259636
+step ns: p99 3730836 max 54543902
+phase compute ns per step 1206939
+phase alloc ns per step 455254
+phase bitmap ns per step 601302
+phase publish ns per step 231417
+phase retire ns per step 250036
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 12809
+OK

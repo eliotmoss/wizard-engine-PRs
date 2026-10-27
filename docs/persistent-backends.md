@@ -3701,6 +3701,109 @@ one medium is not wrong on the other, merely pointless.
 - The absolute `fdatasync` figures are properties of this host's storage stack,
   not of the design. The ratios are the portable result.
 
+## Every campaign again at `95e055fa` (2026-10-27)
+
+Every timing campaign, kill loop and control the thesis cites was rerun on
+2026-10-27 at `95e055fa`, the revision of both test suites, with each
+campaign's original parameters and placement: on Magpie by
+`scripts/magpie-campaigns.sh`, and on sean-tan-PC by
+`scripts/desktop-sitting.sh` (as root: the emulated PMEM device under
+`memmap=1G!8G`, and the governor) driving `scripts/desktop-campaigns.sh`. Each
+step names the run it repeats. The figures quoted on this page stay with their
+own revisions. The reruns check them, and what moves, moves for reasons outside
+the persistence code (below). Magpie's root sitting of 2026-10-16 was not
+rerun; it needs an administrator.
+
+### What reproduces
+
+- **Every verdict.** Magpie: the B+Tree kill loop ends `OK` on `pmem`, `file`
+  and `direct` and `LOST` for the direct mutant
+  (`20261027T074131Z-magpie-pwbtree-kill`); the control's 2×2 is the expected
+  one, the explorer rejecting the mutant and both builds `OK` on PMEM
+  (`20261027T080808Z-magpie-control`); direct-control gives `SURVIVED`, `LOST`,
+  `OK`, `LOST` (`20261027T080832Z-magpie-direct-control`). sean-tan-PC: the
+  B+Tree kill loop ends `OK` for both ordinary runs and the file mutant and
+  `LOST` for the direct mutant (`20261027T082232Z-sean-tan-PC-pwbtree-kill`),
+  and direct-control gives the same four verdicts
+  (`20261027T082236Z-sean-tan-PC-direct-control`).
+- **Magpie's boundaries on PMEM and DAX.** Commit boundary (pwbench):
+  `pmem-dax` 11–12 ns; `file-dax` 927–929 µs on node 0 against 927–929 µs on
+  2026-09-27, and 1.144–1.148 ms on node 1 against 1.146–1.148 ms on 2026-09-18
+  (`20261027T074136Z-magpie-cost`, `20261027T074804Z-magpie-cost-node1`). Region
+  size: 5.03 µs at 2 KiB blocks, 0.927–0.929 ms at 4–16 KiB
+  (`20261027T075530Z-magpie-regionsize`). Matched geometry on node 1, as
+  `20260923T053541Z` was: `file-dax` within 2 %
+  (`20261027T090021Z-magpie-g256x4096-512x4096`). B+Tree inserts on `pmem-auto`
+  57.9 µs against 58.7 µs and on `file-dax` 126.5 µs against 127.2 µs
+  (`20261027T072331Z-magpie-pwbtree-bench`); the sieve's persistence phases on
+  `pmem-auto` 54.4 µs a step against 54.0 µs
+  (`20261027T071544Z-magpie-pwsieve-bench`).
+- **Magpie's mounts and recoveries** (pwopsbench), within 9 %
+  (`20261027T081209Z-magpie-pwops-bench`).
+- **sean-tan-PC under the performance governor, and wherever the NVMe is not
+  synced.** Sieve on CPU 2: `pmem-auto` 165.7 µs a step against 166.5 µs, and
+  `file-block` 1,086 µs against 1,080 µs; on CPU 20, `file-block` 1,267 µs
+  against 1,258 µs (`20261027T084118Z-...-clock-performance`,
+  `20261027T084316Z-...-cpus2-performance-file-ab`,
+  `20261027T084422Z-...-cpus20-performance-file-ab`). CLWB eviction under
+  powersave: the boundary within 4 ns per commit, and the PMEM configurations'
+  wall within 5 % but for `pmem-none` at one entry on CPU 2, 1,011 ns against
+  918 ns (`20261027T083526Z-...-clwb-eviction-cpus2`,
+  `20261027T083555Z-...-clwb-eviction-cpus20`). Its `file-dax` rows now count
+  lines (4, 8 and 18 a commit, where 2026-09-28 shows 0) because the file
+  backend's `writeBack` has issued one `writeBackLine()` per line since
+  2026-10-13 ([above](#the-file-backend-a-restriction-of-the-pmem-model-2026-10-13)),
+  and their time outside the boundary is 3–11 % higher; that the one causes the
+  other is an inference.
+
+### What moves
+
+1. **Magpie's CPU-bound code is 13–20 % slower at `95e055fa`.** The sieve
+   computes for 482 µs a step against 426 µs, B+Tree lookups on `pmem-none`
+   take 333 ns against 277 ns, and pwopsbench's empty commit 22 ns against
+   13 ns. Run interleaved on the same afternoon
+   (`results/20261027T085910Z-magpie-ab-compute`, three pairs), `42edc6ff`'s
+   sieve computes for 426–428 µs and `95e055fa`'s for 482–483 µs, and
+   `1d7c3276`'s `pmem-none` lookup takes 277–278 ns against 333–334 ns: the
+   revision moves them, not the day. The persistence phases do not move. The
+   sieve's computation (`buildSegment` and the count) is the same code at both
+   revisions; what changed is at its boundaries (the rename, a `RegionReader`,
+   `persist()`). sean-tan-PC's computation did not move (150.9 µs against
+   152.1 µs on `pmem-auto`). We infer that the difference is where the code
+   lands on Cascade Lake; `perf` would show it, and needs root on Magpie
+   (`perf_event_paranoid` 4). At `95e055fa` the sieve's shares are 10.1 %
+   (`pmem-auto`) and 56.4 % (`file-block`), against 11.2 % and 57.9 %.
+2. **Magpie's `/home` was slower that day, by an amount that changed within
+   hours, at either revision.** Interleaved
+   (`results/20261027T090704Z-magpie-ab-block`, three pairs), the commit
+   boundary on `file-block` at 8 entries is 141–142 µs at `9f8dead1` and
+   142 µs at `95e055fa`, against 136.6 µs on 2026-09-27; the B+Tree's
+   `file-block` insert takes 2.71–2.73 ms at `1d7c3276` and 2.71–2.72 ms at
+   `95e055fa`, against 2.14 ms on 2026-10-14 and 2.44 ms in that morning's
+   campaign. pwopsbench's block allocations and frees are 3–29 % slower, with
+   per-run spreads of 12–27 % against 0.1–3.7 %. The load was 0.00 when
+   the campaigns began and no other user's process was busy; the cause is not
+   identified.
+3. **sean-tan-PC's NVMe slows under sustained syncs.** The sitting's powersave
+   half began just after a reboot with a 4 KiB `fdatasync` probe on `/` at a
+   1,621 µs median, and its B+Tree campaign's boundaries cost 1.36–1.57 ms
+   against 0.28–0.29 ms on 2026-10-14, with the same work per operation; the
+   state came and went through the next campaign. Rerun later from a 245 µs
+   probe, the B+Tree's first repetition again took 7.80 ms per insert against
+   1.40 ms, and the probe read 1,526 µs straight after it and stayed near
+   1.53 ms for two minutes with nothing else writing (596 KiB in 10 s, mostly
+   T3). So the powersave block-storage figures (the sieve's share under
+   powersave, the clock campaign's block rows, the B+Tree on the NVMe and the
+   direct backend's NVMe cost) could not be repeated; those runs are kept
+   outside `results/`. It is not heat (composite 32 °C, limit 85 °C) and not
+   a missing trim (`fstrim` trimmed 114.5 GiB of `/` on 2026-10-26). The drive
+   is a 1 TB SOLIDIGM SSDPFKKW010X7, shared with a 554 GB NTFS partition, and
+   `/` is 84 % full. The cause is not identified; the drive's own logs need
+   root.
+
+`desktop-campaigns.sh` now probes `fdatasync` before and after every step and
+refuses to start a step while the median is over 500 µs.
+
 ## Toolchain: Virgil revision and build command (recorded 2026-10-25)
 
 Every timed harness and the unit binary are native Virgil programs, so a figure

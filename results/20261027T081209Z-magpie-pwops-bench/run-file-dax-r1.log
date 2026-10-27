@@ -1,0 +1,20 @@
+backend file (mmap + msync/fdatasync)
+boundary fdatasync
+directory /mnt/pmem0.0/sean
+tsc cycles per microsecond 2294
+tsc kHz 2294609
+operations 50000 after 2000 warm-up, mounts 200 after 20 warm-up
+blocks of 4096 bytes; regions of 256 blocks, and 16384 for mount-64mib
+op alloc-1 samples 50000 entries 16 min_ns 33044 median_ns 34208 p90_ns 36147 p99_ns 37765 max_ns 265083 mean_ns 34600 boundaries 1 prepares 5 lines 15
+op free-1 samples 50000 entries 10 min_ns 29137 median_ns 30088 p90_ns 31846 p99_ns 33414 max_ns 341319 mean_ns 30407 boundaries 1 prepares 4 lines 11
+op alloc-8 samples 50000 entries 16 min_ns 33219 median_ns 34674 p90_ns 36641 p99_ns 38448 max_ns 88219 mean_ns 35056 boundaries 1 prepares 6 lines 17
+op free-8 samples 50000 entries 10 min_ns 29389 median_ns 30639 p90_ns 32354 p99_ns 33950 max_ns 89467 mean_ns 30917 boundaries 1 prepares 5 lines 13
+op alloc-64 samples 50000 entries 16 min_ns 37102 median_ns 38568 p90_ns 40510 p99_ns 42266 max_ns 95438 mean_ns 38928 boundaries 1 prepares 6 lines 17
+op free-64 samples 50000 entries 10 min_ns 33140 median_ns 34617 p90_ns 36341 p99_ns 37955 max_ns 1116132 mean_ns 34906 boundaries 1 prepares 5 lines 13
+op commit-empty samples 50000 entries 0 min_ns 21 median_ns 23 p90_ns 24 p99_ns 24 max_ns 2322 mean_ns 23 boundaries 0 prepares 0 lines 0
+op timer samples 50000 entries 0 min_ns 16 median_ns 17 p90_ns 18 p99_ns 18 max_ns 19 mean_ns 17 boundaries 0 prepares 0 lines 0
+op mount-1mib samples 200 entries 0 min_ns 7875 median_ns 8322 p90_ns 10304 p99_ns 12144 max_ns 13769 mean_ns 8995 boundaries 0 prepares 0 lines 0
+op recover-8 samples 200 entries 8 min_ns 17433 median_ns 18080 p90_ns 19905 p99_ns 24073 max_ns 68718 mean_ns 18968 boundaries 1 prepares 8 lines 8
+op recover-24 samples 200 entries 24 min_ns 24367 median_ns 25114 p90_ns 27151 p99_ns 46324 max_ns 69108 mean_ns 26301 boundaries 1 prepares 24 lines 24
+op mount-64mib samples 200 entries 0 min_ns 5322 median_ns 7128 p90_ns 7476 p99_ns 10420 max_ns 23386 mean_ns 7055 boundaries 0 prepares 0 lines 0
+OK

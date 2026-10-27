@@ -1,0 +1,23 @@
+backend direct (pwrite + O_DIRECT + fdatasync) on a file
+directory /home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block
+region 256 blocks of 4096 bytes, rounds 20
+segment span 32512 integers, capacity 167 segments, live segments 2
+steps per round: warmup 8, measured 159
+primes below 5429504: 376256 (reference sieve agrees)
+steps measured 3180
+tsc cycles per microsecond 3417
+tsc kHz 3417538
+wall ns per step 1112745
+step ns: mean 1112726
+step ns: min 1044320 median 1097395 p90 1123040
+step ns: p99 1199573 max 7877016
+phase compute ns per step 154252
+phase alloc ns per step 242096
+phase bitmap ns per step 256258
+phase publish ns per step 228206
+phase retire ns per step 231895
+boundaries per step x1000 4000
+prepare calls per step x1000 11666
+clwb lines per step x1000 0
+minor faults per step x1000 2141
+OK

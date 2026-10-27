@@ -1,0 +1,17 @@
+numa pinning: node 0
+region geometries: 512x4096 (blocks x blockSize)
+provenance -> /home/users/u7599095/ab-block-20261027T090704Z/cost-9f8dead1-3/provenance.txt
+  pmem-dax geometry=512x4096 entries=8 rep=1
+  file-dax geometry=512x4096 entries=8 rep=1
+  file-block geometry=512x4096 entries=8 rep=1
+  direct-block geometry=512x4096 entries=8 rep=1
+---- median boundary ns, median over 1 repetitions
+config        geometry  entries    boundary_ns
+direct-block  512x4096        8         133233
+file-block    512x4096        8         141589
+file-dax      512x4096        8         929416
+pmem-dax      512x4096        8             11
+---- boundaries per commit (must be 1000; a higher value means the overwrite guard fired)
+1000 
+
+csv -> /home/users/u7599095/ab-block-20261027T090704Z/cost-9f8dead1-3/cost.csv

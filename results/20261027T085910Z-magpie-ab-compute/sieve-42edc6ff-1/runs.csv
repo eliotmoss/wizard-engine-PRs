@@ -1,0 +1,3 @@
+config,rep,tsc_per_us,steps,wall_ns_per_step,step_ns_mean,step_ns_median,step_ns_p90,compute_ns,alloc_ns,bitmap_ns,publish_ns,retire_ns,boundaries_x1000,prepare_x1000,clwb_lines_x1000,faults_x1000,load1
+pmem-auto,1,2294,3180,480377,480479,480205,494252,426411,12739,20208,9243,11857,4000,0,94584,2143,0.31
+pmem-none,1,2294,3180,479340,479442,477232,493199,430197,11386,18587,8749,10501,4000,0,94584,2142,0.36

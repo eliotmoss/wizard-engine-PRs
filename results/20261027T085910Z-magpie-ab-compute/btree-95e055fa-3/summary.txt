@@ -1,0 +1,41 @@
+---- per operation, ns; each figure the median over repetitions of a run's statistic
+kind     config         reps     median        p90       mean  spread   compute     alloc     write   publish      free   persist    share
+insert   pmem-none         1      50047      55458      52593    0.0%      3626     22494      6393     12776      7104     48767    92.7%
+insert   pmem-auto         1      57873      62899      59220    0.0%      5652     24275      7807     13395      7885     53362    90.1%
+update   pmem-none         1      49519      51725      49809    0.0%      3504     20728      6058     12257      7068     46111    92.6%
+update   pmem-auto         1      57231      59687      57491    0.0%      5187     23116      7622     13332      8034     52104    90.6%
+lookup   pmem-none         1        334        367        335    0.0%       305         0         0         0         0         0     0.0%
+lookup   pmem-auto         1       1373       2265       1392    0.0%      1363         0         0         0         0         0     0.0%
+
+---- work per operation, checked on every operation of every round: boundaries (min-max) / lines written back / prepare calls, per op; splits
+insert   pmem-none        4.905 (3-6) /   94.876 /    0.000; 93 splits over 15000 ops
+insert   pmem-auto        4.905 (3-6) /   94.876 /    0.000; 93 splits over 15000 ops
+update   pmem-none        5.000 (5-5) /   94.660 /    0.000; 0 splits over 7539 ops
+update   pmem-auto        5.000 (5-5) /   94.660 /    0.000; 0 splits over 7539 ops
+lookup   pmem-none        0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+lookup   pmem-auto        0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+
+---- per boundary: the persistence phases over the boundaries they make, ns
+insert   pmem-none           9942
+insert   pmem-auto          10879
+update   pmem-none           9222
+update   pmem-auto          10421
+
+---- run facts, median over repetitions
+pmem-none      height after the load 2; wall ns per insert 53000, per mixed operation 25517
+pmem-auto      height after the load 2; wall ns per insert 59809, per mixed operation 29999
+
+---- pmem-auto - pmem-none: what the writeback instructions cost an operation, ns (an eADR approximation)
+insert         7826  ( 13.5 % of pmem-auto)
+update         7712  ( 13.5 % of pmem-auto)
+lookup         1039  ( 75.7 % of pmem-auto)
+
+Columns: median, p90 and mean of each run's per-operation rdtsc times; spread = (max - min) / median
+of the per-run medians; the phases are PWBTree's onPhase marks, means per operation; persist =
+alloc + write + publish + free; share = persist / mean, the persistence phases over the whole
+operation's mean time (rdtsc around each put or get), as pwsieve-bench.sh's share is over a
+whole step's wall time; what the marks leave out counts against it. A mutation at height h
+with k new nodes makes k + h + 1 boundaries: k allocations, one fence over the new nodes, the
+publish (root swap and first free) and h - 1 further frees. Inserts include the load's first
+inserts, made while the root is still a leaf. pmem-none drops CLWB and keeps SFENCE: an
+approximation of eADR timing, never durable. A difference is real only outside both spreads.

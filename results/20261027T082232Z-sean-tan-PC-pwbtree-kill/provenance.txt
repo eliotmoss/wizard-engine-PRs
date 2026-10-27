@@ -1,0 +1,16 @@
+---- revision
+commit 95e055faff802e8c179c608ef775a02c99072c09
+dirty  no (tracked files)
+---- host
+hostname pc-ubuntu
+kernel   Linux 7.0.0-38-generic x86_64 GNU/Linux
+started  2026-10-27T08:22:32+00:00
+load     1.48 1.61 1.29
+governor powersave
+---- directory
+block    /home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block
+/dev/nvme1n1p3 ext4 rw,relatime
+---- parameters
+args /home/sean-tan/.cache/engine-wt-95e055fa/bin/campaign-block 50 1 256 4096 <backend> <provider> (max delay 20000 us, capacity 8, key space 600: the defaults)
+unpinned
+finished 2026-10-27T08:22:36+00:00

@@ -1,0 +1,6 @@
+---- step 1: median re-access cycles (median over repetitions)
+medium/op        none     clwb  clflushopt   CLWB leaves the line
+dram/load          46      176         176   EVICTED (clwb ~ clflushopt)
+pmem/load          32     1434        1438   EVICTED (clwb ~ clflushopt)
+dram/store         48      256         256   EVICTED (clwb ~ clflushopt)
+pmem/store         48     1460        1492   EVICTED (clwb ~ clflushopt)

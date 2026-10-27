@@ -1,0 +1,29 @@
+results -> /home/users/u7599095/ab-block-20261027T090704Z/btree-95e055fa-1 (pinned node 0)
+  file-block rep=1
+---- per operation, ns; each figure the median over repetitions of a run's statistic
+kind     config         reps     median        p90       mean  spread   compute     alloc     write   publish      free   persist    share
+insert   file-block        1    2708829    3274267    2775488    0.0%     13560   1167893    796016    283763    513317   2760989    99.5%
+update   file-block        1    2724373    3179547    2783428    0.0%     13528   1189993    760555    282810    535580   2768938    99.5%
+lookup   file-block        1       1461       1806       1497    0.0%      1380         0         0         0         0         0     0.0%
+
+---- work per operation, checked on every operation of every round: boundaries (min-max) / lines written back / prepare calls, per op; splits
+insert   file-block       4.905 (3-6) /   94.876 /   16.430; 93 splits over 15000 ops
+update   file-block       5.000 (5-5) /   94.660 /   16.945; 0 splits over 7539 ops
+lookup   file-block       0.000 (0-0) /    0.000 /    0.000; 0 splits over 7461 ops
+
+---- per boundary: the persistence phases over the boundaries they make, ns
+insert   file-block        562893
+update   file-block        553788
+
+---- run facts, median over repetitions
+file-block     height after the load 2; wall ns per insert 2778102, per mixed operation 1401479
+
+Columns: median, p90 and mean of each run's per-operation rdtsc times; spread = (max - min) / median
+of the per-run medians; the phases are PWBTree's onPhase marks, means per operation; persist =
+alloc + write + publish + free; share = persist / mean, the persistence phases over the whole
+operation's mean time (rdtsc around each put or get), as pwsieve-bench.sh's share is over a
+whole step's wall time; what the marks leave out counts against it. A mutation at height h
+with k new nodes makes k + h + 1 boundaries: k allocations, one fence over the new nodes, the
+publish (root swap and first free) and h - 1 further frees. Inserts include the load's first
+inserts, made while the root is still a leaf. pmem-none drops CLWB and keeps SFENCE: an
+approximation of eADR timing, never durable. A difference is real only outside both spreads.
