@@ -1,0 +1,10 @@
+# Magpie cross-check, 2026-10-28: is the compiler rebuilt on sean-tan-PC from Virgil 47be87e8
+# (~/research/virgil-magpie-47be87e8, a clone of ~/research/virgil-titzer at 47be87e8, bin/dev/aeneas bootstrap)
+# the compiler Magpie's campaigns used? pwsievebench at engine 42edc6ff built once on each host, with
+# build.sh's date stamp and git count fixed (cmprev.sh's sed), USER=x HOST=x. Magpie: git archive of
+# ~/wizard-engine-PRs into /tmp, PATH=$HOME/virgil-titzer/bin:$PATH (v3c -version: Aeneas III-11.1968).
+0055e020f227cd5f61c59c8e1747fe2dea9d6d93445c115c06c2ade7b8445353  sean-tan-PC/bin/pwsievebench.x86-64-linux
+7bae5fc382a856d7d72d9aeba7594159bae65078fd56ec6f0b41e3f46dec126e  magpie/bin/pwsievebench.x86-64-linux
+functions: sean-tan-PC 3000, magpie 3000; resized 0; at a new address 0
+instructions differ once data addresses (>= 0x100000) are masked: ['ValueTypeCode.toHeapType']
+sizes 1204031 and 1203727 bytes (304 apart); the Virgil clone's path is embedded 25 and 25 times, 12 bytes longer on sean-tan-PC: 300 bytes

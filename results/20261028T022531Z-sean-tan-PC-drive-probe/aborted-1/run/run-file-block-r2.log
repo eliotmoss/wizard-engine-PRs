@@ -1,0 +1,7 @@
+backend file (mmap + fdatasync)
+directory /home/sean-tan/.cache/campaign-block-47be87e8
+region 256 blocks of 4096 bytes, rounds 3 measured after 1 audited
+workload per round: load 5000 keys, then 5000 operations, half lookups and half updates, seed 1
+tree capacity 252 keys per node, 508 words per node
+after the load: 5000 keys, height 2, 33 nodes
+round 0 audited 10000 operations: every commit's lines matched its record, every WRITE its nodes; 5000 keys match the reference

@@ -1,0 +1,49 @@
+---- what
+An attempt, on 2026-10-28, to rerun every desktop campaign the thesis cites at
+its original engine revision but compiled by Magpie's Virgil compiler
+(47be87e8, Aeneas III-11.1968, rebuilt on this desktop; see
+results/20261028T012839Z-sean-tan-PC-compiler-compare/magpie-crosscheck.txt),
+so that every result would share one compiler. It stopped at the first
+campaign, the B+Tree on block storage (results/20261014T041846Z-sean-tan-PC-
+pwbtree-bench-cpus2-powersave, engine 73f5aed2): the desktop's drive no
+longer gives the latency it gave in October, whatever the compiler. No
+campaign result from this attempt is used.
+---- host
+sean-tan-PC (pc-ubuntu), Linux 7.0.0-38-generic, the kernel of every October
+desktop campaign (their provenance.txt); governor powersave; the drive is
+nvme1n1, SOLIDIGM SSDPFKKW010X7, partitioned 554 GiB NTFS ("Games") and the
+399 GiB ext4 root that holds $HOME; nvme0n1 holds Windows.
+---- sequence (UTC)
+01:43  attempt 1 (aborted-1/): probe before, 4 KiB pwrite+fdatasync x400,
+       median 226 us (batch.log). Root filesystem 87 % full (320 of 392 GiB).
+       Round 1 of the B+Tree campaign: insert median 7,756,268 ns (file-block)
+       and 7,866,662 ns (direct-block), against 1,417,429 and 1,445,581 ns in
+       round 1 of 20261014T041846Z (runs.csv).
+01:53  stopped; the same probe: median 1,548 us, p10 1,518, p90 1,733.
+       Sean freed space: the root filesystem went to 45 % (164 of 392 GiB).
+02:13  attempt 2 (aborted-2/): probe before, median 252 us. Round 1: insert
+       median 7,817,224 ns (file-block) and 7,862,463 ns (direct-block).
+       Stopped.
+       Sean ran `sudo fstrim -v /`.
+02:23  after 120 s idle, 90 s of 4 KiB pwrite+fdatasync on one 8 MiB file in
+       the campaign block directory, reported per 10 s window
+       (sustained-probe.txt): medians 1,488-1,490 us in six windows and
+       282-289 us in two; p90 1,559-1,705 us in all eight.
+---- reading
+Inference: under sustained syncs the drive takes about 1.5 ms per 4 KiB
+fdatasync, against about 0.25 ms when idle, and freeing and trimming 156 GiB
+of the root filesystem did not change that. The October campaigns ran at the
+fast latency, so the desktop's block-storage timings cannot be repeated now.
+The same state stopped the 2026-10-27 reruns at 95e055fa (docs/persistent-
+backends.md, "Every campaign again at 95e055fa (2026-10-27)"). Cause not
+identified.
+---- decision
+Sean (2026-10-28): keep every campaign as originally built and run, and
+report the two compilers' measured code differences instead
+(docs/persistent-backends.md, "Toolchain", "The two compilers' code").
+---- files
+desktop-campaigns-47be87e8.sh   the driver used (per-step original revision,
+                                 Magpie's compiler first on PATH)
+desktop-sitting-47be87e8.sh     its root stage, prepared and never run
+aborted-1/, aborted-2/           the partial B+Tree campaign and batch logs
+sustained-probe.txt              the 90 s probe

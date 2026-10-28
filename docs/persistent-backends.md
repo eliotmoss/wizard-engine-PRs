@@ -3807,6 +3807,20 @@ rerun; it needs an administrator.
 `desktop-campaigns.sh` now probes `fdatasync` before and after every step and
 refuses to start a step while the median is over 500 µs.
 
+**The same state on 2026-10-28.** An attempt to rerun every cited desktop
+campaign at its original revision with Magpie's compiler (see *The two
+compilers' code*) stopped at the first, the B+Tree on block storage
+(`results/20261028T022531Z-sean-tan-PC-drive-probe`). It started twice: before
+and after Sean freed 156 GiB of `/` (87 % to 45 % full). Both times the probe
+passed (226 and 252 µs), and the first repetition then took 7.76–7.87 ms per
+insert, against 1.42–1.45 ms on 2026-10-14. After `sudo fstrim -v /` and two
+idle minutes, 90 s of 4 KiB `fdatasync`s had a median of 1,488–1,490 µs in six
+10 s windows and 282–289 µs in two. The kernel is the October campaigns'
+(7.0.0-38). *Inference:* the drive now takes about 1.5 ms per sync under
+sustained syncs, against 0.25 ms when idle, so the desktop's block-storage
+timings cannot be repeated now. Sean kept every campaign as originally built
+and run.
+
 ## Toolchain: Virgil revision and build command (recorded 2026-10-25)
 
 Every timed harness and the unit binary are native Virgil programs, so a figure
@@ -3983,6 +3997,12 @@ timed.
   *Inference:* the timed loops run none of these functions, so for these
   harnesses the compiler revision moves no code, and changes the timed
   instructions only in those constants.
+- **The rebuilt compiler is Magpie's.** `pwsievebench` at `42edc6ff`, built
+  with it on sean-tan-PC and with Magpie's own on Magpie, has the same 3,000
+  functions at the same sizes and addresses; the instructions differ, beyond
+  data addresses, only in `ValueTypeCode.toHeapType`. The binaries differ by
+  304 bytes, 300 of them the Virgil clone's path, embedded 25 times and 12
+  bytes longer on sean-tan-PC (`magpie-crosscheck.txt`).
 - **`pwbench`.** Six functions that walk WebAssembly stacks
   (`X86_64Stack.walk` and its helpers) are two to four bytes shorter under
   sean-tan-PC's compiler, so 1,628 of its 2,935 functions sit at a new

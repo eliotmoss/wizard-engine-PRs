@@ -1,0 +1,11 @@
+t= 10.0s syncs=10072 median=1489us p90=1703us
+t= 20.0s syncs=10289 median=1489us p90=1563us
+t= 30.0s syncs=9884 median=1490us p90=1705us
+t= 40.0s syncs=10340 median=1488us p90=1563us
+t= 50.0s syncs=17757 median=289us p90=1559us
+t= 60.0s syncs=17663 median=282us p90=1675us
+t= 70.0s syncs=10307 median=1489us p90=1563us
+t= 80.0s syncs=9905 median=1490us p90=1705us
+02:25:31
+
+[exited with code 0]

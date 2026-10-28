@@ -1,0 +1,10 @@
+results -> /home/sean-tan/.cache/engine-wt-73f5aed2/results/20261028T014317Z-sean-tan-PC-pwbtree-bench-cpus2-powersave (pinned cpus 2 (cpu_core))
+  file-block rep=1
+  direct-block rep=1
+  file-block rep=2
+Terminated                 "${PIN[@]}" "$BENCH_BIN" "${args[1]}" "${args[0]}" "$ROUNDS" "$KEYS" "$OPS" "$blocks" "$bs" "${args[@]:2}" "seed=$SEED" > "$log" 2>&1
+    FAILED -- see /home/sean-tan/.cache/engine-wt-73f5aed2/results/20261028T014317Z-sean-tan-PC-pwbtree-bench-cpus2-powersave/run-file-block-r2.log
+tree capacity 252 keys per node, 508 words per node
+after the load: 5000 keys, height 2, 33 nodes
+round 0 audited 10000 operations: every commit's lines matched its record, every WRITE its nodes; 5000 keys match the reference
+  direct-block rep=2
