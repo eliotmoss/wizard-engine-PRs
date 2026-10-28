@@ -1,0 +1,64 @@
+Direct-backend B+Tree tail on Magpie's /home, 2026-10-28 (run.sh, analyse.py)
+
+---- per run, ms: each run's own statistics (single runs; strace runs inflated)
+run                                kind    median     p90     p99     max   mean  alloc   free
+plain.log                          insert    2.05    2.73    4.02    83.0   2.21   0.87   0.41  direct, alone
+plain.log                          update    2.20    2.87    3.58    71.1   2.33   0.91   0.44  direct, alone
+order/1-direct.log                 insert    2.05    2.75    4.06    74.6   2.23   0.88   0.41  direct, alone
+order/1-direct.log                 update    2.29    2.97   42.21    98.5   3.11   1.28   0.74  direct, alone
+order/2-direct-after-direct.log    insert    2.03    2.70    3.50    69.9   2.18   0.85   0.40  direct, after a direct run
+order/2-direct-after-direct.log    update    2.30    2.98   10.18    90.9   2.78   1.13   0.60  direct, after a direct run
+order/3-file.log                   insert    2.02    2.62    3.16    91.8   2.14   0.88   0.39  file
+order/3-file.log                   update    2.05    2.63    3.13    59.5   2.22   0.92   0.41  file
+order/4-direct-after-file.log      insert    2.03    2.72    4.03    72.8   2.21   0.87   0.41  direct, after the file run
+order/4-direct-after-file.log      update    2.22    2.89    3.53    72.1   2.34   0.93   0.44  direct, after the file run
+strace.log                         insert    3.13    3.58    5.14   168.6   3.21   1.25   0.60  direct, under strace
+strace.log                         update    3.25    3.78    8.71   168.5   3.74   1.46   0.80  direct, under strace
+diskstats/strace.log               insert    3.22    3.68    5.24   156.8   3.30   1.28   0.61  direct, under strace
+diskstats/strace.log               update    3.34    3.85    5.12   151.5   3.53   1.39   0.68  direct, under strace
+
+---- the campaigns' direct-block updates, per repetition (runs.csv), ms
+20261014T111205Z-magpie-pwbtree-bench: 5 reps; median 2.41-2.67, p90 9.36-25.47, p99 35.65-43.60
+20261027T072331Z-magpie-pwbtree-bench: 5 reps; median 2.72-2.87, p90 16.09-25.53, p99 35.76-48.20
+
+---- the tail: direct runs without strace whose update p99 exceeds 10 ms
+2 of 4: order/1-direct.log, order/2-direct-after-direct.log
+update p90 over all 4: 2.87-2.98 ms
+order/1-direct.log: mean update 0.78 ms above the calm direct runs' (plain.log, order/4-direct-after-file.log); alloc + free hold 0.67 ms of it (86 %)
+order/2-direct-after-direct.log: mean update 0.44 ms above the calm direct runs' (plain.log, order/4-direct-after-file.log); alloc + free hold 0.37 ms of it (83 %)
+
+---- the strace runs: per syscall, ms; slow = over 10 ms
+strace.txt.xz
+  pwrite64   384132 calls; median 0.142, p99 0.512, max 183.9; slow 126
+  fdatasync  148408 calls; median 0.020, p99 0.028, max 18.0; slow 4
+  slow pwrite64s by target (4 KiB block[+blocks]): share of slow / share of all writes
+    253      43.7 % /  30.8 %
+    0+3      15.9 % /   7.8 %
+    0+2      12.7 % /  15.2 %
+    0         5.6 % /   7.8 %
+    1         4.0 % /   7.8 %
+  slow pwrite64s within 0.1 s of 9.4 s past a 10 s mark of the epoch: 25 of 126, in 11 of the 11 10 s periods the run spans
+  the other slow pwrite64s, longest first (s after the first write, ms): 49.64 184, 92.85 165, 62.13 165, 31.41 155, 25.05 126, 74.49 90, 0.00 45, 98.83 40
+diskstats/strace.txt.xz
+  pwrite64   384132 calls; median 0.143, p99 0.510, max 200.4; slow 58
+  fdatasync  148408 calls; median 0.021, p99 0.029, max 18.3; slow 4
+  slow pwrite64s by target (4 KiB block[+blocks]): share of slow / share of all writes
+    253      34.5 % /  30.8 %
+    0+2      17.2 % /  15.2 %
+    0        13.8 % /   7.8 %
+    0+3       8.6 % /   7.8 %
+    0+256     6.9 % /   0.0 %
+  slow pwrite64s within 0.1 s of 9.4 s past a 10 s mark of the epoch: 23 of 58, in 11 of the 12 10 s periods the run spans
+  the other slow pwrite64s, longest first (s after the first write, ms): 51.62 200, 25.72 175, 33.78 153, 64.51 136, 76.82 111, 95.22 71, 47.86 32, 0.00 29
+
+---- /proc/diskstats, sampled every 50 ms around the second strace run
+idle, 39 s before the run: sample intervals with I/O
+  dm-0 (/): 2, at s 5.3, 10.4
+  dm-1 (/var/log): 7, at s 4.8, 9.9, 10.4, 14.5, 15.5, 20.7, 25.7
+  dm-2 (/home): 13, at s 5.3, 10.4, 11.4, 11.9, 16.6, 17.6, 18.6, 22.7, 24.2, 25.2, 30.4, 31.9, 37.0
+during the run (102 s):
+  dm-0 (/): 4 intervals with I/O, at s after the first write 20.49 (0 r, 3 w), 25.62 (0 r, 1 w), 90.12 (0 r, 3 w), 95.25 (0 r, 1 w)
+  dm-1 (/var/log): 0 intervals with I/O, at s after the first write 
+  dm-2 (/home): 0 reads
+  slow pwrite64s overlapping (within 50 ms) an interval with I/O on / or /var/log or a read on /home: 4 of 58: 20.44 s 13 ms, 20.48 s 16 ms, 20.50 s 50 ms, 95.22 s 71 ms
+  of the six longest: 51.62 s 200 ms, 25.72 s 175 ms, 33.78 s 153 ms, 64.51 s 136 ms, 76.82 s 111 ms, 100.48 s 74 ms

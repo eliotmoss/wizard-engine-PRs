@@ -2503,6 +2503,8 @@ lookups in ns; the phases are means.
   ([2026-10-16](#what-acknowledges-a-write-on-home)). On the same grounds it
   is withdrawn here too, and what causes the tail is open. The share is 99.5–99.8 % with the tail and
   `file-block`'s 99.2–99.4 % without it, so the bracket does not depend on it.
+  On 2026-10-28 the tail came and went between single runs, and was smaller
+  ([below](#the-direct-backends-tail-again-2026-10-28)).
 - An insert takes 2.14–2.19 ms (median) on Magpie's `/home` against
   1.40–1.44 ms on the PC's NVMe, and 58.7 µs on Magpie's PMEM, so there the
   disk takes 36–37 times as long as PMEM. Wall time
@@ -2515,6 +2517,52 @@ all, some of them the header, WAL and allocator metadata. At 252 keys per node
 height 3 takes a larger region and, every node but the root being at least half
 full, over 30,000 keys (253 × 126; arithmetic, not run). The unit tests and the
 kill loop reach heights 3 and 4 with small node capacities instead.
+
+#### The direct backend's tail again (2026-10-28)
+
+`results/20261028T120946Z-magpie-pwbtree-direct-tail` (`run.sh`, `analyse.py`,
+`summary.txt`) ran the B+Tree on Magpie's `/home` again at `e635180a`, whose
+benchmark code is the 2026-10-27 campaign's, with the campaign's parameters and
+node. They are single runs, made between 12:09 and 12:24 UTC with the load at
+0.00. The 2026-10-27 campaign (`20261027T072331Z-magpie-pwbtree-bench`) has
+the tail in every repetition too: its updates' p90 is 16.1–25.5 ms and their
+p99 35.8–48.2 ms.
+
+- **The tail comes and goes, and is smaller.** Of four direct runs without
+  strace, two have an update p99 over 10 ms (42.2 and 10.2 ms) and two do not
+  (3.58 and 3.53 ms). The p90 is 2.87–2.98 ms in all four, against
+  9.4–25.5 ms on 2026-10-14. As then, the alloc and free phases hold most of
+  the excess mean: 86 % and 83 %, against the two runs without the tail. The
+  one `file-block` run has an update p99 of 3.13 ms.
+- **Running straight after the file backend is not the cause.** Each campaign
+  runs `direct-block` straight after `file-block`. Run in that order, the
+  direct backend had no tail (p99 3.53 ms); run alone, it had one once
+  (42.2 ms) and not once (3.58 ms).
+- **The time is lost in the write.** Two runs went under `strace -T`, which
+  makes an operation 40–60 % slower, so they locate the time and are not
+  timings. Of 384,132 `pwrite64` calls in each, 126 and 58 took over 10 ms (at
+  most 184 and 200 ms), against a 0.14 ms median. `fdatasync` has a 0.02 ms
+  median and 4 calls over 10 ms in each run. The slow writes fall on the
+  blocks the commits write most, not on one: block 253 takes 31 % of all
+  writes, and 44 % and 35 % of the slow ones.
+- **A stall every 10 s, set by the clock.** In both traced runs, 10 minutes
+  apart, a pair of slow writes recurs every 10 s at the same phase of the
+  clock, 9.4 s past each 10 s mark of the epoch: 25 of 126 and 23 of 58 slow
+  writes, in 11 of 11 and 11 of 12 periods. Once every 10 s is one mutation in
+  several thousand, so it reaches the maximum but cannot make a p99. What runs
+  every 10 s is not identified.
+- **Nothing else visible on the disk matches the rest.** `/proc/diskstats`,
+  sampled every 50 ms through the second traced run, shows four short bursts of
+  writes on `/` (one to three writes each), nothing on `/var/log` and no reads
+  on `/home`. Four of the 58 slow writes overlap a burst, and none of the six
+  longest does. Other processes' writes to `/home` cannot be told apart from
+  the run's in these counts.
+
+*Inference:* the tail depends on the state of Magpie's disk path at the time,
+not on the B+Tree alone: the same benchmark code and parameters give an update
+p90 of 16–26 ms on 2026-10-27 and 3 ms on 2026-10-28. The cause is still open.
+A block trace of a direct run with per-request latency (root) would show
+whether the slow writes wait in the device or above it.
 
 #### Crash behaviour of the tree
 
@@ -2715,7 +2763,8 @@ What this does not show:
   tree's writeback placement is checked in the explorer under the baseline
   model (above), for two puts at a small geometry. No run cuts power.
 - **The direct backend's tail on Magpie's `/home`.** It is observed in every
-  repetition and not explained (above).
+  repetition of both campaigns, came and went between single runs on
+  2026-10-28, and is not explained (above).
 - **Five boundaries where the work needs two.** At height 2 a mutation's
   essential ordering is one fence over the new nodes, then one commit that
   allocates them, swaps the root and frees the old path. The other three
