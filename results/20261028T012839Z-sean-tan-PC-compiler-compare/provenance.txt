@@ -1,0 +1,36 @@
+---- what
+Both hosts' Virgil compilers, applied to the same engine sources: does the
+compiler revision change the code of the timed harnesses? Each harness was
+built at the engine revision its campaign ran at, once with each compiler, and
+the two binaries were compared function by function. Nothing was timed.
+---- compilers
+old  Magpie's: Virgil 47be87e81a88f94a744119835eaf4877885f54e7, Aeneas III-11.1968.
+     Rebuilt on sean-tan-PC: git archive 47be87e8 of ~/research/virgil-titzer
+     into /tmp/virgil-cmp/old, then bin/dev/aeneas bootstrap (the checked-in
+     stable builds bin/bootstrap, which builds bin/current), as Magpie's was
+     built (persistent-backends.md, "Toolchain", Magpie). v3c -version:
+     "Aeneas III-11.1968", the version Magpie reports.
+new  sean-tan-PC's: ~/research/virgil-titzer bin/v3c, Virgil
+     eb52db9784036b89c22edd2c1c9019404709bedb, Aeneas III-11.1975, the binary
+     every desktop campaign used (same section).
+Each compile reads lib/ and rt/ from its own compiler's tree, as on each host.
+---- builds (cmprev.sh REV PROG)
+Engine sources: git archive REV into a fresh directory per compiler; build.sh's
+date stamp and git count fixed to constants so that bin/Build-x86-64-linux.v3
+is the same for both; then ./build.sh PROG x86-64-linux with the compiler's
+bin/ first on PATH (build.sh finds v3c and VIRGIL_LOC through PATH).
+Pairs, each a timing campaign's program at its revision (thesis appendix,
+"Revisions"): fc73b0a6 pwopsbench and pwbench (Magpie basic operations),
+42edc6ff pwsievebench (Magpie sieve), 1d7c3276 pwbtreebench (Magpie B+Tree),
+73f5aed2 pwbtreebench (desktop B+Tree), b358dbf0 pwsievebench (desktop
+performance-core sieve).
+---- comparison
+cmpbin.py: nm -S for each function's address and size; objdump -d with every
+numeric constant masked, per function. Output: compare.txt.
+classify.py: every constant that differs within an otherwise equal
+instruction, classified as a data address (>= 0x100000) or a smaller value,
+with each smaller value and each other difference listed. Output: classify.txt.
+sizes.txt: the twelve binaries' sizes.
+---- host
+sean-tan-PC (pc-ubuntu), 2026-10-28T12:28:39+11:00; /tmp/virgil-cmp (tmpfs)
+holds the builds, which are not kept.

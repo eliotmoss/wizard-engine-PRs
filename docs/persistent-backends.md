@@ -3931,7 +3931,7 @@ commands below as `u7599095` in a login shell; the output is
   generation and machine lowering) and `rt/gc/RiGc.v3`; nothing under `lib/`
   and nothing under `aeneas/src/x86-64/` changes. A comparison between the
   hosts therefore also spans two compiler revisions; what that changes in the
-  emitted code is not measured.
+  emitted code is measured below (*The two compilers' code*, 2026-10-28).
 
 The commands only read. Run them in the kind of shell the campaigns ran from,
 so that `PATH` is the same:
@@ -3949,6 +3949,45 @@ grep -n version "$VL/aeneas/src/main/Version.v3"
 stat -c '%y %n' "$VL"/bin/current/*/Aeneas "$VL"/bin/bootstrap/*/Aeneas
 find "$VL" -path "$VL/.git" -prune -o -type f -newer "$(readlink -f "$V3C")" -print | head -20
 ```
+
+**The two compilers' code: measured on 2026-10-28.** Each timing campaign's
+harness was built at its campaign's revision once with each compiler, Magpie's
+rebuilt on sean-tan-PC from `47be87e8` (it reports Magpie's `Aeneas
+III-11.1968`), and the two binaries compared function by function
+(`results/20261028T012839Z-sean-tan-PC-compiler-compare`: `provenance.txt`
+gives the method, `compare.txt` and `classify.txt` the output). Nothing was
+timed.
+
+| Harness @ revision | Functions | Resized | At a new address | Differ beyond constants |
+|---|---|---|---|---|
+| `pwopsbench` @ `fc73b0a6` | 2,972 | 0 | 0 | 1 |
+| `pwsievebench` @ `42edc6ff` | 3,000 | 0 | 0 | 1 |
+| `pwsievebench` @ `b358dbf0` | 3,000 | 0 | 0 | 1 |
+| `pwbtreebench` @ `1d7c3276` | 3,031 | 0 | 0 | 3 |
+| `pwbtreebench` @ `73f5aed2` | 3,027 | 0 | 0 | 3 |
+| `pwbench` @ `fc73b0a6` | 2,935 | 6 | 1,628 | 47 |
+
+- **The sieve, basic-operation and B+Tree harnesses.** Every function has the
+  same size and the same address under both compilers; sean-tan-PC's binaries
+  are 448 to 456 bytes longer, outside the code. Within an otherwise equal
+  instruction the differing constants are of two kinds (`classify.txt`): data
+  addresses, which move by those same 448 to 456 bytes (1,882 to 1,965 a
+  harness), and smaller values (134 to 245 a harness), each a type number
+  that a constructor stores in a new object's header (`movl $X,(reg)`) or a
+  type test compares (`cmp`/`sub $X,%eax`). No field offset or other
+  immediate differs. Beyond constants, one to three functions differ:
+  `ValueTypeCode.toHeapType`, `BpConstants.renderTypeCode`, `Values.default`
+  and `ValueTypes.render`, which handle WebAssembly value types and whose
+  differing bytes disassemble as data. In `pwbtreebench`, jumps inside
+  `main.wiringError`, an error path at start-up, land two bytes apart.
+  *Inference:* the timed loops run none of these functions, so for these
+  harnesses the compiler revision moves no code, and changes the timed
+  instructions only in those constants.
+- **`pwbench`.** Six functions that walk WebAssembly stacks
+  (`X86_64Stack.walk` and its helpers) are two to four bytes shorter under
+  sean-tan-PC's compiler, so 1,628 of its 2,935 functions sit at a new
+  address and 47 differ beyond constants. A `pwbench` timing compared between
+  the hosts spans two code layouts.
 
 For each Magpie campaign, the source revision is the last reflog entry before
 the directory's stamp (the stamp is UTC; the reflog prints local time with its
